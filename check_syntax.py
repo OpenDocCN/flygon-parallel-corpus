@@ -2,7 +2,10 @@ import os
 import yaml
 from os import path
 
-fnames = os.listdir('done')
+fnames = [
+    f for f in os.listdir('done')
+    if f.endswith('.yaml')
+]
 
 for f in fnames:
     print(f)

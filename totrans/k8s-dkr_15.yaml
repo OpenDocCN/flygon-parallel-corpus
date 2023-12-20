@@ -1,0 +1,2706 @@
+- en: '*Chapter 12*: Auditing using Falco and EFK'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Bad people do bad things.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Good people do bad things.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accidents happen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each of the preceding statements has one thing in common: when any one of them
+    occurs, you need to find out what happened.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Too often, auditing is considered only when we think of some form of attack.
+    While we certainly require auditing to find "bad people", we also need to audit
+    everyday standard system interactions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes includes logs for most of the important system events that you will
+    need to audit, but it doesn't include everything. As we discussed in previous
+    chapters, all API interactions will be logged by the system, which includes the
+    majority of events you need to audit. However, there are tasks that users execute
+    that will not go through the API server and may go undetected if you are relying
+    on API logs for all of your auditing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are tools to address the gaps in the native logging functionality. Open
+    source projects such as Falco will provide enhanced auditing for your pods, providing
+    details for events that are logged by the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Logs without a logging system are not very useful. Like many components in Kubernetes,
+    there are many open source projects that provide a full logging system. One of
+    the most popular systems is the EFK stack, which includes Elasticsearch, Fluentd,
+    and Kibana.
+  prefs: []
+  type: TYPE_NORMAL
+- en: All of these projects will be covered in detail throughout this chapter. You
+    will deploy each of these components to gain hands-on experience and to reinforce
+    the material covered in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploring auditing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introducing Falco
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Exploring Falco's configuration files
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying Falco
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Falco kernel module
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To complete the exercises in this chapter, you will need to meet the following
+    technical requirements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An Ubuntu 18.04 server with a minimum of 8 GB of RAM and at least 5 GB of free
+    disk space for Docker volumes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A KinD cluster installed using the instructions in [*Chapter 4*](B15514_04_Final_ASB_ePub.xhtml#_idTextAnchor083),
+    *Deploying Kubernetes using KinD*
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Helm3 binary (should also have been installed in [*Chapter 4*](B15514_04_Final_ASB_ePub.xhtml#_idTextAnchor083),
+    *Deploying Kubernetes using KinD*)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can access the code for this chapter at the GitHub repository for the book,
+    available at [https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide](https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploring auditing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In most environments where you run Kubernetes clusters, you will need to have
+    an auditing system in place. While Kubernetes has some auditing features, they
+    are often too limited for an enterprise to rely on for a complete audit trail,
+    and logs are often only stored on each host filesystem.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In order to correlate events, you are required to pull all the logs you want
+    to search through on your local system, and manually look through logs or pull
+    them into a spreadsheet and attempt to create some macros to search and tie information
+    together.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fortunately, there are many third-party logging systems available for Kubernetes.
+    Optional pay systems such as Splunk and Datadog are popular solutions and open
+    source systems including the EFK stack are commonly used and included with many
+    Kubernetes distributions. All of these systems include some form of a log forwarder
+    that allows you to centralize your Kubernetes logs so you can create alerts, custom
+    queries, and dashboards.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another limitation of native auditing is the limited scope of events, which
+    are limited to API access. While this is important to audit, most enterprises
+    will need to augment or customize the base set of auditing targets beyond simple
+    API events. Extending the base auditing features can be a challenge and most companies
+    will not have the expertise or time to create their own auditing add-ons.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One area of auditing that Kubernetes is missing concerns pod events. As we
+    mentioned, the base auditing capabilities of Kubernetes focus on API access. Most
+    tasks performed by users will trigger a call to the API server. Let''s take an
+    example of a user executing a shell on a pod to look at a file. The user would
+    use **kubectl exec -it <pod name> bash** to spawn a bash shell on the pod in interactive
+    mode. This actually sends a request to the API server, the main call of which
+    to execute is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: I0216 11:42:58.872949   13139 round_trippers.go:420] POST https://0.0.0.0:32771/api/v1/namespaces/ingress-nginx/pods/nginx-ingress-controller-7d6bf88c86-knbrx/exec?command=bash&container=nginx-ingress-controller&stdin=true&stdout=true&tty=true
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking at the event, you can see that an **exec** command was sent to the **nginx-ingress-controller**
+    pod to run the bash process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There may be good reasons that someone is running a shell, for example, to look
+    at an error log or to fix an issue quickly. But the issue here is that, once inside
+    the running pod, any command that is executed does not access the Kubernetes API,
+    and therefore, you will not receive any logged events for the actions executed
+    in the pod. To most enterprises, this is a large hole in the auditing system since
+    no end-to-end audit trail would exist if the action conducted in the container
+    were malicious.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To audit all shell access to pods would lead to many false-positive leads, and
+    in the event that a pod was restarted, you would lose any local audit files in
+    the pod. Instead, you may ignore simple shell access, but you want to log an event
+    if someone tries to execute certain tasks from the shell, such as modifying the
+    **/etc/passwd** file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, you may ask, "*What is the solution?*" The answer is to use Falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Falco
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Falco is an open source system from Sysdig that adds anomaly detection functionality
+    for pods in Kubernetes clusters. Out of the box, Falco includes a base set of
+    powerful, community-created rules that can monitor a number of potentially malicious
+    events, including the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a user attempts to modify a file under **/etc**
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When a user spawns a shell on a pod
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When a user stores sensitive information in a secret
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When a pod attempts to make a call to the Kubernetes API server
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Any attempts to modify a system ClusterRole
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Or any other custom rule you create to meet your needs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When Falco is running on a Kubernetes cluster it watches events, and based on
+    a set of rules, it logs events on the Falco pod that can be picked up by a system
+    such as Fluentd, which would then forward the event to an external logging system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we will explain the configuration of Falco using the technical
+    requirements for our company scenario for FooWidgets. By the end of the chapter,
+    you will know how to set up Falco on a Kubernetes cluster using custom configuration
+    options. You will also understand the rules used by Falco and how to create rules
+    when you need to audit an event that is not included in the base rules. Finally,
+    you will forward events using Fluentd to Elasticsearch using Kibana to visualize
+    the events generated by Falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploring Falco's configuration files
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before you install Falco, you need to understand the configuration options that
+    are available, and that starts with the initial configuration file that will be
+    used to configure how Falco creates events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Falco project includes a set of base configuration files that you can use
+    for your initial auditing. It is highly likely that you will want to change the
+    base configuration to fit your specific enterprise requirements. In this section,
+    we will go over a Falco deployment and provide a basic understanding of the configuration
+    files.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco is a powerful system that can be customized to fit almost any requirement
+    you may have for security. Since it is so extensible, it's not possible to cover
+    every detail of the configuration in a single chapter, but like many popular projects,
+    there is an active GitHub community at [https://github.com/falcosecurity/falco](https://github.com/falcosecurity/falco)
+    where you can post issues or join their Slack channel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Falco configuration files include a base configuration file and the rules
+    files that contain the events that will be audited by the system. The base configuration
+    file is a simple YAML file that contains **key:value** pairs for each configuration
+    option, along with other YAML files that use **key:value** pairs, but they contain
+    details and configurations for the audit events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are four base configuration files that you can use to configure your
+    deployment, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**falco.yaml**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**falco_rules.yaml**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**falco_rules.local.yaml**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**k8s_audit_rules.yaml**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The included configuration files will work out of the box, but you may want
+    to change some of the values to fit your logging requirements. In this section,
+    we will explain the most important configuration options in detail. The first
+    three configuration files are part of a base Falco deployment and will be explained
+    in detail in this chapter. The last configuration file is not required for a base
+    Falco installation. It is an add-on that can be enabled to add additional auditing
+    functionalities to the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The falco.yaml configuration file
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The first file you will need to edit is the **base configuration file** to configure
+    how Falco creates audit events. It allows you to customize the base settings of
+    Falco including the event output format, timestamp configuration, and endpoint
+    targets such as a Slack channel. Let's have a detailed walkthrough of this file
+    and try to understand it bit by bit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first section in the configuration file is the **rules_files** section.
+    This section takes the format of the key **rules_file**, and the values for the
+    rule file(s) with a dash. (This can also be represented as **rules_file: [file1,
+    file2, file3, etc…]**.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will explain the function of each rule file in this chapter. In this example
+    configuration, we are telling Falco to use three files as rules, and each file
+    is mounted from a ConfigMap during installation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rules_file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/falco_rules.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/falco_rules.local.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/k8s_audit_rules.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next set of values will configure how Falco outputs events, including the
+    time format, and the option to output events as text or JSON.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By default, the **time_format_iso_8601** value is set to **false**, which tells
+    Falco to use the local **/etc/localtime** format. Setting the value to **true**
+    tells Falco to stamp each event using the date format of YYYY-MM-DD, a time format
+    using a 24-hour clock, and a time zone of UTC.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Selecting the appropriate format is a decision for your organization. If you
+    have a global organization it may beneficial to set all of your logging to use
+    the ISO 8601 format. However, if you have a regional organization you may be more
+    comfortable using your local date-and-time format since you may not need to worry
+    about correlating events against logging systems in other time zones:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'time_format_iso_8601: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next two lines allow you to configure the output of events as either text
+    or JSON format. The default value is set to **false**, which tells Falco to output
+    events in text format. If the first key is set to **false**, the second value
+    will not be evaluated since JSON is not enabled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'json_output: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'json_include_output_property: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may need to output the events in JSON format, depending on the format that
+    your logging system requires. As an example, if you were going to send Falco events
+    to an Elasticsearch server, you might want to enable JSON to allow Elasticsearch
+    to parse the alerts field. Elasticsearch does not require the events to be sent
+    in JSON format and for the lab in this module, we will leave this set to the default
+    value, **false**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are some examples of the same type of event in both text format
+    and JSON format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Falco text log output looks as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**19:17:23.139089915: Notice A shell was spawned in a container with an attached
+    terminal (user=root k8s.ns=default k8s.pod=falco-daemonset-9mrn4 container=0756e87d121d
+    shell=bash parent=runc cmdline=bash terminal=34816 container_id=0756e87d121d image=<NA>)
+    k8s.ns=default k8s.pod=falco-daemonset-9mrn4 container=0756e87d121d k8s.ns=default
+    k8s.pod=falco-daemonset-9mrn4 container=0756e87d121d**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Falco JSON log output looks as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**{"output":"20:47:39.535071657: Notice A shell was spawned in a container
+    with an attached terminal (user=root k8s.ns=default k8s.pod=falco-daemonset-mjv2d
+    container=daeaaf1c0551 shell=bash parent=runc cmdline=bash terminal=34816 container_id=daeaaf1c0551
+    image=<NA>) k8s.ns=default k8s.pod=falco-daemonset-mjv2d container=daeaaf1c0551
+    k8s.ns=default k8s.pod=falco-daemonset-mjv2d container=daeaaf1c0551","priority":"Notice","rule":"Terminal
+    shell in container","time":"2020-02-13T20:47:39.535071657Z", "output_fields":
+    {"container.id":"daeaaf1c0551","container.image.repository":null,"evt.time":1581626859535071657,"k8s.ns.name":"default","k8s.pod.name":"falco-daemonset-mjv2d","proc.cmdline":"bash","proc.name":"bash","proc.pname":"runc","proc.tty":34816,"user.name":"root"}}**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Continuing on, the next two options tell Falco to log **Falco-level** events
+    to **stderr** and **syslog**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'log_stderr: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'log_syslog: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This setting does not have any impact on the events that your rules file will
+    be monitoring, but rather configures how **Falco system events** will be logged:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'log_stderr: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'log_syslog: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'log_level: info'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default for both options is **true**, so all events will be logged to **stderr**
+    and **syslog**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next is the logging level you want to capture, with accepted values including
+    **emergency**, **alert**, **critical**, **error**, **warning**, **notice**, **info**,
+    and **debug**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Continuing on, the priority level specifies the rulesets that will be used
+    by Falco. Any ruleset that has a rule priority equal to or higher than the configured
+    value will be evaluated by Falco to generate alerts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'priority: debug'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default value is **debug**. Other values that can be set are **emergency**,
+    **alert**, **critical**, **error**, **warning**, **notice**, and **info**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next up is the value to enable or disable **buffered_output**. By default,
+    **buffered_outputs** is set to **false**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'buffered_outputs: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To pass system calls, Falco uses a shared buffer that can fill up, and when
+    the value is set to **true**, the buffer can be configured to tell Falco how to
+    react. The default values are usually a good starting value for an initial configuration.
+    The Falco team has a detailed explanation of dropped events on their main documentation
+    page at [https://falco.org/docs/event-sources/dropped-events/](https://falco.org/docs/event-sources/dropped-events/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **syscall_events_drops** setting can be set to **ignore**, **log**, **alert**,
+    and **exit**. The rate configures how often Falco will execute the configured
+    actions. The value is actions per second, so this example tells Falco to execute
+    one action every 30 seconds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'syscall_event_drops:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'actions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- log'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- alert'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rate: .03333'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'max_burst: 10'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **outputs** section allows you to throttle the notifications from Falco,
+    containing two values, **rate** and **max_burst**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'outputs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rate: 1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'max_burst: 1000'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **syslog_output** section tells Falco to output events to syslog. By default,
+    this value is set to **true**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'syslog_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In certain use cases, you may want to configure Falco to output events to a
+    file in addition to, or as a replacement to, stdout. By default, this is set to
+    **false**, but you can enable it by setting it to **true** and providing a filename.
+    The **keep_alive** value is set to **false** by default, which configures Falco
+    to keep the file open and write data continuously without closing the file. If
+    it is set to **false**, the file is opened for each event as they occur, and closed
+    once the events have been written:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'file_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'keep_alive: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'filename: ./events.txt'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'By default, Falco will output events to **stdout**, so it is set to **true**.
+    If you have a requirement to disable logging events to **stdout**, you can change
+    this value to **false**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'stdout_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **webserver** configuration is used to integrate Kubernetes audit events
+    with Falco. By default, it is enabled to listen on port **8765** using HTTP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can enable secure communication by changing the **ssl_enabled** value to
+    **true**, and supplying a certificate for the **ssl_certificate** value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'webserver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'listen_port: 8765'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'k8s_audit_endpoint: /k8s_audit'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ssl_enabled: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ssl_certificate: /etc/falco/falco.pem'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco can be configured to alerts to other systems. In our example configuration,
+    they show an example using **jq** and **curl** to send an alert to a Slack channel.
+    By default, this section is **disabled**, but if you want to call an external
+    program when alerts are triggered, you can enable the option and provide the program
+    to be executed. Similar to the file output described previously, the **keep_alive**
+    option defaults to **false**, which tells Falco to run the program for each event:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'program_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'keep_alive: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'program: "jq ''{text: .output}'' | curl -d @- -X POST https://hooks.slack.com/services/XXX"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco can send alerts to an HTTP endpoint. We will be deploying an add-on for
+    Falco called **falcosidekick**, which runs a web server to receive requests from
+    the Falco pod. It is disabled by default, but we have enabled it and set it to
+    the name of the service that will be created later in the chapter when we deploy
+    **Falcosidekick**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'http_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'url: http://falcosidekick:2801'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The remaining sections of the file are used to enable and configure a gRPC
+    server. This is not a common configuration when using Falco with Kubernetes, and
+    is only provided here since it''s in the base **falco.yaml** file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'grpc:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'bind_address: "0.0.0.0:5060"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'threadiness: 8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'private_key: "/etc/falco/certs/server.key"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'cert_chain: "/etc/falco/certs/server.crt"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'root_certs: "/etc/falco/certs/ca.crt"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'grpc_output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enabled: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The base configuration is just the initial configuration file to a Falco deployment.
+    It only sets the Falco system configuration; it doesn't create any rules, which
+    are used to create alerts. In the next section, we will explain how to configure
+    the files used to create Falco alerts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco rules config files
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Recall that in our configuration file, the first section had a key called **rules_files**
+    and the key can have multiple values. The values that you provide will contain
+    the filenames, which are mounted using a **configmap**, telling Falco what to
+    audit and how to alert us about a given event.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Rules files can contain three types of elements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rules**: Configures Falco alerts'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Macros**: Creates a function that can shorten definitions in a rule'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Lists**: A collection of items that can be used in a rule'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the upcoming subsections, we'll go over each of these elements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding rules
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Falco includes a set of example Kubernetes rules that you can use as-is, or
+    you can modify the existing rules to fit your specialized requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco is a powerful auditing system that enhances cluster security. Like any
+    system that provides auditing, creating rules to monitor systems can become complex
+    and Falco Kubernetes no exception. To use Falco effectively, you need to understand
+    how it uses the rules files and how you can correctly customize the rules to fit
+    your requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A default Falco installation will include three rulesets:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Table 12.1 – Rules files overview'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/B15514_Table_12.1.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12.1 – Rules files overview
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each of the rules files have the same syntax, so before explaining each file
+    in greater detail, let's explain how rules, macros, and lists work together to
+    create rules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our first example will generate an alert when a pod that is not part of Kubernetes
+    itself tries to contact the API server. This type of activity may signal that
+    an attacker is looking to exploit the Kubernetes API server. To accomplish the
+    most efficient alert, we don't want to generate alerts from pods that are part
+    of the Kubernetes cluster that need to communicate with the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The included rules list includes this event. In the **falco_rules.yaml** file,
+    there is a rule for API server communication:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- rule: Contact K8S API Server From Container'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'desc: Detect attempts to contact the K8S API Server from a container'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: evt.type=connect and evt.dir=< and (fd.typechar=4 or fd.typechar=6)
+    and container and not k8s_containers and k8s_api_server'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'output: Unexpected connection to K8s API Server from container (command=%proc.cmdline
+    %container.info image=%container.image.repository:%container.image.tag connection=%fd.name)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'priority: NOTICE'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'tags: [network, k8s, container, mitre_discovery]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can see that a rule may contain multiple conditions and values. Falco includes
+    a large set of conditions that can be checked, so let's start by explaining this
+    rule in detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To explain how this rule works, we break down each section in the following
+    table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Table 12.2 – Parts of a Falco rule'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/B15514_Table_12.2.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12.2 – Parts of a Falco rule
+  prefs: []
+  type: TYPE_NORMAL
+- en: Most of the table is fairly straightforward, but the condition section has some
+    complex logic that may not make much sense to you. Like most logging systems,
+    Falco uses its own syntax for creating rule conditions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since rules can be difficult to create, the Falco community has provided an
+    extensive list of premade rules. Many people will find that the community rules
+    will fully meet their needs, but there are scenarios where you might need to create
+    custom rules, or need to change one of the existing rules to reduce alerts for
+    events you may not be concerned about. Before you attempt to create or change
+    an event, you need to understand the full logic of a condition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Covering all of the logic and syntax that Falco offers is beyond the scope of
+    this book, but understanding the example rule is the first step to creating or
+    editing existing rules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding conditions (fields and values)
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The example condition contains a few different conditions that we will break
+    down here into three sections to describe each part of the condition in steps.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first component of a condition is the **class** **fields**. A condition
+    can contain multiple class fields and can be evaluated using standard **and**,
+    **not**, or **equals** conditions. Breaking down the example condition, we are
+    using the **event (evt)** and **file descriptor (fd)** class fields:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.1 – Class field example'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.1_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.1 – Class field example
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each class may have a **field** value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.2 – Class Field Value'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.2_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.2 – Class Field Value
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, each field type will have a **value**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.3 – Values in conditions'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.3_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.3 – Values in conditions
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can get a complete list of the available classes from Falco's website at
+    [https://falco.org/docs/rules/supported-fields/](https://falco.org/docs/rules/supported-fields/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco has a number of class fields and values for rules. There are too many
+    classes to explain in a single chapter, but to help with creating your own custom
+    rules, we have provided an explanation using the original example condition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: evt.type=connect and evt.dir=< and (fd.typechar=4 or fd.typechar=6)
+    and container and not k8s_containers and k8s_api_server'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following table explains the event class and its values:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Table 12.3 – Event class example'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/B15514_Table_12.3.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12.3 – Event class example
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Along with using the event class, the rule also uses the file descriptor class,
+    which is explained as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Table 12.4 – File descriptor example'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/B15514_Table_12.4.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12.4 – File descriptor example
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last part of the rule that starts with **and container** value will include
+    any container. However, since we do not want to send alerts for valid communications
+    from Kubernetes itself, the value **and not k8s_containers and k8s_api_server**
+    tells the condition to omit the Kubernetes container and the **api_server**. The
+    values in this example use macros that have been defined in the **falco_rules.yaml**
+    file. We will discuss macros in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using macros
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Macros allow you to create a collection to make rule creation quicker and easier.
+    In the previous example, the condition used two macros, **k8s_containers** and
+    **k8s_api_server.**
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **k8s_containers** macro has been defined to contain the condition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a local/user rules file, list the namespace or container images that are
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: allowed to contact the K8s API Server from within a container. This
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: might cover cases where the K8s infrastructure itself is running
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: within a container.
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '- macro: k8s_containers'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: >'
+  prefs: []
+  type: TYPE_NORMAL
+- en: (container.image.repository in (gcr.io/google_containers/hyperkube-amd64,
+  prefs: []
+  type: TYPE_NORMAL
+- en: gcr.io/google_containers/kube2sky, sysdig/agent, sysdig/falco,
+  prefs: []
+  type: TYPE_NORMAL
+- en: sysdig/sysdig, falcosecurity/falco) or (k8s.ns.name = "kube-system"))
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Macros, like rules, use classes to create conditions. To evaluate **k8s_containers**
+    condition, macros use two classes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **container.image.repository** class field, which validates the repositories
+    for the condition.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **k8s.ns.name** class field, which is used to include any containers running
+    in the **kube-system** namespace.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The **k8s_api_server** has been defined to contain the condition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- macro: k8s_api_server'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: (fd.sip.name="kubernetes.default.svc.cluster.local")'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the **k8s_api_server** condition, macros use a single class field to evaluate
+    the condition – the **fd.sip.name** class field – which checks the domain name
+    of the **server IP** (**SIP**). If it is equal to **kubernetes.default.svc.cluster.local**
+    it is considered a match.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using both of the preceding macros for the rules condition will stop any Kubernetes
+    cluster pods from generating alerts when communicating with the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding lists
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Lists allow you to group items into a single object that can be used in rules,
+    macros, or nested in other lists.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A list only requires two keys in a rules file, **list** and **items**. For
+    example, rather than listing a number of binaries on a condition, you could group
+    the binaries into a **list**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- list: editors'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'items: [vi, nano, emacs]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using lists allows you to use a single entry, rather than including multiple
+    items in a condition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Rules can be challenging, but as you read more of the included rules and start
+    to create your own, it will become easier. So far, we have introduced the basics
+    on how to create rules, macros, and lists. With a basic understanding of these
+    objects under our belts, we will move on to the next configuration file where
+    you will create and append Falco rules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating and appending to custom rules
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Falco comes with a number of base rules that are located in the **falco_rules.yaml**
+    file. This file should never be edited – if you need to change or create a new
+    rule, you should edit the **falco_rules.local.yaml** file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Appending to an existing rule
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: You are not limited to only appending to rules. Falco allows you to append rules,
+    macros, and lists.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The included **falco_rules.local.yaml** is empty by default. You only need to
+    edit this file if an existing rule needs to be modified or removed or a new rule
+    needs to be added. Since the file is used to change or add values to the base
+    **falco_rules.yaml** file, the order in which the files are used by Falco is very
+    important.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco will build rules based on the name from all rules files. The files are
+    read and evaluated in the order that they are referenced in the base Falco configuration
+    file. The base file that we used as an example at the beginning of this chapter
+    has the following order for its rules files:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rules_file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/falco_rules.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/falco_rules.local.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- /etc/falco/k8s_audit_rules.yaml'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that the **falco.rules.local.yaml** file is after the base **falco_rules.yaml**
+    file. Keeping control of the order of the files will help you to track any expected/unexpected
+    behaviors of your rules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using an example from the Falco documentation, let's show how to append to a
+    rule.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The original rule from **falco_rules.yaml** is shown in the following code
+    block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- rule: program_accesses_file'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'desc: track whenever a set of programs opens a file'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: proc.name in (cat, ls) and evt.type=open'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'output: a tracked program opened a file (user=%user.name command=%proc.cmdline
+    file=%fd.name)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'priority: INFO'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As the description states, this rule will trigger whenever a set of programs
+    opens a file. The condition will trigger when **cat** or **ls** is used to open
+    a file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The current rule does not omit the open operation from any users. You have decided
+    that you do not need to know when the root user uses either **cat** or **ls**
+    to open a file, and you want to stop Falco from generating alerts for root.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the **falco_rules.local.yaml** file, you need to create an **append** for
+    the existing rule. To append to a rule, you must use the same rule name, then
+    add **append: true** and any changes you want to make to the rule. An example
+    is shown in the following snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- rule: program_accesses_file'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'append: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'condition: and not user.name=root'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a new rule is easier than appending to an existing rule. Let's see
+    how it works.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a new rule
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Since you are creating a new rule, you only need to add a standard rule to the
+    **falco_rules.local.yaml**. As it is a new rule, it will simply be added to the
+    list of rules that Falco uses to create alerts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco's configuration files are read from a ConfigMap, so you will need to restart
+    the Falco pods if you change any values in the ConfigMap.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Congratulations! A lot of information has been presented to you here, and you
+    probably want to see Falco in action to put your knowledge to work. In the next
+    section, we explain how to deploy Falco, and you will finally get to see it in
+    action.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying Falco
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have included a script to deploy Falco, called **falco-install.sh**, in the
+    GitHub repository in the **chapter12** folder.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The two most popular methods of deploying Falco to a Kubernetes cluster are
+    using the official Helm chart or a DaemonSet manifest from the Falco repo. For
+    the purposes of this module, we will deploy Falco using a modified DaemonSet installation
+    from the book's GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To deploy Falco using the included script, execute the script from within the
+    **chapter12** folder by executing **./install-falco.sh**. We have also included
+    a script called **delete-falco.sh** in the same directory that will remove Falco
+    from the cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The steps that the script performs are detailed in the following list and will
+    be explained in additional detail in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The script executes the following tasks in two sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In **Section 1**, it creates a Falco probe and performs the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Installs Go using **apt**
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Pulls Falco's **driverkit-builder** container
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Pulls the driverkit source from Git and builds the executable
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Creates an ubuntu-generic Falco probe using driverkit
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Copies **falco.ko** to the **modules** folder
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Adds a Falco probe using **modprobe**
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In **Section 2**, it adds Falco to the cluster, performing the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creates a Falco namespace
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Creates a ConfigMap called **falco-config** from the files in **falco/falco-config**
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Deploys the Falco DaemonSet
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: To better understand the installation scripts and why these steps are required,
+    we will explain the installation details, starting with Falco probes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco kernel module
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Falco deploys a kernel module to monitor system calls on the host system. Since
+    kernel modules must be compatible with the host kernel, you need to have a module
+    that works with the worker node's host operating system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco attempts to load or create a module in a few different ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If there is a pre-built module available for the hosts kernel, Falco will download
+    and use the module automatically.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If no pre-built module exists for the worker node's kernel, Falco will attempt
+    to build a module using any installed kernel-headers from the host.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: At the time of writing, Falco offers an early-access alternative method for
+    Falco probes, where they are created using a utility called **driverkit**. This
+    new utility automates the creation of a new probe based on the kernel information
+    of the host machine. The process of creating a probe using driverkit will be covered
+    in detail since we will use it to create a Falco probe for our KinD cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: If your nodes do not have the correct kernel-headers installed, Falco pods will
+    attempt to download a precompiled probe that matched the host's kernel version.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can find your kernel information by executing **uname -r** on your host,
+    then check for support by searching the available probes at the following link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://s3.amazonaws.com/download.draios.com/stable/sysdig-probe-binaries/index.html](https://s3.amazonaws.com/download.draios.com/stable/sysdig-probe-binaries/index.html)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since this requires internet connectivity, it may not be an option for you to
+    use in an enterprise environment where many servers run in air-gapped environments.
+    In this type of environment, it is more common to use the driverkit or kernel-headers
+    creation methods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a kernel module using installed kernel headers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: As I mentioned, we will not be using this method to create a kernel module.
+    This section is only for your reference. We will instead be using driverkit, which
+    is covered in the next section
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a standard Kubernetes node, you may or may not need to install the Linux
+    headers. Depending on how you created your base worker nodes, the kernel-headers
+    may already be included with your installation. If a module isn't available and
+    you do not have the headers installed on the hosts, the Falco pods will fail to
+    start and the pods will go into a **crashloopback** state. This means that before
+    deploying Falco, you need to have your module creation process selected and configured.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The required packages, version, and repository are different for various Linux
+    installations. If you intend to install the headers on your nodes, you will need
+    to know what modules are required, along with any additional repos. Since we have
+    been using Ubuntu as our distribution for the hands-on exercises, we will provide
+    the steps to add the kernel-headers for Ubuntu systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using headers to create the Falco module
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Falco has introduced a utility called DriverKit that we will use to create the
+    kernel module for our KinD Falco installation. We include the process to use kernel-headers
+    as a backup procedure in cases where the Falco DriverKit may not support your
+    Linux distribution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you plan to have Falco create a kernel module using headers, the first step
+    is to download the kernel-headers for your Linux release.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To download the correct headers for Ubuntu, you can use the **uname -r** command
+    along with **apt get** for **linux-headers**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**sudo apt install linux-headers-$(uname -r)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**uname -r** will append the kernel version that is running on the host, providing
+    the **apt install** command with the running kernel. On our example host, the
+    running kernel is **4.4.0-142-generic**, making our **apt install** command **sudo
+    apt install linux-headers- linux-headers-4.4.0-142-generic**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After installation, you can verify that the headers have been added by looking
+    at the **/lib/modules/** directory, where you will see a directory named after
+    the kernel version; in our example, this is **4.4.0-142-generic**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The headers must be installed on every worker node that will be running Falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that the headers are installed, the Falco pods will build a kernel module
+    when they start up using the installed headers on the worker node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As discussed earlier, a newer method has come out from the team that uses a
+    utility called driverkit. This process creates a kernel module that you can add
+    to a host using modprobe. We have selected this as our probe creation process
+    to make deploying Falco on a KinD cluster easier than using the header creation
+    process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a kernel module using driverkit
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There are specialized use cases where installing kernel-headers may be challenging
+    or impossible. If you cannot use the headers to build your module, you can create
+    a module using a Falco utility called driverkit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Driverkit allows you to create a kernel module for a number of different Linux
+    distributions. At the time of writing, this utility currently supports the following
+    distributions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ubuntu-generic
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Ubuntu-aws
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CentOS 8
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CentOS 7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CentOS 6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: AmazonLinux
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: AmazonLinux2
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Debian
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Vanilla Kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The team is actively looking for suggestions for other distributions, so we
+    can be sure that additional distributions will be added as driverkit is developed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will go over the details to create a module for Ubuntu, using the Ubuntu-generic
+    option.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Driverkit requirements
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Before you can create a module using driverkit, you need to meet a few prerequisites:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A running Docker daemon.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Go should be installed (since we are using Ubuntu, we will use **longsleep/golang-backports**).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Your target kernel version and kernel revision.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you are going to use the installation script in the GitHub repository, all
+    of the build and module installation steps are taken care of, but to better understand
+    the process, we will explain it in full in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Installing Falco's driverkit
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The first step to building a kernel module is to install the required dependencies
+    for driverkit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first requirement is to install Go. Since we are using Ubuntu, we can install
+    Go using **snap**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**sudo snap install --classic go**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You should already have Go variables in your profile from the KinD installation
+    in [*Chapter 5*](B15514_05_Final_ASB_ePub.xhtml#_idTextAnchor150)*, Kubernetes
+    Bootcamp*. If you are using a machine that is different from your KinD host, add
+    any required Go variables.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have selected to build using the Docker build method. There are multiple
+    methods documented on the driverkit project page with which you can build the
+    module if you want to use a different build method. We will pull the Docker image
+    so it''s ready to execute when we run the build:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**docker pull falcosecurity/driverkit-builder**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the container has been downloaded, we can build the driverkit executable.
+    The build process will download the source from GitHub and then use Go to create
+    the executable file. The complete process will take a few minutes to complete:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**GO111MODULE="on" go get github.com/falcosecurity/driverkit**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The executable will be created in your Go path. To verify that the driverkit
+    executable was created successfully, check the version by typing the following
+    command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**driverkit -v**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This may return a version number, or in the current early release, it may just
+    return the following:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**driverkit version -+**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If the driverkit command returns **-+** or a version number, it was successfully
+    created. However, if you received a **driverkit: command not found** error when
+    you checked the version, the build may have failed or your Go path may not have
+    been set correctly in your environment variable. If you cannot find the executable
+    after running the build, verify that your Go environment variables are correct,
+    and run the Go build step again.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the module and adding it to the host
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: With driverkit built and verified, we can build our module and add it to the
+    host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before building the module, we need to know the kernel version and release
+    of our host. For our example, we will use the KinD cluster we have been using
+    for the previous chapters in this book. Linux has some commands built in to get
+    the two details we need:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the kernel version, execute **uname -v**, and for the release, **uname
+    -r**:![Figure 12.4 – Docker host Kernel version
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.4_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.4 – Docker host Kernel version
+  prefs: []
+  type: TYPE_NORMAL
+- en: The version is the number after the **#** symbol and before the dash. On our
+    host, we have a version of 100\. The release is the full name that was returned
+    from the **uname -r** command. You will need provide both of these to the **driverkit**
+    command to build the kernel module.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you are using the installation script, we retrieve the options and supply
+    them automatically. If you are doing this step manually, you can use the following
+    two lines of code to store the information in variables to be passed to the build
+    command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kernelversion=$(uname -v | cut -f1 -d'-' | cut -f2 -d'#')
+  prefs: []
+  type: TYPE_NORMAL
+- en: kernelrelease=$(uname -r)
+  prefs: []
+  type: TYPE_NORMAL
+- en: We use the **cut** command to remove the unnecessary information from the **uname
+    -v** command and store it in a variable called **kernelversion**. We also store
+    the output from the **uname -r** command in a variable called **kernelrelease**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, you can use the Docker image we pulled and the driverkit executable to
+    create the module:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**driverkit docker --output-module /tmp/falco.ko --kernelversion=$kernelversion
+    --kernelrelease=$kernelrelease --driverversion=dev --target=ubuntu-generic**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The module build process will take a minute, and once the build completes,
+    driverkit will show you the location of the new module:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**INFO driver building, it will take a few seconds   processor=docker**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**INFO kernel module available                       path=/tmp/falco.ko**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the last step to add the new module, we need to copy it to the correct
+    location and load the module using **modprobe**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: sudo cp /tmp/falco.ko /lib/modules/$kernelrelease/falco.ko
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo depmod
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo modprobe falco
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can verify that the module has been added by running **lsmod**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**lsmod | grep falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If the load was successful, you will see an output similar to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**falco                 634880  4**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: That's it! You now have the Falco module on the host and it will be available
+    to your KinD cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the module on a cluster
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: On a standard Kubernetes cluster, a Falco deployment will map the **/dev** mount
+    in the Falco container to the host's **/dev** mount. By mounting **/dev**, the
+    Falco pod can use the kernel module that is running on the worker node's host
+    operating system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the module in KinD
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You may be asking yourself how adding the Falco module to the host will make
+    it available to a KinD cluster? We only added it to the host itself, and the KinD
+    cluster is a container running in another Docker container. So, how can a KinD
+    pod use a module from the Docker host?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Remember that KinD has a feature to mount extra volumes when it starts the
+    KinD containers? In our installation, we added a mount point for **/dev:/dev**,
+    which will create a mount inside our container that mounts to the host''s **/dev**
+    filesystem. If we look at the host''s **/dev** filesystem, we will see Falco entries
+    in the list, noted by the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**cr--------  1 root root    244,   0 May  4 00:58 falco0**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is what the Falco pod will use as its module when it starts up.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But wait! We just said that **/dev** is mounted in our KinD container, pointing
+    to the host's **/dev** filesystem. So how does a container in the Kubernetes cluster
+    have access to the **/dev** filesystem?
+  prefs: []
+  type: TYPE_NORMAL
+- en: If we take a look at the Falco DaemonSet file we will use in the next section,
+    we will see that the manifest creates a few mount points for the pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One of the **volumeMount** entries is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- mountPath: /host/dev'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: dev-fs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'readOnly: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **volumeMount** entry is using a volume that is declared in the *volumes*
+    section of the DaemonSet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- name: dev-fs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'hostPath:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'path: /dev'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a Falco pod starts it will mount the pod's **/dev** mount to the KinD container's
+    **/dev** mount. Finally, the KinD container's **/dev** mount is mounted to the
+    Docker host's **/dev** where the Falco module is located. (Remember the metaphor
+    of nesting dolls.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: With all of the prerequisites in place, we are ready to deploy Falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying the Falco Daemonset
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: If you are going to run the **install-falco.sh** script from the GitHub repository,
+    Falco will be installed using the same steps provided in this section. In the
+    book's GitHub repo, all of the Falco files are located in the **chapter12** directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Since this chapter has a few different pieces, a description of the **chapter12**
+    directory''s contents is provided in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.5 – Diagram of the chapter12 directory in the book''s GitHub repository'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.5_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.5 – Diagram of the chapter12 directory in the book's GitHub repository
+  prefs: []
+  type: TYPE_NORMAL
+- en: Remember that Falco includes a set of standard rules that include standard auditing
+    rules. We have put the rules files in the **falco/falco-config** directory. The
+    only value we have changed from the default installation is the logging format,
+    which we changed to JSON, and additionally set the values for **http_output**
+    to use Falcosidekick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To deploy the Falco DaemonSet manually, you need to deploy the three manifests
+    in the **install** directory and create a secret using the **falco-config** directory
+    contents.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the Falco service account and service
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Since we want to run Falco in a dedicated namespace, we need to create a namespace
+    called **falco** on our cluster. Run the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl create ns falco
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like all Kubernetes applications, we need to create an account that has the
+    correct RBAC permission for the application to perform the necessary tasks. Our
+    first step is to create that service account, which will be used to assign RBAC
+    permissions in the DaemonSet deployment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using **kubectl**, create the service account:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl apply -f falco/install/falco-account.yaml -n falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we need to create a service for Falco. The included **falco-service.yaml**
+    file will create a new service on TCP port **8765**. Using kubectl, apply the
+    manifest:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl apply -f falco/install/falco-service.yaml -n falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Falco uses files for the base configuration and rules. Since we are running
+    Falco in Kubernetes, we need to store the files in a Kubernetes object so they
+    can be used by the Falco pods. To store the files in a ConfigMap, create a new
+    ConfigMap called **falco-config** using all of the files in the **falco-config**
+    directory:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create configmap falco-config --from-file=falco/falco-config -n falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you need to modify any of the configuration files after you deploy Falco,
+    you should delete the ConfigMap and recreate it using the newly updated files.
+    After updating the ConfigMap, you will also need to restart each Falco pod to
+    reload the updated files from the ConfigMap.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The last step is to deploy the DaemonSet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl apply -f falco/install/falco-daemonset-configmap.yaml -n falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the Falco pod(s) are running, you can verify the health by looking at
+    the logs for the pod. The output will look similar to the following output (the
+    errors are expected, Falco is trying to find the kernel module in all locations,
+    some of which do not exist, causing the "errors"):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.6 – Successful Falco pod startup log'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.6_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.6 – Successful Falco pod startup log
+  prefs: []
+  type: TYPE_NORMAL
+- en: You now have a Falco DaemonSet set up that will audit events in your pods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You may receive an error on the last line of the Falco pod logs, similar to
+    the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Tue May 5 20:38:14 2020: Runtime error: error opening device /host/dev/falco0\.
+    Make sure you have root credentials and that the falco-probe module is loaded.
+    Exiting.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this case, your Falco module may not be loaded, so go back to the modprobe
+    steps and execute them again. You should not need to restart the Falco pod as
+    the change will be picked up and Falco will start logging once it can see the
+    module in the **/dev** directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, to be useful, we need the events to be forwarded to a central logging
+    system. In a default deployment, Falco logs are only available on the pod running
+    on each host. If you have 30 hosts, you will have 30 unique Falco logs, one on
+    each host. Finding an event in a decentralized system, as the saying goes, is
+    like looking for a needle in a haystack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falco logs use standard output, so we can easily forward the logs to any third-party
+    logging system. While there are many options that we could select as our logging
+    server, we have chosen to forward our logs using **Elasticsearch, Fluentd, and
+    Kibana** (**EFK**) along with Falcosidekick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying EFK
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our first step will be to deploy **Elasticsearch** to receive event data. To
+    install Elasticsearch, we require persistent storage for the data. Luckily, we
+    are using a KinD cluster so we have persistent storage thanks to Rancher's local
+    provisioner.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make the deployment easy, we will deploy our stack using Bitnami's Helm charts
+    for Elasticsearch and Kibana. You will need to have the Helm binary installed
+    to deploy the charts to the cluster. If you are doing the exercises in the book,
+    you should already have Helm3 installed from the KinD deployment in [*Chapter
+    5*](B15514_05_Final_ASB_ePub.xhtml#_idTextAnchor150)*, Kubernetes Bootcamp*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Verify you have Helm installed and running by running the **helm version**
+    command. If Helm is installed on your path, you should receive a reply with the
+    version of Helm you are running:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: version.BuildInfo{Version:"v3.2.0", GitCommit:"e11b7ce3b12db2941e90399e874513fbd24bcb71",
+    GitTreeState:"clean", GoVersion:"go1.13.10"}
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you receive an error, you will need to reinstall Helm before continuing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the GitHub repository, we have included a script to deploy EFK. The script
+    is called **install-logging.sh** and is located in the **chapter12/logging** directory.
+    Like all of the previous scripts, we will go over the details of the script and
+    the commands that are executed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a new namespace
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Since we may want to delegate access to a centralized logging team, we will
+    create a new namespace called **logging**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl create ns logging
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding chart repos to Helm
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Since we are going to use Helm to deploy charts from Bitnami, we need to add
+    the Bitnami chart repository to Helm. You add chart repos using the **helm repo
+    add <repo name> <repo url>** command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: helm repo add bitnami https://charts.bitnami.com/bitnami
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You should receive a confirmation that Bitnami has been added:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"bitnami" has been added to your repositories'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the Bitnami repository has been added, you can start to deploy charts from
+    the Bitnami repo.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying the Elasticsearch chart
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The Elasticsearch deployment will store data on persistent disks. We want to
+    control the size of the created disks, so we pass values in the **helm install**
+    command to limit the size to 1 GB.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To deploy Bitnami''s Elasticsearch with the options, use the following **helm
+    install** command. We are only setting a few values for our installation, but
+    like any Helm chart, there is a long list of options that allow us to customize
+    the installation. For our example deployment, we are only setting the persistent
+    volume size to 1 GB and the number of data replicas to **2**. We also want the
+    chart to be deployed in the **logging** namespace, so we also add the **--namespace
+    logging** option:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: helm install elasticsearch bitnami/elasticsearch --set master.persistence.size=1Gi,data.persistence.size=1Gi,data.replicas=2
+    --namespace logging
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you start to deploy the chart, you will receive a warning about the **vm.max_map_count**
+    kernel setting. For our KinD clusters, the included **initContainer** will set
+    this value on our worker node. In a production environment, you may not allow
+    privileged pods to run, which will cause the initContainer to fail. If you do
+    not allow privileged pods to run in your cluster (which is a **very** good idea),
+    you will need to set this value manually on each host before deploying Elasticsearch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can check the status of the deployment by checking the pods in the **logging**
+    namespace. Using **kubectl**, verify that all of the pods are in a running state
+    before moving on to the next step:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl get pods -n logging
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You should receive the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.7 – Elasticsearch pod list'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.7_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.7 – Elasticsearch pod list
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we can see, the Helm chart created a few Kubernetes objects. The main objects
+    include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Elasticsearch server pod (**elasticsearch-elasticsearch-coordinating-only**)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Elasticsearch Data StatefulSet (**elasticsearch-elasticsearch-data-x**)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Elasticsearch Master StatefulSet (**elasticsearch-elasticsearch-master-x**)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Each StatefulSet created a PersistentVolumeClaim of 1 GB for each pod that
+    was created. We can view the PVCs using **kubectl get pvc -n logging**, producing
+    the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.8 – PVC list used by Elasticsearch'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.8_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.8 – PVC list used by Elasticsearch
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Three ClusterIP services were created since Elasticsearch will only be used
+    by other Kubernetes objects. We can view the services using **kubectl get services
+    -n logging**, producing the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.9 – Elasticsearch services'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.9_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.9 – Elasticsearch services
+  prefs: []
+  type: TYPE_NORMAL
+- en: By looking at the pods, services, and PVCs, we can confirm that the chart deployment
+    was successful and we can move on to the next component, Fluentd.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying Fluentd
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We have included a Fluentd deployment located in the GitHub repo in the **chapter12/logging**
+    directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fluentd is a common log forwarder used with Kubernetes to forward logs to a
+    central location. We are installing it to forward Kubernetes logs to Elasticsearch
+    to provide a complete example of an EFK deployment. Our Falco events will be forwarded
+    using Falcosidekick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first step to deploying Fluentd to a cluster is to apply a Fluentd configuration.
+    The **fluentd-config.yaml** file will create a ConfigMap that contains the configuration
+    options for the Fluentd deployment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring Fluentd is outside of the scope for this book. To forward logs using
+    Fluentd, we do need to explain the **output.conf** section of the ConfigMap, which
+    configures the host that Fluentd will send logs to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the **fluentd-config.yaml** file, at the bottom of the file, you will see
+    a section titled **output.conf**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.10 – Fluentd output configuration'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.10_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.10 – Fluentd output configuration
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can see that we have options set for **id** and **type** of **elasticsearch**,
+    and the host setting has been set to **elasticsearch-elasticsearch-coordinating-only.logging.svc**.
+    If you go back a few pages and look at the output from the **kubectl get services
+    -n logging** command, you will see a service with that name in the output. This
+    is the service that must be targeted when interacting with the Elasticsearch deployment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: elasticsearch-elasticsearch-coordinating-only   ClusterIP   10.107.207.18
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that we also added the namespace and svc to the hostname. The Fluentd
+    DaemonSet will install to the **kube-system** namespace, so to communicate with
+    a service in another namespace, we need to supply the full name to the service.
+    In our KinD cluster, we do not need to add the cluster name to the **hostname**
+    value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can deploy the ConfigMap using **kubectl apply**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl apply -f fluentd-config.yaml
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After the ConfigMap, we can deploy the DaemonSet with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl apply -f fluentd-ds.yaml
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Verify that the Fluentd pod(s) is running by checking the pods in the **kube-system**
+    namespace:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl get pods -n kube-system
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Since we only have one node, we only see one Fluentd pod:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.11 – Fluentd DaemonSet pod list'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.11_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.11 – Fluentd DaemonSet pod list
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fluentd will be used to forward **all** container logs to Elasticsearch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make it easier to use Kibana, which we will look at later in this chapter,
+    we want to forward the Falco logs without any other container logs. The easiest
+    way to do this is to use another project from the Falco team, called Falcosidekick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying Falcosidekick
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Falco has a utility that can format and forward Falco events to different logging
+    servers. The project is on GitHub at [https://github.com/falcosecurity/falcosidekick](https://github.com/falcosecurity/falcosidekick).
+    At the time of writing, it supports 15 different logging systems, including Slack,
+    Teams, Datadog, Elasticsearch, AWS Lamda, SMTP, and Webhooks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since Falcosidekick opens up an easy forwarding method for various different
+    backends, we are going to deploy it to forward the Falco events to Elasticsearch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To deploy Falcosidekick, we will use Helm to deploy the chart using a local
+    copy from our GitHub repository. The chart files are located in the **chapter12/logging/falcosidekick**
+    directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like all charts, we can use a **values.yaml** file to configure the chart options.
+    We have provided a preconfigured file that has the required entries to send Falco
+    events to our Elasticsearch deployment. The entries in the file that we have configured
+    are shown in the following code block. We had to configure the host port to target
+    our Elasticsearch service with HTTP and port **9200**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'elasticsearch:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'host port: "http://elasticsearch-elasticsearch-coordinating-only.logging.svc:9200"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'index: "falco"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'type: "event"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'minimumpriority: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The easiest way to deploy the chart is to change your working directory to
+    the **falcosidkick** directory. Once you are in the directory, run the following
+    **helm install** command to deploy the chart:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm install falcosidekick -f values.yaml . --namespace falco**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To verify the chart was deployed correctly, grab the logs from the Falcosidekick
+    instance running in the **logging** namespace:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kubectl logs falcosidekick-7656785f89-q2z6q -n logging
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:40:25 [INFO]  : Enabled Outputs : Elasticsearch**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:40:25 [INFO]  : Falco Sidekick is up and listening on port
+    2801**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the Falcosidekick pod starts to receive data from the Falco pods, the
+    log files will have entries showing a successful Elasticsearch Post:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:42:40 [INFO]  : Elasticsearch - Post OK (201)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:42:40 [INFO]  : Elasticsearch - Post OK (201)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:42:40 [INFO]  : Elasticsearch - Post OK (201)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2020/05/05 23:42:40 [INFO]  : Elasticsearch - Post OK (201)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What does this give us so far? We have deployed Elasticsearch to store the information
+    that the Fluentd agent will forward from our worker node. Right now, our worker
+    node is sending all of its logs to the Elasticsearch instance using the Fluentd
+    agent, and Falcosidekick is forwarding the Falco events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Elasticsearch will have a lot of information to sort through to make the data
+    useful. To parse the data and create useful information for the logs, we need
+    to install a system that we can use to create custom dashboards and to search
+    the collected data. This is where the **K** in the **EFK** stack comes in. The
+    next step in our deployment is to install Kibana.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying Kibana
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The next chart will install the Kibana server. We chose to use a deployment
+    that is only serving Kibana over HTTP with no authentication. In a production
+    environment, you should enable both to increase your security. Of course, Kibana
+    is not accessible outside of the cluster yet, so we need to create an ingress
+    rule that will configure our NGINX Ingress to direct traffic to the pod:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To deploy Kibana to the cluster using the Bitnami chart, use the following
+    commands:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm install kibana --set elasticsearch.hosts[0]=elasticsearch-elasticsearch-coordinating-only
+    -- elasticsearch.port=9200,persistence.size=1Gi --namespace logging bitnami/kibana**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the deployment has started, you will see some output from Helm that tells
+    you how to port-forward using kubectl to access Kibana:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Get the application URL by running these commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**  export POD_NAME=$(kubectl get pods --namespace logging -l "app.kubernetes.io/name=kibana,app.kubernetes.io/instance=kibana"
+    -o jsonpath="{.items[0].metadata.name}")**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**  echo "Visit http://127.0.0.1:8080 to use your application"**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**  kubectl port-forward svc/kibana 8080:80**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can ignore these instructions since we going to expose Kibana using an ingress
+    rule so it can be accessed on any workstation on your network.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating an ingress rule for Kibana
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For the ingress rule, we will create a rule based on a nip.io domain:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To create the ingress rule with the correct nip.io name, we have provided a
+    script in the **chaper12/logging** folder called **create-ingress.sh**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**ingressip=$(hostname  -I | cut -f1 -d'' '')**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**ingress=`cat "kibana-ingress.yaml" | sed "s/{hostip}/$ingressip/g"`**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**echo "$ingress" | kubectl apply -f -**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The script will find the IP address of the Docker host and patch the ingress
+    manifest with a nip.io host using **kibana.w.x.y.z.nip.ip** (here, **w.x.y.z**
+    will contain the host's IP address).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the ingress rule has been created, the details to access your Kibana dashboard
+    will be displayed:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**You can access your Kibana dashboard in any browser on your local network
+    using http://kibana.10.2.1.107.nip.io**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have Kibana installed, we can open the Kibana dashboard to start
+    our configuration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the Kibana dashboard
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To browse to the Kibana dashboard, follow these steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Open a browser from any machine on your local network.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Use the ingress name that was shown from the **install-ingress.sh** script.
+    In our example, we would browse to [http://kibana.10.2.1.107.nip.io](http://kibana.10.2.1.107.nip.io).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The request will come back to your client with the IP address **10.2.1.107**
+    and will be sent to your Docker host on port **80**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Tip
+  prefs: []
+  type: TYPE_NORMAL
+- en: Remember that we exposed the Docker container for the KinD worker node on ports
+    **80** and **443**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When your Docker host receives the request for the hostname on port **80**,
+    it will be forwarded to the Docker container and ultimately it will then hit the
+    NGINX Ingress controller.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'NGINX will look for a rule that matches the hostname and will send the traffic
+    to the Kibana pod. In your browser, you will be presented with the Kibana welcome
+    screen:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![Figure 12.12 – Kibana welcome screen'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.12_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.12 – Kibana welcome screen
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While you now have a fully functioning audit logging system running, you still
+    have one more step to use Kibana: you need to create a default index.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a Kibana Index
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: To view logs or create visualizations and dashboards, you need to create an
+    index. You can have multiple indexes on a single Kibana server, allowing you to
+    view different logs from a single location. On our example server, we will have
+    two different sets of incoming logs, one that starts with the name logstash and
+    the other with the name falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The data in the logstash files container consists of the Kubernetes log files,
+    which includes all logs that are being forwarded by the Fluentd forwarder. The
+    Falco files are being forwarded by Falcosidekick and only contain the alerts from
+    the Falco pods. For the purposes of this chapter, we will focus on the Falco files
+    since they contain only Falco data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In Kibana, click the setup tool ![](image/Icon_1.png) located on the left-hand
+    side to open the Kibana management page.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: To create an index and set it to default, click on index patterns link in the
+    upper-left section of the browser.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Next, click on the upper-right button to create a new index pattern.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Since we only want to create an index that contains the Falco data, enter **falco***
+    in the box. This will create an index that contains all current and future Falco
+    logs:![Figure 12.13 – Kibana index pattern definition
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.13_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.13 – Kibana index pattern definition
+  prefs: []
+  type: TYPE_NORMAL
+- en: Click the **Next step** button to continue.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the configuration settings, click the dropdown and select **time**, then
+    click **Create index pattern** to create the pattern:![Figure 12.14 – Creating
+    an index
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.14_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.14 – Creating an index
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, set the index to the default index by clicking the star in the upper
+    right of the final screen:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![Figure 12.15 – Setting a default index'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.15_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.15 – Setting a default index
+  prefs: []
+  type: TYPE_NORMAL
+- en: That's it, you now have a full Falco logging system running on your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To start viewing data, click the discover button ![](image/Icon_2.png) located
+    in the upper left of the Kibana screen, which will take you to the main Kibana
+    page where you will see events from your cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.16 – Kibana homepage'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.16_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.16 – Kibana homepage
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can search for events by typing keywords into the search field. This is
+    helpful if you are looking for a single type of event, and know what value(s)
+    to search for.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The real benefit of logging systems like Kibana is the ability to create custom
+    dashboards that provide a view into multiple events that can be grouped by counts,
+    averages, and more. In the next section, we will explain how to create a dashboard
+    that provides a collection of Falco events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Creating dashboards is a skill that you need to develop, and it will take time
+    to understand how to group data and what values to use in a dashboard. This section
+    is meant to provide you with the basic tools you need to start creating dashboards
+    like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.17 – Example dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.17_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.17 – Example dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: People love dashboards, and Kibana provides tools to create dynamic and easily
+    interpreted views of a system. Dashboards can be created using any data that Kibana
+    has access to, including Falco events. Before we create a dashboard, let's understand
+    what a *visualization* means.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualizations
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: A visualization is a graphical representation of a collection of data – in our
+    context, from a Kibana index. Kibana includes a set of visualizations that allow
+    you to group data into tables, gauges, horizontal bars, pie charts, vertical bars,
+    and more.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To create a new visualization, click on the visualize icon ![](image/Icon_3_new.png)
+    on the left-hand bar that looks like a small graph. This will bring up the new
+    visualization selection screen. Then, follow these steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To select the visualization you want to create, select it from the list. Let's
+    use a common one for this visualization, the pie chart:![Figure 12.18 – Falco
+    visualizations
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.18_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.18 – Falco visualizations
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each visualization requires a source. For our example, we only have one index
+    created called **falco***, so select that as the source:![Figure 12.19 – Selecting
+    a visualization source
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.19_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.19 – Selecting a visualization source
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next step is to select a metric and a bucket. A metric defines how you want
+    to aggregate the results from the bucket. The bucket is the value you want to
+    visualize. For our example, we want our pie chart to display the total count of
+    event priorities, ranging from **error**, **notice**, and **warning** to **debug**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: First, set the metric aggregation value to **Count**:![Figure 12.20 – Visualization
+    metric options
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.20_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.20 – Visualization metric options
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, we need to select the field we want to aggregate. For **Aggregation**,
+    select **Terms**, and for **Field**, select **priority.keyword**:![Figure 12.21
+    – Selecting bucket values
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.21_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.21 – Selecting bucket values
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before saving the visualization, you can preview the results by clicking the
+    arrow button at the top of the metric box. A preview of the results will be shown
+    in the right-hand pane:![Figure 12.22 – Visualization preview
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.22_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.22 – Visualization preview
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If the results are what you expected, you can save the visualization by clicking
+    the **Save** link at the top of the main view. Enter a name for the visualization
+    so you can find it later when you create a dashboard:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![Figure 12.23 – Saving a new visualization'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.23_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.23 – Saving a new visualization
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you save the visualization, it will remain on screen, but you should see
+    a confirmation in the lower-right corner that the save was successful.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To create additional visualizations, you only need to click on the visualization
+    button again and select your desired type to create another one. Using what we
+    went over for the first visualization, create two additional visualizations that
+    use the following parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Visualization Type**: Horizontal bar'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Source**: **falco***'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Metrics**: Aggregation: Count'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Buckets**: X-Axis, Aggregation: Terms, Field: **rule.keyword**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Metrics**: Count, Size: 5, Custom label: Top 5 Falco Rules'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Visualization Name**: Top 5 Falco Rules'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Visualization Type**: Data Table'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Source**: **falco***'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Metrics**: Aggregation: Count'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Buckets**: Split rows, Aggregation: Terms, Field: **output_fields.fd.name.keyword**,
+    Metric: Count, Size: 5, Custom label: Top 5 Modified Files'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Visualization Name**: Top 5 Falco Modified Files'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, we will create a dashboard that displays the visualizations
+    that you created.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a dashboard
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Dashboards allow you to display visualizations in a collection that is easy
+    to read with information updated every minute:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To create a dashboard, click on the dashboard button ![](image/Icon_4.png) on
+    the sidebar.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The button looks like 4 stacked blocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This will bring up the **Create your first dashboard screen**. Click the **Create
+    new dashboard** button to start creating your dashboard.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'You will be presented a blank dashboard with a single button on the screen:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.24 – Creating a new dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.24_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.24 – Creating a new dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: This button provides you the option to use an existing visualization or to create
+    a new one. Since we created three visualizations earlier, click the **Add an existing**
+    link. Once selected, all existing visualizations will be presented on the right-hand
+    side of the dashboard in the **Add panels** box:![ Figure 12.25 – Adding panels
+    to a dashboard
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.25_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.25 – Adding panels to a dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We want to add the three visualizations that we created: **Falco - Priority
+    Count**, **Top 5 Falco Modified Files**, and **Top 5 Falco Rules**. To add each
+    one, click on each of them **once**.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Once you have added all of the visualizations to the dashboard, you can close
+    the **Add panels** pane by clicking the **X** in the upper right-hand of that
+    pane. Once it's closed, you should see your dashboard with the visualizations
+    you selected:![Figure 12.26 – Dashboard view after adding visualizations
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.26_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.26 – Dashboard view after adding visualizations
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Oops! It looks like we may have added the Top 5 Falco Rules visualization twice.
+    When we went through the steps to add a visualization, we emphasized a key word
+    in the step: "To add each one, click on each of them **once**." Visualizations
+    are added each time you click on them. When we added the Falco rules to our dashboard,
+    we double-clicked it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you did happen to double-click a visualization, it will be added to the
+    dashboard twice. If you accidentally added a visualization twice, you can simply
+    remove one of them by clicking the gear in the corner of the visualization and
+    selecting **Delete from dashboard**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 12.27 – Deleting a panel from a dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.27_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.27 – Deleting a panel from a dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After deleting the duplicate visualization, you can save the dashboard by clicking
+    the save link at the top of your browser window. This will prompt you to save
+    your dashboard, so give it the name **Falco Dashboard** and click **Save**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![Figure 12.28 – Saving a dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_12.28_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 12.28 – Saving a dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you save a dashboard, it will be available via the dashboards button on
+    the left-hand side of the Kibana homepage. This is the same button you used earlier
+    to create the first dashboard.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter covered how to create an enhanced auditing system to your Kubernetes
+    cluster. We started the chapter by introducing Falco, an auditing add-on that
+    was donated to the CNCF by Sysdig. Falco adds a level of auditing that Kubernetes
+    does not include, and combined with the including auditing functionality, provides
+    an audit trail for everything from API access to actions in a pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Logs aren't beneficial if you can't store them in a logging system that allows
+    you to store logs on persistent storage and usually offers a management interface
+    to search logs and create dashboards. We installed the common EFK stack on our
+    KinD cluster and created a custom dashboard to show Falco events in Kibana.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With the topics you learned in this chapter, you should have a strong foundational
+    knowledge of how to add Falco to a cluster and use EFK to store logs and present
+    data in visualizations and dashboards.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While logging and auditing are important, it is equally important to have a
+    process to restore workloads in the event of a disaster. In the next chapter,
+    we will introduce Velero, an open source backup utility from Heptio.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: If you need to edit an included Falco rule, which file would you edit?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. **falco.yaml**
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. **falco_rules.yaml**
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. **falco_rules.changes.yaml**
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. **falco_rules.local.yaml**
+  prefs: []
+  type: TYPE_NORMAL
+- en: Which of the following is a common log forwarder used by Kubernetes?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Kube-forwarder.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Fluentd.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Forwarder.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Kubernetes doesn't use forwarders.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is the product that provides a way to present logs using visualizations
+    and dashboards when you deploy the EFK stack?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Fluentd
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Elasticsearch
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Kibana
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Excel
+  prefs: []
+  type: TYPE_NORMAL
+- en: Which of the following tools forwards only Falco logs to a central logging system?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Falco.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Falcosidekick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. The Kubernetes API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. All products forward every log, not just the Falco logs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is the name of the object in Falco that allows you to create a collection
+    of items?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Lists
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Rules
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Arrays
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Collections
+  prefs: []
+  type: TYPE_NORMAL

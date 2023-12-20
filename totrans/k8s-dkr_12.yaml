@@ -1,0 +1,883 @@
+- en: '*Chapter 9*: Deploying a Secured Kubernetes Dashboard'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kubernetes clusters are made up of more than the API server and the kubelet.
+    Clusters are generally made up of additional applications that need to be secured,
+    such as container registries, source control systems, pipeline services, GitOps
+    applications, and monitoring systems. The users of your cluster will often need
+    to interact with these applications directly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While many clusters are focused on authenticating access to user-facing applications
+    and services, cluster solutions are not given the same first-class status. Users
+    often are asked to use kubectl's **port-forward** or **proxy** capability to access
+    these systems. This method of access is an anti-pattern from a security and user
+    experience standpoint. The first exposure users and administrators will have to
+    this anti-pattern is the Kubernetes Dashboard. This chapter will detail why this
+    method of access is an anti-pattern and how to properly access the Dashboard.
+    We'll walk you through how not to deploy a secure web application and point out
+    the issues and risks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll use the Kubernetes Dashboard as a way to learn about web application security
+    and how to apply those patterns in your own cluster. These lessons will work with
+    not just the dashboard, but other cluster focused applications such as the Kiali
+    dashboard for Istio, Grafana, Prometheus, and other cluster management applications.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we'll spend some time talking about local dashboards and how to evaluate
+    their security. This is a popular trend, but not universal. It's important to
+    understand the security of both approaches, and we'll explore them in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How does the dashboard know who you are?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Is the dashboard insecure?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying the dashboard with a reverse proxy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Integrating the dashboard with OpenUnison
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To follow the exercises in this chapter you will require a KinD cluster running
+    with OIDC integration. We created this in [*Chapter 7*](B15514_07_Final_ASB_ePub.xhtml#_idTextAnchor203)*,
+    Integrating Authentication into Your Cluster.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can access the code for this chapter at the following GitHub repository:
+    [https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide](https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How does the dashboard know who you are?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The Kubernetes Dashboard is a powerful web application for quickly accessing
+    your cluster from inside a browser. It lets you browse your namespaces and view
+    the status of nodes, and even provides a shell you can use to access Pods directly.
+    There is a fundamental difference between using the dashboard and kubectl. The
+    dashboard, being a web application, needs to manage your session, whereas kubectl
+    does not. This leads to a different set of security issues during deployment that
+    are often not accounted for, leading to severe consequences. In this section,
+    we'll explore how the dashboard identifies users and interacts with the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dashboard architecture
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Before diving into the specifics of how the dashboard authenticates a user,
+    it''s important to understand the basics of how the dashboard works. The dashboard
+    at a high level has three layers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**User Interface**: This is the Angular + HTML frontend that is displayed in
+    your browser and that you interact with.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Middle Tier**: The frontend interacts with a set of APIs hosted in the dashboard''s
+    container to translate calls from the frontend into Kubernetes API calls.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**API Server**: The middle tier API interacts directly with the Kubernetes
+    API server.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This three-layered architecture of the Kubernetes Dashboard can be seen in
+    the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 9.1 – Kubernetes Dashboard architecture'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.1_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.1 – Kubernetes Dashboard architecture
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a user interacts with the dashboard, the user interface makes calls to
+    the middle tier, which in turn makes calls to the API server. The dashboard doesn't
+    know how to collect credentials, with which most of the applications users would
+    generally get access. There's no place to put a username or password. It has a
+    very simple session mechanism system based on cookies, but for the most part the
+    dashboard doesn't really know, or care, who the currently logged in user is. The
+    only thing the dashboard cares about is what token to use when communicating with
+    the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, how does the dashboard know who you are?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Authentication methods
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are three ways that the dashboard can determine who a user is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**No credentials**: The dashboard can be told not to collect any tokens or
+    credentials. When this happens, the dashboard will interact with the API server
+    using the container''s own service account with whatever privileges it is assigned
+    via RBAC.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Token from login/uploaded kubectl configuration**: The dashboard can prompt
+    the user for their kubectl configuration file or for a bearer token to use. Once
+    a token is provided (or extracted from the configuration file uploaded to the
+    dashboard), an encrypted cookie is created to store the token. This cookie is
+    decrypted by the middle tier, and the token inside is passed to the API server.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Token from a reverse proxy**: If there''s an authorization header containing
+    a bearer token in requests from the user interface to the middle tier, the middle
+    tier will use that bearer token in requests to the API server. This is the most
+    secure option and the implementation that will be detailed in this chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Throughout the rest of this chapter, the first two options will be explored
+    as anti-patterns for accessing the dashboard, and we will explain why the reverse
+    proxy pattern is the best option for accessing a cluster's dashboard implementation
+    from a security standpoint and a user experience standpoint.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding dashboard security risks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The question of the dashboard's security often comes up when setting up a new
+    cluster. Securing the dashboard boils down to how the dashboard is deployed, rather
+    than if the dashboard itself is secure. Going back to the architecture of the
+    dashboard application, there is no sense of "security" being built in. The middle
+    tier simply passes a token to the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When talking about any kind of IT security, it's important to look at it through
+    the lens of *defense in depth*. This is the idea that any system should have multiple
+    layers of security. If one fails, there are other layers to fill the gap until
+    the failed layers can be addressed. A single failure doesn't give an attacker
+    direct access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The most often cited incident related to the dashboard's security was the breach
+    of Tesla in 2018 by crypto-miners. Attackers were able to access Pods running
+    in Tesla's clusters because the dashboard wasn't secured. The cluster's Pods had
+    access to tokens that provided the attackers with access to Tesla's cloud providers
+    where the attackers ran their crypto-mining systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dashboards in general are often an attack vector because they make it easy to
+    find what attackers are looking for and can easily be deployed insecurely. Illustrating
+    this point, at KubeCon NA 2019 a **Capture the Flag** (**CTF**) was presented
+    where one of the scenarios was a developer "accidentally" exposing the cluster's
+    dashboard.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CTF is available as a home lab at [https://securekubernetes.com/](https://securekubernetes.com/).
+    It's a highly recommended resource for anyone learning Kubernetes security. In
+    addition to being educational, and terrifying, it's also really fun!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since the Tesla breach, it's become harder to deploy the dashboard without credentials.
+    It's no longer the default and requires updates to both the dashboard and the
+    cluster. To demonstrate just how dangerous this can be, let's go through the steps
+    to do it and see what damage can be done.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Going through these steps might bring about the thought "does anyone really
+    go through all these steps to get to the dashboard?" The answer is probably something
+    no one wants to talk about. In the previous chapter, multiple options for authorizing
+    access to a cluster and designing multi-tenancy were discussed. One of the options
+    was tenancy at the cluster layer, where each tenant gets its own cluster. Unfortunately,
+    many of these deployments include cluster-admin access for the tenants, which
+    would give them the ability to perform these steps. Cluster administrators are
+    a few Google searches away from instructions to easily bypass that pesky VPN developers
+    don't like using from home.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying an insecure dashboard
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: While this may sound crazy, it's something that we have seen in the wild far
+    too often. The recommended dashboard installation states multiple times not to
+    use this type of configuration outside of an isolated development lab. The downfall
+    is that since it does make deploying the dashboard so easy, many newer administrators
+    use it since it's easy to set up, and they often use the same deployment in a
+    production cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s show how easy it is to attack a dashboard that is deployed without
+    security in mind:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first step is to tell the dashboard to allow users to bypass authentication.
+    Edit the **kubernetes-dashboard** deployment in the **kubernetes-dashboard** namespace:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl edit deployment kubernetes-dashboard -n kubernetes-dashboard**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Look for the **args** option for the container, add **- --enable-skip-login**,
+    then save:![Figure 9.2 – Enabling skip-login on the dashboard
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.2_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.2 – Enabling skip-login on the dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now we need to expose the dashboard to the network by creating a new Ingress
+    rule. Create a new Ingress manifest called **insecure-dashboard.yaml** with the
+    following YAML. Remember to replace the IP address in the **host** section with
+    your Docker host''s IP address:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'apiVersion: networking.k8s.io/v1beta1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: Ingress'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: dashboard-external-auth'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'annotations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kubernetes.io/ingress.class: nginx'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'nginx.ingress.kubernetes.io/affinity: cookie'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'nginx.ingress.kubernetes.io/backend-protocol: https'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'nginx.ingress.kubernetes.io/secure-backends: "true"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'nginx.org/ssl-services: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rules:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- host: k8s-secret-dashboard.apps.192-168-2-129.nip.io'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'http:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'paths:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- backend:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'serviceName: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'servicePort: 443'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'path: /'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create the Ingress rule by deploying the manifest using **kubectl**. Since
+    we added the namespace value to the manifest, we do need to add **-n** to the
+    kubectl command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create -f insecure-dashboard.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the Ingress is created, open a browser and go to your secret dashboard
+    using the Nip.io name specified in the **host** section of the Ingress rule.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You will see an authentication screen that asks for a token or a Kubeconfig
+    file, but since we enabled the option to skip the login when we edited the dashboard,
+    you can simply skip the login by clicking on **Skip**:![Figure 9.3 – Kubernetes
+    Dashboard with login disabled
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.3_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.3 – Kubernetes Dashboard with login disabled
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once in the dashboard, the default service account doesn't have access to anything:![Figure
+    9.4 – Kubernetes Dashboard with the default service account
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.4_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.4 – Kubernetes Dashboard with the default service account
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far this may not look too bad. You will see *access forbidden* errors, so
+    right now the dashboard will not allow you to do any damage. Unfortunately, many
+    people get to this point and go the extra step to change the permissions that
+    the default service account has on the cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right now, the service account isn't authorized for access to the cluster, so
+    change that by creating a new **ClusterRoleBinding** to the cluster-admin **ClusterRole**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Create a new file called **dashboard-role.yaml** with the following contents:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: rbac.authorization.k8s.io/v1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ClusterRoleBinding'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: secret-dashboard-cluster-admin'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'roleRef:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiGroup: rbac.authorization.k8s.io'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ClusterRole'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: cluster-admin'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'subjects:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroup: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ServiceAccount'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create the new **ClusterRoleBinding** by applying it using **kubectl**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create -f dashboard-role.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Congratulations! The secret dashboard is now available for anyone who may want
+    to use it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, you may be thinking *"Who can find my dashboard? They would need to know
+    the URL, and I'm not telling anyone what it is."* You feel secure because nobody
+    else knows the URL or the IP address to your dashboard. This is called Security
+    by Obscurity and is generally accepted to be a terrible approach to securing a
+    system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's use a scenario of how someone may exploit the dashboard without you knowing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You are a big Reddit fan, and one day you come across a Reddit post titled
+    *This is a great tool for securing your Kubernetes Dashboard*. The post seems
+    to be legit and you are excited to test this new tool out. After reading the post,
+    you see the link at the bottom to the utility and the command to run it: You can
+    download it from [https://raw.githubusercontent.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/master/chapter9/kubectl-secure-my-dashboard.go](https://raw.githubusercontent.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/master/chapter9/kubectl-secure-my-dashboard.go)
+    to give it a try!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To fully experience this example, you can run the tool on your KinD cluster
+    by executing the following command from your cloned repository in the **chapter9**
+    directory. Be sure to change the URL to your dashboard''s Ingress host:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: go run kubectl-secure-my-dashboard.go https://k8s-secret-dashboard.apps.192-168-2-129.nip.io
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Running analysis on https://k8s-secret-dashboard.apps.192-168-2-129.nip.io**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Your dashboard has been secured!**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s see review what just happened. Open a browser and go to your secret
+    dashboard site to view what''s been changed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 9.5 – Kubernetes Dashboard showing malware deployed'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.5_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.5 – Kubernetes Dashboard showing malware deployed
+  prefs: []
+  type: TYPE_NORMAL
+- en: It appears our hardening plugin was a ruse to deploy a bitcoin miner. How rude!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you have seen how easily an insecure dashboard can be exploited, delete
+    the deployment using kubectl.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While this attack could be mitigated by preauthorizing registries with approved
+    images (this topic will be covered when **OpenPolicyAgent** is covered in [*Chapter
+    11*](B15514_11_Final_ASB_ePub.xhtml#_idTextAnchor272), *Extending Security Using
+    Open Policy Manager)*, at that point the security is reactive, trying to respond
+    to threats instead of preventing them. Using an admission controller won't stop
+    someone from extracting secrets from your dashboard either.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While this was the simplest way to get access to the dashboard insecurely,
+    it''s not the only way. The kubectl utility includes two features that can make
+    accessing the dashboard easy. The port-forward utility is often used to create
+    a tunnel to a pod inside the cluster. This utility creates a TCP stream to a specific
+    port on your pod, making it accessible to your local host (or more if you wanted).
+    This still bypasses authentication in the dashboard, requiring that the dashboard''s
+    service account has access via RBAC to perform whichever tasks are needed. While
+    it is true that the user must have RBAC authorization to port-forward to a pod,
+    this leaves the dashboard open via two attack vectors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**External**: Any script running on a user''s local workstation can access
+    the forwarded network tunnel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Internal**: Any pod inside of the cluster can access the dashboard pod.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For internal access, network policies can be used to limit which namespaces
+    and Pods can access the dashboard's API. It's a good idea to use network policies
+    to begin with, but that's a single point of failure in this instance. One misconfigured
+    policy will open the dashboard to attack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threats from external sources will likely come in the form of scripts you (or
+    another tool you use) may decide to run. Web browsers aren't able to access the
+    ports opened by port-forwarding from a page hosted outside your local system,
+    but any script running on your workstation can. For instance, while you could
+    access a port-forwarded host by opening your browser and going directly to that
+    port, a web page with malicious JavaScript that loads from a remote site can't
+    open a connection to your local host. Attempt to run the hardening script from
+    earlier in the section against a forwarded port and the same result will occur,
+    an unwanted pod on your infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another technique for providing access is to use the API server's integrated
+    proxy utility. Running **kubectl proxy** creates a local network tunnel to the
+    API server that can then be used to proxy HTTP requests to any pod, including
+    the dashboard. This has the same drawbacks as **kubectl port-forward** and will
+    open your cluster up to attacks from any script running locally.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The common thread among these methods is they have a single point of failure
+    in their security. Even with mitigations put in place to limit what images can
+    be deployed, an unsecured dashboard can still be used to access Secret objects,
+    delete deployments, and even remote shell into Pods via the terminal integrated
+    into the dashboard.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having explored how to bypass all authentication on the dashboard, and its implications,
+    next we'll look at how to provide a token to the dashboard without deploying additional
+    infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using a token to log in
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A user may upload a token or kubectl configuration file to the dashboard as
+    a login to avoid the perils of a secret dashboard. As discussed earlier, the dashboard
+    will take the user's bearer token and use it with all requests to the API server.
+    While this may appear to solve the problem of giving the dashboard its own privileged
+    service account, it brings its own issues. The dashboard isn't kubectl and doesn't
+    know how to refresh tokens as they expire. This means that a token would need
+    to be fairly long lived to be useful. This would require either creating service
+    accounts that can be used or making your OpenID Connect **id_tokens** longer lived.
+    Both options would negate much of the security put in place by leveraging OpenID
+    Connect for authentication.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we've only focused on the wrong way to deploy the dashboard. While it
+    is important to understand this, what is the correct method? In the next section,
+    we'll detail the correct way to deploy the dashboard using a reverse proxy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying the dashboard with a reverse proxy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Proxies are a common pattern in Kubernetes. There are proxies at every layer
+    in a Kubernetes cluster. The proxy pattern is also used by most service mesh implementations
+    on Kubernetes, creating side cars that will intercept requests. The difference
+    between the reverse proxy described here and these proxies is in their intent.
+    Microservice proxies often do not carry a session, whereas web applications need
+    a session to manage state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows the architecture of a Kubernetes Dashboard with
+    a reverse proxy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 9.6 – Kubernetes Dashboard with a reverse proxy'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.6_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.6 – Kubernetes Dashboard with a reverse proxy
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The reverse proxy shown in *Figure 9.6* performs three roles:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Authentication**: The reverse proxy intercepts unauthenticated requests (or
+    stale sessions) and triggers the authentication process with an OpenID Connect
+    identity provider to authenticate the user.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Session management**: Kubernetes'' Dashboard is a user-facing application.
+    It should have the typical controls put in place to support session timeouts and
+    revocation. Be wary of a reverse proxy that stores all session data in a cookie.
+    These methods are difficult to revoke.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Identity injection**: Once the proxy has authenticated a user, it needs to
+    be able to inject an HTTP authorization header on each request that is a JWT identifying
+    the logged-in user, is signed by the same OpenID Connect identity provider, and
+    has the same issuer and recipient as the API server. The exception to this is
+    using impersonation, which, as discussed in [*Chapter 7*](B15514_07_Final_ASB_ePub.xhtml#_idTextAnchor203)
+    *, Integrating Authentication into Your Cluster*, injects specific headers into
+    the requests.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The reverse proxy does not need to run on the cluster. Depending on your setup,
+    it may be advantageous to do so, especially when utilizing impersonation with
+    your cluster. When using impersonation, the reverse proxy uses a service account's
+    token, so it's best for that token to never leave the cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The focus of this chapter has been on the Kubernetes project's dashboard. There
+    are multiple options for dashboard functionality. Next, we'll explore how these
+    dashboards interact with the API server and how to evaluate their security.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Local dashboards
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A common theme among third-party dashboards is to run locally on your workstation
+    and use a Kubernetes SDK to interact with the API server the same way kubectl
+    would. These tools offer the benefit of not having to deploy additional infrastructure
+    to secure them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Visual Studio Code''s Kubernetes plugin is an example of a local application
+    leveraging direct API server connections. When launching the plugin Visual Studio
+    Code accesses your current kubectl configuration and interacts with the API server
+    using that configuration. It will even refresh an OpenID Connect token when it
+    expires:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 9.7 – Visual Studio Code with the Kubernetes plugin'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.7_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.7 – Visual Studio Code with the Kubernetes plugin
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Kubernetes plugin for Visual Studio Code is able to refresh its OpenID Connect
+    Token because it's built with the client-go SDK, the same client libraries used
+    by kubectl. When evaluating client dashboards make sure it works with your authentication
+    type even if it isn't OpenID Connect. Many of the SDKs for Kubernetes don't support
+    OpenID Connect token refreshes. The Java and Python SDKs only recently (as of
+    the published date of this book) began supporting the refresh of OpenID Connect
+    tokens the way the client-go SDK does. When evaluating a local dashboard, make
+    sure it's able to leverage your short-lived tokens and can refresh them as needed,
+    just like kubectl can.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other cluster-level applications
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The introduction of this chapter discussed how a cluster is made up of several
+    applications besides Kubernetes. Other applications will likely follow the same
+    model as the dashboard for security, and the reverse proxy method is a better
+    method for exposing those applications than kubectl port-forward, even when the
+    application has no built-in security. Use the common Prometheus stack as an example.
+    Grafana has support for user authentication, but Prometheus and Alert Manager
+    do not. How would you track who had access to these systems or when they were
+    accessed using port-forwarding?
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's no user context provided. Using a reverse proxy, logs of each URL and
+    the user that was authenticated to access the URL can be forwarded to a central
+    log management system and analyzed by a **Security Information and Event Manager**
+    (**SIEM**) providing an additional layer of visibility into a cluster's usage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just as with the dashboard, using a reverse proxy with these applications provides
+    a layered security approach. It offloads sessions management from the application
+    in question and provides the capability to have enhanced authentication measures
+    in place such as multi-factor authentication and session revocation. These benefits
+    will lead to a more secure, and easier to use, cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Integrating the dashboard with OpenUnison
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The topic of how OpenUnison injected identity headers using impersonation was
+    covered in [*Chapter 7*](B15514_07_Final_ASB_ePub.xhtml#_idTextAnchor203)*, Integrating
+    Authentication into Your Cluster*, but not how OpenUnison injected user's identity
+    into the dashboard with an OpenID Connect integrated cluster. It worked, but it
+    wasn't explained. This section will use the OpenUnison implementation as an example
+    of how to build a reverse proxy for the dashboard. Use the information in this
+    section to get a better understanding of API security or to build your own solution
+    for dashboard authentication.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The OpenUnison deployment comprises two integrated applications:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The OpenID Connect Identity Provider & Login Portal**: This application hosts
+    the login process and the discovery URLs used by the API server to get the keys
+    needed to validate an **id_token**. It also hosts the screens where you can obtain
+    your token for kubectl.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The dashboard**: A reverse proxy application that authenticates to the integrated
+    OpenID Connect identity provider and injects the user''s **id_token** into each
+    request.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This diagram shows how the dashboard's user interface interacts with its server
+    side component with a reverse proxy injecting the user's **id_token****:**
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 9.8 – OpenUnison integration with the dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_9.8_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 9.8 – OpenUnison integration with the dashboard
+  prefs: []
+  type: TYPE_NORMAL
+- en: The dashboard uses the same OpenID Connect identity provider as the API server,
+    but doesn't use the **id_token** provided by it. Instead, OpenUnison has a plugin
+    that will generate a new **id_token** independent of the identity provider with
+    the user's identity data in it. OpenUnison can do this because the key used to
+    generate an **id_token** for the OpenID Connect identity provider, used by kubectl
+    and the API server, is stored in OpenUnison.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A new, short-lived token is generated separate from the OpenID Connect session
+    used with kubectl. This way, the token can be refreshed independently of a kubectl
+    session. This process provides the benefits of 1- to 2-minute token life with
+    the convenience of a direct login process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you have an eye for security, you may point out that this method has a glaring
+    single-point-of-failure in the security model, a user's credentials! Just as with
+    the Secret dashboard built earlier in this chapter in the *Understanding dashboard
+    security risks section*, an attacker generally just needs to ask for credentials
+    in order to get them. This is often done via email in an attack called phishing,
+    where an attacker sends a victim a link to a page that looks like their login
+    page but really just collects credentials. This is why multi-factor authentication
+    is so important for infrastructure systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a 2019 study, Google showed multi-factor authentication stopped 99% of automated
+    and phishing attacks (https://security.googleblog.com/2019/05/new-research-how-effective-is-basic.html).
+    Adding multi-factor authentication to the identity provider OpenUnison authenticates
+    against, or integrating it directly into OpenUnison, is one of the most effective
+    ways to secure the dashboard and your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we explored the security of the Kubernetes Dashboard in detail.
+    First, we walked through the architecture and how the dashboard passes your identity
+    information on to the API server. We then explored how the dashboard gets compromised,
+    and finally we detailed how to correctly deploy the dashboard securely.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this knowledge, you can now provide a secured tool to your users. Many
+    users prefer the simplicity of accessing the dashboard via a web browser. Adding
+    multi-factor authentication adds an additional layer of security and peace of
+    mind. When your security team questions the security of the dashboard, you'll
+    have the answers needed to satisfy their concerns.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The previous three chapters focused on the security of the Kubernetes APIs.
+    Next, we'll explore securing the soft underbelly of every Kubernetes deployment,
+    nodes!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The dashboard is insecure.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL
+- en: How can the dashboard identify a user?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. The options are either no authentication, or a token injected from a reverse
+    proxy
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Username and password
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. ServiceAccount
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Multi-factor authentication
+  prefs: []
+  type: TYPE_NORMAL
+- en: How does the dashboard track session state?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Sessions are stored in etcd.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Sessions are stored in custom resource objects called **DashboardSession**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. There are no sessions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. If a token is uploaded, it's encrypted and stored in the browser as a cookie.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When using a token, how often can the dashboard refresh it?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Once a minute
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Every thirty seconds
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. When the token expires
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. None of the above
+  prefs: []
+  type: TYPE_NORMAL
+- en: What's the best way to deploy the dashboard?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Using **kubectl port-forward**
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Using **kubectl proxy**
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. With a secret ingress host
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Behind a reverse proxy
+  prefs: []
+  type: TYPE_NORMAL
+- en: The dashboard doesn't support impersonation.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL
+- en: OpenUnison is the only reverse proxy that supports the dashboard.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL

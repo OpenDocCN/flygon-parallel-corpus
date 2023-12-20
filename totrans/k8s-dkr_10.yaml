@@ -1,0 +1,2679 @@
+- en: '*Chapter 7*: Integrating Authentication into Your Cluster'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Once a cluster has been built, users will need to interact with it securely.
+    For most enterprises, this means authenticating individual users and making sure
+    they can only access what they need in order to do their jobs. With Kubernetes,
+    this can be challenging because a cluster is a collection of APIs, not an application
+    with a frontend that can prompt for authentication.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, you'll learn how to integrate enterprise authentication into
+    your cluster using the OpenID Connect protocol and Kubernetes impersonation. We'll
+    also cover several anti-patterns and explain why you should avoid using them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding how Kubernetes knows who you are
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding OpenID Connect
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What are the other options?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring KinD for OpenID Connect
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How cloud Kubernetes knows who you are
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring your cluster for impersonation
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring impersonation without OpenUnison
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's get started!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To complete the exercises in this chapter, you will require the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An Ubuntu 18.04 server with 8 GB of RAM
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A KinD cluster running with the configuration from [*Chapter 5*](B15514_05_Final_ASB_ePub.xhtml#_idTextAnchor150),
+    *Deploying a Cluster Using KinD*
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can access the code for this chapter at the following GitHub repository:
+    [https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter7](https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter7).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding how Kubernetes knows who you are
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There Is No Spoon
+  prefs: []
+  type: TYPE_NORMAL
+- en: – The Matrix, 1999
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the 1999 sci-fi film *The Matrix*, Neo talks to a child about the Matrix
+    as he waits to see the Oracle. The child explains to him that the trick to manipulating
+    the Matrix is to realize that *"There is no spoon"*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is a great way to look at users in Kubernetes because they don't exist.
+    With the exception of service accounts, which we'll talk about later, there are
+    no objects in Kubernetes called "User" or "Group". Every API interaction must
+    include enough information to tell the API server who the user is and what groups
+    the user is a member of. This assertion can take different forms, depending on
+    how you plan to integrate authentication into your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this section, we will get into the details of the different ways Kubernetes
+    can associate a user with a cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: External users
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Users who are accessing the Kubernetes API from outside the cluster will usually
+    do so using one of a two authentication methods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Certificate**: You can assert who you are using a client certificate that
+    has information about you, such as your username and groups. The certificate is
+    used as part of the TLS negotiation process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Bearer token**: Embedded in each request, a bearer token can either be a
+    self-contained token that contains all the information needed to verify itself
+    or a token that can be exchanged by a webhook in the API server for that information.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can also use service accounts to access the API server outside the cluster,
+    though it's strongly discouraged. We'll cover the risks and concerns around using
+    service accounts in the *What are the other options?* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Groups in Kubernetes
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Different users can be assigned the same permissions without creating **RoleBinding
+    objects** for each user individually via groups. Kubernetes includes two types
+    of groups:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**System assigned**: These groups start with the **system:** prefix and are
+    assigned by the API server. An example group is **system:authenticated**, which
+    is assigned to all authenticated users. Other examples of system assigned groups
+    are the **system:serviceaccounts:namespace** group, where **Namespace** is the
+    name of the namespace that contains all the service accounts for the namespace
+    named in the group.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**User asserted groups**: These groups are asserted by the authentication system
+    either in the token provided to the API server or via the authentication webhook.
+    There are no standards or requirements for how these groups are named. Just as
+    with users, groups don''t exist as objects in the API server. Groups are asserted
+    at authentication time by external users and tracked locally for system generated
+    groups. When asserting a user''s groups, the primary difference between a user''s
+    unique ID and groups is that the unique ID is expected to be unique, whereas groups
+    are not.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You may be authorized for access by groups, but all access is still tracked
+    and audited based on your user's unique ID.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Service accounts
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Service accounts are objects that exist in the API server to track which pods
+    can access the various APIs. Service account tokens are called **JSON Web Tokens**,
+    or **JWTs**. Depending on how the token was generated, there are two ways to obtain
+    a service account:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first is from a secret that was generated by Kubernetes when the service
+    account was created.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second is via the **TokenRequest** API, which is used to inject a secret
+    into pods via a mount point or used externally from the cluster. All service accounts
+    are used by injecting the token as a header in the request into the API server.
+    The API server recognizes it as a service account and validates it internally.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Unlike users, service accounts can **NOT** be assigned to arbitrary groups.
+    Service accounts are members of pre-built groups, but you can't create a group
+    of specific service accounts for assigning roles.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we explored the fundamentals of how Kubernetes identifies users, we'll
+    explore how this framework fits into the **OpenID Connect** (**OIDC**) protocol.
+    OIDC provides the security most enterprises require and is standards-based, but
+    Kubernetes doesn't use it in a way that is typical of many web applications. Understanding
+    these differences and why Kubernetes needs them is an important step in integrating
+    a cluster into an enterprise security environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding OpenID Connect
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: OpenID Connect is a standard identity federation protocol. It's built on the
+    OAuth2 specification and has some very powerful features that make it the preferred
+    choice for interacting with Kubernetes clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The main benefits of OpenID Connect are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Short-lived tokens**: If a token is leaked, such as via a log message or
+    breach, you want the token to expire as quickly as possible. With OIDC, you''re
+    able to specify tokens that can live for 1-2 minutes, which means the token will
+    likely be expired by the time an attacker attempts to use it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**User and group memberships**: When we start talking about authorizations,
+    we''ll see quickly that it''s important to manage access by groups instead of
+    managing access by referencing users directly. OIDC tokens can embed both the
+    user''s identifier and their groups, leading to easier access management.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Refresh tokens scoped to timeout policies**: With short-lived tokens, you
+    need to be able to refresh them as needed. The time a refresh token is valid for
+    can be scoped to your enterprise''s web application idle timeout policy, keeping
+    your cluster in compliance with other web-based applications.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**No plugins required for kubectl**: The **kubectl** binary supports OpenID
+    Connect natively, so there''s no need for any additional plugins. This is especially
+    useful if you need to access your cluster from a jump box or VM because you''re
+    unable to install the **Command-Line Interface** (**CLI**) tools directly onto
+    your workstation.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**More multi-factor authentication options**: Many of the strongest multi-factor
+    authentication options require a web browser. Examples include FIDO U2F and WebAuth,
+    which use hardware tokens.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: OIDC is a peer reviewed standard that has been in use for several years and
+    is quickly becoming the preferred standard for identity federation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Identity federation is the term used to describe the assertion of identity data
+    and authentication without sharing the user's confidential secret or password.
+    A classic example of identity federation is logging into your employee website
+    and being able to access your benefits provider without having to log in again.
+    Your employee website doesn't share your password with your benefits provider.
+    Instead, your employee website *asserts* that you logged in at a certain date
+    and time and provides some information about you. This way, your account is *federated*
+    across two silos (your employee website and benefits portal), without your benefits
+    portal knowing your employee website password.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The OpenID Connect protocol
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As you can see, there are multiple components to OIDC. To fully understand how
+    OIDC works, let's begin the OpenID connect protocol.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The two aspects of the OIDC protocol we will be focusing on are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using tokens with **kubectl** and the API server
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Refreshing tokens to keep your tokens up to date
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We won't focus too much on obtaining tokens. While the protocol to get a token
+    does follow a standard, the login process does not. How you obtain tokens from
+    an identity provider will vary, based on how you choose to implement the OIDC
+    **Identity Provider** (**IdP**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are three tokens that are generated from an OIDC login process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**access_token**: This token is used to make authenticated requests to web
+    services your identity provider may provide, such as obtaining user information.
+    It is **NOT** used by Kubernetes and can be discarded.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**id_token**: This token is a JWT that encapsulates your identity, including
+    your unique identifier (sub), groups, and expiration information about you that
+    the API server can use to authorize your access. The JWT is signed by your identity
+    provider''s certificate and can be verified by Kubernetes simply by checking the
+    JWT''s signature. This is the token you pass to Kubernetes for each request to
+    authenticate yourself.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**refresh_token**: **kubectl** knows how to refresh your **id_token** for you
+    automatically once it expires. To do this, it makes a call to your IdP''s token
+    endpoint using **refresh_token** to obtain a new **id_token**. A **refresh_token**
+    can only be used once and is opaque, meaning that you, as the holder of the token,
+    have no visibility into its format and it really doesn''t matter to you. It either
+    works, or it doesn''t *refresh_token never goes to Kubernetes (or any other application).
+    It is only used in communications with the IdP.*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Once you have your tokens, you can use them to authenticate with the API server.
+    The easiest way to use your tokens is to add them to the **kubectl** configuration
+    using command-line parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl config set-credentials username --auth-provider=oidc --auth-provider-arg=idp-issuer-url=https://host/uri
+    --auth-provider-arg=client-id=kubernetes --auth-provider-arg=refresh-token=$REFRESH_TOKEN
+    --auth-provider-arg=id-token=$ID_TOKEN
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**config set-credentials** has a few options that need to be provided. We have
+    already explained **id-token** and **refresh_token**, but there are two additional
+    options:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**idp-issuer-url**: This is the same URL we will use to configure the API server
+    and points to the base URL used for the IdP''s discovery URL.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**client-id**: This is used by your IdP to identify your configuration. This
+    is unique to a Kubernetes deployment and is not considered secret information.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The OpenID Connect protocol has an optional element, known as a **client_secret**,
+    that is shared between an OIDC client and the IdP. It is used to "authenticate"
+    the client prior to making any requests, such as refreshing a token. While it's
+    supported by Kubernetes as an option, its recommended to not use it and instead
+    configure your IdP to use a public endpoint (which doesn't use a secret at all).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The client secret has no practical value since you'd need to share it with every
+    potential user and since it's a password, your enterprise's compliance framework
+    will likely require that it is rotated regularly, causing support headaches. Overall,
+    it's just not worth any potential downsides in terms of security.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes requires that your identity provider supports the discovery URL endpoint,
+    which is a URL that provides some JSON to tell you where you can get keys to verify
+    JWTs and the various endpoints available. Take any issuer URL and add **/.well-known/openid-configuration**
+    to see this information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Following OIDC and the API's interaction
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Once **kubectl** has been configured, all of your API interactions will follow
+    the following sequence:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 7.1 – Kubernetes/kubectl OpenID Connect sequence diagram'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.1_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.1 – Kubernetes/kubectl OpenID Connect sequence diagram
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding diagram is from Kubernetes'' authentication page at [https://kubernetes.io/docs/reference/access-authn-authz/authentication/#openid-connect-tokens](https://kubernetes.io/docs/reference/access-authn-authz/authentication/#openid-connect-tokens).
+    Authenticating a request involves doing the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Log in to your Identity Provider (IdP)**: This will be different for each
+    IdP. This could involve providing a username and password to a form in a web browser,
+    a multi-factor token, or a certificate. This will be implementation-specific to
+    every implementation.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Provide tokens to the user**: Once authenticated, the user needs a way to
+    generate the tokens needed by **kubectl** to access the Kubernetes APIs. This
+    can take the form of an application that makes it easy for the user to copy and
+    paste them into the configuration file, or can be a new file to download.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: This step is where **id_token** and **refresh_token** are added to the **kubectl**
+    configuration. If the tokens were presented to the user in the browser, they can
+    be manually added to the configuration. If a new configuration is provided so
+    that it can be downloaded, it can be. There are also **kubectl** plugins that
+    will launch a web browser to start the authentication process and, once completed,
+    generate your configuration for you.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Inject id_token**: Once the **kubectl** command has been called, each API
+    call includes an addition header, called the **Authorization** header, that includes
+    **id_token**.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**JWT signature validation**: Once the API server receives **id_token** from
+    the API call, it validates the signature against the public key provided by the
+    identity provider. The API server will also validate whether the issuer matches
+    the issuer for the API server configuration, and also that the recipient matches
+    the client ID from the API server configuration.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Check the JWT''s expiration**: Tokens are only good for a limited amount
+    of time. The API server ensures that the token hasn''t expired.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Authorization check**: Now that the user has been authenticated, the API
+    server will determine whether the user identified by the provided **id_token**
+    is able to perform the requested action by matching the user''s identifier and
+    asserted groups to internal policies.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Execute the API**: All checks are complete and the API server executes the
+    request, generating a response that will be sent back to **kubectl**.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Format the response for the user**: Once the API call is complete (or a series
+    of API calls), the JSON is formatted for the user by **kubectl**.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general terms, authentication is the process of validating you are you. Most
+    of us encounter this when we put our username and password into a website. We're
+    proving who we are. In the enterprise world, authorization then becomes the decision
+    of whether we're allowed to do something. First, we authenticate and then we authorize.
+    The standards built around API security don't assume authentication and go straight
+    to authorization based on some sort of token. It's not assumed that the caller
+    has to be identified. For instance, when you use a physical key to open a door,
+    the door doesn't know who you are, only that you have the right key. This terminology
+    can become very confusing, so don't feel bad if you get a bit lost. You're in
+    good company!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**id_token** is self-contained; everything the API server needs to know about
+    you is in that token. The API server verifies **id_token** using the certificate
+    provided by the identity provider and verifies that the token hasn''t expired.
+    As long as that all lines up, the API server will move on to authorizing your
+    request based on its own RBAC configuration. We''ll cover the details of that
+    process later. Finally, assuming you''re authorized, the API server provides a
+    response.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Notice that Kubernetes never sees your password or any other secret information
+    that you, and only you, know. The only thing that''s shared is **id_token**, and
+    that''s ephemeral. This leads to several important points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since Kubernetes never sees your password or other credentials, it can't compromise
+    them. This can save you a tremendous amount of time working with your security
+    team, because all the tasks related to securing passwords can be skipped!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**id_token** is self-contained, which means that if it''s compromised, there
+    is nothing you can do, short of re-keying your identity provider, to stop it from
+    being abused. This is why it''s so important for your **id_token** to have a short
+    lifespan. At 1-2 minutes, the likelihood that an attacker will be able to obtain
+    an **id_token**, realize what it is, and abuse it, is very low.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If, while performing its calls, **kubectl** finds that **id_token** has expired,
+    it will attempt to refresh it by calling the IdP's token endpoint using **refresh_token**.
+    If the user's session is still valid, the IdP will generate a new **id_token**
+    and **refresh_token**, which **kubectl** will store for you in the **kubectl**
+    configuration. This happens automatically with no user intervention. Additionally,
+    a **refresh_token** has a one-time use, so if someone tries to use a previously
+    used **refresh_token**, your IdP will fail the refresh process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's bound to happen. Someone may need to be locked out immediately. It may
+    be that they're being walked out or that their session has been compromised. This
+    is dependent on your IdP, so when choosing an IdP, make sure it supports some
+    form of session revocation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, if **refresh_token** has expired or the session has been revoked, the
+    API server will return a **401 Unauthorized** message to indicate that it will
+    no longer support the token.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We've spent a considerable amount of time examining the OIDC protocol. Now,
+    let's take an in-depth look at **id_token**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: id_token
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'An **id_token** is a JSON web token that is base64-encoded and is digitally
+    signed. The JSON contains a series of attributes, known as claims, in OIDC. There
+    are some standard claims in i**d_token**, but for the most part, the claims you
+    will be most concerned with are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**iss**: The issuer, which **MUST** line up with the issuer in your kubectl
+    configuration'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**aud**: Your client ID'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**sub**: Your unique identifier'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**groups**: Not a standard claim, but should be populated with groups specifically
+    related to your Kubernetes deployment'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Many deployments attempt to identify you by your email address. This is an anti-pattern
+    as your email address is generally based on your name, and names change. The sub
+    claim is supposed to be a unique identifier that is immutable and will never change.
+    This way, it doesn't matter if your email changes because your name changes. This
+    can make it harder to debug *"who is cd25d24d-74b8-4cc4-8b8c-116bf4abbd26?"* but
+    will provide a cleaner and easier to maintain cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are several other claims that indicate when an **id_token** should no
+    longer be accepted. These claims are all measured in seconds from epoch (January
+    1, 1970) UTC time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**exp**: When **id_token** expires'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**iat**: When **id_token** was created'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**nbf**: The absolute earliest an **id_token** should be allowed'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Why doesn't a token just have a single expiration time?
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's unlikely that the clock on the system that created **id_token** has the
+    exact same time as the system that is evaluating it. There's often a skew and
+    depending on how the clock is set, it may be a few minutes. Having a not-before
+    in addition to an expiration gives some room for standard time deviation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are other claims in an **id_token** that don't really matter but are there
+    for additional context. Examples include your name, contact information, organization,
+    and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While the primary use for tokens is to interact with the Kubernetes API server,
+    they are not limited to only API interaction. In addition to going to the API
+    server, webhook calls may also receive your **id_token**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may have deployed OPA as a validating webhook on a cluster. When someone
+    submits a pod creation request, the webhook will receive the user's **id_token**,
+    which can be used for other decisions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One example is that you want to ensure that the PVCs are mapped to specific
+    PVs based on the submitter's organization. The organization is included in **id_token**
+    , which is passed to Kubernetes, and then onto OPA webhook. Since the token has
+    been passed to the webhook, the information can then be used in your OPA policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other authentication options
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, we focused on OIDC and presented reasons why it's the best
+    mechanism for authentication. It is certainly not the only option, and we will
+    cover the other options in this section and when they're appropriate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Certificates
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: This is generally everyone's first experience authenticating to a Kubernetes
+    cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once a Kubernetes installation is complete, a pre-built kubectl **config** file
+    that contains a certificate and private key is created and ready to be use. This
+    file should only be used in "break glass in case of emergency" scenarios, where
+    all other forms of authentication are not available. It should be controlled by
+    your organization's standards for privileged access. When this configuration file
+    is used, it doesn't identify the user and can easily be abused since it doesn't
+    allow for an easy audit trail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While this is a standard use case for certificate authentication, it's not the
+    only use case for certificate authentication. Certificate authentication, when
+    done correctly, is one of the strongest recognized credentials in the industry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Certificate authentication is used by the US Federal Government for its most
+    important tasks. At a high level, certificate authentication involves using a
+    client key and certificate to negotiate your HTTPS connection to the API server.
+    The API server can get the certificate you used to establish the connection and
+    validate it against a **Certificate Authority** (**CA**) certificate. Once verified,
+    it maps attributes from the certificate to a user and groups the API server can
+    recognize.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the security benefits of certificate authentication, the private key
+    needs to be generated on isolated hardware, usually in the form of a smartcard,
+    and never leave that hardware. A certificate signing request is generated and
+    submitted to a CA that signs the public key, thus creating a certificate that
+    is then installed on the dedicated hardware. At no point does the CA get the private
+    key, so even if the CA were compromised, you couldn't gain the user's private
+    key. If a certificate needs to be revoked, it's added to a revocation list that
+    can either be pulled from an LDAP directory, a file, or can be checked using the
+    OCSP protocol.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This may look like an attractive option, so why shouldn't you use certificates
+    with Kubernetes?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Smartcard integration uses a standard called PKCS11, which neither **kubectl**
+    or the API server support.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The API server has no way of checking certificate revocation lists or using
+    OCSP, so once a certificate has been minted, there's no way to revoke it so that
+    the API server can use it.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Additionally, the process to correctly generate a key pair is rarely used. It
+    requires a complex interface to be built that is difficult for users to use combine
+    with command-line tools that need to be run. To get around this, the certificate
+    and key pair are generated for you and you download it or it's emailed to you,
+    negating the security of the process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other reason you shouldn't use certificate authentication for users is that
+    it's difficult to leverage groups. While you can embed groups into the subject
+    of the certificate, you can't revoke a certificate. So, if a user's role changes,
+    you can give them a new certificate but you can't keep them from using the old
+    one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As stated in the introduction to this section, using a certificate to authenticate
+    in "break glass in case of emergencies" situations is a good use of certificate
+    authentication. It may be the only way to get into a cluster if all other authentication
+    methods are experiencing issues.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Service accounts
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Service accounts appear to provide an easy access method. Creating them is
+    easy. The following command creates a service account object and a secret to go
+    with it that stores the service account''s token:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl create sa mysa -n default
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, the following command will retrieve the service account''s token in JSON
+    format and return only the value of the token. This token can then be used to
+    access the API server:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl get secret $(kubectl get sa mysa -n default -o json | jq -r '.secrets[0].name')
+    -o json | jq -r '.data.token' | base64 -d
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To show an example of this, let''s call the API endpoint directly, without
+    providing any credentials:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: curl -v --insecure https://0.0.0.0:32768/api
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You will receive the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"kind": "Status",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"apiVersion": "v1",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"metadata": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"status": "Failure",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"message": "forbidden: User \"system:anonymous\" cannot get path \"/api\"",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"reason": "Forbidden",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"details": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"code": 403'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '* Connection #0 to host 0.0.0.0 left intact'
+  prefs: []
+  type: TYPE_NORMAL
+- en: By default, most Kubernetes distributions do not allow anonymous access to the
+    API server, so we receive a *403 error* because we didn't specify a user.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s add our service account to an API request:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: export KUBE_AZ=$(kubectl get secret $(kubectl get sa mysa -n default -o json
+    | jq -r '.secrets[0].name') -o json | jq -r '.data.token' | base64 -d)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'curl  -H "Authorization: Bearer $KUBE_AZ" --insecure https://0.0.0.0:32768/api'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"kind": "APIVersions",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"versions": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"v1"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"serverAddressByClientCIDRs": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"clientCIDR": "0.0.0.0/0",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"serverAddress": "172.17.0.3:6443"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Success! This was an easy process, so you may be wondering, *"Why do I need
+    worry about all the complicated OIDC mess?"* This solution''s simplicity brings
+    multiple security issues:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Secure transmission of the token**: Service accounts are self-contained and
+    need nothing to unlock them or verify ownership, so if a token is taken in transit,
+    you have no way of stopping its use. You could set up a system where a user logs
+    in to download a file with the token in it, but you now have a much less secure
+    version of OIDC.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**No expiration**: When you decode a service account token, there is nothing
+    that tell you when the token expires. That''s because the token never expires.
+    You can revoke a token by deleting the service account and recreating it, but
+    that means you need a system in place to do that. Again, you''ve built a less
+    capable version of OIDC.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Auditing**: The service account can easily be handed out by the owner once
+    the key has been retrieved. If there are multiple users using a single key, it
+    becomes very difficult to audit use of the account.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In addition to these issues, you can't put a service account into arbitrary
+    groups. This means that RBAC bindings have to either be direct to the service
+    account or use one of the pre-built groups that service accounts are a member
+    of. We'll explore why this is an issue when we talk about authorization, so just
+    keep it in mind for now.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, service accounts were never designed to be used outside of the cluster.
+    It's like using a hammer to drive in a screw. With enough muscle and aggravation,
+    you will drive it in, but it won't be pretty and no one will be happy with the
+    result.
+  prefs: []
+  type: TYPE_NORMAL
+- en: TokenRequest API
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: At the time of writing, the **TokenRequest** API is still a **beta** feature.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **TokenRequest** API lets you request a short-lived service account for
+    a specific scope. While it provides slightly better security since it will expire
+    and has a limited scope, it's still bound to a service account, which means no
+    groups, and there's still the issue of securely getting the token to the user
+    and auditing its use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tokens generated by the **TokenRequest** API are built for other systems to
+    talk to your cluster; they are not meant to be used by users.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Custom authentication webhooks
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you already have an identity platform that doesn't use an existing standard,
+    a custom authentication webhook will let you integrate it without having to customize
+    the API server. This feature is commonly used by cloud providers who host managed
+    Kubernetes instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can define an authentication webhook that the API server will call with
+    a token to validate it and get information about the user. Unless you manage a
+    public cloud with a custom IAM token system that you are building a Kubernetes
+    distribution for, don't do this. Writing your own authentication is like writing
+    your own encryption – just don't do it. Every custom authentication system we've
+    seen for Kubernetes boils down to either a pale imitation of OIDC or "pass the
+    password". Much like the analogy of driving a screw in with a hammer, you could
+    do it, but it will be very painful. This is mostly because instead of driving
+    the screw through a board, you're more likely to drive it into your own foot.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keystone
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Those familiar with OpenStack will recognize the name Keystone as an identity
+    provider. If you are not familiar with Keystone, it is the default identity provider
+    used in an OpenStack deployment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Keystone hosts the API that handles authentication and token generation. OpenStack
+    stores users in Keystone''s database. While using Keystone is more often associated
+    with OpenStack, Kubernetes can also be configured to use Keystone for username
+    and password authentication, with some limitations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The main limitation of using Keystone as an IdP for Kubernetes is that it only
+    works with Keystone's LDAP implementation. While you could use this method, you
+    should consider that only username and password are supported, so you're creating
+    an identity provider with a non-standard protocol to authenticate to an LDAP server,
+    which pretty much any OIDC IdP can do out of the box.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can't leverage SAML or OIDC with Keystone, even though Keystone supports
+    both protocols for OpenStack, which limits how users can authenticate, thus cutting
+    you off from multiple multi-factor options.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Few, if any, applications know how to use the Keystone protocol outside of OpenStack.
+    Your cluster will have multiple applications that make up your platform, and those
+    applications won't know how to integrate with Keystone.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using Keystone is certainly an appealing idea, especially if you're deploying
+    on OpenStack, but ultimately, it's very limiting and you will likely put in just
+    as much working getting Keystone integrated as just using OIDC.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next section will take the details we've explored here and apply them to
+    integrating authentication into a cluster. As you move through the implementation,
+    you'll see how **kubectl**, the API server, and your identity provider interact
+    to provide secure access to the cluster. We'll tie these features back to common
+    enterprise requirements to illustrate why the details for understanding the OpenID
+    Connect protocol are important.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring KinD for OpenID Connect
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For our example deployment, we will use a scenario from our customer, FooWidgets.Foowidgets
+    has a Kubernetes cluster that they would like integrated using OIDC. The proposed
+    solution needs to address the following requirements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes must use our central authentication system, Active Directory Federation
+    Services.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We need to be able map Active Directory groups into our RBAC **RoleBinding**
+    objects.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Users need access to the Kubernetes Dashboard.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Users need to be able to use the CLI.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All enterprise compliance requirements must be met.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's explore each of these in detail and explain how we can address the customer's
+    requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Addressing the requirements
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our enterprise's requirements require multiple moving parts, both inside and
+    outside our cluster. We'll examine each of these components and how they relate
+    to building an authenticated cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use Active Directory Federation Services
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Most enterprises today use Active Directory from Microsoft™ to store information
+    about users and their credentials. Depending on the size of your enterprise, it's
+    not unusual to have multiple domain or forests where users live. If your IdP is
+    well integrated into a Microsoft's Kerberos environment, it may know how to navigate
+    these various systems. Most non-Microsoft applications are not, including most
+    identity providers. **Active Directory Federation Services** (**ADFS**) is Microsoft's
+    IdP that supports both SAML2 and OpenID Connect, and it knows how to navigate
+    the domains and forest of an enterprise implementation. It's common in many large
+    enterprises.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next decision with ADFS is whether to use SAML2 or OpenID Connect. At the
+    time of writing, SAML2 is much easier to implement and most enterprise environments
+    with ADFS prefer to use SAML2\. Another benefit of SAML2 is that it doesn't require
+    a connection between our cluster and the ADFS servers; all of the important information
+    is transferred through the user's browser. This cuts down on potential firewall
+    rules that need to be implemented in order to get our cluster up and running.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't worry – you don't need ADFS ready to go to run this exercise. We have
+    a handy SAML testing identity provider we'll use. You won't need to install anything
+    to use SAML2 with your KinD cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mapping Active Directory Groups to RBAC RoleBindings
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: This will become important when we start talking about authorization. What's
+    important to point out here is that ADFS has the capability to put a user's group
+    memberships in the SAML assertion, which our cluster can then consume.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes Dashboard access
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The dashboard is a powerful way to quickly access information about your cluster
+    and make quick updates. When deployed correctly, the dashboard does not create
+    any security issues. The proper way to deploy the dashboard is with no privileges,
+    instead relying on the user's own credentials. We'll do this with a reverse proxy
+    that injects the user's OIDC token on each request, which the dashboard will then
+    use when it makes calls to the API server. Using this method, we'll be able to
+    constrain access to our dashboard the same way we would with any other web application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are a few reasons why using the **kubectl** built-in proxy and port-forward
+    aren't a great strategy for accessing the dashboard. Many enterprises will not
+    install CLI utilities locally, forcing you to use a jump box to access privileged
+    systems such as Kubernetes, meaning port forwarding won't work. Even if you can
+    run **kubectl** locally, opening a port on loopback (127.0.0.1) means anything
+    on your system can use it, not just you from your browser. While browsers have
+    controls in place to keep you from accessing ports on loopback using a malicious
+    script, that won't stop anything else on your workstation. Finally, it's just
+    not a great user experience.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll dig into the details of how and why this works in [*Chapter 9*](B15514_09_Final_ASB_ePub.xhtml#_idTextAnchor246)*,
+    Deploying a Secured Kubernetes Dashboard.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes CLI access
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Most developers want to be able to access **kubectl** and other tools that rely
+    on the **kubectl** configuration. For instance, the Visual Studio Code Kubernetes
+    plugin doesn't require any special configuration. It just uses the **kubectl**
+    built-in configuration. Most enterprises tightly constrain what binaries you're
+    able to install, so we want to minimize any additional tools and plugins we want
+    to install.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enterprise compliance requirements
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Being cloud-native doesn't mean you can ignore your enterprise's compliance
+    requirements. Most enterprises have requirements such as having 20-minute idle
+    timeouts, may require multi-factor authentication for privileged access, and so
+    on. Any solution we put in place has to make it through the control spreadsheets
+    needed to go live. Also, this goes without saying, but everything needs to be
+    encrypted (and I do mean everything).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pulling it all together
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To fulfill these requirements, we''re going to use OpenUnison. It has prebuilt
+    configurations to work with Kubernetes, the dashboard, the CLI, and SAML2 identity
+    providers such as ADFS. It''s also pretty quick to deploy, so we don''t need to
+    concentrate on provider-specific implementation details and instead focus on Kubernetes''
+    configuration options. Our architecture will look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 7.2 – Authentication architecture'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.2_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.2 – Authentication architecture
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our implementation, we''re going to use two hostnames:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**k8s.apps.X-X-X-X.nip.io**: Access to the OpenUnison portal, where we''ll
+    initiate our login and get our tokens'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**k8sdb.apps.X-X-X-X.nip.io**: Access to the Kubernetes dashboard'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a quick refresher, **nip.io** is a public DNS service that will return an
+    IP address from the one embedded in your hostname. This is really useful in a
+    lab environment where setting up DNS can be painful. In our examples, X-X-X-X
+    is the IP of your Docker host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a user attempts to access **https://k8s.apps.X-X-X-X.nip.io/**, they'll
+    be redirected to ADFS, which will collect their username and password (and maybe
+    even a multi-factor authentication token). ADFS will generate an assertion that
+    will be digitally signed and contain our user's unique ID, as well as their group
+    assignments. This assertion is similar to **id_token**, which we examined earlier,
+    but instead of being JSON, it's XML. The assertion is sent to the user's browser
+    in a special web page that contains a form that will automatically submit the
+    assertion back to OpenUnison. At that point, OpenUnison will create user objects
+    in the OpenUnison namespace to store the user's information and create OIDC sessions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Earlier, we described how Kubernetes doesn't have user objects. Kubernetes lets
+    you extend the base API with **Custom Resource Definitions** (**CRDs**). OpenUnison
+    defines a User CRD to help with high availability and to avoid needing a database
+    to store state in. These user objects can't be used for RBAC.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the user is logged into OpenUnison, they can get their **kubectl** configuration
+    to use the CLI or use the Kubernetes dashboard, [https://kubernetes.io/docs/tasks/access-application-cluster/web-ui-dashboard/](https://kubernetes.io/docs/tasks/access-application-cluster/web-ui-dashboard/),
+    to access the cluster from their browser. Once the user is ready, they can log
+    out of OpenUnison, which will end their session and invalidate their **refresh_token**,
+    making it impossible for them to use **kubectl** or the dashboard until after
+    they log in again. If they walk away from their desk for lunch without logging
+    out, when they return, their **refresh_token** will have expired, so they'll no
+    longer be able to interact with Kubernetes without logging back in.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have walked through how users will log in and interact with Kubernetes,
+    we'll deploy OpenUnison and integrate it into the cluster for authentication.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying OIDC
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We have included two installation scripts to automate the deployment steps.
+    These scripts, **install-oidc-step1.sh** and **install-oidc-step2.sh**, are located
+    in this book's GitHub repository, in the **chapter7** directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section will explain all of the manual steps that the script automates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you install OIDC using the scripts, you **must** follow this process for
+    a successful deployment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Step 1: Run the **./install-oidc-step1.sh** script.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Step 2: Register for an SAML2 test lab by following the procedure in the *Registering
+    for a SAML2 test lab* section.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Step3: Run the **./install-oidc-step2.sh** script to complete the OIDC deployment.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Deploying OIDC to a Kubernetes cluster using OpenUnison is a five-step process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploy the dashboard.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Deploy the OpenUnison operator.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Create a secret.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Create a **values.yaml** file.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Deploy the chart.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Let's perform these steps one by one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying OpenUnison
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The dashboard is a popular feature for many users. It provides a quick view
+    into resources without us needing to use the kubectl CLI. Over the years, it has
+    received some bad press for being insecure, but when deployed correctly, it is
+    very secure. Most of the stories you may have read or heard about come from a
+    dashboard deployment that was not set up correctly. We will cover this topic in
+    [*Chapter 9*](B15514_09_Final_ASB_ePub.xhtml#_idTextAnchor246)*, Securing the
+    Kubernetes Dashboard*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we''ll deploy the dashboard from https://github.com/kubernetes/dashboard:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v2.0.0/aio/deploy/recommended.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**namespace/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**serviceaccount/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**service/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**secret/kubernetes-dashboard-certs created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**secret/kubernetes-dashboard-csrf created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**secret/kubernetes-dashboard-key-holder created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**configmap/kubernetes-dashboard-settings created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**role.rbac.authorization.k8s.io/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**clusterrole.rbac.authorization.k8s.io/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**rolebinding.rbac.authorization.k8s.io/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**clusterrolebinding.rbac.authorization.k8s.io/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**deployment.apps/kubernetes-dashboard created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**service/dashboard-metrics-scraper created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**deployment.apps/dashboard-metrics-scraper created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we need to add the repository that contains OpenUnison to our Helm list.
+    To add the Tremolo chart repository, use the **Helm repo add** command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Helm repo add tremolo https://nexus.tremolo.io/repository/Helm/
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**https://nexus.tremolo.io/repository/Helm/"tremolo" has been added to your
+    repositories**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Helm is a package manager for Kubernetes. Helm provides a tool that will deploy
+    a "Chart" to your cluster and help you manage the state of the deployment. We're
+    using Helm v3, which does not require you to deploy any components, such as Tiller,
+    to your cluster to work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once added, you need to update the repository using the **Helm repo update**
+    command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm repo update**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Hang tight while we grab the latest from your chart repositories...**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**...Successfully got an update from the "tremolo" chart repository**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Update Complete. Happy Helming!**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You are now ready to deploy the OpenUnison operator using the Helm chart.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we want to deploy OpenUnison in a new namespace called **openunison**.
+    We need to create the namespace before deploying the Helm chart:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create ns openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**namespace/openunison created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the namespace created, you can deploy the chart into the namespace using
+    Helm. To install a chart using Helm, use **Helm install <name> <chart> <options>**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm install openunison tremolo/openunison-operator --namespace openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME: openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**LAST DEPLOYED: Fri Apr 17 15:04:50 2020**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAMESPACE: openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**STATUS: deployed**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**REVISION: 1**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**TEST SUITE: None**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The operator will take a few minutes to finish deploying.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: An operator is a concept that was pioneered by CoreOS with the goal of encapsulating
+    many of the tasks an administrator may perform that can be automated. Operators
+    are implemented by watching for changes to a specific CRD and acting accordingly.
+    The OpenUnison operator looks for objects of the OpenUnison type and will create
+    any objects that are needed. A secret is created with a PKCS12 file; Deployment,
+    Service and Ingress objects are all created too. As you make changes to an OpenUnison
+    object, the operator makes updates to the Kubernetes object as needed. For instance,
+    if you change the image in the OpenUnison object, the operator updates the Deployment,
+    which triggers Kubernetes to rollout new pods. For SAML, the operator also watches
+    metadata so that if it changes, the updated certificates are imported.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the operator has been deployed, we need to create a secret that will store
+    passwords used internally by OpenUnison. Make sure to use your own values for
+    the keys in this secret (remember to base64 encode them):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create -f - <<EOF**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**apiVersion: v1**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**type: Opaque**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**metadata:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   name: orchestra-secrets-source**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   namespace: openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**data:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   K8S_DB_SECRET: cGFzc3dvcmQK**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   unisonKeystorePassword: cGFzc3dvcmQK**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**kind: Secret**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**EOF**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**secret/orchestra-secrets-source created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: From here on out, we'll assume you're using Tremolo Security's testing identity
+    provider. This tool will let you customize the user's login information without
+    having to stand up a directory and identity provider. Register by going to https://portal.apps.tremolo.io/and
+    clicking on **Register**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To provide the accounts for the OIDC environment, we will use a SAML2 testing
+    lab, so be sure to register before moving on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, we need to need to log into the testing identity provider by going to
+    [https://portal.apps.tremolo.io/](https://portal.apps.tremolo.io/) and clicking
+    on the **SAML2 Test Lab** badge:![Figure 7.3 – SAML2 Test Lab badge
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.3_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.3 – SAML2 Test Lab badge
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you've clicked on the badge, you'll be presented with a screen that shows
+    your test IdP metadata URL:![Figure 7.4 – Testing identity provider's page, highlighting
+    the SAML2 metadata URL
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.4_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.4 – Testing identity provider's page, highlighting the SAML2 metadata
+    URL
+  prefs: []
+  type: TYPE_NORMAL
+- en: Copy this value and store it in a safe place.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we need to create a **values.yaml** file that will be used to supply configuration
+    information when we deploy OpenUnison. This book''s GitHub repository contains
+    a base file in the **chapter7** directory:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'openunison_host: "k8sou.apps.XX-XX-XX-XX.nip.io"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'dashboard_host: "k8sdb.apps.XX-XX-XX-XX.nip.io"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'api_server_host: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'session_inactivity_timeout_seconds: 900'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'k8s_url: https://0.0.0.0:6443'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'cert_template:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ou: "Kubernetes"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'o: "MyOrg"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'l: "My Cluster"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'st: "State of Cluster"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'c: "MyCountry"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'image: "docker.io/tremolosecurity/openunison-k8s-login-saml2:latest"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'myvd_config_path: "WEB-INF/myvd.conf"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'k8s_cluster_name: kubernetes'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'enable_impersonation: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'dashboard:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: "kubernetes-dashboard"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'cert_name: "kubernetes-dashboard-certs"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'label: "k8s-app=kubernetes-dashboard"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'service_name: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'certs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'use_k8s_cm: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'trusted_certs: []'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'monitoring:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'prometheus_service_account: system:serviceaccount:monitoring:prometheus-k8s'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'saml:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'idp_url: https://portal.apps.tremolo.io/idp-test/metadata/dfbe4040-cd32-470e-a9b6-809c840'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata_xml_b64: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You need to change the following values for your deployment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Network: openunison_host:** This value should use the IP address of your
+    cluster, which is the IP address of your Docker host; for example, **k8sou.apps.192-168-2=131.nip.io**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Network: dashboard_host**: This value should use the IP address of your cluster,
+    which is the IP address of your Docker host; for example, **k8sdb.apps.192-168-2-131.nip.io**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**saml: idp url**: This value should be the SAML2 metadata URL that you retrieved
+    from the SAML2 lab page in the previous step.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: After you've edited or created the file using your own entries, save the file
+    and move on to deploying your OIDC provider.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To deploy OpenUnison using your **values.yaml** file, execute a **Helm install**
+    command that uses the **-f** option to specify the **values.yaml** file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm install orchestra tremolo/openunison-k8s-login-saml2 --namespace openunison
+    -f ./values.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME: orchestra**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**LAST DEPLOYED: Fri Apr 17 16:02:00 2020**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAMESPACE: openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**STATUS: deployed**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**REVISION: 1**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**TEST SUITE: None**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a few minutes, OpenUnison will be up and running. Check the deployment status
+    by getting the pods in the **openunison** namespace:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl get pods -n openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME                                    READY   STATUS    RESTARTS   AGE**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**openunison-operator-858d496-zzvvt       1/1    Running   0          5d6h**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**openunison-orchestra-57489869d4-88d2v   1/1     Running   0          85s**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is one more step you need to follow to complete the OIDC deployment:
+    you need to update the SAML2 lab with the relying party for your deployment.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now that OpenUnison is running, we need to get the SAML2 metadata from OpenUnison
+    using the host in **network.openunison_host** in our **values.yaml** file and
+    the **/auth/forms/saml2_rp_metadata.jsp** path:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**curl --insecure https://k8sou.apps.192-168-2-131.nip.io/auth/forms/saml2_rp_metadata.jsp**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**<?xml version="1.0" encoding="UTF-8"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+    ID="fc334f48076b7b13c3fcc83d1d116ac2decd7d665" entityID="https://k8sou.apps.192-168-2-131.nip.io/auth/SAML2Auth">**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Copy the output, paste it into the testing identity provider where it says **Meta
+    Data**, and click **Update Relying Party**:![Figure 7.5 – Testing the identity
+    provider with the relying party metadata
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.5_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.5 – Testing the identity provider with the relying party metadata
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we need to add some attributes to our test user. Add the attributes
+    shown in the following screenshot:![Figure 7.6 – Identity provider test user configuration
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.6_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.6 – Identity provider test user configuration
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, click **Update Test User Data** to save your attributes. With that, you're
+    ready to log in.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You can log into the OIDC provider using any machine on your network by using
+    the assigned nip.io address. Since we will test access using the dashboard, you
+    can use any machine with a browser. Navigate your browser to **network.openunison_host**
+    in your **values.yaml** file. Enter your testing identity provider credentials,
+    if needed, and then click **Finish Login** at the bottom of the screen. You should
+    now be logged into OpenUnison:![Figure 7.7 – OpenUnison home screen
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.7_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.7 – OpenUnison home screen
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s test the OIDC provider by clicking on the **Kubernetes Dashboard** link.
+    Don''t panic when you look at the initial dashboard screen – you''ll see something
+    like the following:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](image/Fig_7.8_B15514.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.8 – Kubernetes Dashboard before SSO integration has been completed
+    with the API server
+  prefs: []
+  type: TYPE_NORMAL
+- en: That looks like a lot of errors! We're in the dashboard, but nothing seems to
+    be authorized.That's because the API server doesn't trust the tokens that have
+    been generated by OpenUnison yet. The next step is to tell Kubernetes to trust
+    OpenUnison as its OpenID Connect Identity Provider.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the Kubernetes API to use OIDC
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: At this point, you have deployed OpenUnison as an OIDC provider and it's working,
+    but your Kubernetes cluster has not been configured to use it as a provider yet.
+    To configure the API server to use an OIDC provider, you need to add the OIDC
+    options to the API server and provide the OIDC certificate so that the API will
+    trust the OIDC provider.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since we are using KinD, we can add the required options using a few **kubectl**
+    and **docker** commands.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To provide the OIDC certificate to the API server, we need to retrieve the
+    certificate and copy it over to the KinD master server. We can do this using two
+    commands on the Docker host:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first command extracts OpenUnison''s TLS certificate from its secret. This
+    is the same secret referenced by OpenUnison''s Ingress object. We use the **jq**
+    utility to extract the data from the secret and then base64 decode it:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl get secret ou-tls-certificate -n openunison -o json | jq -r ''.data["tls.crt"]''
+    | base64 -d > ou-ca.pem**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The second command will copy the certificate to the master server into the
+    **/etc/Kubernetes/pki** directory:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**docker cp ou-ca.pem cluster01-control-plane:/etc/kubernetes/pki/ou-ca.pem**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we mentioned earlier, to integrate the API server with OIDC, we need to
+    have the OIDC values for the API options. To list the options we will use, describe
+    the **api-server-config** ConfigMap in the **openunison** namespace:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl describe configmap api-server-config -n openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Name:         api-server-config**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Namespace:    openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Labels:       <none>**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Annotations:  <none>**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Data**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**====**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**oidc-api-server-flags:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**----**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**--oidc-issuer-url=https://k8sou.apps.192-168-2-131.nip.io/auth/idp/k8sIdp**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**--oidc-client-id=kubernetes**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**--oidc-username-claim=sub**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**--oidc-groups-claim=groups**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**--oidc-ca-file=/etc/kubernetes/pki/ou-ca.pem**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, edit the API server configuration. OpenID Connect is configured by changing
+    flags on the API server. This is why managed Kubernetes generally doesn''t offer
+    OpenID Connect as an option, but we''ll cover that later in this chapter. Every
+    distribution handles these changes differently, so check with your vendor''s documentation.
+    For KinD, shell into the control plane and update the manifest file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**docker exec -it cluster-auth-control-plane bash**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**apt-get update**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**apt-get install vim**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**vi /etc/kubernetes/manifests/kube-apiserver.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Look for two options under **command** called **--oidc-client** and **–oidc-issuer-url**.
+    Replace those two with the output from the preceding command that produced the
+    API server flags. Make sure to add spacing and a dash (**-**) in front. It should
+    look something like this when you''re done:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '- --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --oidc-issuer-url=https://k8sou.apps.192-168-2-131.nip.io/auth/idp/k8sIdp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --oidc-client-id=kubernetes'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --oidc-username-claim=sub'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --oidc-groups-claim=groups'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --oidc-ca-file=/etc/kubernetes/pki/ou-ca.pem'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- --proxy-client-cert-file=/etc/kubernetes/pki/front-proxy-client.crt'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Exit vim and the Docker environment (*ctl+d*) and then take a look at the **api-server**
+    pod:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kubectl get pod kube-apiserver-cluster-auth-control-plane -n kube-system
+  prefs: []
+  type: TYPE_NORMAL
+- en: NAME                      READY   STATUS    RESTARTS  AGE kube-apiserver-cluster-auth-control-plane   1/1  Running
+    0 73s
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that it's only **73s** old. That's because KinD saw that there was a
+    change in the manifest and restarted the API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The API server pod is known as a "static pod". This pod can't be changed directly;
+    its configuration has to be changed from the manifest on disk. This gives you
+    a process that's managed by the API server as a container, but without giving
+    you a situation where you need to edit pod manifests in EtcD directly if something
+    goes wrong.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Verifying OIDC integration
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Once OpenUnison and the API server have been integrated, we need to test that
+    the connection is working:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To test the integration, log back into OpenUnison and click on the **Kubernetes
+    Dashboard** link again.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Click on the bell in the upper right and you'll see a different error:![](image/Fig_7.9_B15514.jpg)
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Figure 7.9 – SSO enabled but the user is not authorized to access any resources
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'SSO between OpenUnison and you''ll see that Kubernetes is working! However,
+    the new error, **service is forbidden: User https://...**, is an authorization
+    error, **not** an authentication error. The API server knows who we are, but isn''t
+    letting us access the APIs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We''ll dive into the details of RBAC and authorizations in the next chapter,
+    but for now, create this RBAC binding:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**kubectl create -f - <<EOF**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**apiVersion: rbac.authorization.k8s.io/v1**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**kind: ClusterRoleBinding**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**metadata:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   name: ou-cluster-admins**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**subjects:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**- kind: Group**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   name: k8s-cluster-admins**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   apiGroup: rbac.authorization.k8s.io**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**roleRef:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   kind: ClusterRole**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   name: cluster-admin**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   apiGroup: rbac.authorization.k8s.io**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**EOF**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**clusterrolebinding.rbac.authorization.k8s.io/ou-cluster-admins created**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, go back to the dashboard and you'll see that you have full access to
+    your cluster and all that of error messages are gone.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The API server and OpenUnison are now connected. Additionally, an RBAC policy
+    has been created to enable our test user to manage the cluster as an administrator.
+    Access was verified by logging into the Kubernetes dashboard, but most interactions
+    will take place using the **kubectl** command. The next step is to verify we're
+    able to access the cluster using **kubectl**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using your tokens with kubectl
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Important Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section assumes you have a machine on your network that has a browser and
+    **kubectl** running.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using the Dashboard has its use cases, but you will likely interact with the
+    API server using **kubectl**, rather than the dashboard, for the majority of your
+    day. In this section, we will explain how to retrieve your JWT and how to add
+    it to your Kubernetes config file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can retrieve you token from the OpenUnison dashboard. Navigate to the OpenUnison
+    home page and click on the key that says **Kubernetes Tokens**. You'll see a screen
+    that looks as follows:![Figure 7.10 – OpenUnison kubectl configuration tool
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.10_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.10 – OpenUnison kubectl configuration tool
+  prefs: []
+  type: TYPE_NORMAL
+- en: OpenUnison provides a command line that you can copy and paste into your host
+    session that adds all the required information to your config.
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, click on the double documents button next to the **kubectl** command
+    to copy your **kubectl** command into your buffer. Leave the web browser open
+    in the background.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'You may want to back up your original config file before pasting the **kubectl**
+    command from OpenUnison:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: cp .kube/config .kube/config.bak
+  prefs: []
+  type: TYPE_NORMAL
+- en: export KUBECONFIG=/tmp/k
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubectl get nodes
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**W0423 15:46:46.924515    3399 loader.go:223] Config not found: /tmp/k error:
+    no configuration has been provided, try setting KUBERNETES_MASTER environment
+    variable**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Then, go to your host console and paste the command into the console (the following
+    output has been shortened, but your paste will start with the same output):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: export TMP_CERT=$(mktemp) && echo -e "-----BEGIN CER. . .
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Cluster "kubernetes" set.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Context "kubernetes" modified.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**User "mlbiamext" set.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Switched to context "kubernetes".**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, verify that you can view the cluster nodes using **kubectl get nodes**:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kubectl get nodes
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME                         STATUS   ROLES    AGE   VERSION**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**cluster-auth-control-plane   Ready    master   47m   v1.17.0**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**cluster-auth-worker          Ready    <none>   46m   v1.17.0**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You are now using your login credentials instead of the master certificate!
+    As you work, the session will refresh. Log out of OpenUnison and watch the list
+    of nodes. Within a minute or two, your token will expire and no longer work:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**$ kubectl get nodes**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Unable to connect to the server: failed to refresh token: oauth2: cannot
+    fetch token: 401 Unauthorized**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Congratulations! You''ve now set up your cluster so that it does the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Authenticate using SAML2 using your enterprise's existing authentication system.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use groups from your centralized authentication system to authorize access to
+    Kubernetes (we'll get into the details of how in the next chapter).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Give access to your users to both the CLI and the dashboard using the centralized
+    credentials.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Maintain your enterprise's compliance requirements by having short-lived tokens
+    that provide a way to time out.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Everything uses TLS from the user's browser, to the Ingress Controller, to OpenUnison,
+    the dashboard, and finally the API server.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Next, you'll learn how to integrate centralized authentication into your managed
+    clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing impersonation to integrate authentication with cloud-managed clusters
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'It''s very popular to use managed Kubernetes services from cloud vendors such
+    as Google, Amazon, Microsoft, and DigitalOcean (among many others). When it comes
+    to these services, its generally very quick to get up and running, and they all
+    share a common thread: they don''t support OpenID Connect.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Earlier in this chapter, we talked about how Kubernetes supports custom authentication
+    solutions through webhooks and that you should never, ever, use this approach
+    unless you are a public cloud provider or some other host of Kubernetes systems.
+    It turns out that pretty much every cloud vendor has its own approach to using
+    these webhooks that uses their own identity and access management implementations.
+    In that case, why not just use what the vendor provides? There are several reasons
+    why you may not want to use a cloud vendor''s IAM system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Technical**: You may want to support features not offered by the cloud vendor,
+    such as the dashboard, in a secure fashion.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Organizational**: Tightly coupling access to managed Kubernetes with that
+    cloud''s IAM puts an additional burden on the cloud team, which means that they
+    may not want to manage access to your clusters.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**User Experience**: Your developers and admins may have to work across multiple
+    clouds. Providing a consistent login experience makes it easier on them and requires
+    learning fewer tools.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Security and Compliance**: The cloud implementation may not offer choices
+    that line up with your enterprise''s security requirements, such as short-lived
+    tokens and idle timeouts.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All that being said, there may be reasons to use the cloud vendor's implementation.
+    You'll need to balance out the requirements, though. If you want to continue to
+    use centralized authentication and authorization with hosted Kubernetes, you'll
+    need to learn how to work with Impersonation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is Impersonation?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Kubernetes Impersonation is a way of telling the API server who you are without
+    knowing your credentials or forcing the API server to trust an OpenID Connect
+    IdP. When you use **kubectl**, instead of the API server receiving your **id_token**
+    directly, it will receive a service account or identifying certificate that will
+    be authorized to impersonate users, as well as a set of headers that tell the
+    API server who the proxy is acting on behalf of:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 7.11 – Diagram of how a user interacts with the API server when using
+    Impersonation'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.11_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.11 – Diagram of how a user interacts with the API server when using
+    Impersonation
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The reverse proxy is responsible for determining how to map from **id_token**,
+    which the user provides (or any other token, for that matter), to the **Impersonate-User**
+    and **Impersonate-Group** HTTP headers. The dashboard should never be deployed
+    with a privileged identity, which the ability to impersonate falls under. To allow
+    Impersonation with the 2.0 dashboard, use a similar model, but instead of going
+    to the API server, you go to the dashboard:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 7.12 – Kubernetes Dashboard with Impersonation'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_7.12_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.12 – Kubernetes Dashboard with Impersonation
+  prefs: []
+  type: TYPE_NORMAL
+- en: The user interacts with the reverse proxy just like any web application. The
+    reverse proxy uses its own service account and adds the impersonation headers.
+    The dashboard passes this information through to the API server on all requests.
+    The dashboard never has its own identity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Security considerations
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The service account has a certain superpower: it can be used to impersonate
+    **anyone** (depending on your RBAC definitions). If you''re running your reverse
+    proxy from inside the cluster, a service account is OK, especially if combined
+    with the **TokenRequest** API to keep the token short-lived. Earlier in the chapter,
+    we talked about **ServiceAccount** objects having no expiration. That''s important
+    here because if you''re hosting your reverse proxy off cluster, then if it were
+    compromised, someone could use that service account to access the API service
+    as anyone. Make sure you''re rotating that service account often. If you''re running
+    the proxy off cluster, it''s probably best to use a shorter-lived certificate
+    instead of a service account.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When running the proxy on a cluster, you want to make sure it's locked down.
+    It should run in its own namespace at a minimum. Not **kube-system** either. You
+    want to minimize who has access. Using multi-factor authentication to get to that
+    namespace is always a good idea, as are network policies that control what pods
+    can reach out to the reverse proxy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Based on the concepts we've just learned about regarding impersonation, the
+    next step is to update our cluster's configuration to use impersonation instead
+    of using OpenID Connect directly. You don't need a cloud-managed cluster to work
+    with impersonation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring your cluster for impersonation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s deploy an impersonating proxy for our cluster. Assuming you''re reusing
+    your existing cluster, we first need to delete our orchestra Helm deployment (this
+    will not delete the operator; we want to keep the OpenUnison operator). So, let''s
+    begin:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Run the following command to delete our **orchestra** Helm deployment:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**$ helm delete orchestra --namespace openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**release "orchestra" uninstalled**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The only pod running in the **openunison** namespace is our operator. Notice
+    that all the Secrets, Ingress, Deployments, Services, and other objects that were
+    created by the operator when the orchestra Helm chart was deployed are all gone.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, redeploy OpenUnison, but this time, update our Helm chart to use impersonation.
+    Edit the **values.yaml** file and add the two bold lines shown in the following
+    example file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'openunison_host: "k8sou.apps.192-168-2-131.nip.io"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'dashboard_host: "k8sdb.apps.192-168-2-131.nip.io"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**  api_server_host: "k8sapi.apps.192-168-2-131.nip.io"**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'session_inactivity_timeout_seconds: 900'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'k8s_url: https://192.168.2.131:32776'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'cert_template:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ou: "Kubernetes"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'o: "MyOrg"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'l: "My Cluster"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'st: "State of Cluster"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'c: "MyCountry"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'image: "docker.io/tremolosecurity/openunison-k8s-login-saml2:latest"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'myvd_config_path: "WEB-INF/myvd.conf"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'k8s_cluster_name: kubernetes'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**enable_impersonation: true**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'dashboard:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: "kubernetes-dashboard"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'cert_name: "kubernetes-dashboard-certs"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'label: "k8s-app=kubernetes-dashboard"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'service_name: kubernetes-dashboard'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'certs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'use_k8s_cm: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'trusted_certs: []'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'monitoring:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'prometheus_service_account: system:serviceaccount:monitoring:prometheus-k8s'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'saml:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'idp_url: https://portal.apps.tremolo.io/idp-test/metadata/dfbe4040-cd32-470e-a9b6-809c8f857c40'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata_xml_b64: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have made two changes here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Added a host for the API server proxy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Enabled impersonation
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These changes enable OpenUnison's impersonation features and generate an additional
+    RBAC binding to enable impersonation on OpenUnison's service account.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Run the Helm chart with the new **values.yaml** file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**helm install orchestra tremolo/openunison-k8s-login-saml2 –namespace openunison
+    -f ./values.yaml**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME: orchestra**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**LAST DEPLOYED: Thu Apr 23 20:55:16 2020**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAMESPACE: openunison**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**STATUS: deployed**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**REVISION: 1**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**TEST SUITE: None**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just like with our OpenID Connect integration with Kubernetes, finish the integration
+    with the testing identity provider. First, get the metadata:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**$ curl --insecure https://k8sou.apps.192-168-2-131.nip.io/auth/forms/saml2_rp_metadata.jsp**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**<?xml version="1.0" encoding="UTF-8"?><md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+    ID="f4a4bacd63709fe486c30ec536c0f552a506d0023" entityID="https://k8sou.apps.192-168-2-131.nip.io/auth/SAML2Auth">**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**   <md:SPSSODescriptor WantAssertionsSigned="true" protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**protocol">**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, log into [https://portal.apps.tremolo.io/](https://portal.apps.tremolo.io/),
+    choose the testing identity provider, and copy and paste the resulting metadata
+    into the testing identity provider where it says **Meta Data**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Finally, to update the change, click **Update Relying Party**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The new OpenUnison deployment is configured as a reverse proxy for the API server
+    and has been re-integrated with our SAML2 identity provider. There are no cluster
+    parameters to set because impersonation doesn't need any cluster-side configuration.
+    The next step is to test the integration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing impersonation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, let''s test our impersonation setup. Follow these steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a browser, enter the URL for your OpenUnison deployment. This is the same
+    URL you used for your initial OIDC deployment.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Log into OpenUnison and then click on the dashboard. You should recall that
+    the first time you opened the dashboard on the your initial OpenUnison deployment,
+    you received a lot of errors until you created the new RBAC role, which granted
+    access to the cluster.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After you've enabled impersonation and opened the dashboard, you shouldn't see
+    any error messages, even though you were prompted for new certificate warnings
+    and didn't tell the API server to trust the new certificates you're using with
+    the dashboard.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Click on the little circular icon in the upper right-hand corner to see who
+    you're logged in as.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Next, go back to the main OpenUnison dashboard and click on the **Kubernetes
+    Tokens** badge.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Notice that the **--server** flag being passed to kubectl no longer has an IP.
+    Instead, it has the hostname from **network.api_server_host** in the **values.yaml**
+    file. This is impersonation. Instead of interacting directly with the API server,
+    you're now interacting with OpenUnison's reverse proxy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, let''s copy and paste our **kubectl** command into a shell:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: export TMP_CERT=$(mktemp) && echo -e "-----BEGIN CERTIFI...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Cluster "kubernetes" set.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Context "kubernetes" created.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**User "mlbiamext" set.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Switched to context "kubernetes".**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To verify you have access, list the cluster nodes:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kubectl get nodes
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NAME                         STATUS   ROLES    AGE    VERSION**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**cluster-auth-control-plane   Ready    master   6h6m   v1.17.0**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**cluster-auth-worker          Ready    <none>   6h6m   v1.17.0**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just like when you integrated the original deployment of OpenID Connect, once
+    you''ve logged out of the OpenUnison page, within a minute or two, the tokens
+    will expire and you won''t be able to refresh them:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: kubectl get nodes
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Unable to connect to the server: failed to refresh token: oauth2: cannot
+    fetch token: 401 Unauthorized**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You've now validated that your cluster is working correctly with impersonation.
+    Instead of authenticating directly to the API server, the impersonating reverse
+    proxy (OpenUnison) is forwarding all requests to the API server with the correct
+    impersonation headers. You're still meeting your enterprise's needs by providing
+    both a login and logout process and integrating your Active Directory groups.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring Impersonation without OpenUnison
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The OpenUnison operator automated a couple of key steps to get impersonation
+    working. There are other projects designed specifically for Kubernetes, such as
+    JetStack's OIDC Proxy ([https://github.com/jetstack/kube-oidc-proxy](https://github.com/jetstack/kube-oidc-proxy)),
+    that are designed to make using impersonation easier. You can use any reverse
+    proxy that can generate the correct headers. There are two critical items to understand
+    when doing this on your own.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Impersonation RBAC policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'RBAC will be covered in the next chapter, but for now, the correct policy to
+    authorize a service account for impersonation is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: rbac.authorization.k8s.io/v1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ClusterRole'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: impersonator'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rules:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'resources:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- users'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- groups'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'verbs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- impersonate'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To constrain what accounts can be impersonated, add **resourceNames** to your
+    rule.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Default groups
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: When impersonating a user, Kubernetes does not add the default group, **system:authenticated**,
+    to the list of impersonated groups. When using a reverse proxy that doesn't specifically
+    know to add the header for this group, configure the proxy to add it manually.
+    Otherwise, simple acts such as calling the **/api** endpoint will fail as this
+    will be unauthorized for anyone except cluster administrators.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter detailed how Kubernetes identifies users and what groups their
+    members are in. We detailed how the API server interacts with identities and explored
+    several options for authentication. Finally, we detailed the OpenID Connect protocol
+    and how it's applied to Kubernetes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning how Kubernetes authenticates users and the details of the OpenID Connect
+    protocol are an important part of building security into a cluster. Understanding
+    the details and how they apply to common enterprise requirements will help you
+    decide the best way to authenticate to clusters, and also provide justification
+    regarding why the anti-patterns we explored should be avoided.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we'll apply our authentication process to authorizing access
+    to Kubernetes resources. Knowing who someone is isn't enough to secure your clusters.
+    You also need to control what they have access to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: OpenID Connect is a standard protocol with extensive peer review and usage.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL
+- en: Which token does Kubernetes use to authorize your access to an API?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. **access_token**
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. **id_token**
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. **refresh_token**
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. **certificate_token**
+  prefs: []
+  type: TYPE_NORMAL
+- en: In which situation is certificate authentication a good idea?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Day-to-day usage by administrators and developers
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Access from external CI/CD pipelines and other services
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Break glass in case of emergency when all other authentication solutions
+    are unavailable
+  prefs: []
+  type: TYPE_NORMAL
+- en: How should you identify users accessing your cluster?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Email address
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Unix login ID
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Windows login ID
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. An immutable ID not based on a user's name
+  prefs: []
+  type: TYPE_NORMAL
+- en: Where are OpenID Connect configuration options set in Kubernetes?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Depends on the distribution
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. In a ConfigMap object
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. In a Secret
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Set as flags on the Kubernetes API server executable
+  prefs: []
+  type: TYPE_NORMAL
+- en: When using impersonation with your cluster, the groups your user brings are
+    the only ones needed.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL
+- en: The dashboard should have its own privileged identity to work properly.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False
+  prefs: []
+  type: TYPE_NORMAL

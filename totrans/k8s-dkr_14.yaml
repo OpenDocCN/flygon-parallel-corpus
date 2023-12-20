@@ -1,0 +1,1788 @@
+- en: '*Chapter 11*: Extending Security Using Open Policy Agent'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far, we have covered Kubernetes' built in authentication and authorization
+    capabilities, which help to secure a cluster. While this will cover most use cases,
+    it doesn't cover all of them. Several security best practices that Kubernetes
+    can't handle are pre-authorizing container registries and ensuring that resource
+    requests are on all **Pod** objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These tasks are left to outside systems and are called dynamic admission controllers.
+    The **Open Policy Agent** (**OPA**), and its Kubernetes native sub-project, GateKeeper,
+    are one of the most popular ways to handle these use cases. This chapter will
+    detail the deployment of OPA and GateKeeper, how it's architected, and how to
+    develop policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introduction to validating webhooks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What is OPA and how does it work?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using Rego to write policies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Enforcing memory constraints
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Enforcing Pod security policies using OPA
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To complete the hands-on exercises in this chapter, you will require an Ubuntu
+    18.04 server, running a KinD cluster with the configuration from [*Chapter 8*](B15514_08_Final_ASB_ePub.xhtml#_idTextAnchor228),
+    *RBAC Policies and Auditing*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can access the code for this chapter at the following GitHub repository:
+    [https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter11.](https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter11
+    )'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introduction to dynamic admission controllers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are two ways to extend Kubernetes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Build a custom resource definition so that you can define your own objects and
+    APIs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implement a webhook that listens for requests from the API server and responds
+    with the necessary information. You may recall that in [*Chapter 7*](B15514_07_Final_ASB_ePub.xhtml#_idTextAnchor203),
+    *Integrating Authentication into Your Cluster*, we explained that a custom webhook
+    was used to validate tokens.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Starting in Kubernetes 1.9, a webhook can be defined as a dynamic admission
+    controller, and in 1.16, the dynamic admission controller API became **Generally
+    Available** (**GA**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The protocol is very straightforward. Once a dynamic admission controller is
+    registered for a specific object type, the webhook is called with an HTTP post
+    every time an object of that type is created or edited. The webhook is then expected
+    to return JSON that represents whether it is allowed or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: As of 1.16, **admission.k8s.io/v1** is at GA. All examples will use the GA version
+    of the API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The request submitted to the webhook is made up of several sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Object Identifiers**: The **resource** and **subResource** attributes identify
+    the object, API, and group. If the version of the object is being upgraded, then
+    **requestKind**, **requestResource**, and **requestSubResource** are specified.
+    Additionally, **namespace** and **operation** are provided to know where the object
+    is and whether it is a **CREATE**, **UPDATE**, **DELETE**, or **CONNECT** operation.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Submitter Identifiers**: The **userInfo** object identifies the user and
+    groups of the submitter. The submitter and the user who created the original request
+    are not always the same. For instance, if a user creates a **Deployment**, then
+    the **userInfo** object won''t be for the user who created the original **Deployment**;
+    it will be for the **ReplicaSet** controller''s service account because the **Deployment**
+    creates a **ReplicaSet** that creates the **Pod**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Object**: **object** represents the JSON of the object being submitted, where
+    **oldObject** represents what is being replaced if this is an update. Finally,
+    **options** specifies additional options for the request.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The response from the webhook will simply have two attributes, the original
+    **uid** from the request, and **allowed**, which can be **true** or **false**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **userInfo** object can create complications quickly. Since Kubernetes often
+    uses multiple layers of controllers to create objects, it can be difficult to
+    track usage creation based on a user who interacts with the API server. It's much
+    better to authorize based on objects in Kubernetes, such as namespace labels or
+    other objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A common use case is to allow developers to have a "sandbox" that they are administrators
+    in, but that has very limited capacity. Instead of trying to validate the fact
+    that a particular user doesn't try to request too much memory, annotate a personal
+    namespace with a limit so that the admission controller has something concrete
+    to reference regardless of whether the user submits a **Pod** or a **Deployment**.
+    This way, the policy will check the **annotation** on the **namespace** instead
+    of the individual user. To ensure that only the user who owns the namespace is
+    able to create something in it, use RBAC to limit access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One final point on generic validating webhooks: there is no way to specify
+    a key or password. It''s an anonymous request. While in theory, a validating webhook
+    could be used to implement updates, it is not recommended.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we've covered how Kubernetes implements dynamic access controllers,
+    we'll look at one of the most popular options in OPA.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is OPA and how does it work?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: OPA is a lightweight authorization engine that fits well in Kubernetes. It didn't
+    get its start in Kubernetes, but it's certainly found a home there. There's no
+    requirement to build dynamic admission controllers in OPA, but it's very good
+    at it and there are extensive resources and existing policies that can be used
+    to start your policy library.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section provides a high-level overview of OPA and its components with the
+    rest of the chapter getting into the details of an OPA implementation in Kubernetes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: OPA architecture
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'OPA is comprised of three components – the HTTP listener, the policy engine,
+    and the database:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.1 – OPA architecture'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.1_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.1 – OPA architecture
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The database used by OPA is in memory and ephemeral. It doesn''t persist information
+    used to make policy decisions. On the one hand, this makes OPA very scalable since
+    it is essentially an authorization microservice. On the other hand, this means
+    that every instance of OPA must be maintained on its own and must be kept in sync
+    with authoritative data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.2 – OPA in Kubernetes'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.2_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.2 – OPA in Kubernetes
+  prefs: []
+  type: TYPE_NORMAL
+- en: When used in Kubernetes, OPA populates its database using a side car, called
+    *kube-mgmt*, which sets up watches on the objects you want to import into OPA.
+    As objects are created, deleted, or changed, *kube-mgmt* updates the data in its
+    OPA instance. This means that OPA is "eventually consistent" with the API server,
+    but it won't necessarily be a real-time representation of the objects in the API
+    server. Since the entire etcd database is essentially being replicated over and
+    over again, great care needs to be taken in order to refrain from replicating
+    sensitive data, such as **Secrets**, in the OPA database.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Rego, the OPA policy language
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We''ll cover the details of Rego in the next section in detail. The main point
+    to mention here is that Rego is a policy evaluation language, not a generic programming
+    language. This can be difficult for developers who are used to languages such
+    as Golang, Java, or JavaScript, which support complex logic such as iterators
+    and loops. Rego is designed to evaluate policy and is streamlined as such. For
+    instance, if you wanted to write code in Java to check that all the container
+    images in a **Pod** starting with one of a list of registries, it would look something
+    like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: public boolean validRegistries(List<Container> containers,List<String> allowedRegistries)
+    {
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'for (Container c : containers) {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: boolean imagesFromApprovedRegistries = false;
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'for (String allowedRegistry : allowedRegistries) {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: imagesFromApprovedRegistries =  imagesFromApprovedRegistries  || c.getImage().startsWith(allowedRegistry);
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (! imagesFromApprovedRegistries) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: return false;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: return true;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This code iterates over every container and every allowed registry to make
+    sure that all of the images conform to the correct policy. The same code in Rego
+    is much smaller:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry {
+  prefs: []
+  type: TYPE_NORMAL
+- en: ok_images = [image | startswith(input_images[j],input.parameters.registries[_])
+    ; image = input_images[j] ]
+  prefs: []
+  type: TYPE_NORMAL
+- en: count(ok_images) != count(input_images)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding rule will evaluate to **true** if any of the images on the containers
+    come from unauthorized registries. We'll cover the details as to how this code
+    works later in the chapter. The key to understanding why this code is so much
+    more compact is that much of the boilerplate of loops and tests are inferred in
+    Rego. The first line generates a list of conforming images, and the second line
+    makes sure that the number of conforming images matches the number of total images.
+    If they don't match, then one or more of the images must come from invalid registries.
+    The ability to write compact policy code is what makes Rego so well suited for
+    admission controllers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GateKeeper
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Thus far, everything discussed has been generic to OPA. It was mentioned in
+    the beginning of the chapter that OPA didn't get its start in Kubernetes. Early
+    implementations had a sidecar that kept the OPA database in sync with the API
+    server, but you had to manually create policies as **ConfigMap** objects and manually
+    generate responses for webhooks. In 2018, Microsoft debuted GateKeeper, [https://github.com/open-policy-agent/gatekeeper](https://github.com/open-policy-agent/gatekeeper),
+    to provide a Kubernetes-native experience.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In addition to moving from **ConfigMap** objects to proper custom resources,
+    GateKeeper adds an audit function that lets you test policies against existing
+    objects. If an object violates a policy, then a violation entry is created to
+    track it. This way, you can get a snapshot of the existing policy violations in
+    your cluster or know whether something was missed during GateKeeper downtime due
+    to an upgrade.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A major difference between GateKeeper and generic OPA is that in GateKeeper,
+    OPA's functionality is not exposed via an API anyone can call. OPA is embedded,
+    with GateKeeper calling OPA directly to execute policies and keep the database
+    up to date. Decisions can only be made based on data in Kubernetes or by pulling
+    data at evaluation time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying GateKeeper
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The examples that will be used will assume the use of GateKeeper instead of
+    a generic OPA deployment. Based on the directions from the GateKeeper project,
+    use the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: $ kubectl apply -f https://raw.githubusercontent.com/open-policy-agent/gatekeeper/master/deploy/gatekeeper.yaml
+  prefs: []
+  type: TYPE_NORMAL
+- en: This launches the GateKeeper namespace **Pods**, and creates the validating
+    webhook. Once deployed, move on to the next section. We'll cover the details of
+    using GateKeeper throughout the rest of this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Automated testing framework
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: OPA has a built-in automated testing framework for your policies. This is one
+    of the most valuable aspects of OPA. Being able to test policies consistently
+    before deployment can save you hours of debugging time. When writing policies,
+    have a file with the same name as your policies file, but with **_test** in the
+    name. For instance, to have test cases associated with **mypolicies.rego**, have
+    the test cases in **mypolicies_test.rego** in the same directory. Running **opa
+    test** will then run your test cases. We'll show how to use this to debug your
+    code in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having covered the basics of OPA and how it is constructed, the next step is
+    to learn how to use Rego to write policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Rego to write policies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Rego is a language specifically designed for policy writing. It is different
+    to most languages you have likely written code in. Typical authorization code
+    will look something like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: //assume failure
+  prefs: []
+  type: TYPE_NORMAL
+- en: boolean allowed = false;
+  prefs: []
+  type: TYPE_NORMAL
+- en: //on certain conditions allow access
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (someCondition) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: allowed = true;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: //are we authorized?
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (allowed) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: doSomething();
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Authorization code will generally default to unauthorized, with a specific condition
+    having to happen in order to allow the final action to be authorized. Rego takes
+    a different approach. Rego is generally written to authorize everything unless
+    a specific set of conditions happens.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another major difference between Rego and more general programming languages
+    is that there are no explicit "**if**/**then**/**else**" control statements. When
+    a line of Rego is going to make a decision, the code is interpreted as "if this
+    line is false, stop execution." For instance, the following code in Rego says
+    "if the image starts with **myregistry.lan/**, then stop execution of the policy
+    and pass this check, otherwise generate an error message":'
+  prefs: []
+  type: TYPE_NORMAL
+- en: not startsWith(image,"myregistry.lan/")
+  prefs: []
+  type: TYPE_NORMAL
+- en: msg := sprintf("image '%v' comes from untrusted registry", [image])
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The same code in Java might look as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (! image.startsWith("myregistry.lan/")) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: throw new Exception("image " + image + " comes from untrusted registry");
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This difference between inferred control statements and explicit control statements
+    is often the steepest part of the learning curve when learning Rego. Where this
+    can produce a steeper learning curve than other languages, Rego more than makes
+    up for it by making it easy to test and build policies in an automated and manageable
+    way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: OPA can be used to automate the testing of policies. This is incredibly important
+    when writing code that the security of your cluster relies upon. Automating your
+    testing will help speed your development and will increase your security by catching
+    any bugs introduced into previously working code by means of new working code.
+    Next, let's work through the life cycle of writing an OPA policy, testing it,
+    and deploying it to our cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Developing an OPA policy
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A common example of using OPA is to limit which registries a Pod can come from.
+    This is a common security measure in clusters to help restrict which Pods can
+    run on a cluster. For instance, we''ve mentioned Bitcoin miners a few times. If
+    the cluster won''t accept **Pods** except from your own, internal registry, then
+    that''s one more step that needs to be taken for a bad actor to abuse your cluster.
+    First, let''s write our policy, taken from the OPA documentation website (https://www.openpolicyagent.org/docs/latest/kubernetes-introduction/):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: package k8sallowedregistries
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry {
+  prefs: []
+  type: TYPE_NORMAL
+- en: input_images[image]
+  prefs: []
+  type: TYPE_NORMAL
+- en: not startswith(image, "quay.io/")
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: input_images[image] {
+  prefs: []
+  type: TYPE_NORMAL
+- en: image := input.review.object.spec.containers[_].image
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: input_images[image] {
+  prefs: []
+  type: TYPE_NORMAL
+- en: image := input.review.object.spec.template.spec.containers[_].image
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first line in this code declares the **package** our policy is in. Everything
+    is stored in OPA in a package, both data and policies. Packages in OPA are like
+    directories on a filesystem. When you place a policy in a package, everything
+    is relative to that package. In this case, our policy is in the **k8sallowedregistries**
+    package.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next section defines a rule. This rule ultimately will be **undefined**
+    if our **Pod** has an image that comes from **quay.io**. If the **Pod** doesn't
+    have an image from **quay.io**, the rule will return **true**, signifying that
+    the registry is invalid. GateKeeper will interpret this as a failure and return
+    **false** to the API server when the **Pod** is evaluated during a dynamic admission
+    review.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next two rules look very similar. The first of the **input_images** rules
+    says "evaluate the calling rule against every **container** in the object''s **spec.container**",
+    matching **Pod** objects directly submitted to the API server, and extract all
+    the **image** values for each **container**. The second **input_images** rule
+    states: "evaluate the calling rule against every **container** in the object''s
+    **spec.template.spec.containers**" to short circuit **Deployment** objects and
+    **StatefulSets**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, we add the rule that GateKeeper requires to notify the API server
+    of a failed evaluation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'violation[{"msg": msg, "details": {}}] {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry
+  prefs: []
+  type: TYPE_NORMAL
+- en: msg := "Invalid registry"
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This rule will return an empty **msg** if the registry is valid. It's a good
+    idea to break up your code into code that makes policy decisions and code that
+    responds with feedback. This makes it easier to test, which we'll do next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing an OPA policy
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Once we have written our policy, we want to set up an automated test. Just
+    as with testing any other code, it''s important that your test cases cover both
+    expected and unexpected input. It''s also important to test both positive and
+    negative outcomes. It''s not enough to corroborate that our policy allowed a correct
+    registry; we also need to make sure it stops an invalid one. Here are eight test
+    cases for our code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: package k8sallowedregistries
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_deployment_registry_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: not invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_deployment_registry_not_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_pod_registry_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: not invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_pod_registry_not_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_cronjob_registry_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: not invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_cronjob_registry_not_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry with input as {"apiVersion"...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_error_message_not_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: control := {"msg":"Invalid registry","details":{}}
+  prefs: []
+  type: TYPE_NORMAL
+- en: result = violation with input as {"apiVersion":"admissi…
+  prefs: []
+  type: TYPE_NORMAL
+- en: result[_] == control
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: test_error_message_allowed {
+  prefs: []
+  type: TYPE_NORMAL
+- en: result = violation with input as {"apiVersion":"admissi…
+  prefs: []
+  type: TYPE_NORMAL
+- en: control := {"msg":"Invalid registry","details":{}}
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are eight tests in total; two tests to make sure that the proper error
+    message is returned when there's an issue, and six tests covering two use cases
+    for three input types. We're testing simple **Pod** definitions, **Deployment**,
+    and **CronJob**. To validate success or failure as expected, we have included
+    definitions that have **image** attributes that include **docker.io** and **quay.io**
+    for each input type. The code is abbreviated for print, but can be downloaded
+    from [https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter11/simple-opa-policy/rego/](https://github.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/tree/master/chapter11/simple-opa-policy/rego/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To run the tests, first install the OPA command-line executable as per the
+    OPA website – https://www.openpolicyagent.org/docs/latest/#running-opa. Once downloaded,
+    go to the **simple-opa-policy/rego** directory and run the tests:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: $ opa test .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'data.kubernetes.admission.test_cronjob_registry_not_allowed: FAIL (248ns)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--------------------------------------------------------------'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'PASS: 7/8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'FAIL: 1/8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Seven of the tests passed, but **test_cronjob_registry_not_allowed** failed.
+    The **CronJob** submitted as **input** should not be allowed because its **image**
+    uses *docker.io*. The reason it snuck through was because **CronJob** objects
+    follow a different pattern to **Pod** and **Deployment**, so our two **input_image**
+    rules won't load any of the container objects from the **CronJob**. The good news
+    is that when the **CronJob** ultimately submits the **Pod**, GateKeeper will not
+    validate it, thereby preventing it from running. The bad news is that no one will
+    know this until the **Pod** was supposed to be run. Making sure we pick up **CronJob**
+    objects in addition to our other objects with containers in them will make it
+    much easier to debug because the **CronJob** won't be accepted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To get all tests passing, add a new **input_container** rule to the **limitregistries.rego**
+    file in the Github repo that will match the container used by a **CronJob**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: input_images[image] {
+  prefs: []
+  type: TYPE_NORMAL
+- en: image := input.review.object.spec.jobTemplate.spec.template.spec.containers[_].image
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, running the tests will show that everything passes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: $ opa test .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'PASS: 8/8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With a policy that has been tested, the next step is to integrate the policy
+    into GateKeeper.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying policies to GateKeeper
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The policies we''ve created need to be deployed to GateKeeper, which provides
+    Kubernetes custom resources that policies need to be loaded into. The first custom
+    resource is **ConstraintTemplate**, which is where the Rego code for our policy
+    is stored. This object lets us specify parameters in relation to our policy enforcement,
+    and we''ll cover this next. To keep things simple, create a template with no parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: templates.gatekeeper.sh/v1beta1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ConstraintTemplate'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'crd:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'names:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: K8sAllowedRegistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'listKind: K8sAllowedRegistriesList'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'plural: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'singular: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'validation: {}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'targets:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- target: admission.k8s.gatekeeper.sh'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rego: |'
+  prefs: []
+  type: TYPE_NORMAL
+- en: package k8sallowedregistries
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: The entire source code for this template is available at [https://raw.githubusercontent.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/master/chapter11/simple-opa-policy/yaml/gatekeeper-policy-template.yaml](https://raw.githubusercontent.com/PacktPublishing/Kubernetes-and-Docker-The-Complete-Guide/master/ch).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once created, the next step is to apply the policy by creating a constraint
+    based on the template. Constraints are objects in Kubernetes based on the configuration
+    of **ConstraintTemplate**. Notice that our template defines a custom resource
+    definition. This gets added to the **constraints.gatekeeper.sh** API group. If
+    you look at the list of CRDs on your cluster, you''ll see **k8sallowedregistries**
+    listed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.3 – CRD created by ConstraintTemplate'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.3_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.3 – CRD created by ConstraintTemplate
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the constraint means creating an instance of the object defined in
+    the template.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To keep from causing too much havoc in our cluster, we''re going to restrict
+    this policy to the **openunison** namespace:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: constraints.gatekeeper.sh/v1beta1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: K8sAllowedRegistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: restrict-openunison-registries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'match:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: [""]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds: ["Pod"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: ["apps"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- StatefulSet'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- Deployment'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: ["batch"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- CronJob'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespaces: ["openunison"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'parameters: {}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The constraint limits the policy we wrote to just **Deployment**, **CronJob**,
+    and **Pod** objects in the OpenUnison namespace. Once created, if we try to kill
+    the **openunison-operator** Pod, it will fail to successfully be recreated by
+    the replica set controller because the image comes from **dockerhub.io**, not
+    **quay.io**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.4 – Pod fails to create because of GateKeeper policy'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.4_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.4 – Pod fails to create because of GateKeeper policy
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, look at the policy object. You will see that there are several violations
+    in the **status** section of the object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.5 – List of objects that violate the image registry policy'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.5_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.5 – List of objects that violate the image registry policy
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having deployed your first GateKeeper policy, you may quickly notice it has
+    a few issues. The first is that the registry is hardcoded. This means that we'd
+    need to replicate our code for every change of registry. It's also not flexible
+    for the namespace. All of Tremolo Security's images are stored in **docker.io/tremolosecurity**,
+    so instead of limiting a specific registry server, we may want flexibility for
+    each namespace and to allow multiple registries. Next, we'll update our policies
+    to provide this flexibility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building dynamic policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our current registry policy is limiting. It is static and only supports a single
+    registry. Both Rego and GateKeeper provide functionality to build a dynamic policy
+    that can be reused in our cluster and configured based on individual namespace
+    requirements. This gives us one code base to work from and debug instead of having
+    to maintain repetitive code. The code we're going to use is in [https://github.com/packtpublishing/Kubernetes-and-Docker-The-Complete-Guide/blob/master/chapter11/parameter-opa-policy/](https://github.com/packtpublishing/Kubernetes-and-Docker-The-Complete-Guide/blob/master/chapter11/pa).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When inspecting **rego/limitregistries.rego**, the main difference between
+    the code in **parameter-opa-policy** and **simple-opa-policy** comes down to the
+    **invalidRegistry** rule:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry {
+  prefs: []
+  type: TYPE_NORMAL
+- en: ok_images = [image | startswith(input_images[i],input.parameters.registries[_])
+    ; image = input_images[i] ]
+  prefs: []
+  type: TYPE_NORMAL
+- en: count(ok_images) != count(input_images)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The goal of the first line of the rule is to determine which images come from
+    approved registries using a comprehension. Comprehensions provide a way to build
+    out sets, arrays, and objects based on some logic. In this case, we want to only
+    add images to the **ok_images** array that start with any of the allowed registries
+    from **input.parameters.registries**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To read a comprehension, start with the type of brace. Ours starts with a square
+    bracket, so the result will be an array. Objects and sets can also be generated.
+    The word between the open bracket and the pipe character, (**|**), is called the
+    head and this is the variable that will be added to our array if the right conditions
+    are met. Everything to the right of the pipe character, (**|**), is a set of rules
+    used to determine what **image** should be and if it should have a value at all.
+    If any of the statements in the rule resolve to undefined or false, the execution
+    exits for that iteration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first rule of our comprehension is where most of the work is done. The
+    **startswith** function is used to determine whether each of our images starts
+    with the correct registry name. Instead of passing two strings to the function,
+    we instead pass arrays. The first array has a variable we haven''t declared yet,
+    **i**, and the other uses an underscore (**_**) where the index would usually
+    be. The **i** is interpreted by Rego as "do this for each value in the array,
+    incrementing by 1 and let it be referenced throughout the comprehension." The
+    underscore is shorthand in Rego for "do this for all values." Since we specified
+    two arrays, every combination of the two arrays will be used as input to the **startswith**
+    function. That means that if there are two containers and three potential pre-approved
+    registries, then **startswith** will be called six times. When any of the combinations
+    return **true** from **startswith**, the next rule is executed. That sets the
+    **image** variable to **input_image** with index **i**, which then means that
+    image is added to **ok_images**. The same code in Java would look something like
+    the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ArrayList<String> okImages = new ArrayList<String>();
+  prefs: []
+  type: TYPE_NORMAL
+- en: for (int i=0;i<inputImages.length;i++) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: for (int j=0;j<registries.length;j++) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (inputImages[i].startsWith(registries[j])) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: okImages.add(inputImages[i]);
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One line of Rego eliminated seven lines of mostly boilerplate code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The second line of the rule compares the number of entries in the **ok_images**
+    array with the number of known container images. If they are equal, we know that
+    every container contains a valid image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With our updated Rego rules for supporting multiple registries, the next step
+    is to deploy a new policy template (if you haven''t done so already, delete the
+    old **k8sallowedregistries** **ConstraintTemplate** and **restrict-openunison-registries**
+    **K8sAllowedRegistries**). Here''s our updated **ConstraintTemplate**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: templates.gatekeeper.sh/v1beta1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ConstraintTemplate'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'crd:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'names:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: K8sAllowedRegistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'listKind: K8sAllowedRegistriesList'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'plural: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'singular: k8sallowedregistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'validation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**openAPIV3Schema:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**          properties:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**            registries:**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**              type: array**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**              items: string**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'targets:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- target: admission.k8s.gatekeeper.sh'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'rego: |'
+  prefs: []
+  type: TYPE_NORMAL
+- en: package k8sallowedregistries
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Beyond including our new rules, the highlighted section shows that we added
+    a schema to our template. This will allow for the template to be reused with specific
+    parameters. This schema goes into the **CustomResourceDefenition** that will be
+    created and is used to validate input for the **K8sAllowedRegistries** objects
+    we'll create in order to enforce our pre-authorized registry lists.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, let''s create our policy for the **openunison** namespace. Since the
+    only containers that are running in this namespace should come from Tremolo Security''s
+    **dockerhub.io** registry, we''ll limit all Pods to **docker.io/tremolosecurity/**
+    using the following policy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: constraints.gatekeeper.sh/v1beta1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: K8sAllowedRegistries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: restrict-openunison-registries'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'match:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: [""]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds: ["Pod"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: ["apps"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- StatefulSet'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- Deployment'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- apiGroups: ["batch"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kinds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- CronJob'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespaces: ["openunison"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'registries: ["docker.io/tremolosecurity/"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Unlike our previous version, this policy specifies which registries are valid
+    instead of embedding the policy data directly into our Rego. With our policies
+    in place, let''s try to run the **busybox** container in the **openunison** namespace
+    to get a shell:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.6 – Failed busybox shell'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.6_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.6 – Failed busybox shell
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using this generic policy template, we can restrict which registries the namespaces
+    are able to pull from. As an example, in a multi-tenant environment, you may want
+    to restrict all **Pods** to the owner's own registry. If a namespace is being
+    used for a commercial product, you can stipulate that only that vendor's containers
+    can run in it. Before moving on to other use cases, it's important to understand
+    how to debug your code and handle Rego's quirks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Debugging Rego
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Debugging Rego can be challenging. Unlike more generic programming languages
+    such as Java or Go, there's no way to step through code in a debugger. Take the
+    example of the generic policy we just wrote for checking registries. All the work
+    was done in a single line of code. Stepping through it wouldn't do much good.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make Rego easier to debug, the OPA project provides a trace of all failed
+    tests when verbose output is set on the command line. This is another great reason
+    to use OPA's built-in testing tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To make better use of this trace, Rego has a function called **trace** that
+    accepts a string. Combining this function with **sprintf** lets you more easily
+    track where your code is not working as expected. In the **chapter11/paramter-opa-policy-fail/rego**
+    directory, there''s a test that will fail. There is also an **invalidRegistry**
+    rule with multiple trace options added:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidRegistry {
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'trace(sprintf("input_images : %v",[input_images]))'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ok_images = [image |
+  prefs: []
+  type: TYPE_NORMAL
+- en: trace(sprintf("image %v",[input_images[j]]))
+  prefs: []
+  type: TYPE_NORMAL
+- en: startswith(input_images[j],input.parameters.registries[_]) ;
+  prefs: []
+  type: TYPE_NORMAL
+- en: image = input_images[j]
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: trace(sprintf("ok_images %v",[ok_images]))
+  prefs: []
+  type: TYPE_NORMAL
+- en: trace(sprintf("ok_images size %v / input_images size %v",[count(ok_images),count(input_images)]))
+  prefs: []
+  type: TYPE_NORMAL
+- en: count(ok_images) != count(input_images)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the test is run, OPA will output a detailed trace of every comparison and
+    code path. Wherever it encounters the **trace** function, a "note" is added to
+    the trace. This is the equivalent of adding print statements in your code to debug.
+    The output of the OPA trace is very verbose, and far too much text to include
+    in print. Running **opa test.** **-v** in this directory will give you the full
+    trace you can use to debug your code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using existing policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Before moving into more advanced use cases for OPA and GateKeeper, it's important
+    to understand the implications of how OPA is built and used. If you inspect the
+    code we worked through in the previous section, you might notice that we aren't
+    checking for **initContainers**. We're only looking for the primary containers.
+    **initContainers** are special containers that are run before the containers listed
+    in a **Pod** are expected to end. They're often used to prepare the filesystem
+    of a volume mount and for other "initial" tasks that should be performed before
+    the containers of a **Pod** have run. If a bad actor tried to launch a **Pod**
+    with an **initContainers** that pulls in a Bitcoin miner (or worse), our policy
+    wouldn't stop it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to be very detailed in the design and implementation of policies.
+    One of the ways to make sure you're not missing something when building policies
+    is to use policies that already exist and have been tested. The GateKeeper project
+    maintains several libraries of pre-tested policies and how to use them in its
+    GitHub repo at https://github.com/open-policy-agent/gatekeeper/tree/master/library.
+    Before attempting to build one of your own policies, see whether one already exists
+    there first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section provided an overview of Rego and how it works in policy evaluation.
+    It didn't cover everything, but should give you a good point of reference for
+    working with Rego's documentation. Next, we'll learn how to build policies that
+    rely on data from outside our request, such as other objects in our cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enforcing memory constraints
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far in this chapter, we've built policies that are self-contained. When checking
+    whether an image is coming from a pre-authorized registry, the only data we needed
+    was from the policy and the containers. This is often not enough information to
+    make a policy decision. In this section, we'll work on building a policy that
+    relies on other objects in your cluster to make policy decisions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before diving into the implementation, let's talk about the use case. It's a
+    good idea to include at least memory requirements on any **Pod** submitted to
+    the API server. There are certain namespaces though where this doesn't make as
+    much sense. For instance, many of the containers in the **kube-system** namespace
+    don't have CPU and memory resource requests.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are multiple ways we could handle this. One way is to deploy a constraint
+    template and apply it to every namespace we want to enforce memory resource requests
+    on. This can lead to repetitive objects or require us to explicitly update policies
+    to apply them to certain namespaces. Another method is to add a label to the namespace
+    that lets OPA know it needs all **Pod** objects to have memory resource requests.
+    Since Kubernetes already has **ResourceQuota** objects for managing memory, we
+    can also establish whether a namespace has a **ResourceQuota** and, if it does,
+    then we know there should be memory requests.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our next example, we''ll write a policy that says any **Pod** created in
+    a namespace that has a **ResourceQuota** must have a memory resource request.
+    The policy itself should be pretty simple. The pseudocode will look something
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: if (hasResourceQuota(input.review.object.metdata.namespace) &&  containers.resource.requests.memory
+    == null) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: generate error;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The hard part here is understanding if the namespace has a **ResourceQuota**.
+    Kubernetes has an API, which you could query, but that would mean either embedding
+    a secret into the policy so it can talk to the API server or allowing anonymous
+    access. Neither of those options are a good idea. Another issue with querying
+    the API server is that it's difficult to automate testing since you are now reliant
+    on an API server being available wherever you run your tests.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We discussed earlier that OPA can replicate data from the API server in its
+    own database. GateKeeper uses this functionality to create a "cache" of objects
+    that can be tested against. Once this cache is populated, we can replicate it
+    locally to provide test data for our policy testing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enabling the GateKeeper cache
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The GateKeeper cache is enabled by creating a **Config** object in the **gatekeeper-system**
+    namespace. Add this configuration to your cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: config.gatekeeper.sh/v1alpha1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: Config'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: config'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: "gatekeeper-system"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'sync:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'syncOnly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- group: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'version: "v1"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: "Namespace"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- group: ""'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'version: "v1"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: "ResourceQuota"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This will begin replicating **Namespace** and **ResourceQuota** objects in
+    GateKeeper''s internal OPA database. Let''s create a **Namespace** with a **ResourceQuota**
+    and one without a **ResourceQuota**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: v1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: Namespace'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: ns-with-no-quota'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec: {}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '---'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: v1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: Namespace'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: ns-with-quota'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec: {}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '---'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'kind: ResourceQuota'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'apiVersion: v1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'metadata:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'name: memory-quota'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'namespace: ns-with-quota'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'hard:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'requests.memory: 1G'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'limits.memory: 1G'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After a moment, the data should be in the OPA database and ready to query.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The GateKeeper service account has read access to everything in your cluster
+    with its default installation. This includes secret objects. Be careful what you
+    replicate in GateKeeper's cache as there are no security controls from inside
+    a Rego policy. Your policy could very easily log secret object data if you are
+    not careful. Also, make sure to control who has access to the **gatekeeper-system**
+    namespace. Anyone who gets hold of the service account's token can use it to read
+    any data in your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mocking up test data
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to automate testing of our policy, we need to create test data. In
+    the previous examples, we used data injected into the **input** variable. Cache
+    data is stored in the **data** variable. Specifically, in order to access our
+    resource quota, we need to access **data.inventory.namespace["ns-with-quota"]["v1"]["ResourceQuota"]["memory-quota"]**.
+    This is the standard way for you to query data from Rego in GateKeeper. Just as
+    we did with input, we can inject a mocked-up version of this data by creating
+    a data object. Here''s what our JSON will look like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inventory": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"namespace":{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ns-with-no-quota" : {},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ns-with-quota":{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"v1":{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ResourceQuota": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"memory-quota":{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"kind": "ResourceQuota",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"apiVersion": "v1",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"metadata": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"name": "memory-quota",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"namespace": "ns-with-quota"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"spec": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"hard": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"requests.memory": "1G",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"limits.memory": "1G"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}}}}}}}}}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you look at **chapter11/enforce-memory-request/rego/enforcememory_test.rego**,
+    you'll see the tests have **with input as {…} with data as {…}** with the preceding
+    document as our control data. This lets us test our policies with data that would
+    exist in GateKeeper without having to deploy our code in a cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building and deploying our policy
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Just as before, we''ve written test cases prior to writing our policy. Next,
+    we''ll examine our policy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: package k8senforcememoryrequests
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'violation[{"msg": msg, "details": {}}] {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidMemoryRequests
+  prefs: []
+  type: TYPE_NORMAL
+- en: msg := "No memory requests specified"
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: invalidMemoryRequests {
+  prefs: []
+  type: TYPE_NORMAL
+- en: data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: inventory
+  prefs: []
+  type: TYPE_NORMAL
+- en: .namespace
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[input.review.object.metadata.namespace]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '["v1"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '["ResourceQuota"]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: containers := input.review.object.spec.containers
+  prefs: []
+  type: TYPE_NORMAL
+- en: ok_containers = [ok_container |
+  prefs: []
+  type: TYPE_NORMAL
+- en: containers[j].resources.requests.memory ;
+  prefs: []
+  type: TYPE_NORMAL
+- en: ok_container = containers[j]  ]
+  prefs: []
+  type: TYPE_NORMAL
+- en: count(containers) != count(ok_containers)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This code should look familiar. It follows a similar pattern as our earlier
+    policies. The first rule, **violation**, is the standard reporting rule for GateKeeper.
+    The second rule is where we test our **Pod**. The first line will fail and exit
+    out if the namespace for the specified **Pod** doesn't contain a **ResourceQuota**
+    object. The next line loads all of the containers of the **Pod**. After this,
+    a composition is used to construct a list of containers that has memory requests
+    specified. Finally, the rule will only succeed if the number of compliant containers
+    doesn't match the total number of containers. If **invalidMemoryRequests** succeeds,
+    this means that one or more containers does not have memory requests specified.
+    This will force **msg** to be set and **violation** to inform the user of the
+    issue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To deploy, add **chapter11/enforce-memory-request/yaml/gatekeeper-policy-template.yaml**
+    and **chapter11/enforce-memory-request/yaml/gatekeeper-policy.yaml** to your cluster.
+    To test this, create a **Pod** without memory requests in both our **ns-with-quota**
+    and **ns-with-no-quota** namespaces:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 11.7 – Creating pods without memory requests'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](image/Fig_11.7_B15514.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 11.7 – Creating pods without memory requests
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first attempt to create a **Pod** in the **ns-with-quota** namespace fails
+    because our **require-memory-requests** policy rejected it since **ns-with-quota**
+    has a **ResourceQuota** in it. The second attempt succeeds because it is running
+    in a namespace with no **ResourceQuota**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Most of this chapter has been spent writing policies. The final use case for
+    OPA will focus on using GateKeeper's prebuilt policies to replace Pod security
+    policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enforcing Pod Security Policies using OPA
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In [*Chapter 10*](B15514_10_Final_ASB_ePub.xhtml#_idTextAnchor260), *Creating
+    Pod Security Policies*, we discussed the fact that the existing Pod security policy
+    implementation for Kubernetes would never become "GA". One of the alternatives
+    to using the Kubernetes implementation was to use OPA and GateKeeper to enforce
+    the same policies, but in OPA instead of on the API server. This process works
+    differently to the standard implemented by Kubernetes, but using it can keep your
+    clusters more vendor-independent and less susceptible to the changes that will
+    eventually arise with whatever comes next for Kubernetes' Pod security policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GateKeeper's policies are all published at [https://github.com/open-policy-agent/gatekeeper/tree/master/library/pod-security-policy](https://github.com/open-policy-agent/gatekeeper/tree/master/library/pod-security-policy).
+    They're built as a series of **ConstraintTemplate** objects and example constraints.
+    This approach to Pod security policies makes for some specific differences in
+    how policies are implemented.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first major difference is that using GateKeeper, you have to declare everything
+    in your Pod definition so that GateKeeper has something to audit against. This
+    isn't necessary with Pod security policies because Kubernetes will mutate the
+    Pod definition to conform to the policy. To illustrate this, look at the **openunison-operator**,
+    **Deployment**, in the **openunison** namespace in our KinD cluster. No **runAsUser**
+    is declared. Now look at the actual Pod definition and you'll see that **runAsUser**
+    is set to **1**. GateKeeper version 3 isn't yet capable of supporting Pod mutation,
+    so in order to ensure that **Deployment** or **Pod** has **runAsUser** set, a
+    separate mutating webhook needs to set the **runAsUser** attribute accordingly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next major difference between the Kubernetes standard policy implementation
+    and using GateKeeper is how a Pod is assigned a policy. The Kubernetes standard
+    implementation uses a combination of RBAC, leveraging both the account information
+    of the submitter and **serviceAccount** of the **Pod**, and the capabilities requested
+    by the **Pod** to determine which policy to use. This can lead to some unexpected
+    results when assigning policies. GateKeeper instead provides the same matching
+    criteria as any other constraint implemented by GateKeeper, using namespaces and
+    label selectors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For example, to run a Pod using a privileged constraint, you may create the
+    constraint with a specific **labelSelector**. Then, when the Pod is submitted,
+    that label needs to be on the **Pod** so GateKeeper knows to apply it. This makes
+    it much easier to explicitly apply policies to a **Pod**. It doesn't cover how
+    to enforce the labeling of resources. You may not want someone to be able to label
+    their own **Pod** as privileged.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, GateKeeper's library of policies are broken up instead of being part
+    of one object. In order to apply a policy that enforces an unprivileged container
+    that runs in a certain user range, you need two separate policy constraint implementations
+    and two separate constraints.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As of the time of writing, you couldn't replicate what we built in [*Chapter
+    10*](B15514_10_Final_ASB_ePub.xhtml#_idTextAnchor260), *Creating Pod Security
+    Policies*, without significant additional work. The goal of the GateKeeper project
+    is to get to that point in the future. The more complete solution is still the
+    standard implementation of Pod security policies in Kubernetes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we explored how to use GateKeeper as a dynamic admission controller
+    to provide additional authorization policies on top of Kubernetes' built-in RBAC
+    capabilities. We looked at how GateKeeper and OPA are architected. Finally, we
+    learned how to build, deploy, and test policies in Rego.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Extending Kubernetes' policies leads to a stronger security profile in your
+    clusters and provides greater confidence in the integrity of the workloads running
+    on your cluster. Using GateKeeper can also help catch previously missed policy
+    violations through its application of continuous audits. Using these capabilities
+    will provide a stronger foundation for your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter focused on whether or not to launch a **Pod**. In the next chapter,
+    we'll learn how to track what **Pods** are doing once active.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Are OPA and GateKeeper the same thing?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Yes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. NO.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How is Rego code stored in GateKeeper?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. It is stored as **ConfigMap** objects that are watched.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Rego has to be mounted to the Pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Rego needs to be stored as secret objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Rego is saved as a **ConstraintTemplate**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How do you test Rego policies?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. In production
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. Using an automated framework built directly into OPA
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. By first compiling to Web Assembly
+  prefs: []
+  type: TYPE_NORMAL
+- en: In Rego, how do you write a **for** loop?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. You don't need to; Rego will identify iterative steps.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. By using the **for all** syntax.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. By initializing counters in a loop.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. There are no loops in Rego.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is the best way to debug Rego policies?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. Use an IDE to attach to the GateKeeper container in a cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. In production.
+  prefs: []
+  type: TYPE_NORMAL
+- en: C. Add trace functions to your code and run the **opa test** command with **-v**
+    to see execution traces.
+  prefs: []
+  type: TYPE_NORMAL
+- en: D. Include **System.out** statements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Constraints all need to be hardcoded.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GateKeeper can replace Pod security policies.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A. True.
+  prefs: []
+  type: TYPE_NORMAL
+- en: B. False.
+  prefs: []
+  type: TYPE_NORMAL

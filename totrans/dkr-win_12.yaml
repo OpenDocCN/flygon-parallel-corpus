@@ -1,0 +1,1237 @@
+- en: Understanding the Security Risks and Benefits of Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Docker is a new type of application platform, and it has been built with a strong
+    focus on security. You can package an existing application as a Docker image,
+    run it in a Docker container, and get significant security benefits without changing
+    any code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A .NET 2.0 WebForms app currently running on Windows Server 2003 will happily
+    run under .NET 4.7 in a Windows container based on Windows Server Core 2019 with
+    no code changes: an immediate upgrade that applies 16 years of security patches!
+    There are still huge numbers of Windows applications running on Server 2003 which
+    is out of support, or Server 2008 which will shortly be out of support. Moving
+    to Docker is a great way to bring those apps onto a modern technology stack.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Security in Docker encompasses a wide range of topics, which I will cover in
+    this chapter. I'll explain the security aspects of containers and images, the
+    extended features in **Docker Trusted Registry** (**DTR**), and the secure configuration
+    of Docker in swarm mode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter I''ll look at some of the internals of Docker to show how security
+    is implemented. I''ll cover:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding container security
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Securing applications with secure Docker images
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Securing the software supply chain with DTR
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding security in swarm mode
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding container security
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Application processes running in Windows Server containers are actually running
+    on the host. If you run multiple ASP.NET applications in containers, you'll see
+    multiple `w3wp.exe` processes in the task list on the host machine. Sharing the
+    operating system kernel between containers is how Docker containers are so efficient—the
+    container doesn't load its own kernel, so the startup and shutdown times are very
+    fast and the overhead on runtime resources is minimal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Software running inside a container may have security vulnerabilities, and
+    the big question security folks ask about Docker is: How secure is the isolation
+    between containers? If an app in a Docker container is compromised, that means
+    a host process is compromised. Could the attacker use that process to compromise
+    other processes, potentially hijacking the host machine or other containers running
+    on the host?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Breaking out of a container and compromising other containers and the host could
+    be possible if there was a vulnerability in the operating system kernel that the
+    attacker could exploit. The Docker platform is built with the principle of security-in-depth,
+    so even if that were possible, the platform provides multiple ways to mitigate
+    it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Docker platform has near feature parity between Linux and Windows, with
+    a few gaps on the Windows side being actively worked on. But Docker has a longer
+    history of production deployment on Linux and much of the guidance and tooling
+    such as Docker Bench and the CIS Docker Benchmark is specific to Linux. It's useful
+    to know the Linux side, but many of the practical points do not apply to Windows
+    containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Container processes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'All Windows processes are started and owned by a user account. The permissions
+    of the user account determine whether the process can access files and other resources
+    and whether they are available to modify or just to view. In the Docker base image
+    for Windows Server Core, there is a default user account called **container administrator**.
+    Any process you start in a container from that image will use that user account—you
+    can run the `whoami` tool, which just writes out the current username:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can run an interactive container by starting a PowerShell and find the
+    user ID (SID) of the container administrator account:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You''ll find that the container user always has the same SID, `S-1-5-93-2-1`,
+    as the account is part of the Windows image. Due to this, it has the same attributes
+    in every container. The container process is really running on the host, but there
+    is no **container administrator** user on the host. In fact, if you look at the
+    container process on the host, you''ll see a blank entry for the username. I''ll
+    start a long-running `ping` process in a background container and check the **process
+    ID** (**PID**) inside the container:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is a Windows Server container running in Docker on Windows Server 2019,
+    so the `ping` process is running directly on the host, and the PID inside the
+    container will match the PID on the host. On the server, I can check the details
+    of that same PID, which is `7704` in this case:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is no username because the container user does not map any users on the
+    host. Effectively, the host process is running under an anonymous user, and it
+    has no permissions on the host, it only has the permissions configured within
+    the sandboxed environment of one container. If a Windows Server vulnerability
+    was found that allowed attackers to break out of a container, they would be running
+    a host process with no access to host resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's possible that a more extreme vulnerability could allow the anonymous user
+    on the host to assume wider privileges, but that would be a major security hole
+    in the core Windows permissions stack, one of the scale that typically gets a
+    very fast response from Microsoft. The anonymous host user approach is a good
+    mitigation to limit the impact of any unknown vulnerabilities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Container user accounts and ACLs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In a Windows Server Core container, the default user account is the container
+    administrator. This account is in the administrator group on the container, so
+    it has complete access to the whole filesystem and all the resources on the container.
+    The process specified in the `CMD` or `ENTRYPOINT` instruction in a Dockerfile
+    will run under the container administrator account.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This can be problematic if there is a vulnerability in the application. The
+    app could be compromised, and, while the chances of an attacker breaking out of
+    the container are small, the attacker could still do a lot of damage inside the
+    application container. Administrative access means that the attacker could download
+    malicious software from the internet and run it in the container or copy state
+    from the container to an external location.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can mitigate this by running container processes under a least-privilege
+    user account. The Nano Server images use this approach—they are set up with a
+    container administrator user, but the default account for container processes
+    is a user without admin permissions. You can see that, by echoing the username
+    in a Nano Server container:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The Nano Server image doesn't have the `whoami` command, and it doesn't even
+    have PowerShell installed. It is set up with the bare minimum that's necessary
+    to run new applications. This is another part of security-in-depth with containers.
+    If there was an exploit in the `whoami` command, then your container applications
+    could be vulnerable, so Microsoft don't package the command at all. This makes
+    sense because you wouldn't use it in a production application. It's still there
+    in Windows Server Core to preserve backwards compatibility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `ContainerUser` account does not have admin access inside the container.
+    If you need admin rights to set up your application, you can switch to the admin
+    account in your Dockerfile with the `USER ContainerAdministrator` command. But
+    if your application doesn't need admin access, you should switch back at the end
+    of your Dockerfile with `USER ContainerUser` so that the container startup command
+    runs as the least-privilege account.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Internet Information Services** (**IIS**) and ASP.NET images from Microsoft
+    are other examples of running as least-privilege users. The external-facing process
+    is the IIS Windows service, which runs under a local account in the `IIS_IUSRS`
+    group. This group has read access to the IIS root path `C:\inetpub\wwwroot`, but
+    no write access. An attacker could compromise the web application, but they would
+    not be able to write files, so the ability to download malicious software is gone.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In some cases, the web application needs write access to save the state, but
+    it can be granted at a very fine level in the Dockerfile. As an example, the open
+    source **content management system** (**CMS**) Umbraco can be packaged as a Docker
+    image, but the IIS user group needs write permissions to the content folder. Rather
+    than changing the Dockerfile to run the service as an administrative account,
+    you can set ACL permissions with a `RUN` instruction:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: I won't go into detail on Umbraco here, but it runs very nicely in a container.
+    You can find sample Dockerfiles for Umbraco and lots of other open source software
+    in my GitHub repository at [https://github.com/sixeyed/dockerfiles-windows](https://github.com/sixeyed/dockerfiles-windows).
+  prefs: []
+  type: TYPE_NORMAL
+- en: You should use a least-privilege user account to run processes and set ACLs
+    as narrowly as possible. This limits the scope for any attackers who gain access
+    to the process inside the container, but there are still attack vectors from outside
+    the container that you need to consider.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running containers with resource constraints
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You can run Docker containers with no constraints, and the container process
+    will use as much of the host's resources as it needs. That's the default, but
+    it can be an easy attack vector. A malicious user could generate an excess load
+    on the application in the container, which could try and grab 100% CPU and memory,
+    starving other containers on the host. This is especially significant if you're
+    running hundreds of containers that are serving multiple application workloads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker has mechanisms to prevent individual containers using excessive resources.
+    You can start containers with explicit constraints to limit the resources they
+    can use, ensuring no single container consumes the majority of the host's compute
+    power. You can limit a container to an explicit number of CPU cores and memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I have a simple .NET console app and a Dockerfile to package this in the `ch09-resource-check`
+    folder. The application is built to hog compute resources, and I can run it in
+    a container to show how Docker limits the impact of a rogue application. I can
+    use the app to successfully allocate 600 MB of memory, like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The console application allocates 600 MB of memory in the container, which
+    is actually 600 MB of memory from the server in a Windows Server container. I
+    ran the container without any constraints, so the app is able to use as much memory
+    as the server has. If I limit the container to 500 MB of memory using a `--memory`
+    limit in the `docker container run` command, then the application cannot allocate
+    600 MB:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The sample application can also hog the CPU. It computes Pi to a given number
+    of decimal places, which is a computationally expensive operation. In an unrestricted
+    container, computing Pi to 20,000 decimal places takes just under a second on
+    my quad-core development laptop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'I can use a CPU restriction by specifying a `--cpu` limit in the `run` command,
+    and Docker will limit the compute resources available to this container, retaining
+    more CPU for other tasks. The same computation takes more than twice as long:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The same memory and CPU constraints can be applied to a production Docker Swarm
+    deployment by using resource limits in the deploy section. This example limits
+    the new NerdDinner REST API to 25% of available CPU and 250 MB of memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It can be challenging to verify that the resource constraints are in place.
+    The underlying Windows APIs to get the CPU count and memory capacity use the OS
+    kernel, and in a container that will be the host''s kernel. The kernel reports
+    the full hardware spec, so the limits don''t appear to be in place inside the
+    container, but they are enforced. You can use WMI to check the constraints, but
+    the output will not be as expected:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the container reports four CPUs and 16 GB of RAM, even though it has been
+    constrained to one CPU and 1 GB of RAM. The constraints are actually in place,
+    but they operate at a level above the WMI call. If a process running inside the
+    container tried to allocate more than 1 GB of RAM, then it would fail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Remember that only Windows Server containers have access to all the host's compute
+    power, where the container process is actually running on the host. Hyper-V containers
+    each have a lightweight VM where the process is running, and that VM has its own
+    allocation of CPU and memory. You can apply container limits using the same Docker
+    commands, and they're applied to the container's VM.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running containers with restricted capabilities
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There are two useful features of the Docker platform to restrict what applications
+    can do inside containers. Currently, they only work with Linux containers, but
+    they are worth understanding if you need to deal with mixed workloads, and support
+    for Windows may be coming in future versions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Linux containers can be run with the `read-only` flag, which creates the container
+    with a read-only filesystem. This option can be used with any image, and it will
+    start a container with the same entry process as usual. The difference is that
+    the container does not have a writeable filesystem layer, so no files can be added
+    or changed—the container cannot modify the contents of the image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is a useful security feature. A web application could have a vulnerability
+    that allows attackers to execute code on the server, but a read-only container
+    severely limits what the attacker can do. They cannot change application configuration
+    files, alter access permissions, download new malware, or replace application
+    binaries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Read-only containers can be combined with Docker volumes, so applications can
+    write to known locations for logging or caching data. If you have an application
+    that writes to the filesystem, that's how you can run it in a read-only container
+    without changing functionality. You need to be aware that if you write logs to
+    a file in a volume and an attacker has gained access to the filesystem, they could
+    read historical logs, which they can't do if logs are written to standard output
+    and consumed by the Docker platform.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you run Linux containers, you can also explicitly add or drop the system
+    capabilities that are available to the container. As an example, you can start
+    a container without the `chown` capability, so no process inside the container
+    can change file access permissions. Similarly, you can restrict binding to network
+    ports or write access to kernel logs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `read-only`, `cap-add`, and `cap-drop` options have no effect on Windows
+    containers, but support may come in future versions of Docker on Windows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One great thing about Docker is that the open source components are built into
+    the supported Docker Enterprise version. You can make feature requests and track
+    bugs on GitHub in the `moby/moby` repository, which is the source code for Docker
+    Community Edition. When features are implemented in Docker CE, they become available
+    in the subsequent Docker Enterprise release.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows containers and Active Directory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Large organizations use **Active Directory** (**AD**) to manage all the users,
+    groups, and machines in their Windows network. Application servers can be domain-joined,
+    giving them access to AD for authentication and authorization. This is how internal
+    web applications in .NET are usually deployed. The app uses Windows authentication
+    to give users single sign-on, and the IIS application pool runs as a service account
+    that has access to SQL Server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Servers running Docker can be domain-joined, but the containers on the machine
+    are not. You can run a legacy ASP.NET app in a container, but with a default deployment
+    you'll find that Windows authentication does not work for the users, and the application
+    itself can't connect to the database.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is a deployment concern, and you can give Windows containers access to
+    AD using a **group-Managed Service Account** (**gMSA**), which is a type of AD
+    account that you can use without a password. Active Directory quickly becomes
+    a complex topic, so I will just give an overview here so that you''re aware that
+    you can make use of AD services inside your containers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A domain administrator creates the gMSA in Active Directory. This requires one
+    domain controller to be running on Windows Server 2012 or later.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Grant access permission for the gMSA to your Docker servers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use the `CredentialSpec` PowerShell module to generate a JSON-formatted credential
+    specification for the gMSA.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Run containers with the `security-opt` flag, specifying the path to the JSON
+    credential spec.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The application in the container is effectively domain-joined, and can use AD
+    with the permissions that have been assigned to the gMSA.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Accessing AD services from inside a container is much easier in Windows Server
+    2019\. Previously, there were restrictions on the names you had to use for the
+    gMSA, which made it difficult to apply credential specifications when you were
+    running in Docker Swarm. Now, you can use any name for your gMSA, and use one
+    gMSA for many containers. Docker Swarm supports credential specifications in the
+    compose file via the use of the `credential_spec` value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There''s a full walkthrough of creating and using a gMSA and a credential spec
+    in Microsoft''s container documentation on GitHub: [https://github.com/MicrosoftDocs/Virtualization-Documentation/tree/live/windows-server-container-tools/ServiceAccounts](https://github.com/MicrosoftDocs/Virtualization-Documentation/tree/live/windows-server-container-tools/ServiceAccounts).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Isolation in Hyper-V containers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Docker on Windows has one big security feature that Docker on Linux does not
+    have: extended isolation with Hyper-V containers. Containers running on Windows
+    Server 2019 use the host''s operating system kernel. You can see this when you
+    run a container, and the process inside the container is listed on Task Manager
+    on the host.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On Windows 10, the default behavior is different. With the Windows 1809 update,
+    you can run Windows Server containers with process isolation on Windows 10 by
+    adding the `--isolation=process` flag to your docker container run commands. You
+    need to specify the isolation level in the command or in the Docker configuration
+    file, because the default on Windows 10 is `hyperv`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Containers with their own kernel are called **Hyper-V** containers. They are
+    implemented with a lightweight virtual machine that provides the server kernel,
+    but this is not a full VM and doesn't have the typical overhead of a VM. Hyper-V
+    containers use normal Docker images and they run in the normal Docker engine in
+    the same way as all containers. They don't show in the Hyper-V management tool
+    because they are not full virtual machines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hyper-V containers can also be run on Windows Server using the `isolation`
+    option. This command runs the IIS image as a Hyper-V container, publishing port
+    `80` to a random port on the host:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The container behaves in the same way. External users can browse to port `80`
+    on the host and the traffic is handled by the container. On the host, you can
+    run `docker container inspect` to see the IP address and go to the container directly.
+    Features such as Docker networking, volumes, and swarm mode work in the same way
+    for Hyper-V containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The extended isolation of Hyper-V containers offers additional security. There
+    is no shared kernel, so even if a kernel vulnerability allowed the container application
+    to access the host, the host is just a thin VM layer running in its own kernel.
+    There are no other processes or containers running on that kernel, so there is
+    no ability for attackers to compromise other workloads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hyper-V containers have additional overheads because of the separate kernels.
+    They typically have a slower startup time, and by default they impose memory and
+    CPU limits, restricting resources at the kernel level that the container can't
+    exceed. In some scenarios, the trade-off is worthwhile. In multi-tenant situations,
+    where you assume zero trust for every workload, extended isolation can be a useful
+    defense.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Licensing is different for Hyper-V containers. Normal Windows Server containers
+    are licensed at the host level, so you need a license for each server, and then
+    you can run as many containers as you like. Hyper-V containers each have their
+    own kernel, and there are licensing levels that restrict the number of containers
+    you can run on each host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Securing applications with secure Docker images
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I've covered many aspects of securing containers at runtime, but the Docker
+    platform provides security in depth that starts before any containers are run.
+    You can start securing your application by securing the image that packages your
+    application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building minimal images
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: It's unlikely that an attacker can compromise your application and gain access
+    to the container, but you should build your image to mitigate the damage if that
+    happens. Building a minimal image is key. The ideal Docker image should contain
+    nothing more than the application and the dependencies it needs to run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is more difficult to achieve for Windows applications than Linux apps.
+    A Docker image for a Linux app can use a minimal distribution as the base, packaging
+    just the application binaries on top. The attack surface for that image is very
+    small. Even if an attacker gained access to the container, they would find themselves
+    in an operating system with very few features.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In contrast, Docker images using Windows Server Core have a fully featured operating
+    system at the base. The minimal alternative is Nano Server, which has a significantly
+    reduced Windows API and does not even have PowerShell installed, which removes
+    a large feature set that could be exploited. In theory, you can remove features,
+    disable Windows Services, and even delete Windows binaries in your Dockerfile
+    to limit the capabilities of the final image. However, you would need to do a
+    lot of testing to be sure that your app would run correctly in your customized
+    version of Windows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker's recognition for experts and community leaders is the Captain's program.
+    Docker Captains are like Microsoft MVPs, and Stefan Scherer is both a Captain
+    and an MVP. Stefan has done some promising work by looking at reducing Windows
+    image size by creating images with an empty filesystem and adding a minimal set
+    of Windows binaries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can''t easily limit the features of the base Windows image, but you can
+    limit what you add on top. Wherever possible, you should add just your application
+    content and the minimal application runtime so that an attacker can''t modify
+    the app. Some programming languages have better support for this than others,
+    for example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Go applications can be compiled to native binaries, so you only need to package
+    the executable in your Docker image, not the full Go runtime.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: .NET Core apps can be published as assemblies, so you only need to package the
+    .NET Core runtime to execute them, not the full .NET Core SDK.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: .NET Framework apps need the matching .NET Framework installed in the container
+    image, but you can still minimize the app content that you package. You should
+    compile the app in release mode and ensure that you don't package debug files.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Node.js uses V8 as an interpreter and compiler, so, to run apps in Docker, the
+    image needs to have the full Node.js runtime installed, and the full source code
+    for the app needs to be packaged.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You will be limited by what your application stack supports, but a minimal image
+    is the goal. If your application will run on Nano Server, it's definitely preferable
+    to Windows Server Core. Full .NET apps don't run on Nano Server but .NET Standard
+    is advancing rapidly, so it could be a viable option to port your app to .NET
+    Core, which can then run on Nano Server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you run your application in Docker, the unit you work with is the container,
+    and you administer and monitor it using Docker. The underlying operating system
+    doesn't affect how you interact with the container, so having a minimal OS doesn't
+    limit what you can do with your application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker Security Scanning
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A minimal Docker image could still contain software with known vulnerabilities.
+    Docker images use a standard, open format, which means that tools can be reliably
+    built to navigate and inspect image layers. One tool is Docker Security Scanning,
+    which examines the software inside Docker images for vulnerabilities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker Security Scanning looks at all the binary files in the image, in your
+    application dependencies, the application framework, and even the operating system.
+    Every binary is checked against multiple **Common Vulnerability and Exploit**
+    (**CVE**) databases, looking for known vulnerabilities. If any issues are found,
+    Docker reports the details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Docker Security Scanning is available on Docker Hub for official repositories
+    and on the Docker Trusted Registry for your own private registry. The web interface
+    of those systems shows the output of each scan. Minimal images such as Alpine
+    Linux can be completely free of vulnerabilities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/9f1d7121-06c6-4dcf-baa3-ab74a483095f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The official NATS image has a Nano Server 2016 variant, and you can see that
+    there is a vulnerability in that image:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/ecb59cef-aa94-407c-85a5-92798a94e8c8.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Where there are vulnerabilities, you can drill down to see exactly which binaries
+    are flagged, and that links off to the CVE database, describing the vulnerability.
+    In the case of the `nats:nanoserver` image, there are vulnerabilities in the versions
+    of zlib and SQLite, which packaged in the Nano Server base image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These scan results are from official images on Docker Hub. Docker Enterprise
+    provides security scanning in DTR too, and you can run manual scans on demand
+    or configure any push to the repository to trigger a scan. I''ve created a repository
+    for the NerdDinner web application, which is configured to scan on every image
+    push:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/41764876-a665-4d54-b05c-9c8d25b49bf1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Access to this repository is based on the same security setup from [Chapter
+    8](98e12163-b4ad-4b5d-aecc-827f5e204caa.xhtml), *Administering and Monitoring
+    Dockerized Solutions*, with the **nerd-dinner** organization and the **Nerd Dinner
+    Ops** team. DTR uses the same authorization as UCP, so you build organizations
+    and teams once in Docker Enterprise and you can use them to secure images and
+    runtime resources. The user **elton** is in the **Nerd Dinner Ops** team, with
+    read-write access to the **nerd-dinner-web** repository, which means access to
+    push and pull images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When I push an image to this repository, Docker Trusted Registry will begin
+    a security scan, thus identifying all the binaries in every layer of the image
+    and checking them all for known vulnerabilities in the CVE databases. The NerdDinner
+    web application is based on Microsoft''s ASP.NET image, and, at the time of writing,
+    there are known vulnerabilities with components in that image:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/8e898f88-e3e4-420f-b52a-84e193d4f88a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: The issues in `System.Net.Http` are only exploitable in ASP.NET Core applications,
+    so I could confidently say they're not an issue in my .NET Framework app. The
+    `Microsoft.AspNet.Mvc` **cross-site scripting** (**XSS**) issue definitely applies
+    though, and I would want to read more about the exploit and add tests to my CI
+    process to confirm that attackers can't exploit that through my app.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These vulnerabilities are not in libraries that I've added in my Dockerfile—they
+    are in the base image, and they're actually part of ASP.NET and ASP.NET Core.
+    This is nothing to do with running in containers. If you're running any version
+    of ASP.NET MVC from 2.0 through to 5.1 on any version of Windows, then you have
+    this XSS exploit in your production system, but you probably didn't know about
+    it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you find vulnerabilities in your images, you can see exactly where they
+    are and decide how to mitigate them. You could try removing the binaries altogether
+    if you have an automated test suite that you can confidently use to verify that
+    your app still works without them. Alternatively, you may decide that there's
+    no path to the vulnerable code from your application and leave the image as it
+    is, adding tests to make sure that there is no way to exploit the vulnerability.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However you manage it, knowing that there are vulnerabilities in your application
+    stack is extremely useful. Docker Security Scanning can work on each push, so
+    you get immediate feedback if a new version introduces a vulnerability. It also
+    links into UCP, so you can see from the management interface if there are vulnerabilities
+    in the images for your running containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Managing Windows updates
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The process of managing updates to the application stack for your Docker image
+    applies to Windows updates too. You wouldn't connect to a running container to
+    update the version of Node.js it uses, and you wouldn't run Windows Update either.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Microsoft release a combined set of security patches and other hotfixes for
+    Windows, typically on a monthly basis as a Windows update. At the same time, they
+    publish new versions of the Windows Server Core and Nano Server base images and
+    any dependent images on Docker Hub and Microsoft Container Registry. The version
+    number in the image tag matches the hotfix number of the Windows release.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's a good practice to explicitly state the Windows version to use in the `FROM`
+    instruction in your Dockerfile and use specific versions of any dependencies you
+    install. This makes your Dockerfile deterministic—any time you build it in the
+    future, you will get the same image with all the same binaries as a result.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Specifying the Windows version also makes it clear how you manage Windows updates
+    for your Dockerized applications. The Dockerfile for a .NET Framework application
+    may start like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This pins the image to Windows Server 2019 with update `KB4471332`. That''s
+    a searchable Knowledge Base ID that tells you it''s the December 2018 update of
+    Windows. With the release of the new Windows base image, you update your application
+    by changing the tag in the `FROM` instruction and rebuilding your image, in this
+    case by using release `KB4480116`, which is the January 2019 update:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: I'll cover automated build and deployment in [Chapter 10](e0946741-5df7-4a13-b220-ffc963f1e3d3.xhtml),
+    *Powering a Continuous Deployment Pipeline with Docker*. With a good CI/CD pipeline,
+    you can rebuild your images with a new Windows version and run all your tests
+    to confirm that the update doesn't impact any features. Then, you can roll out
+    the update to all your running applications with no downtime by using `docker
+    stack deploy` or `docker service update`, specifying the new versions of your
+    application images. The whole process can be automated, so the IT Admin's pain
+    on *Patch Tuesday* disappears with Docker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Securing the software supply chain with DTR
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'DTR is the second part of Docker''s extended EE offering. (I covered **Universal
+    Control Plane** (**UCP**) in [Chapter 8](98e12163-b4ad-4b5d-aecc-827f5e204caa.xhtml),
+    *Administering and Monitoring Dockerized Solutions.*) DTR is a private Docker
+    registry that adds an important piece to the overall security story of the Docker
+    platform: a secure software supply chain.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can digitally sign Docker images with DTR, and DTR lets you configure who
+    can push and pull images, securely storing all the digital signatures that users
+    have applied to an image. It also works in conjunction with UCP to enforce **content
+    trust**. With Docker Content Trust, you can set up your cluster so that it only
+    runs containers from images that have been signed by specific users or teams.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is a powerful feature that meets the audit requirements for a lot of regulated
+    industries. There may be requirements for a company to prove that the software
+    running in production is actually built from the code in the SCM. This is very
+    difficult to do without a software supply chain; you have to rely on manual processes
+    and a document trail. With Docker, you can enforce it at the platform and meet
+    the audit requirements with automated processes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Repositories and users
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: DTR uses the same authentication model as UCP, so you can use either your **Active
+    Directory** (**AD**) account to log in, or you can use an account that's been
+    created in UCP. DTR uses the same authorization model with organizations, teams,
+    and users from UCP, but the permissions are separate. Users can have completely
+    different access rights to image repositories in DTR and the services that are
+    running from those images in UCP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some parts of the DTR authorization model are similar to Docker Hub. Users can
+    own public or private repositories, which are prefixed with their username. Administrators
+    can create organizations, and organization repositories can set access to users
+    and teams with a fine level of control.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I covered image registries and repositories in [Chapter 4](cba48cea-1666-4d9a-a268-ee2a104f5565.xhtml),
+    *Sharing Images with Docker Registries*. The full name for a repository contains
+    the registry host, the owner, and the repository name. I''ve set up a Docker Enterprise
+    cluster in Azure using Docker Certified Infrastructure. I''ve created a user called
+    `elton` who has one private repository that they own:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/016f0d1b-a23f-4268-b118-5a272601c40e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'To push an image to the repository called `private-app` for the user `elton`,
+    I need to tag it with the full DTR domain in the repository name. My DTR instance
+    is running at `dtrapp-dow2e-hvfz.centralus.cloudapp.azure.com`, so the full image
+    name I need to use is `dtrapp-dow2e-hvfz.centralus.cloudapp.azure.com/elton/private-app`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is a private repository, so it can only be accessed by the user `elton`.
+    DTR presents the same API as any other Docker registry, so I need to log in with
+    the `docker login` command, specifying the DTR domain as the registry address:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: If I make the repository public, anyone with access to DTR can pull the image,
+    but this is a user-owned repository, so only the `elton` account has permission
+    to push.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is the same as Docker Hub, where anyone can pull an image from my `sixeyed`
+    user repositories, but only I can push them. For shared projects where multiple
+    users need access to push images, you use organizations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Organizations and teams
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Organizations are for shared ownership of repositories. Organizations and the
+    repositories they own are separate from the users who have permissions to the
+    repositories. Specific users may have admin access, while others may have read-only
+    access, and specific teams may have read-write access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The user and organization model of DTR is the same in the paid subscription
+    tiers of Docker Hub. If you don't need the full production suite of Docker Enterprise
+    but you need private repositories with shared access, you can use Docker Hub.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I''ve created repositories for more of the components of the NerdDinner stack
+    under the nerd-dinner organization:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/8a5e090e-42bb-443a-aa48-b0592e29a4b2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'I can grant access to the repositories to individual users or to teams. The
+    **Nerd Dinner Ops** team is the group for the admin users that I created in UCP.
+    Those users may push images directly, so they have read-write access to all the
+    repositories:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/efec642a-563b-4090-80e9-737e9293866a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The Nerd Dinner Testers team only needs read access to the repositories, so
+    they can pull images locally for testing but can''t push images to the registry:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/d3812ad2-757f-48e7-9a60-ea678de03287.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: How you organize repositories in DTR is up to you. You may put all application
+    repositories under one organization, and have a separate organization for shared
+    components that might be used in many projects—such as NATS and Elasticsearch.
+    This means that shared components can be managed by a dedicated team, who can
+    approve updates and make sure that the same versions are being used by all projects.
+    Project team members have read access, so they can always pull the latest shared
+    images and run their full application stack, but they can only push updates to
+    their project repositories.
+  prefs: []
+  type: TYPE_NORMAL
+- en: DTR has permission levels of none, read, read-write, and admin. They can be
+    applied at the repository level to teams or individual users. The consistent authentication
+    but separate authorization models of DTR and UCP mean that a developer can have
+    full access to pull and push images in DTR but may have only read access to view
+    running containers in UCP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a mature workflow, you would not have individual users pushing images—it
+    would all be automated. Your initial push would be from the CI system that built
+    the image, and then you would add layers of provenance to your images, starting
+    with promotion policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Image promotion policies in DTR
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Many companies use multiple repositories in their registry to store images at
+    different stages of the application life cycle. The simplest example would be
+    a `nerd-dinner-test/web` repository for images that are going through various
+    phases of testing, and a nerd-dinner-prod/web repository for images that have
+    been approved for production.
+  prefs: []
+  type: TYPE_NORMAL
+- en: DTR provides image promotion policies for automatically copying images from
+    one repository to another if they meet the criteria you specify. This adds an
+    important link to the secure software supply chain. The CI process can push images
+    to the test repository from every build, and then DTR can check the image and
+    promote it to the production repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can configure promotion rules based on the number of vulnerabilities found
+    in the scan, the contents of the image tag, and the software licenses used in
+    open source components in the image. I''ve configured some sensible policies for
+    promoting images from `nerd-dinner-test/web` to `nerd-dinner-prod/web`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/cf81e705-c28b-4049-9b36-131360593401.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'When I push an image to the test repository that meets all the criteria, it
+    gets automatically promoted by DTR to the production repository:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/2218ea06-00d5-4f85-ab96-a2ce137c079f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Configuring your production repositories so that no end users can push to them
+    directly means that images can only get there through an automated process, such
+    as through promotion by DTR.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker Trusted Registry gives you all the pieces you need to build a secure
+    delivery pipeline, but it doesn't mandate any particular process or technology.
+    Events from DTR can trigger webhooks, which means that you can integrate your
+    registry with pretty much any CI system. One event that triggers a webhook is
+    image promotion, which you could use to trigger the automated signing of the new
+    image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Image signing and content trust
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: DTR makes use of the client certificates managed by UCP to sign images with
+    a digital signature that can be tracked to a known user account. Users download
+    a client bundle from UCP, which contains a public and private key for their client
+    certificate, which is used by the Docker CLI.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can use the same approach with user accounts for other systems—so you can
+    create an account for your CI service and set up repositories so that only the
+    CI account has access to push. That lets you integrate image signing into your
+    secure delivery pipeline, applying the signature from the CI process and using
+    that to enforce content trust.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can switch Docker Content Trust on with an environment variable, and, when
+    you push images to a registry, Docker will sign them using the key from your client
+    bundle. Content trust will work only for specific image tags and not the default
+    `latest` tag, as the signatures are stored against the tag.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I can add the `v2` tag to my private image, enable content trust in the PowerShell
+    session, and push the tagged image to DTR:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The act of pushing the image adds the digital signature, in this case using
+    the certificate for the `elton` account and creating new key pairs for the repository.
+    DTR records the signatures for each image tag, and in the UI I can see that the
+    `v2` image tag is signed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/2dfc1580-d358-4b20-ada7-acac29c0dd88.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Users can push images to add their own signature. This enables an approval pipeline,
+    where authorized users pull an image, run whatever tests they need to, and then
+    push it again to confirm their approval.
+  prefs: []
+  type: TYPE_NORMAL
+- en: DTR uses Notary to manage access keys and signatures. Like SwarmKit and LinuxKit,
+    Notary is an open source project that Docker integrates into a commercial product,
+    adding features and providing support. To see image signing and content trust
+    in action, check out my Pluralsight course, *Getting Started with Docker Datacenter*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'UCP integrates with DTR to verify image signatures. In the Admin Settings,
+    you can configure UCP so that it will run containers from images that have been
+    signed by a known team in an organization:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/1e574805-ce05-490b-b97e-c170869b6550.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'I''ve configured Docker Content Trust so that UCP will only run containers
+    that have been signed by members of the Nerd Dinners Ops team. This explicitly
+    captures the release approval workflow, and the platform enforces it. Not even
+    administrators can run containers from images that have not been signed by users
+    from the required teams—UCP will throw an error stating that the image did not
+    meet the signing policy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/94659751-ead8-47c1-b879-881b3dbb21c3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Building a secure software supply chain is about making an automated pipeline
+    where you can guarantee that images have been pushed by a known user account,
+    that they meet specific quality criteria, and they have been signed by a known
+    user account. DTR provides all the features for integrating that into a CI pipeline
+    using tools like Jenkins or Azure DevOps. You can use any automation server or
+    service, provided it can run shell commands and respond to webhooks—which is pretty
+    much every system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's a Docker Reference Architecture that covers the secure supply chain
+    in detail, using GitLab as the example CI server and showing you how to integrate
+    a secure delivery pipeline with Docker Hub or DTR. You can find it at [https://success.docker.com/article/secure-supply-chain](https://success.docker.com/article/secure-supply-chain).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Golden images
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One final security consideration for images and registries is the source of
+    the base images that are used for application images. Companies running Docker
+    in production typically restrict the base images that developers can use for a
+    set, which has been approved by infrastructure or security stakeholders. This
+    set of golden images that are available to use may just be captured in documentation,
+    but it is easier to enforce with a private registry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Golden images in a Windows environment may be limited to two options: a version
+    of Windows Server Core and a version of Nano Server. Instead of allowing users
+    to use the public Microsoft images, the Ops team may build custom images from
+    Microsoft''s base images. The custom images may add security or performance tweaks
+    or set some defaults that apply to all applications, such as packaging the company''s
+    Certificate Authority certs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using DTR, you can create an organization for all your base images, where the
+    Ops team has read-write access to the repositories, while all other users have
+    read access. Checking that images are using a valid base just means checking that
+    the Dockerfile is using an image from the base-images organization, which is an
+    easy test to automate in your CI/CD process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Golden images add a management overhead to your organization, but it's one that
+    becomes worthwhile as you move more and more applications to Docker. Owning your
+    own image with ASP.NET that's been deployed and configured with your company's
+    defaults makes it easy for the security team to audit that base image. You also
+    own your release cadence and the domain for your registry, so you don't need to
+    use arcane image names in your Dockerfiles.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding security in swarm mode
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Docker's security-in-depth approach covers the whole software life cycle, from
+    image signing and scanning at build time through to container isolation and management
+    at runtime. I'll end this chapter with an overview of the security features that
+    are implemented in swarm mode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Distributed software offers a lot of attractive attack vectors. Communication
+    between components can be intercepted and modified. Rogue agents can join the
+    network and gain access to data or run workloads. Distributed data stores can
+    be compromised. Docker swarm mode, which is built on top of the open source SwarmKit
+    project, addresses these vectors at a platform level so that your application
+    is running on a secure base by default.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nodes and join tokens
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You can switch to swarm mode by running `docker swarm init`. The output of this
+    command gives you a token that you can use so that other nodes can join the swarm.
+    There are separate tokens for workers and managers. Nodes cannot join a swarm
+    without the token, so you need to keep the token protected, like any other secret.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The join tokens are comprised of the prefix, the format version, the hash of
+    the root key, and a cryptographically strong random string.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker uses a fixed `SWMTKN` prefix for tokens, so you can run automated checks
+    to see whether a token has been accidentally shared in source code or on another
+    public location. If the token is compromised, rogue nodes could join the swarm
+    if they had access to your network. Swarm mode can use a specific network for
+    node traffic, so you should use a network that is not publicly accessible.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Join tokens can be rotated with the `join-token rotate` command, which can
+    target either the worker token or the manager token:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Token rotation is a fully managed operation by the swarm. Existing nodes are
+    all updated and any error conditions, such as nodes going offline or joining mid-rotation,
+    are gracefully handled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encryption and secrets
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Communication between swarm nodes is encrypted using **Transport Layer Security**
+    (**TLS**). The swarm manager configures itself as a certification authority when
+    you create the swarm, and the manager generates certificates for each node when
+    they join. Communication between nodes in the swarm is encrypted using mutual
+    TLS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutual TLS means that the nodes can securely communicate and trust each other,
+    as every node has a trusted certificate to identify itself. Nodes are assigned
+    a random ID that is used in the certificate, so the swarm doesn't rely on attributes
+    such as the hostname, which could potentially be faked.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trusted communication between nodes is the foundation for Docker Secrets in
+    swarm mode. Secrets are stored and encrypted in the Raft log on the managers,
+    and a secret is sent to the worker only if that worker is going to run a container
+    that uses the secret. The secret is always encrypted in transit using mutual TLS.
+    On the worker node, the secret is made available in plain text on a temporary
+    RAM drive that is surfaced to the container as a volume mount. The data is never
+    persisted in plain text.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows doesn't have a native RAM drive, so the secrets implementation currently
+    stores the secret data on the disk on the worker nodes, with the recommendation
+    that BitLocker is used for the system drive. Secret files are secured with ACLs
+    on the host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inside the container, access to secret files is restricted to certain user accounts.
+    The accounts with access can be specified in Linux, but in Windows, there's currently
+    a fixed list. I used secrets in the ASP.NET web application in [Chapter 7](bf6a5e90-bbba-435b-b0a0-734611e0e834.xhtml),
+    *Orchestrating Distributed Solutions with Docker Swarm*, and you can see there
+    that I configured the IIS application pool to use an account with access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When containers are stopped, paused, or removed, the secrets that were available
+    to the container are removed from the host. On Windows, where secrets are currently
+    persisted to disk, if the host is forcefully shut down, then secrets are removed
+    when the host restarts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node labels and external access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Once a node has been added to a swarm, it is a candidate for container workloads
+    to be scheduled. Many production deployments use constraints to ensure that applications
+    are run on the correct type of node, and Docker will try to match the requested
+    constraints to labels on the nodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a regulated environment, you may have requirements to ensure that applications
+    run only on those servers that have met required audit levels, like PCI compliance
+    for credit card processing. You can identify compliant nodes with labels and use
+    constraints to ensure that the applications only run on those nodes. Swarm mode
+    helps ensure that these constraints are properly enforced.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are two types of labels in swarm mode: engine labels and node labels.
+    Engine labels are set by the machine in the Docker service configuration, so,
+    if a worker was compromised, an attacker could add labels and make a machine they
+    own appear to be compliant. Node labels are set by the swarm, so they can only
+    be created by a user with access to a swarm manager. Node labels mean you don''t
+    have to rely on claims made by individual nodes, so, if they are compromised,
+    the impact can be limited.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node labels are also useful in segregating access to applications. You may have
+    Docker hosts that are accessible only on your internal network and others that
+    have access to the public internet. With labels, you can explicitly record it
+    as a distinction and run containers with constraints based on the labels. You
+    could have a content management system in a container that is only available internally
+    but a web proxy that is available publicly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Integration with container security technologies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Docker Swarm is a secure container platform, and, because it uses open source
+    components and open standards, it integrates nicely with third-party tools. Applications
+    all expose the same API when they're running in containers—you can use Docker
+    to check the processes running in the container, view log entries, navigate the
+    filesystem, and even run new commands. The container security ecosystem is evolving
+    powerful tools that take advantage of that to add more security at runtime.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are two main vendors to evaluate if you''re looking for extended security
+    for Windows containers: Twistlock and Aqua Security. Both have comprehensive product
+    suites that include image scanning and secret management, and runtime protection,
+    which is the most innovative way of adding security to your applications.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you deploy a runtime security product to your cluster, it monitors the
+    container and builds a profile of that application's typical behavior—including
+    CPU and memory usage, and network traffic in and out. Then, it looks for anomalies
+    in instances of that application, where a container starts to behave differently
+    from the expected model. This is a powerful way of identifying that an application
+    has been compromised, as attackers will typically start running new processes
+    or moving unusual amounts of data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Taking Aqua Security as an example, it has a full suite of protection for Docker
+    on Windows, scanning images and providing runtime security controls for containers.
+    That includes preventing containers running from images that don't meet security
+    criteria—flagged as CVE severity or average score, blacklisted and whitelisted
+    packages, malware, sensitive data, and custom compliance checks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Aqua also enforces container immutability, comparing running containers to their
+    originating images and preventing changes, like new executables being installed.
+    This is a powerful way to prevent malicious code injection or attempts to bypass
+    the image pipeline controls. If you're building images from a large base image
+    with a lot of components you don't actually need, Aqua can profile the attack
+    surface and whitelist the functionality and capabilities that are actually required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These features apply to legacy apps in containers just as much as new cloud-native
+    applications. The ability to add security in-depth to every layer of an application
+    deployment, and to have automated monitoring for suspected compromises in real-time,
+    makes the security aspect one of the strongest reasons for moving to containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter looked at the security considerations of Docker and Windows containers.
+    You learned that the Docker platform is built for security in depth, and that
+    the runtime security of containers is only one part of the story. Security scanning,
+    image signing, content trust, and secure distributed communication can be combined
+    to give you a secure software supply chain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You looked at the practical security aspects of running apps in Docker and learned
+    how processes in Windows containers run in a context that makes it difficult for
+    attackers to escape from containers and invade other processes. Container processes
+    will use all the compute resources they need, but I also demonstrated how to limit
+    CPU and memory usage, which can prevent rogue containers from starving the host's
+    compute resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a dockerized application, you have much more scope to enforce security in
+    depth. I explained why minimal images help keep applications safe and how you
+    can use Docker Security Scanning to be alerted if there are vulnerabilities in
+    any of the dependencies your application uses. You can enforce good practices
+    by digitally signing images and configure Docker so that it will only run containers
+    from images that have been signed by approved users.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lastly, I looked at the security implementation in Docker Swarm. Swarm mode
+    has the most in-depth security of all the orchestration layers, and it provides
+    a solid foundation for you to run your apps securely. Using secrets to store sensitive
+    application data and node labels to identify host compliance makes it very easy
+    for you to run a secure solution, and the open API makes it easy to integrate
+    third-party security enhancements such as Aqua.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter we'll work with a distributed application and look at building
+    a pipeline for CI/CD. The Docker Engine can be configured to provide remote access
+    to the API, so it's easy to integrate Docker deployments with any build system.
+    The CI server can even run inside a Docker container and you can use Docker for
+    the build agents, so you don't need any complex configuration for CI/CD.
+  prefs: []
+  type: TYPE_NORMAL

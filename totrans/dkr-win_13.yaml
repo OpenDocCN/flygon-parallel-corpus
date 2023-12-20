@@ -1,0 +1,998 @@
+- en: Powering a Continuous Deployment Pipeline with Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Docker supports building and running software in components that can be easily
+    distributed and managed. The platform also lends itself to development environments,
+    where source control, build servers, build agents, and test agents can all be
+    run in Docker containers from standard images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Docker for development lets you consolidate many projects in a single
+    set of hardware while maintaining isolation. You could have services running a
+    Git server and an image registry with high availability in Docker Swarm, shared
+    by many projects. Each project could have a dedicated build server configured
+    with their own pipeline and their own build setup, running in a lightweight Docker
+    container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up a new project in this environment is simply a case of creating a
+    new repository in the source control repository and a new namespace in the registry,
+    and running new containers for the build process. These steps can all be automated,
+    so project onboarding becomes a simple process that takes minutes and uses existing
+    hardware.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, I''ll walk you through the setup of a **continuous integration
+    and continuous delivery** (**CI/CD**) pipeline using Docker. I''ll cover:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing CI/CD with Docker
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Running shared development services in Docker
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring CI/CD using Jenkins in Docker
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying to a remote Docker Swarm using Jenkins
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You will need Docker running on Windows 10 update 18.09, or Windows Server 2019,
+    to follow along with the examples. The code for this chapter is available at [https://github.com/sixeyed/docker-on-windows/tree/second-edition/ch10](https://github.com/sixeyed/docker-on-windows/tree/second-edition/ch10).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing CI/CD with Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The pipeline will support full continuous integration. When developers push
+    code to the shared source repository, that will trigger a build that produces
+    a release candidate. The release candidates will be tagged Docker images that
+    are stored in a local registry. The CI workflow deploys the solution from the
+    built images as containers and runs an end-to-end test pack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: My sample pipeline has a manual quality gate. If the tests pass, the image versions
+    are made publicly available on Docker Hub, and the pipeline can start a rolling
+    upgrade in a public environment running on a remote Docker Swarm. In a full CI/CD
+    environment, you can automate the deployment to production in your pipeline, too.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The stages of the pipeline will all be powered by software running in Docker
+    containers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Source control**: Gogs, a simple open source Git server written in Go'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Build server**: Jenkins, a Java-based automation tool that uses plugins to
+    support many workflows'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Build agent**: The .NET SDK packaged into a Docker image to compile code
+    in a container'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Test agent**: NUnit packaged into a Docker image to run end-to-end tests
+    against deployed code'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Gogs and Jenkins can run in long-running containers on a Docker Swarm or on
+    an individual Docker Engine. The build and test agents are task containers that
+    will be run by Jenkins to perform the pipeline steps—then, they will exit. The
+    release candidate will be deployed as a set of containers that are removed when
+    the tests are completed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The only requirement to set this up is to give containers access to the Docker
+    API—both in the local and remote environments. On the local server, I'll use named
+    pipes from Windows. For the remote Docker Swarm, I'll use a secured TCP connection.
+    I covered securing the Docker API in [Chapter 1](59b504fb-1012-4118-aa49-c5e0efce06d3.xhtml),
+    *Getting Started with Docker on Windows*, using the `dockeronwindows/ch01-dockertls`
+    image to generate TLS certificates. You need to have local access configured so
+    that the Jenkins container can create containers in development, and remote access
+    so that Jenkins can start the rolling upgrade in the public environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The workflow for this pipeline starts when a developer pushes code to the Git
+    server, which is running Gogs in a Docker container. Jenkins is configured to
+    poll the Gogs repository, and it will start a build if there are any changes.
+    All the custom components in the solution use multi-stage Dockerfiles, which are
+    stored in the Git repository for the project. Jenkins runs `docker image build`
+    commands for each Dockerfile, building the image on the same Docker host where
+    Jenkins itself is running in a container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the builds complete, Jenkins deploys the solution locally as containers
+    on the same Docker host. Then, it runs end-to-end tests, which are packaged in
+    a Docker image and run as a container in the same Docker network as the application
+    being tested. If all the tests pass, then the final pipeline step pushes these
+    images as release candidates to the local registry, and the registry is also running
+    in a Docker container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you run your development tools in Docker, you get the same benefits that
+    you have when you run production workloads in Docker. The whole toolchain becomes
+    portable, and you can run it wherever you like with minimal compute requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running shared development services in Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Services such as source control and the image registry are good candidates to
+    be shared between many projects. They have similar requirements for high availability
+    and reliable storage, so they can be deployed across a cluster that has enough
+    capacity for many projects. The CI server can be run as a shared service or as
+    a separate instance for each team or project.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I covered running a private registry in a Docker container in [Chapter 4](cba48cea-1666-4d9a-a268-ee2a104f5565.xhtml),
+    *Sharing Images with Docker Registries*. Here, we'll look at running a Git server
+    and a CI server in Docker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packaging a Git server into a Windows Docker image
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Gogs is a popular open source Git server. It's written in Go, which is cross
+    platform, and you can package it as a Docker image based on a minimal Nano Server
+    installation or on Windows Server Core. Gogs is a simple Git server; it provides
+    remote repository access over HTTP and HTTPS, and it has a web UI. The Gogs team
+    provides images on Docker Hub for Linux, but you need to build your own to run
+    in Windows containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Packaging Gogs in a Docker image is straightforward. It''s a case of scripting
+    the installation instructions in a Dockerfile, which I''ve done for the `dockeronwindows/ch10-gogs:2e`
+    image. That image uses a multi-stage build, starting with Windows Server Core,
+    to download the Gogs release and expand the ZIP file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: There's nothing new here, but there are a couple of points worth looking at.
+    The Gogs team provides a CDN with their releases, and the URLs use the same format,
+    so I have parameterized the version number to download. The `ARG` instruction
+    uses a default Gogs version of `0.11.86`, but I can install a different version
+    without changing the Dockerfile by specifying a build argument.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make it clear which version is being installed, I write that out before downloading
+    the ZIP file. The download is in a separate `RUN` instruction, so the downloaded
+    file gets stored in its own layer in the Docker cache. If I need to edit the later
+    steps in the Dockerfile, I can build the image again and get the downloaded file
+    from the cache, so it doesn't need to be downloaded repeatedly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The final image could be based on Nano Server, as Gogs is a cross-platform
+    technology, but it has dependencies on Git tooling that are difficult to set up
+    in Nano Server. It''s straightforward to install the dependencies with Chocolatey,
+    but that doesn''t work in Nano Server. I''m using `sixeyed/chocolatey` for the
+    base application image, which is a public image on Docker Hub with Chocolatey
+    installed on top of Windows Server Core, and then I set up the environment for
+    Gogs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: I'm capturing the Gogs version and the installation path as `ARG` instructions,
+    so that they can be specified at build time. Build arguments aren't stored in
+    the final image, so I copy them into environment variables in the `ENV` instructions.
+    Gogs uses port `3000` by default, and I create volumes for all the data, logs,
+    and repository directories.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Gogs is a Git server, but it doesn''t include Git in the release, which is
+    why I''m using an image with Chocolatey installed. I use the `choco` command line
+    to install `git`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, I copy in the expanded `Gogs` directory from the installer stage,
+    and bundle a default set of configurations from the local `app.ini` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building this image gives me a Git server that I can run in a Windows container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's not a best practice to have an application image that uses a larger base
+    image than it needs, and includes installation tools such as Chocolatey. If my
+    Gogs container was compromised, the attacker would have access to the `choco`
+    command as well as all the features of PowerShell. In this case, the container
+    won't be on a public network, so the risks are mitigated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running the Gogs Git server in Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You run Gogs just like any other container: setting it to be detached, publishing
+    the HTTP port, and using a host mount to store the volumes in known locations
+    outside of the container:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The Gogs image has default configuration settings bundled inside it, but when
+    you first run the application, you need to complete an installation wizard. I
+    can browse to `http://localhost:3000`, leave the default values, and click the
+    Install Gogs button:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/25fa9119-bc6b-4f11-9fe2-edabd0b2d520.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Now, I can register a user and sign in, which takes me to the Gogs dashboard:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/729ae508-9bc9-46ae-9fdb-1e3c84e7b997.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Gogs supports issue tracking and pull requests in addition to the usual Git
+    features, so it's very much like a slimmed-down local version of GitHub. I've
+    gone on to create a repository called `docker-on-windows` to store the source
+    code for this book. To use it, I need to add the Gogs server as a remote in my
+    local Git repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I''ve used `gogs` as the container name, so other containers can reach the
+    Git server by that name. I''ve also added an entry into my hosts file with the
+    same name that points to the local machine, so I can use the same `gogs` name
+    on my machine and inside containers (this is in `C:\Windows\System32\drivers\etc\hosts`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: I tend to do this quite a lot, adding the local machine or container IP addresses
+    to my hosts file. I have a PowerShell alias set up to make it easier, which gets
+    the container IP address and adds the line to the hosts file. I've blogged about
+    this and other aliases I use at [https://blog.sixeyed.com/your-must-have-powershell-aliases-for-docker](https://blog.sixeyed.com/your-must-have-powershell-aliases-for-docker).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, I can push source code from my local machine to Gogs just like any other
+    remote Git server, such as GitHub or GitLab. It''s running in a local container,
+    but that''s transparent to the Git client on my laptop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Gogs is stable and lightweight in a Docker container. My instance typically
+    uses 50 MB of memory and less than 1% CPU when idle.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running a local Git server is a good idea, even if you use a hosted service
+    such as GitHub or GitLab. Hosted services have outages, and, although rare, they
+    can have a significant impact on productivity. Having a local secondary running
+    with very little cost can protect you from being impacted when the next outage
+    occurs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next step is to run a CI server in Docker that can fetch code from Gogs
+    and build the application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packaging a CI server into a Windows Docker image
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Jenkins is a popular automation server that is used for CI/CD. It supports custom
+    job workflows with multiple trigger types, including schedules, SCM polling, and
+    manual starts. It's a Java application that is straightforward to package in Docker,
+    although it's not so simple to fully automate the Jenkins setup.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the source code for this chapter, I have a Dockerfile for the `dockersamples/ch10-jenkins-base:2e` image.
+    This Dockerfile packages a clean installation of Jenkins, using Windows Server
+    Core in the installation stage to download the Jenkins web archive. I use an argument
+    to capture the Jenkins version, and the installer also downloads the SHA256 hash
+    for the download and checks that the downloaded file hasn''t been corrupted:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Checking the file hash for a download is an important security task to make
+    sure that the file you download is the same as the one the publisher made available.
+    It's a step that people typically leave out when they manually install software,
+    but it's easy to automate in your Dockerfile and it gives you a more secure deployment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The final stage of the Dockerfile uses the official OpenJDK image as the base,
+    sets up the environment, and copies in the download from the installer stage:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: A clean Jenkins installation doesn't have many useful features; almost all functionality
+    is provided by plugins that you install after Jenkins is set up. Some of these
+    plugins also install the dependencies they need, but others don't. For my CI/CD
+    pipeline, I need a Git client in Jenkins so that it can connect to the Git server
+    running in Docker, and I also want the Docker CLI so that I can use Docker commands
+    in my builds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I can install these dependencies in the Jenkins Dockerfile, but that would make
+    it large and difficult to manage. Instead, I'm going to fetch these tools from
+    other Docker images. I'm using `sixeyed/git` and `sixeyed/docker-cli`, which are
+    public images on Docker Hub. I use these along with the Jenkins base image to
+    build my final Jenkins image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Dockerfile for `dockeronwindows/ch10-jenkins:2e` starts from the base and
+    copies in the binaries from the Git and Docker CLI images:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The final line just adds all the new tool locations to the system path so that
+    Jenkins can find them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using public Docker images for the dependencies gives me a final Jenkins image
+    with all the components I need, but with a manageable Dockerfile using a set of
+    reusable source images. Now, I can run Jenkins in a container and finish the setup
+    by installing plugins.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running the Jenkins automation server in Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Jenkins uses port `8080` for the Web UI, so you can run it from the image in
+    this chapter using this command, which maps the port and mounts a local folder
+    for the Jenkins root directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Jenkins generates a random administrator password for each new deployment.
+    I can fetch that password from the container logs before I browse to the site:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, I will browse to port `8080` on localhost, enter the generated password,
+    and add the Jenkins plugins I need. As a bare minimum example, I''ve chosen to
+    customize the plugin installation and chosen the Folders, Credentials Binding,
+    and Git plugins, which gives me most of the functionality I require:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/70485e78-a4b8-4455-bde2-bb6d97d03c8a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'I need one more plugin to run PowerShell scripts in build jobs. This isn''t
+    a recommended plugin so it doesn''t show in the initial setup list. Once Jenkins
+    starts, I go to Manage Jenkins | Manage Plugins, and, from the Available list,
+    I choose PowerShell and click on Install without restart:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/fb15f9c8-c31c-4d2b-a3b7-3c6d8d03dfaa.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: When this is complete, I have all the infrastructure services I need to run
+    my CI/CD pipeline. However, they're running in containers that have been customized.
+    The apps in the Gogs and Jenkins containers have been through a manual setup stage
+    and are not in the same state as the image they run from. If I replace the containers,
+    I'll lose the additional setup that I did. I can get around that by creating images
+    from the containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Committing images from running containers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You should build your images from a Dockerfile. That's a repeatable process
+    in a script that can be stored in source control for versioning, comparison, and
+    authorization. But there are some applications that need additional setup steps
+    after the application is deployed, and those steps need to be executed manually.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Jenkins is a good example of this. You can automate the plugin installation
+    with Jenkins, but it requires an additional download and some scripting of the
+    Jenkins API. Plugin dependencies are not always resolved when you install that
+    way, so it can be safer to manually set up the plugins and verify the deployment.
+    Once you've done that, you can persist the final setup by committing the container,
+    which generates a new Docker image from the container's current state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On Windows, you need to stop containers to commit them, and then run `docker
+    container commit`, giving the name of the container and the new image tag to create:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: For my setup, I've committed Jenkins and Gogs and I have a Docker Compose file
+    to configure them, together with the registry container. These are infrastructure
+    components, but this is still a distributed solution. The Jenkins container will
+    access the Gogs and registry containers. The services all have the same SLA, so
+    defining them in a Compose file lets me capture that and start all the services
+    together.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring CI/CD using Jenkins in Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I'll configure my Jenkins build job to poll the Git repository and use Git pushes
+    as the trigger for a new build.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Jenkins will connect to Git through the repository URL for Gogs, and all the
+    actions to build, test, and deploy the solution will run as Docker containers.
+    The Gogs server and the Docker Engine have different authentication models, but
+    Jenkins supports many credential types. I can configure the build job to securely
+    access the source repository and Docker on the host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up Jenkins credentials
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Gogs integrates with external identity providers and also features its own basic
+    username/password authentication, which I'm using in my setup. This is not secure
+    over HTTP, so, in a real environment, I would use SSH or HTTPS for Git, either
+    by packaging a **Secure Sockets Layer** (**SSL**) certificate in the image, or
+    by using a proxy server in front of Gogs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the `Users` section of the Gogs admin interface, I''ve created a `jenkins`
+    user and given it read access to the `docker-on-windows` Git repository, which
+    I''ll use for my sample CI/CD job:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/2f498d84-eb8f-4736-98db-af02df316ae2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Jenkins will pull the source code repository from Gogs, authenticating as the
+    `jenkins` user. I''ve added the username and password to Jenkins as global credentials
+    so that they can be used by any job:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/7340759f-72e0-4e85-813e-65ba10c4dee1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Jenkins doesn't display the password once entered, and it records an audit trail
+    for all the jobs that use the credential, so this is a secure way of authenticating.
+    My Jenkins container is running with a volume that mounts the Docker named pipe
+    from the Windows host so that it can work with the Docker Engine without authenticating.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an alternative, I could connect to a remote Docker API over TCP. To authenticate
+    with Docker, I would use the **Transport Layer Security** (**TLS**) certificates
+    I generated when securing the Docker engine. There are three certificates—the
+    **Certificate Authority** (**CA**), the client certificate, and the client key.
+    They need to be passed to the Docker CLI as file paths, and Jenkins supports this
+    with credentials that can be saved as secret files, thus storing the certificate
+    PEM files in Jenkins.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the Jenkins CI job
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, the sample solution is in the `ch10-nerd-dinner` folder. It's
+    the modernized NerdDinner application that has evolved over the previous chapters.
+    There's a Dockerfile for every component. This uses a multi-stage build, and a
+    set of Docker Compose files for building and running the application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The folder structure here is worth looking at to see how distributed applications
+    are usually arranged—the `src` folder contains all the application and database
+    source code, the `docker` folder contains all the Dockerfiles, and the `compose`
+    folder contains all the Compose files.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I''ve created a freestyle job in Jenkins to run the build, and configured Git
+    for source code management. It''s simple to configure Git—I''m using the same
+    repository URL that I use for the Git repository on my laptop, and I''ve selected
+    the Gogs credentials so that Jenkins can access them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/3830a303-627f-4ede-bf31-101c321f60ff.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Jenkins is running in a Docker container, and Gogs is running in a container
+    on the same Docker network. I'm using the hostname `gogs`, which is the container
+    name, so that Jenkins can reach the Git server. On my laptop, I've add `gogs`
+    as an entry in my hosts file, so I can use the same repository URL in development
+    and on the CI server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Jenkins supports multiple types of build triggers. In this case, I'm going to
+    poll the Git server on a set schedule. I'm using `H/5 * * * *` as the schedule
+    frequency, which means Jenkins will check the repository every five minutes. If
+    there are any new commits since the last build, Jenkins will run the job.
+  prefs: []
+  type: TYPE_NORMAL
+- en: That's all the job configuration I need, and all the build steps will now run
+    using Docker containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building the solution using Docker in Jenkins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The build steps use PowerShell, running simple scripts so that there''s no
+    dependency on more complex Jenkins plugins. There are plugins specific to Docker
+    that wrap up several tasks, such as building images and pushing them to a registry,
+    but I can do everything I need with basic PowerShell steps and the Docker CLI.
+    The first step builds all the images:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: It would be much nicer to use `docker-compose build` with override files, but
+    there's an outstanding issue with the Docker Compose CLI, which means it doesn't
+    work correctly with named pipes inside a container. When this is resolved in a
+    future release of Compose, the build steps will be simpler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Docker Compose is open source, and you can check on the status of this issue
+    on GitHub here: [https://github.com/docker/compose/issues/5934](https://github.com/docker/compose/issues/5934).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker builds the images using multi-stage Dockerfiles, and each step of the
+    build executes in a temporary Docker container. Jenkins itself is running in a
+    container, and it has the Docker CLI available in the image. I haven't had to
+    install Visual Studio on a build server, or even install the .NET Framework or
+    the .NET Core SDKs. All the prerequisites are in Docker images, so the Jenkins
+    build just needs the source code and Docker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running and verifying the solution
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The next build step in Jenkins will deploy the solution locally, running in
+    Docker containers, and verify that the build is working correctly. This step is
+    another PowerShell script, which starts by deploying the application with `docker
+    container run` commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: One advantage of using the Docker CLI over Compose in the build is that I can
+    create containers in a specific order, which gives more time for slow-starting
+    applications such as the NerdDinner website to be ready before testing them. I'm
+    also adding a label, `ci`, to all the containers, which I can use later to clean
+    up all the test containers, without removing any other containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After this step is completed, all the containers should be running. Before
+    I run the end-to-end test suite, which could be a lengthy operation, I have another
+    PowerShell step in the build that runs a simple verification test to make sure
+    that the application responds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Remember that these commands are running inside the Jenkins container, which
+    means it can access other containers by name. I don't need to publish specific
+    ports or inspect containers to get their IP addresses. The script starts the Traefik
+    container with the name `nerd-dinner-test`, and all the frontend containers use
+    that same hostname in their Traefik rules. The Jenkins job can access that URL
+    and the app will respond if the build has been successful.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, the application has been built from the latest source code,
+    and it''s all up and running in containers. I''ve verified that the home page
+    is accessible, which proves that the site is working. The build steps are all
+    console commands, so the output will be written to the job log in Jenkins. For
+    every build, you will see all the output, including the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker executing the Dockerfile commands
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NuGet and MSBuild steps compiling the application
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Docker starting application containers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: PowerShell making the web request to the application
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `Invoke-WebRequest` cmdlet is a simple build verification test. It gives
+    an error if the build or deployment has failed, but, if it succeeds, that still
+    does not mean the application is working correctly. For greater confidence in
+    the build, I run end-to-end integration tests in the next build step.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running end-to-end tests in Docker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There's one more component I've added to the NerdDinner solution in this chapter,
+    which is a test project that uses a simulated browser to interact with the web
+    application. The browser sends HTTP requests to an endpoint, which will actually
+    be a container, and asserts that the responses contain the correct content.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `NerdDinner.EndToEndTests` project uses SpecFlow to define feature tests,
+    stating the expected behavior of the solution. The SpecFlow tests are executed
+    using Selenium, which automates browser testing, and SimpleBrowser, which presents
+    a headless browser. These are web tests that can be run from the console, so no
+    UI components are needed and the tests can be executed in a Docker container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If that sounds like a lot of technology to add to your test infrastructure,
+    it''s actually a very neat way to perform a full integration test of the application,
+    which has been specified in simple scenarios that use human language:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'I have a Dockerfile to build the test project into the `dockeronwindows/ch10-nerd-dinner-e2e-tests:2e`
+    image. It uses a multi-stage build to compile the test project and then package
+    the test assembly. The final stage of the build uses an image on Docker Hub that
+    has the NUnit Console Runner installed, so it is able to run the end-to-end tests
+    through the console. The Dockerfile sets up a `CMD` instruction to run all the
+    tests when the container starts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: I can run a container from this image and it will start the test suite, connecting
+    to `http://nerd-dinner-test` and asserting that the content in the response contains
+    the expected header text. This one simple test actually verifies that my new home
+    page container and the reverse proxy container are both running, that they can
+    access each other on the Docker network, and that the proxy rules have been set
+    up correctly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I only have one scenario in my tests, but because the whole stack is running
+    in containers, it's very easy to write a suite of high-value tests that execute
+    the key features of the app. I could build a custom database image with known
+    test data and write simple scenarios to verify the user-login, list-dinner, and
+    create-dinner workflows. I could even query the SQL Server container in the test
+    assertions to make sure that new data is inserted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next step of the Jenkins build runs these end-to-end tests. Again, it''s
+    a simple PowerShell script that does this, building the end-to-end Docker image,
+    and then running a container. The test container will execute in the same Docker
+    network as the application, so the headless browser can reach the web application
+    using the container name in the URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'NUnit generates an XML file with the test results, and it would be useful to
+    add that to the Jenkins workspace so that it''s available to view in the Jenkins
+    UI after all the containers have been removed. The PowerShell step uses `docker
+    container cp` to copy that file out of the container into the current directory
+    of the Jenkins workspace, using the container ID stored from the run command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There''s some additional PowerShell in this step to read the XML from that
+    file and determine whether the tests have passed (you can find the full script
+    in the source folder for this chapter, in the `ci\04_test.ps1` file). When it
+    completes, the output from NUnit is echoed to the Jenkins log:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When the tests complete, the database container and all the other application
+    containers are removed in the final part of the test step. This uses the `docker
+    container ls` command to list the IDs of all containers with the `ci` label – those
+    are the ones that were created by this job—and then forcibly removes them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, I have a set of application images that are tested and known to be good.
+    The images exist only on the build server, so the next step is to push them to
+    the local registry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tagging and pushing Docker images in Jenkins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: How you push images to your registry during the build process is your choice.
+    You might start by tagging every image with the build number and pushing all image
+    versions to the registry as part of the CI build. Projects using efficient Dockerfiles
+    will have minimal differences between builds, so you benefit from cached layers,
+    and the amount of storage you use in your registry shouldn't be excessive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you have larger projects with a lot of development churn and a shorter release
+    cadence, the storage requirements could grow out of hand. You might move to a
+    scheduled push, tagging images daily and pushing the latest build to the registry.
+    Or, if you have a pipeline with a manual quality gate, the final release stage
+    could push to the registry, so the only images you store are valid release candidates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For my sample CI job, I''ll push to the local registry with every successful
+    build once the tests have passed, using the Jenkins build number as the image
+    tag. The build step to tag and push images is another PowerShell script that uses
+    the `BUILD_TAG` environment variable from Jenkins for tagging:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: This script uses  a simple loop to apply a new tag to all the built images.
+    The new tag includes my local registry domain, `registry:5000`, and adds the Jenkins
+    build tag as a suffix so that I can easily identify which build the image came
+    from. Then, it pushes all the images to the local registry—again, this is running
+    in a container in the same Docker network as the Jenkins container, so it's accessible
+    by the container name `registry`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: My registry is only configured to use HTTP, not HTTPS, so it needs to be explicitly
+    added as an insecure registry in the Docker Engine configuration. I covered this
+    in [Chapter 4](cba48cea-1666-4d9a-a268-ee2a104f5565.xhtml), *Sharing Images with
+    Docker Registries*. The Jenkins container is using the Docker Engine on the host,
+    so it uses the same configuration and can push to the registry that is running
+    in another container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After a few builds have completed, I can make a REST call to the registry API
+    from my development laptop to query the tags for the `dockeronwindows/nerd-dinner-index-handler`
+    repository. The API will give me a list of all the tags for my message handler
+    application image so that I can verify that they''ve been pushed by Jenkins with
+    the correct tags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The Jenkins build tag gives me the complete path to the job that created the
+    images. I could also use the `GIT_COMMIT` environment variable that Jenkins provides
+    to tag images with the commit ID. This makes for a much shorter tag, but the Jenkins
+    build tags include the incrementing build number, so I can always find the latest
+    version by ordering the tags. The Jenkins web UI shows the Git commit ID for each
+    build, so it's easy to track back from the job number to the exact source revision.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CI part of the build is now done. For every new push to the Git server,
+    Jenkins will compile, deploy, and test the application, and then push good images
+    to the local registry. The next part is deploying the solution to the public environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying to a remote Docker Swarm using Jenkins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The workflow for my sample application uses a manual quality gate and separates
+    the concerns for local and external artifacts. On every source code push, the
+    solution is deployed locally and tests are run. If they pass, images are saved
+    to the local registry. The final deployment stage is to push these images to an
+    external registry and deploy the application to the public environment. This simulates
+    a project approach where builds happen internally, and approved releases are then
+    pushed externally.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this example, I'll use public repositories on Docker Hub and deploy to a
+    multi-node Docker Enterprise cluster running in Azure. I'll continue to use PowerShell
+    scripts and run basic `docker` commands. The principles are exactly the same to
+    push images to other registries such as DTR, and deploy to on-premises Docker
+    Swarm clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I've created a new Jenkins job for the deployment step, which is parameterized
+    to take the version number to deploy. The version number is the job number from
+    the CI build, so I can deploy a known version at any time. In the new job, I need
+    some additional credentials. I've added secret files for the Docker Swarm manager's
+    TLS certificates that will allow me to connect to the manager node of the Docker
+    Swarm running in Azure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I''m also going to push images to Docker Hub as part of the release step, so
+    I''ve added a username and password credential in Jenkins that I can use to log
+    in to Docker Hub. To authenticate in the job step, I''ve added a binding for the
+    credentials in the deployment job, and this exposes the username and password
+    as environment variables:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/ccdcae51-bcc9-4a2b-af46-a54243d3c2b6.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Then, I set up the command configuration and used `docker login` in the PowerShell
+    build step, specifying the credentials from the environment variables:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Registry logins are executed with the Docker CLI, but the logged-in context
+    is actually stored in the Docker Engine. When I run this step in the Jenkins container,
+    the host where that container is running is logged in to Docker Hub using the
+    Jenkins credentials. If you follow a similar process, you need to ensure that
+    the job logs out after each run, or that the engine where the build server runs
+    is secure, otherwise users could access that machine and push images as the Jenkins
+    account.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, for each of the built images, I pull them from the local registry, tag
+    them for Docker Hub, and then push them to the Hub. The initial pull is there
+    in case I want to deploy a previous build. The local server cache may have been
+    cleaned since the build, so this ensures that the correct image is present from
+    the local registry. For Docker Hub, I use a simpler tagging format, just applying
+    the version number.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This script uses a PowerShell loop for pulling and pushing all the images:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When this step completes, the images are publicly available on Docker Hub.
+    Now, the last step in the deployment job runs the latest application version on
+    the remote Docker Swarm using these public images. I need to generate a Compose
+    file that contains the latest version numbers in the image tag, and I can use
+    `docker-compose config` with override files to do that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `docker-compose.latest.yml` file is the last one that''s added in the command,
+    and it uses the `VERSION_NUMBER` environment variable, which is populated by Jenkins
+    to create the image tags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `config` command isn't affected by the issue that stops you from using Docker
+    Compose to deploy containers when you're running inside a container using named
+    pipes. `docker-compose config` just joins and parses the files—it doesn't communicate
+    with the Docker Engine.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, I have a Docker Compose file with all the setup for my hybrid Linux and
+    Windows Docker Swarm, using the latest versioned application images from Docker
+    Hub. The final step uses `docker stack deploy` to actually run the stack on the
+    remote swarm:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This last command uses a secured TCP connection to the Docker API on the remote
+    swarm manager. The `$config` object is set up with all the parameters that the
+    Docker CLI needs in order to make that connection:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`host` is the public, fully-qualified domain name of the manager node'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tlsverify` specifies that this is a secure connection and that the CLI should
+    present client certificates'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tlscacert` is the certificate authority for the swarm'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tlscert` is the client certificate for the user'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tlskey` is the key for the user''s client certificate'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All the certificates are surfaced as files from Jenkins secrets when the job
+    runs. The files are available in the workspace, when the Docker CLI needs them;
+    hence, this is a seamless secure connection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When the job completes, the updated services will have been deployed. Docker
+    compares stack definitions against running services in the same way that Docker
+    Compose does for containers, so services are only updated if the definition has
+    changed. After the deployment job is complete, I can browse to the public DNS
+    entry (which is a CNAME for my Docker Swarm cluster) and see the application:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/10d36d30-f70c-4886-8c31-c846ed9233b5.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: My workflow uses two jobs, so I can manually control the release to the remote
+    environment, which could be a QA site, or it could be production. This can be
+    automated for a full CD setup, and you can easily build on your Jenkins jobs to
+    add more functionality—displaying the test output and coverage, joining the builds
+    into a pipeline, and breaking jobs up into reusable parts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'This chapter covered CI/CD in Docker with a sample deployment workflow configured
+    in Jenkins. Every part of the process I demonstrated ran in Docker containers:
+    the Git server, Jenkins itself, the build agents, the test agents, and the local
+    registry.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You saw that it is straightforward to run your own development infrastructure
+    with Docker, giving you an alternative to hosted services. It's also straightforward
+    to use these services for your own deployment workflow, whether it's full CI/CD
+    or separate workflows with a gated manual step.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You saw how to configure and run the Gogs Git server and the Jenkins automation
+    server in Docker to power the workflow. I used multi-stage builds for all the
+    images in my latest cut of the NerdDinner code, which means that I can have a
+    very simple Jenkins setup with no need to deploy any toolchains or SDKs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: My CI pipeline was triggered from a developer pushing changes to Git. The build
+    job pulled the source, compiled the application components, built them into Docker
+    images, and ran a local deployment of the app in Docker. It then ran end-to-end
+    tests in another container, and if they passed, it tagged and pushed all the images
+    to the local registry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I demonstrated a manual deployment step with a job that the user initiates,
+    specifying the built version to be deployed. This job pushes the built images
+    to the public Docker Hub and deploys an update to the public environment by deploying
+    the stack on a Docker Swarm running in Azure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are no hard dependencies on any of the technologies I used in this chapter.
+    The process I implemented with Gogs, Jenkins, and the open source registry can
+    just as easily be implemented with hosted services like GitHub, AppVeyor, and
+    Docker Hub. All the steps of this process use simple PowerShell scripts and can
+    be run on any stack that supports Docker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter I'll step back to the developer experience and look at the
+    practicalities of running, debugging, and troubleshooting applications in containers.
+  prefs: []
+  type: TYPE_NORMAL

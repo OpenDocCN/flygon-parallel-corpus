@@ -1,0 +1,834 @@
+- en: Isolating Network Access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A fundamental component of application security is the ability to control network
+    access, both inbound to and outbound from your applications. AWS provides EC2
+    security groups that provide such a capability, which you can apply on a per-network-interface
+    basis to your EC2 instances. This mechanism works well for traditional applications
+    that are deployed to EC2 instances, but historically has not been as effective
+    for container applications, which often operate on shared EC2 instances that communicate
+    via a shared host interface on the EC2 instance. For ECS, the approach until recently
+    has been that you have two applied security groups that accommodate the network
+    security requirements of all the containers you need to support running on a given
+    ECS container instance, which reduces the effectiveness of your security rules,
+    and for applications with high security requirements is not acceptable. The only
+    alternative to this approach up until recently was to build dedicated ECS clusters
+    per application, ensuring application security requirements could be met but at
+    the price of additional infrastructure and operational overhead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: AWS announced a feature referred to as ECS task networking in late 2017, which
+    introduces the ability to dynamically allocate an elastic network interface (ENI)
+    to your ECS container instances, which is reserved for use for a given ECS task.
+    This allows you to create security groups that are specific to each of your container
+    applications, and run these applications concurrently on the same ECS container
+    instance without compromising security.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, you will learn how to configure ECS task networking, which
+    requires you to understand how ECS task networking works, configure ECS task definitions
+    for task networking, and create and deploy ECS services that are linked to your
+    task-networking-enabled ECS task definitions. When combined with the ECS task
+    roles feature you configured in the previous chapter, this will enable you to
+    build highly secure container application environments that enforce isolation
+    and separation at both an IAM-permissions and network-security level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following topics will be covered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding ECS task networking
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring a NAT Gateway
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring ECS task networking
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying and testing ECS task networking
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following lists the technical requirements to complete this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Administrator access to an AWS account
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Local AWS profile configured as per instructions in Chapter 3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: AWS CLI 1.15.71 or higher
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Completed Chapter 9 and successfully deployed sample application to AWS
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The following GitHub URL contains the code samples used in this chapter: [https://github.com/docker-in-aws/docker-in-aws/tree/master/ch10](https://github.com/docker-in-aws/docker-in-aws/tree/master/ch10).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Check out the following video to see the Code in Action:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://bit.ly/2MUBJfs](http://bit.ly/2MUBJfs)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding ECS task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Under the hood, ECS task networking is actually quite a complex feature that
+    relies on a number of Docker networking features and requires a detailed understanding
+    of Docker networking. As someone who designs, builds, and deploys container environments
+    in AWS using ECS, the good news is that you don't have to understand this level
+    of detail, and really you just need a high-level understanding of how ECS task
+    networking works. I will therefore provide a high-level overview of how ECS task
+    networking works in this section, however, if you are interested in how ECS task
+    networking works in greater detail, this blog post from AWS ([https://aws.amazon.com/blogs/compute/under-the-hood-task-networking-for-amazon-ecs/](https://aws.amazon.com/blogs/compute/under-the-hood-task-networking-for-amazon-ecs/))
+    provides further information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker bridge networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To understand ECS task networking, it helps to have a picture of how Docker
+    networking and the standard configuration of an ECS container works by default.
+    By default, ECS task definitions are configured with the Docker bridge networking
+    mode, which is illustrated in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/64cd1234-38fd-40fb-9d7b-c30700f382ea.png)Docker bridge networking'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding diagram, you can see that each ECS task has its own dedicated
+    network interface, which is dynamically created by the Docker Engine when the
+    ECS task container(s) are created. The Docker bridge interface is a Layer 2 networking
+    component similar to an Ethernet switch that connects each of the Docker container
+    network interfaces together within a network internal to the Docker Engine host.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that each container has an IP address within the `172.16.0.x` subnet,
+    whereas the external AWS public network and elastic network interface of the ECS
+    container instance have IP addresses within the `172.31.0.x` subnet, and you can
+    see that all container traffic routes through a single host network interface,
+    which, in the case of an AWS EC2 instance, is the default elastic network interface
+    allocated to the instance. An elastic network interface (ENI) is an EC2 resource
+    that provides network connectivity to your VPC subnets, and is what you would
+    consider the standard network interface that each of your EC2 instances uses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ECS agent, which also runs as a Docker container, is different from the
+    other containers in that it operates in host-networking mode, meaning it uses
+    the host operating system network interface (that is, the ENI) for its networking.
+    Because the containers sit on a different IP network that is internal to the Docker
+    Engine host, in order to provide network connectivity with the outside world,
+    Docker configures iptables rules on the ENI, which translate all outbound network
+    traffic to the elastic network interface IP address, and set up dynamic port-mapping
+    rules for inbound network traffic. For example, a dynamic port-mapping rule for
+    one of the containers in the preceding diagram would translate incoming traffic
+    for `172.31.0.99:32768` to `172.16.0.101:8000`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: iptables are a standard Linux kernel capability that provides network access
+    control and network address translation features to your Linux hosts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although many applications work just fine with network address translation (NAT),
+    some applications do not work well or at all with NAT, and using NAT can have
+    a performance impact for applications with high volumes of network traffic. Notice
+    also that the security group applied to the ENI is shared across all containers,
+    the ECS agent, and by the operating system itself, meaning the security group
+    must permit the combined network connectivity requirements of all of these components,
+    which may compromise the security of your containers and ECS container instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is possible to configure your ECS task definitions to operate in host-networking
+    mode, meaning their network configuration would be similar to the ECS agent configuration,
+    where no network address translation (NAT) is required. Host-networking mode has
+    its own security implications and is generally not recommended for applications
+    that want to avoid NAT or require network isolation—instead you should use ECS
+    task networking for such requirements. Host networking should be used with care
+    and only for ECS tasks that perform a system function, such as logging or monitoring
+    a sidecar container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ECS task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that you have a basic understanding of the default networking configuration
+    for an ECS container instance and its associated containers, let''s review how
+    this picture changes when you configure ECS task networking. The following diagram
+    illustrates how ECS task networking works at a high level:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/bf9feb71-45dc-4c68-9b73-e707910cb295.png)ECS task networking'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding diagram, each ECS task is allocated and configured to use its
+    own dedicated elastic network interface. This is quite different from the first
+    diagram, where containers use an internal network interface that is dynamically
+    created by Docker—instead, ECS is responsible for the dynamic creation of each
+    ECS task elastic network interface. This is more complex for ECS, however comes
+    with the advantage that your containers can be directly attached to your VPC subnets
+    and can have their own independent security groups. This means your container
+    network ports no longer require complicated features, such as dynamic port-mapping,
+    that compromise both security and performance, with your container ports being
+    exposed directly to the AWS networking environment and becoming directly accessible
+    by your load balancers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One point to note in the preceding diagram is the external networking configuration,
+    which introduces the notion of a private subnet and public subnet. I have represented
+    network connectivity in this manner because, at the time of writing, ECS task
+    networking does not support allocation of public IP addresses to each dynamically
+    created ENI, hence you do need an additional VPC network setup if your containers
+    require internet connectivity. This setup involves creating either a NAT gateway
+    or HTTP proxy on a public network, which your ECS tasks can then route internet
+    traffic to. In the scenario of the current todobackend application, the entrypoint
+    script introduced in Chapter 9 communicates with the AWS Secrets Manager API that
+    is located on the internet, hence requires a network setup similar to that shown
+    in the first diagram.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ECS agent does not have the limitation of being unable to assign a public
+    IP address, given it uses the default EC2 instance ENI that is allocated to the
+    instance on creation. So you could, for example in the preceding diagram, connect
+    the default ENI used by the ECS agent to the public network or another network
+    with internet connectivity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see by comparing both the previous diagrams, ECS task networking
+    simplifies the internal networking configuration of your ECS container instances,
+    making it look much like the traditional virtual machine networking model, if
+    you imagine the ECS container instance is a bare-metal server and your containers
+    are virtual machines. This comes with the benefit of greater performance and security,
+    but at the expense of a more complicated network setup externally, where a NAT
+    gateway or HTTP proxy configuration is required for outbound internet connectivity
+    and ECS is responsible for dynamically attaching ENIs to your instances, which
+    comes with its own limitations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For example, the maximum number of ENIs that can be attached to a given EC2
+    instance varies depending on the EC2 instance type, and if you take a look at
+    [https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html#AvailableIpPerENI](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html#AvailableIpPerENI),
+    you can see that the free tier t2.micro instance type only supports a maximum
+    of two ENIs, limiting the maximum number of ECS tasks you can run in the ECS task-networking
+    mode to just one per instance (given one ENI will always be reserved for the host).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring a NAT gateway
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As you learned in the previous section, at the time of writing, ECS task networking
+    does not support the assignment of public IP addresses, which means you must configure
+    additional infrastructure to support any internet connectivity your application
+    might require. Although the application can be accessed without outbound internet
+    access via the application load balancers in your stack, the application container
+    entrypoint script does need to communicate with the AWS Secrets Manager service
+    on startup, which requires internet connectivity to communicate with the Secrets
+    Manager API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To provide this connectivity, there are two typical approaches you can adopt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Configure a NAT Gateway**: This is an AWS-managed service that provides network
+    address translation for outbound communications, enabling hosts and containers
+    located on private subnets to access the internet.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Configure an HTTP Proxy**: This provides a forward proxy where applications
+    configured with proxy support and forward HTTP, HTTPS, and FTP requests to your
+    proxy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I typically recommend the latter approach, because it provides you with the
+    ability to restrict access to websites based upon DNS naming for both HTTP and
+    HTTPS traffic (the latter depending on the capability of the HTTP proxy in use),
+    whereas the NAT gateway only has the ability to restrict access based upon IP
+    addresses. Setting up a proxy does however require more effort and incurs the
+    operational overhead of managing an additional service, so in the interest of
+    focusing on ECS task networking and keeping things simple, we will implement the
+    NAT gateway approach in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring private subnets and route tables
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In order to support NAT gateway with a typical routing configuration you would
+    see in the real world, we need to first add a private subnet along with a private
+    route table, which we will add as CloudFormation resources in your todobackend
+    stack. The following example demonstrates performing this configuration in the
+    `stack.yml` file located at the root of the todobackend-aws repository:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the interests of keeping this example simple, we are creating network resources
+    in the todobackend application stack, however you typically would create network
+    subnets and associated resources such as NAT gateways in a separate network-focused
+    CloudFormation stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Creating a private subnet and route table
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you create private subnet and route table resources,
+    and then associate them via the `PrivateSubnetRouteTableAssociation` resource.
+    This configuration means that all network traffic sent from the private subnet
+    will be routed according to routes published in the private route table. Notice
+    that you only specify a single subnet in availability zone A of your local AWS
+    region—in a real-world scenario, you would typically configure at least two subnets
+    in two availability zones for high availability. One other point to note is that
+    you must ensure the `CidrBlock` configured for your subnets falls within the IP
+    range configured for your VPC and is not allocated to any other subnets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates using the AWS CLI to determine the VPC IP
+    range and to view existing subnet CIDR blocks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Querying VPC and subnet CIDR blocks
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you can see that the default VPC has been configured
+    with a CIDR block of `172.31.0.0/16`, and you can also see the existing CIDR blocks
+    that have been allocated to the default subnets created in the default VPC. If
+    you refer back to the first example, you can see that we have chosen the next
+    `/20` subnet in this block (`172.31.96.0/20`) for the newly defined private subnet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring NAT gateways
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With a private routing configuration in place, you can now configure a NAT gateway
+    and other supporting resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A NAT gateway requires an elastic IP address, which is the fixed public IP address
+    that outbound traffic traversing the NAT gateway will appear to be sourced from,
+    and must be installed on a public subnet that has internet connectivity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates configuring a NAT gateway along with an
+    associated elastic IP address:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring a NAT gateway
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you create an elastic IP address that is allocated
+    for use with VPCs, and then link the allocated IP address to the NAT gateway via
+    the `AllocationId` property.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Elastic IP addresses are somewhat interesting from a billing perspective, in
+    that AWS does not charge you for them as long as you are actively using them.
+    If you create Elastic IP addresses but don't associate them with an EC2 instance
+    or a NAT gateway, then AWS will charge you for them. See [https://aws.amazon.com/premiumsupport/knowledge-center/elastic-ip-charges/](https://aws.amazon.com/premiumsupport/knowledge-center/elastic-ip-charges/)
+    for more details on how billing works for Elastic IP addresses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note the use of the `Fn::Select` intrinsic function when specifying `SubnetId`,
+    and it is important to understand that the subnet must be in the same availability
+    zone as the subnet and route table resources that will be linked to the NAT gateway.
+    In our use cases, this is availability zone A and the `ApplicationSubnets` input
+    includes two subnet IDs that reside in availability zones A and B, respectively,
+    hence you select the first zero-indexed subnet ID. Note you can verify the availability
+    zone of your subnets by using the `aws ec2 describe-subnets` command demonstrated
+    in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Querying subnet IDs by availability zone
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you can see that the first item in the `ApplicationSubnets`
+    input within the `dev.cfg` file is the subnet ID for `us-east-1a`, ensuring that
+    the NAT gateway will be installed into the correct availability zone.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring routing for your private subnets
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The final step in configuring your NAT gateway is to configure a default route
+    for your private subnets that points to your NAT gateway resource. This configuration
+    will ensure all outbound internet traffic will be routed to your NAT gateway,
+    which will then perform address translation, enabling your private hosts and containers
+    to communicate with the internet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates adding a default route for the private route
+    table you created earlier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring a default route
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you can see that you configure the `RouteTableId`
+    and `NatGatewayId` properties to ensure the default route for the private route
+    table you created in the very first example is set to the NAT gateway you created
+    in the later example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You are now ready to deploy your changes, but before you do this, let''s create
+    a separate branch in the todobackend-aws repository called **ecs-task-networking**,
+    so that you can easily revert your changes at the end of this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Creating an ECS task networking branch
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now you can deploy your changes using the familiar `aws cloudformation deploy` command
+    you have been using through out this book for stack  deployments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Deploying changes to the todobackend application
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding example, after successful deployment of the CloudFormation
+    changes, you use the `aws ec2 describe-subnets` command to query the subnet ID
+    of the new subnet you created, as you will need this value later on in this chapter.
+    You also run the `aws ec2 describe-nat-gateways` command to verify the NAT gateway
+    was created successfully and to view the elastic IP address of the gateway, which
+    is represented by the highlighted `PublicIP` property. Note you should also check
+    the default routes were created correctly, as demonstrated in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Checking default routes
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you can see that two default routes exist, with one
+    default route associated with a NAT gateway and the other with an internet gateway,
+    confirming one of the route tables in your account is routing internet traffic
+    to your newly created NAT gateway.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring ECS task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that you have established networking infrastructure that will support the
+    private IP addressing requirement of ECS task networking, you can proceed to configure
+    ECS task networking on your ECS resources. This requires the following configurations
+    and considerations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You must configure your ECS task definitions and ECS services to support ECS
+    task networking.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The network mode of your task definition must be set to `awsvpc`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An elastic network interface used for ECS task networking can only have one
+    ECS task associated with it. Depending on your ECS instance type, this will limit
+    the maximum number of ECS tasks you can run in any given ECS container instance.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deployment of ECS tasks with ECS task-networking-configured takes longer than
+    traditional ECS deployments, as an elastic network interface needs to be created
+    and bound to your ECS container instance.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Because your container applications have a dedicated network interface, dynamic
+    port mapping is no longer available and your container ports are exposed directly
+    on the network interface.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When an ECS service that uses the `awsvpc` network mode is used in conjunction
+    with an application load balancer target group, the target type must be set to `ip` (the
+    default is `instance`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The implication of the removal of dynamic port mapping means that, for example,
+    the todobackend application (which runs on port 8000) will be accessed on port
+    `8000` externally with task networking enabled, rather than via a dynamically
+    mapped port. This results in better performance for applications that generate
+    large amounts of network traffic, and also means your security rules can target
+    the specific port(s) your application runs on, rather than permitting access to
+    the ephemeral range of network ports that are used with dynamic port mapping.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring ECS task definitions for task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The first step in configuring ECS task networking is to configure your ECS
+    task definitions. The following example demonstrates modifying the `ApplicationTaskDefinition`
+    resource to support ECS task networking:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring ECS task definitions to use task networking
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding example, the `NetworkMode` property has been added and configured
+    with a value of `awsvpc`. By default, this property is set to `bridge`, which
+    implements the default Docker behavior, as illustrated in the very first diagram,
+    of including a Docker bridge interface with the network address translation configured
+    to enable dynamic port mapping. By setting the network mode to `awsvpc`, ECS will
+    ensure any ECS tasks that are deployed from this task definition are allocated
+    a dedicated elastic network interface (ENI), and configure containers in the task
+    definition to use the network stack of the ENI. The other configuration change
+    in this example is that the `HostPort: 0` configuration has been removed from
+    the `PortMappings` section, given ECS task networking does not use or support
+    dynamic port mapping.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring ECS services for task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With your ECS task definitions configured to use the correct network mode for
+    task networking, you next need to configure your ECS services. Your ECS service
+    configuration defines the target subnets where ECS should create an ENI, and also
+    defines the security groups that should be applied to the ENI. The following example
+    demonstrates updating the `ApplicationService` resource in your todobackend stack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring ECS services to use task networking
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, a new property called `NetworkConfiguration` is added
+    to the ECS service definition. This property is required whenever you enable task
+    networking, and you can see that you need to configure the subnets and security
+    groups associated with the ENI that will be created by ECS. Notice that you reference
+    the `PrivateSubnet` resource you created earlier in this chapter, which ensures
+    your container network interface will not be reachable directly from the Internet. 
+    One change that is not immediately obvious is that the `Role` property has been
+    removed - whenever you use have an ECS service that uses ECS task networking,
+    AWS automatically configures the ECS role, and will raise an error if you attempt
+    to set this role.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring supporting resources for task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'If you take a look back at the previous example, you will notice that you reference
+    a new security group called `ApplicationSecurityGroup`, which needs to be added
+    to your template, as demonstrated in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring security groups for task networking
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, you first create a security group that includes an
+    egress rule set that permits outbound DNS and HTTPS traffic, which is required
+    to allow the entrypoint script in your containers to communicate with the AWS
+    Secrets Manager API. Notice that you need to modify the existing `AWS::EC2::SecurityGroupIngress`
+    and `AWS::EC2::SecurityGroupEgress` resources, which previously permitted access
+    between the application load balancer/application database and the application
+    autoscaling group instances. You can see that for the `ApplicationLoadBalancerToApplicationEgress`
+    and `ApplicationLoadBalancerToApplicationEgress` resources, the port range has
+    been reduced from the ephemeral port range of `32768` to `60999` to just port
+    `8000`, which results in a much more secure configuration. Also, the ECS container
+    instance control plane (which is associated with the `ApplicationAutoscalingSecurityGroup`
+    resource) can now no longer access your application database (only your application
+    can do this now), which again is more secure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's one problem with the current modifications to the todobackend stack,
+    which is that you have not updated your `MigrateTaskDefinition` to use task networking.
+    The main reason I am not doing this is because it would require your ECS container
+    instances to support more elastic network interfaces than what the free tier t2.micros
+    supports, and also would require the ECS Task Runner custom resource to be updated
+    to support running ad-hoc ECS tasks. Of course if you want to use ECS task networking
+    in a production environment, you would need to address such concerns, however
+    for the purposes of providing a basic understanding of ECS task networking, I
+    have chosen not to do this. This does mean if you make any change that requires
+    the migrate task to be run, it will fail with the configuration changes of the
+    previous example, however, once this chapter is complete, you will revert your
+    todobackend stack configuration to not use ECS task networking to ensure you can
+    complete the remaining chapters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, there is one last change you need to make to your template, which
+    is to modify the application-load-balancer target group associated with your ECS
+    service. When your ECS services run tasks that operate in the `awsvpc` networking
+    mode, you must change the target group type from the default of `instance` to
+    a value of `ip`, as demonstrated in the following example, given your ECS tasks
+    now have their own unique IP addresses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Updated application-load-balancer target group target type
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying and testing ECS task networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You are now ready to deploy your changes and verify that ECS task networking
+    is working correctly. If you run the `aws cloudformation deploy` command, the
+    following should happen:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A new revision of the application task definition will be created, which is
+    configured for ECS task networking.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The ECS service configuration will detect the changes and attempt to deploy
+    the new revision, along with the ECS service configuration changes. ECS will dynamically
+    attach a new ENI to the private subnet and allocate this ENI to a new ECS task
+    for the `ApplicationService` resource.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Once deployment is complete, you should verify your application is still working
+    and once you have done this, you can browse to the ECS console, click on your
+    ECS service, and select the current task running for the service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot shows the ECS task screen:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/08553c56-6741-4783-b651-bb2a69b13d8b.png)ECS task in task networking
+    mode'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see, the network mode of the task is now `awsvpc`, and an ENI has
+    been dynamically allocated from the private subnet you created earlier in this
+    chapter. If you click on the ENI ID link, you will be able to verify the security
+    group(s) attached to the ENI, and also check that the ENI has been attached to
+    one of your ECS container instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, you should commit the final set of changes you made in this
+    chapter to the ECS task networking branch, check out the master branch, and redeploy
+    your CloudFormation stack. This will revert all of the changes made in this chapter,
+    restoring your stack to the same state as it was at the end of the preceding chapter.
+    This is required, given we don''t want to have to upgrade to a larger instance
+    type to accommodate the `MigrateTaskDefinition` resource and future auto scaling
+    scenarios we will be testing in later chapters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Reverting the todobackend-aws repository
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned how to increase the network isolation and security
+    of your Docker applications using ECS task networking. ECS task networking changes
+    the default out-of-the-box Docker bridge and NAT network configuration to a model
+    where each ECS task receives its own dedicated elastic network interface or ENI.
+    This means that your Docker applications are assigned their own dedicated security
+    groups and can be accessed directly via their published ports, which avoids the
+    need to implement features, such as dynamic port mapping, that can affect performance
+    and require more permissive security rules to work. ECS task networking, however,
+    does come with its own set of challenges and limitations, which include a more
+    complex network topology to accommodate the current private IP address-only restrictions,
+    and the ability to only run a single ECS task per ENI.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ECS task networking currently does not support public IP addresses, which means
+    you must provide a NAT gateway or HTTP proxy if your tasks required outbound internet
+    connectivity. NAT gateways are a managed service provided by AWS and you learned
+    how to configure a private subnet used for your ECS tasks, and how to configure
+    a private route table to route internet traffic to a NAT gateway you created in
+    one of your pre-existing public subnets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You learned that configuring ECS task networking requires you to specify the
+    awsvpc network mode in your ECS task definitions, and that you need to add a network
+    configuration to your ECS services that specifies the subnet(s) your ECS tasks
+    will be connected to and the security group(s) that will be applied. If your application
+    is serviced by an application load balancer, you also need to ensure the target
+    type of the target group linked to your ECS service is configured as `ip`, rather
+    than the default `instance` target type. If you are applying these changes to
+    an existing environment, you may also need to update security groups attached
+    to resources, such as load balancers and databases, given your ECS tasks are no
+    longer associated with the security groups applied at an ECS container instance
+    level and have their own dedicated security groups.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next two chapters, you will learn how to deal with some of the more challenging
+    operational aspects of ECS, including managing the life cycle of your ECS container
+    instances and autoscaling your ECS clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'True/false: The default Docker network configuration uses iptables to perform
+    network address translation.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You have an application that forms application-level clusters and uses EC2 metadata
+    to discover the IP addresses of other hosts running your application. When you
+    run your application using ECS, you notice that your applications are using a
+    `172.16.x.x/16` address but your EC2 instances are configured with an `172.31.x.x/16`
+    address. Which Docker network modes could help resolve this problem?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'True/false: The `host` value for `NetworkMode` in your ECS task definitions
+    enables ECS task networking.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You enable ECS task networking for an ECS task definition, however your application
+    load balancers can no longer reach your application. You check the rules on the
+    security group attached to your ECS container instance and confirm that your load
+    balancers are permitted access to your application. How can you resolve this issue?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You enable ECS task networking for an ECS task definition, however your containers
+    fail on startup with an error unable to reach a location that is located on the
+    internet. How can you resolve this issue?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the maximum number of ENIs you can run on a t2.micro instance?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the maximum number of ECS tasks that you can run in task-networking
+    mode on a t2.micro instance?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the maximum number of containers that you can run in task-networking
+    mode on a t2.micro instance?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After enabling the ECS task-networking mode, you receive a deployment error
+    indicating a target group has a target type instance, which is incompatible with
+    the awsvpc network mode. How can you resolve this?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After enabling the ECS task-networking mode, you receive a deployment error
+    stating you cannot specify an IAM role for services that require a service-linked
+    role. How can you resolve this?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You can check out the following links for more information about the topics
+    covered in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Docker networking overview: [https://docs.docker.com/network/](https://docs.docker.com/network/)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Task Networking with the awsvpc Network Mode: [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-networking.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-networking.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Under the Hood: Task Networking for Amazon ECS: [https://aws.amazon.com/blogs/compute/under-the-hood-task-networking-for-amazon-ecs/](https://aws.amazon.com/blogs/compute/under-the-hood-task-networking-for-amazon-ecs/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Maximum Network Interfaces for EC2 Instance Types: [https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html#AvailableIpPerENI](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-eni.html#AvailableIpPerENI)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NAT Gateways: [https://docs.aws.amazon.com/AmazonVPC/latest/UserGuide/vpc-nat-gateway.html](https://docs.aws.amazon.com/AmazonVPC/latest/UserGuide/vpc-nat-gateway.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation NAT Gateway Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-natgateway.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-natgateway.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation EC2 Elastic IP Address Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-eip.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-eip.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation EC2 Subnet Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation EC2 Subnet Route Table Association Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet-route-table-assoc.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-subnet-route-table-assoc.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation EC2 Route Table Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route-table.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route-table.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation EC2 Route Resource Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ec2-route.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using Service-Linked Roles for Amazon ECS: [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using-service-linked-roles.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/using-service-linked-roles.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

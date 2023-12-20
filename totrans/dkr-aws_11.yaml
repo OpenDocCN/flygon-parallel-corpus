@@ -1,0 +1,887 @@
+- en: Managing ECS Infrastructure Life Cycle
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A fundamental ongoing activity associated with operating ECS infrastructure
+    is the requirement to manage the life cycle of your ECS container instances. In
+    any production-grade scenario, you will be required to patch your ECS container
+    instances, and ensure the core components of your ECS container instances such
+    as the Docker Engine and ECS agent are updated frequently to ensure you have access
+    to the latest features, and security and performance enhancements. In an immutable
+    infrastructure world where your ECS container instances are considered "cattle",
+    the standard approach is that you destroy and replace your ECS container instances
+    by rolling in new Amazon Machine Images (AMIs), rather than taking the traditional
+    approach of patching *pets* and keeping your ECS container instances around for
+    a long period of time. Another common use case where you need to manage the life
+    cycle is related to Auto Scaling—for example, if you scale your ECS clusters in
+    after a period of heavy demand, you need to be able to remove ECS container instances
+    from your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Taking an ECS container instance out of service probably sounds like quite a
+    simple task, however consider what happens if you have running containers on your
+    instance. If you take the instance out of service immediately, users connected
+    to applications running on those containers will be disrupted, which might result
+    in data loss and at the very least, unhappy users. What is required is a mechanism
+    that enables your ECS container instances to be taken out of service gracefully,
+    maintaining current user connections until they can be closed without any impact
+    to the end user, and then actually terminate the instance once you can be sure
+    the instance is completely out of service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, you will learn how to implement such a capability, by leveraging
+    two key AWS features—EC2 Auto Scaling life cycle hooks and ECS container instance
+    draining. EC2 Auto Scaling life cycle hooks let you be informed of a pending life
+    cycle event related to an EC2 instance being started or being taken out of service,
+    and provide you with an opportunity to perform any appropriate initialization
+    or cleanup actions before signalling that the life cycle event can proceed. This
+    is where you can leverage ECS container instance draining, which marks ECS tasks
+    on the affected ECS container instance as draining or out of service, and proceeds
+    to gracefully take the tasks out of service by starting new replacement ECS tasks
+    on other ECS container instances in the cluster, and then draining connections
+    to the affected ECS tasks until the tasks can be stopped and the ECS container
+    instance is drained.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following topics will be covered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding ECS infrastructure life cycle management
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Building a new ECS container instance AMI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Configuring EC2 Auto Scaling rolling updates
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating EC2 Auto Scaling life cycle hooks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating a Lambda function for consuming life cycle hooks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying and testing Auto Scaling life cycle hooks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following lists the technical requirements to complete this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Administrator access to an AWS account
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Local AWS profile configured as per instructions in Chapter 3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: AWS CLI version 1.15.71 or higher
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This chapter continues on from Chapter 9 (NOT Chapter 10) so it requires you
+    to have successfully completed all configuration tasks defined in Chapter 9, and
+    ensure you have reset the **todobackend-aws** repository to the master branch
+    (which should be based upon completion of Chapter 9)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The following GitHub URL contains the code samples used in this chapter - [https://github.com/docker-in-aws/docker-in-aws/tree/master/ch11](https://github.com/docker-in-aws/docker-in-aws/tree/master/ch11)[.](https://github.com/docker-in-aws/docker-in-aws/tree/master/ch4)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Check out the following video to see the Code in Action:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://bit.ly/2BT7DVh](http://bit.ly/2BT7DVh)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding ECS life cycle management
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As described in the introduction to this chapter, ECS life cycle management
+    refers to the process of taking existing ECS container instances out of service
+    without impacting end users that may be connected to applications running on your
+    affect instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This requires you to leverage two key features provided by AWS:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: EC2 Auto Scaling life cycle hooks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: ECS container instance draining
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: EC2 Auto Scaling life cycle hooks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'EC2 Auto Scaling life cycle hooks allow you to receive notice of a pending
+    life cycle event and perform some action before the event takes place. Currently,
+    you can be notified of the following life cycle hook events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`EC2_INSTANCE_LAUNCHING`: Raised when an EC2 instance is about to be launched'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`EC2_INSTANCE_TERMINATING`: Raised when an EC2 instance is about to be terminated'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In general, you don't need to worry about `EC2_INSTANCE_LAUNCHING` events, however
+    anybody who runs a production-grade ECS cluster should be interested in `EC2_INSTANCE_TERMINATING`
+    events, given an instance that is about to be terminated may be running containers
+    with active end user connections. Once you have subscribed to a life cycle hook
+    event, the EC2 Auto Scaling service will wait for you to signal that the life
+    cycle action can proceed. This provides you with a mechanism that allows you to
+    perform graceful tear down actions in the case of an `EC2_INSTANCE_TERMINATING`
+    event, and this is where you can leverage ECS container instance draining.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ECS container instance draining
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: ECS container instance draining is a feature that allows you to gracefully *drain* your
+    ECS container instances of running ECS tasks, with the end result being your ECS
+    container instance has no running ECS tasks or containers, meaning it is safe
+    to terminate the instance without impacting your container applications. ECS container
+    instance draining first marks your ECS container instance in a DRAINING state,
+    which will cause all ECS tasks running on the instance to be gracefully shut down
+    and started on other container instances in the cluster. This draining activity
+    uses the standard *rolling* behavior you have already seen with ECS services—for
+    example, if you have an ECS task associated with an ECS service that has application
+    load balancer integration, ECS will first attempt to register a new ECS task on
+    another ECS container instance as a new target in the application load balancer
+    target group, and then place the target associated with the ECS container instance
+    that is being drained into a connection draining state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that it is important that your ECS cluster has enough resources and ECS
+    container instances to migrate each of the affected ECS tasks, which can be challenging
+    given you are also reducing the ECS cluster capacity by an instance. This means,
+    for example, if you are performing planned replacements of ECS container instances
+    in your cluster (for example, you are updating to a new AMI), then you need to
+    temporarily add extra capacity to your cluster so that you swap out instances
+    in a rolling fashion without reducing overall cluster capacity. If you are using
+    CloudFormation to deploy your EC2 Auto Scaling groups, a very useful feature is
+    the ability to specify update policies that can temporarily add extra capacity
+    to your Auto Scaling groups during a rolling update, and you will learn how to
+    leverage this feature to always ensure you maintain ECS cluster capacity at all
+    times when performing rolling updates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ECS life cycle management solution
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that you have some background of ECS life cycle management, let's discuss
+    the solution that you will implement in this chapter, which will leverage EC2
+    life cycle hooks to trigger ECS container instance draining and signal the EC2
+    Auto Scaling service when it is safe to terminate your ECS container instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram illustrates a simple EC2 Auto Scaling group and an ECS
+    cluster with two ECS container instances in service, supporting ECS **Service
+    A** and ECS **Service B**, which both have two ECS tasks or instances of the ECS
+    service running:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/3d9ec502-31d9-4b33-bf8b-3f86c5ae59cb.png)In Service EC2 Auto Scaling
+    Group/ECS Cluster'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s assume that you now want to update the ECS container instances in your
+    EC2 Auto Scaling group with a new Amazon Machine Image, which requires the termination
+    and replacement of each instance. The following diagram illustrates how our life
+    cycle hook solution will deal with this requirement and ensure each of the instances
+    in the Auto Scaling group can be replaced in a manner that does not disrupt end
+    users that are connected to the applications serviced by each ECS service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/e6a15c2d-7fc9-4819-875d-25b7e000dba6.png)Performing Rolling Updates
+    on an In-Service EC2 Auto Scaling Group/ECS Cluster'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding diagram, the following steps take place:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CloudFormation rolling updates are configured for the EC2 Auto Scaling group,
+    which causes the CloudFormation service to temporarily increase the size of the
+    EC2 Auto Scaling group.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The EC2 Auto Scaling group adds a new EC2 instance (ECS container instance C)
+    to the Auto Scaling group in response to the increase in group size from CloudFormation.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Once the new EC2 instance has started and signalled SUCCESS to CloudFormation,
+    the CloudFormation service then instructs the EC2 Auto Scaling service to terminate
+    ECS container instance A, given ECS container instance C is now joined to the
+    EC2 Auto Scaling group and ECS cluster.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Before terminating the instance, the EC2 Auto Scaling service triggers a life
+    cycle hook event, publishing this event to a configured Simple Notification Service
+    (SNS) topic. SNS is a publish/subscribe style notification service that can be
+    used for a variety of use cases, and in our solution we will subscribe a Lambda
+    function to the SNS topic.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A Lambda function is invoked by the SNS topic in response to the life cycle
+    hook event being published to the topic.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The Lambda function instructs ECS to drain the ECS container instance that is
+    about to be terminated. The function then polls the running task count on the
+    ECS container instance, waiting until the task count is zero before considering
+    that the draining process is complete.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: ECS drains the current tasks running on ECS container instance A to other container
+    instances that have spare capacity. In the preceding diagram, because ECS container
+    instance C was recently added to the cluster, the ECS tasks running on ECS container
+    instance A can be drained to container instance C. Note that if container instance
+    C had not been added to the cluster, there would be insufficient capacity in the
+    cluster to drain container instance A, so ensuring your cluster has sufficient
+    capacity for these types of events is very important.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In many cases, ECS container instance draining may take longer than the current
+    five minute execution timeout limit for Lambda. In this scenario, you can simply
+    republish the life cycle hook event notification to the SNS topic, which will
+    automatically reinvoke the Lambda function.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The Lambda function once again instructs ECS to drain container instance A (which
+    is already in progress), and continues to poll the running task count, waiting
+    until the running task count is zero.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Assuming the container instance completes draining and the running task count
+    reduces to zero, the Lambda function signals the EC2 Auto Scaling service that
+    the life cycle hook is complete.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The EC2 Auto Scaling service terminates the ECS container instance now that
+    the life cycle hook has completed.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: At this point, the rolling update that was initiated way back in step 1 by CloudFormation
+    is 50% complete, as the old ECS container instance A has been replaced by ECS
+    container instance C. The process described in preceding diagram repeats once
+    again, with a new ECS container instance introduced to the cluster and ECS container
+    instance B marked for termination. Once draining of ECS container instance B has
+    completed, all instances in the Auto Scaling group/cluster have been replaced,
+    and the rolling update is complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a new ECS container instance AMI
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To test our life cycle management solution, we need to have a mechanism to force
+    your ECS container instances to be terminated. Although you could simply adjust
+    the desired count of your Auto Scaling group (which actually is a common scenario
+    when your Auto Scaling groups are scaling down), another common scenario where
+    this can happen is when you need to update your ECS container instances by introducing
+    a newly built Amazon Machine Image (AMI), complete with the latest operating system
+    and security patches, and up-to-date versions of Docker Engine and the ECS agent.
+    At the very least, if you are building a custom ECS container instance AMI using
+    an approach similar to what you learned in Chapter 6, you should be rebuilding
+    your AMI each time Amazon releases a new version of the base ECS-optimized AMI,
+    and it is common practice to update your AMIs on a weekly or monthly basis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To simulate introducing a new AMI into your ECS cluster, you can simply perform
+    the same steps you executed in Chapter 6, which will output a new AMI that you
+    can then use as an input into your stack and force your ECS cluster to upgrade
+    each of its ECS container instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates running the `make build` command from the
+    root of the **packer-ecs** repository, which will output a new AMI ID for the
+    newly created and published image. Ensure you note down this AMI ID as you will
+    require it later on in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Running a Packer build
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring EC2 Auto Scaling rolling updates
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When you use CloudFormation to create and manage your EC2 Auto Scaling groups,
+    a useful capability is the ability to manage rolling updates. Rolling updates
+    refers to the ability to *roll* in new EC2 instances into your Auto Scaling group,
+    in a controlled manner that ensures your update process can be completed without
+    causing disruption. In Chapter 8, when you created an EC2 Auto Scaling group via
+    CloudFormation, you learned how CloudFormation supports creation policies, that
+    can help you ensure all instances in your EC2 Auto Scaling have initialized successfully.
+    CloudFormation also supports update policies, which as you saw earlier in the
+    previous diagram, help you manage and control how updates to your EC2 Auto Scaling
+    group are managed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you open the todobackend-aws repository and browse to the CloudFormation
+    template located in the `stack.yml` file, you can add an update policy to the `ApplicationAutoscaling` resource,
+    as demonstrated in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring a CloudFormation Auto Scaling Group Update Policy
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding example, the `UpdatePolicy` setting is applied to the `ApplicationAutoscaling` resource,
+    which configures CloudFormation to orchestrate rolling updates according to the
+    following `AutoScalingRollingUpdate` configuration parameters whenever instances
+    within the Auto Scaling group need to be replaced (*updated*):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`MinInstancesInService`: The minimum number of instances that must be in service
+    during a rolling update. A standard approach here is to specify the desired count
+    of the Auto Scaling group, which means the Auto Scaling will temporarily increase
+    in size as new instances are added in order to maintain the minimum number of
+    required instances.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`MinSuccessfulInstancesPercent`: The minimum percentage of new instances that
+    must be deployed successfully for the rolling update to be considered a success.
+    If this percentage is not met, then CloudFormation will roll back the stack changes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`WaitOnResourceSignals`: When set to true, specifies that CloudFormation waits
+    for a SUCCESS signal from each instance before it considers an instance successfully
+    deployed. This requires your EC2 instances to have the `cfn-bootstrap` scripts
+    that installed in Chapter 6 and configured in Chapter 7 to signal to CloudFormation
+    once initialization of the instance has completed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PauseTime`: When `WaitOnResourceSignals` is configured, specifies the maximum
+    amount of time to wait for each instance to signal SUCCESS. This value is expressed
+    in ISO8601 format and in the following example is configured to wait for up to
+    15 minutes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Then, deploy your changes using the `aws cloudformation deploy` command as
+    demonstrated in the following example, your Auto Scaling group will now have the
+    update policy applied:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring a CloudFormation Auto Scaling Group Update Policy
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, you can now update your stack to use the new AMI you created
+    in the very first example. This requires you to first update the `dev.cfg` file
+    at the root of the todobackend-aws repository:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Updating the ECS AMI
+  prefs: []
+  type: TYPE_NORMAL
+- en: Then, deploy the change using the same `aws cloudformation deploy` command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While the deployment is running, if you open the AWS console, browse to the
+    CloudFormation dashboard, and select the todobackend stack **Events** tab, you
+    should be able to see how CloudFormation performs rolling updates:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/8bcbaeaf-b39e-44b4-89e1-f01e76b5a885.png)CloudFormation Rolling
+    Updates'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, you can see that CloudFormation first temporarily
+    increases the size of the Auto Scaling group, given it needs to keep at least
+    one instance in service at all times. Once the new instance signals SUCCESS to
+    CloudFormation, the old instance in the Auto Scaling group is terminated and the
+    rolling update is complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At this point, you might be feeling pretty happy—with just a small change to
+    your CloudFormation configuration, you have been able to add rolling updates to
+    your stack. There is just one problem though, that being when the old EC2 instance
+    was terminated, it was terminated *immediately*. This actually causes a disruption
+    to the service, which you can see an indication of if you navigate to the CloudWatch
+    console, select Metrics, in the All metrics tab select ECS **|** ClusterName,
+    and then select the MemoryReservation metric for the cluster named todobackend-cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot shows this screen once you have clicked on the Graphed
+    metrics tab and changed the Statistic column to Minimum and Period to 1 Minute:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/a53807f6-88a9-49e8-938f-b488d5040709.png)ECS Memory Reservation'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you look back at the timeline in the earlier screenshot, you can see that
+    at 21:17:33 the old ECS container instance is terminated, and in the preceding
+    screenshot, you can see a corresponding dip in the memory reservation of the cluster
+    to 0% at 21:18 (09:18). This indicates that at this point in time, there were
+    no actual containers running, given the percentage of cluster memory reserved
+    was 0, illustrating there was a small, albeit brief, outage whilst ECS attempted
+    to recover the todobackend service to the new ECS container instance after the
+    old instance was abruptly terminated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Because the minimum CloudWatch metrics resolution is 1 minute, it is possible
+    that you may not observe the dip to 0% in the previous figure if ECS is able to
+    recover the ECS service within a minute, but rest assured there is an outage to
+    your application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clearly this is not ideal and as we discussed earlier, we now need to introduce
+    EC2 Auto Scaling life cycle hooks to resolve this situation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating EC2 Auto Scaling life cycle hooks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To fix the problem of EC2 instance termination affecting our ECS services,
+    we now need to create an EC2 Auto Scaling life cycle hook that will notify us
+    that an EC2 instance is about to be terminated. Referring back to the first diagram,
+    this requires several resources:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The actual life cycle hook
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A life cycle hook role that grants the EC2 Auto Scaling group permission to
+    publish life cycle hook notifications to an SNS topic
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An SNS topic where life cycle hooks can be published and subscribed to
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates creating the life cycle hook, life cycle
+    hook role, and SNS topic:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Creating Life Cycle Hook Resources in CloudFormation
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, the `LifecycleHook` resource creates a new hook, which
+    is linked to the `ApplicationAutoscaling` resource using the `AutoScalingGroupName`
+    property, and is triggered by EC2 instances within the Auto Scaling group that
+    are about to be terminated, as specified by the value `autoscaling:EC2_INSTANCE_TERMINATING`
+    configured for the `LifecycleTransition` property. The hook is configured to send
+    a notification to a new SNS topic resource called `LifecycleHookTopic`, with the
+    linked `LifecycleHookRole` IAM role granting the `autoscaling.amazonaws.com` service
+    (as specified in the `AssumeRolePolicyDocument` section of the role) permissions
+    to publish life cycle hook events to this topic. The `DefaultResult` property
+    specifies the default result that should be created if the `HeartbeatTimeout`
+    period is reached and no response has been received for the hook, which in this
+    example is to send a `CONTINUE` message that instructs the Auto Scaling service
+    to continue processing any other life cycle hooks that may be registered. The
+    other option for the `DefaultResult` property is to send an `ABANDON` message,
+    which still instructs the Auto Scaling service to continue with instance termination,
+    but abandons processing any other life cycle hooks that may be configured.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The final `LifecycleHookSubscription` resource creates a subscription to the
+    `LifecycleHookTopic` SNS topic resource, subscribing a Lambda function resource
+    called `LifecycleHookFunction` that we will create soon, meaning this function
+    will be invoked anytime a message is published to the SNS topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a Lambda function for consuming life cycle hooks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With the various life cycle hook resources in place, the final piece of the
+    puzzle is to create a Lambda function and associated resources that will subscribe
+    to the life cycle hook SNS topic you defined in the previous section and will
+    ultimately perform ECS container instance draining before signalling that the
+    life cycle hook action can continue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s first focus on the Lambda function itself and the associated source
+    code that it will need to execute:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Creating a Lambda Function to Process Life Cycle Hooks
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Lambda function is a little bit more involved than what we dealt with so
+    far, but is still a relatively simple function that should be reasonably easy
+    to follow if you have experience with Python.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The function first defines the required libraries and looks for an environment
+    variable called `ECS_CLUSTER`, which is required so that the function knows which
+    ECS cluster the life cycle hook relates to, and this environment variable value
+    is passed in via the `Environment` property on the Lambda function resource.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, the function declares three AWS clients:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ecs`: Communicates with ECS to introspect ECS container instance information
+    and drain the correct instance based upon the EC2 instance ID received in the
+    life cycle hook.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`autoscaling`: Signals the EC2 Auto Scaling service when the life cycle hook
+    can continue.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sns`: Republishes the life cycle hook event if the Lambda function is about
+    to reach the maximum five minute execution timeout and the ECS container instance
+    has not drained yet. This will reinvoke the Lambda function again, until the ECS
+    container instance has completely drained.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `handler` method defines the entry point for the Lambda function, and first extracts
+    out a number of variables that capture information from the received SNS message including
+    the life cycle hook event type ( `transition` variable), hook name (`hook` variable),
+    Auto Scaling group name (`group` variable), and EC2 instance ID (`ec2_instance` variable).
+    A check is then made immediately to verify the life cycle hook event type does
+    relate to an EC2 instance terminating event, and if the  event type (captured
+    in the transition variable) does not equal the value `autoscaling:EC2_INSTANCE_TERMINATING`,
+    then the function returns immediately, effectively ignoring the event.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Assuming the event does relate to an EC2 instance terminating, the handler next
+    queries the ECS service via the `ecs` client, first describing all instances in
+    the configured cluster and then attempting to locate the ECS container instance
+    that matches the EC2 instance ID captured from the life cycle hook event. If the
+    instance cannot be found, then a `ValueError` exception is raised, which will
+    be caught by the catch statement, resulting in an error being logged and the function
+    completing the life cycle hook with a result of `ABANDON`. If the instance is
+    found, the handler proceeds to drain the instance by calling the `update_container_instances_state()`
+    method on the `ecs` client, which sets the status of the instance to `DRAINING`,
+    meaning ECS will no longer schedule any new tasks to the instance and attempt
+    to migrate existing tasks to other instances in the cluster. At this point, the
+    handler needs to wait for all current ECS tasks running on the instance to be
+    drained, and this can be achieved by polling the ECS task count in a `while` loop
+    every five seconds until the task count reduces to zero. You could attempt to
+    do this indefinitely, however Lambda has a maximum five minute execution time
+    limit at the time of writing, so the `while` loop uses the `context.get_remaining_time_in_millis()`
+    method to check if the Lambda execution timeout is about to be reached.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `context` object is an object that is passed by the Lambda runtime environment
+    to your handler method and includes information about the Lambda environment including
+    memory, CPU, and remaining execution time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the event the task count reduces to zero, you can safely terminate the ECS
+    container instance, and the autoscaling client completes the life cycle hook with
+    a result of `CONTINUE`, meaning the EC2 Auto Scaling service will continue processing
+    any other registered hooks and terminate the instance. If the task count does
+    not reduce to zero before the function is about to exit, then the function simply
+    republishes the original life cycle hook notification, which will reinvoke the
+    function from the start again. Because all of the actions in the function are
+    idempotent, that is updating the status of an ECS container instance that is already
+    draining to DRAINING results in the same draining state, this approach is safe
+    and a very simple and elegant approach to overcoming the execution timeout limits
+    of Lambda.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring permissions for the life cycle hook Lambda function
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The Lambda function is now in place and the final configuration task is to
+    add the required permissions for the various API calls and operations the Lambda
+    function performs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring Permissions for a Life Cycle Hook Lambda Function
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, a resource called `LifecycleHookPermission` of type `AWS::Lambda::Permission`
+    is required, which grants permission for the SNS service (as referenced by the
+    `Principal` property) to invoke the Lambda function (as referenced by the `LambdaFunction`
+    property) for notifications published to the SNS topic (as referenced by the `SourceArn`
+    property). This approach to configuring permissions is typically required whenever
+    you need to grant another AWS service the ability to invoke a Lambda function
+    on your behalf, although there are exceptions to this rule (such as the CloudFormation
+    custom resource use case, where CloudFormation implicitly has such a permission).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You also create an IAM role for the Lambda function called `LambdaFunctionRole`,
+    which grants the function the ability to execute the various tasks and operations
+    it needs to perform including:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Listing, describing, and updating ECS container instances within the application
+    cluster
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Republishing the life cycle hook event to SNS if the Lambda function is about
+    to timeout
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Completing the life cycle action once the ECS container instance has drained
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Writing logs to CloudWatch logs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying and testing Auto Scaling life cycle hooks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You can now deploy your complete Auto Scaling life cycle hooks solution using
+    the `aws cloudformation deploy` command as demonstrated earlier in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once deployment is complete, to test life cycle management is working as expected,
+    a simple change you can perform to force replacement of the current ECS container
+    instance in your ECS cluster is to revert the AMI change you made earlier in this
+    chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Reverting the ECS AMI
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once you now deploy this change, again using the  `aws cloudformation deploy` command
+    as demonstrated in earlier example, next switch to the CloudFormation console
+    and when the event to terminate the existing EC2 instance is raised, quickly navigate
+    to the ECS dashboard and select your ECS cluster. On the container instances tab,
+    you should see the status of one of your ECS container instances is draining as
+    demonstrated in the following screenshot, and once all tasks have drained from
+    this instance, the life cycle hook function will signal the EC2 Auto Scaling service
+    to proceed with terminating the instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/48e994f8-8700-4055-85be-dce072cd5887.png)ECS Container Instance
+    Draining'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you repeat the steps taken in the previous screenshots to view cluster memory
+    reservation during the period the ECS container instances are drained and terminated,
+    you should see a graph that looks something like as follows in the example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/6ce7187e-5fa4-4457-bea3-ce1220c04bb1.png)Cluster Memory Reservation
+    during ECS Container Instance Draining'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshots, notice that the cluster memory reservation does
+    not drop to 0% at any time during the rolling update. The memory utilization percentage
+    does change due to their being two instances in the cluster during the rolling
+    upgrade, but the ability for us to drain ECS container instances ensures uninterrupted
+    service for your applications running on your clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a final check, you can also navigate to the CloudWatch logs group for the
+    life cycle hooks function, which is shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/5a4701c4-7ce4-4900-9301-222be446dc52.png)Life Cycle Hooks Function
+    Logs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, you can see that the function sleeps periodically
+    whilst the container instance is draining, and after approximately two minutes
+    in this case, all tasks drain and the function sends a `CONTINUE` signal for the
+    hook to the Auto Scaling service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you created a solution for managing the life cycle of your
+    ECS container instances and ensuring the applications and services running on
+    your ECS clusters are not impacted any time you need to terminate and replace
+    an ECS container instance within your ECS cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You learned how to configure rolling updates for your EC2 Auto Scaling groups,
+    by leveraging CloudFormation update policies that enable you to control how new
+    instances can be added to your Auto Scaling groups in a rolling fashion.  You
+    saw that this feature works well at an Auto Scaling and EC2 instance level, however
+    you found that the abrupt termination of existing ECS container instances in your
+    cluster causes outages for your applications.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To address this challenge, you created an EC2 life cycle hook registered for
+    `EC2_INSTANCE_TERMINATING` events and configured this hook to publish notifications
+    to an SNS topic, which in turn triggers a Lambda function. This function is responsible
+    for locating the ECS container instance associated with the EC2 instance about
+    to be terminated, draining the container instance, and then waiting until the
+    ECS task count reaches 0, indicating all ECS tasks on the instance have been terminated
+    and replaced. In the event the ECS container instance takes longer than the five
+    minute maximum execution time of a Lambda function, you learned that you can simply
+    republish the SNS event that contains the life cycle hook information, which in
+    turn will trigger a new invocation of the function, and this process can continue
+    indefinitely until the ECS task count on the instance reaches 0.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, you will learn how you can dynamically manage the capacity
+    of your ECS clusters, which is critical to support the Auto Scaling requirements
+    of your applications. This involves the ongoing adding and remove ECS container
+    instances to your ECS cluster, so you can see that the ECS container instance
+    life cycle mechanisms introduced in this chapter are critical for ensuring your
+    applications are not affected by any Auto Scaling operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'True/false: When you terminate an ECS container instance, the instance will
+    automatically drain running ECS tasks to another instance in the cluster.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are the types of EC2 Auto Scaling life cycle hooks you can receive?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What type of responses can you send once you have finished processing EC2 Auto
+    Scaling life cycle hooks?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'True/false: EC2 Auto Scaling life cycle hooks can publish events to AWS Kinesis.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You create a Lambda function that processes a life cycle hook and drains your
+    ECS container instances.  You have noticed that sometimes this takes around 4
+    – 5 minutes, but often takes 15 minutes.  What can you do to resolve this issue?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What CloudFormation feature can you configure to enable rolling updates for
+    Auto Scaling groups?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You want to perform rolling updates and ensure that you always have at least
+    the current desired count of instances in service during the update. How would
+    you achieve this?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When using CloudFormation to subscribe a Lambda function to an SNS topic, what
+    type of resource do you need to create to ensure the SNS service has appropriate
+    permissions to invoke the function?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You can check the following links for more information about the topics covered
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CloudFormation UpdatePolicy attribute: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-updatepolicy.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-attribute-updatepolicy.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Amazon EC2 Auto Scaling life cycle hooks: [https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html](https://docs.aws.amazon.com/autoscaling/ec2/userguide/lifecycle-hooks.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation life cycle hook resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-as-lifecyclehook.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-as-lifecyclehook.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation SNS topic resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-sns-topic.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-sns-topic.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation SNS subscription resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation Lambda permission resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation ECS task definition resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-taskdefinition.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-taskdefinition.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation ECS service resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-service.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-ecs-service.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation Lambda function resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-function.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation Lambda function code: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation custom resource documentation: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-custom-resources.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/template-custom-resources.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CloudFormation custom resource reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

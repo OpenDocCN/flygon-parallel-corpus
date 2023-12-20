@@ -1,0 +1,2405 @@
+- en: Building Custom ECS Container Instances
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In earlier chapters, you learned how you use the Amazon ECS-Optimized Amazon
+    Machine Image (AMI) to create ECS container instances and join them to an ECS
+    cluster in a few simple steps. Although the ECS-Optimized AMI is great for getting
+    up and running quickly, you may want to add additional features to your ECS container
+    instances for your production environments, such as adding logging agents or including
+    support for HTTP proxies so you can place your ECS clusters in private subnets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, you will learn how you can build your own custom ECS container
+    instances, using the ECS-Optimized AMI as a base machine image and applying your
+    own customizations using a popular open source tool called Packer. You will extend
+    the base image to include the AWS CloudWatch logs agent, which enables centralized
+    logging from your ECS container instances using the CloudWatch logs service, and
+    install a useful set of CloudFormation helper scripts, called cfn-bootstrap, which
+    will allow you to run powerful initialization scripts at instance-creation time
+    and also provide powerful integration features with CloudFormation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, you will create a first-run script that will allow you to adapt your
+    instances to the specifics of your target environment without needing to build
+    a new AMI for every application and environment. This script will enable you to
+    conditionally enable HTTP proxy support, allowing you to install your ECS container
+    instances in more secure private subnets, and will also include a healthcheck
+    that will wait until your ECS container instances have registered with their configured
+    ECS cluster, before signalling CloudFormation that your instances have been successfully
+    initialized.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following topics will be covered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing a custom AMI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Building a custom AMI using Packer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating custom storage configurations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Installing CloudFormation helper scripts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Installing the CloudWatch logs agent
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating a first-run script
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Testing your custom ECS container instance
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following lists the technical requirements to complete this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packer 1.0 or higher (instructions will be provided on how to install Packer)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Administrator access to an AWS account
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Local AWS profile configured as per the instructions in Chapter 3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: GNU Make version 3.82 or higher (note that macOS does not ship with this version
+    by default)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: AWS CLI 1.15.71 or higher
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This GitHub URL contains the code samples used in this chapter: [https://github.com/docker-in-aws/docker-in-aws/tree/master/ch6](https://github.com/docker-in-aws/docker-in-aws/tree/master/ch6)[.](https://github.com/docker-in-aws/docker-in-aws/tree/master/ch4)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Check out the following video to see the Code in Action:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://bit.ly/2LzoxaO](http://bit.ly/2LzoxaO)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing a custom Amazon Machine Image
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before you learn how to build a custom Amazon Machine Image, it is important
+    to understand *why* you would want or need to build your own custom image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The reasons for this vary depending on your use case or organizational requirements,
+    however in general there are a number of reasons why you might want to build a
+    custom image:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Custom storage configuration**: The default ECS-optimized AMI ships with
+    a 30 GB volume that includes 8 GB for the operating system partition and a 22
+    GB volume for storing Docker images and container filesystems. One aspect of your
+    configuration that I typically recommend to change is that, by default, Docker
+    volumes, which do not use layered filesystems, are stored on the 8 GB operating
+    system partition. This approach generally should be avoided for production use
+    cases, and instead you should mount a dedicated volume for storing Docker volumes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Installation of additional packages and tools**: In keeping with the minimalist
+    philosophy of Docker, the ECS-optimized AMI ships with a minimal installation
+    of Amazon Linux that only includes the core components required to run a Docker
+    Engine and the supporting ECS agent. For real-world use cases, at a minimum, you
+    will typically want to add the CloudWatch logs agent, which supports logging at
+    a system level (for example, Operating system, Docker Engine, and ECS agent logs)
+    to the AWS CloudWatch logs service. Another important set of tools you should
+    consider installing are the cfn-bootstrap tools, which provide a set of CloudFormation
+    helper scripts that you can use to define custom provisioning actions for your
+    instances in CloudFormation templates, and also allow your EC2 instances to signal
+    CloudFormation once provisioning and instance initialization is complete.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Adding first-run scripts**: When deploying ECS container instances to AWS,
+    you may use them in a variety of use cases that require different configurations
+    depending on the nature of the application. For example, a common security best
+    practice is to deploy your ECS container instances into private subnets that have
+    no default route attached. This means that your ECS container instance must be
+    configured with an HTTP proxy in order to communicate with AWS services such as
+    ECS and CloudWatch logs, or any other internet services the ECS container instance
+    may rely on. However in some scenarios, using an HTTP proxy may not be feasible
+    (for example, consider the ECS container instances that run ECS containers that
+    provide the HTTP proxy service for your environment), and rather than build separate
+    machine images (one with HTTP proxy enabled and one without an HTTP proxy), you
+    can created provisioning scripts that will only run once on instance creation,
+    that conditionally enable/disable a desired configuration, such as HTTP proxy
+    settings, depending on the target use case.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Of course there are a whole bunch of other use cases that may drive you to build
+    your own custom image, however in this chapter we will focus on examples of the
+    use cases defined here, which will provide you with a solid foundation and understanding
+    of how to apply any additional customizations that you may want to use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a custom AMI using Packer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that you understand the rationale for building a custom ECS container instance
+    image, let's introduce a tool called Packer, which allows you to build machine
+    images for a wide variety of platforms, including AWS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Packer** is an open source tool created by HashiCorp, which you can find
+    out more about at [https://www.packer.io/](https://www.packer.io/). Packer can
+    build machine images for a wide variety of target platforms, however in this chapter
+    we will only focus on building Amazon Machine Images.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Installing Packer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before you can get started using Packer, you need to install it on your local
+    environment. Packer is supported for Linux, mac OS, and Windows platforms, and
+    to install Packer for your target platform, follow the instructions located at
+    [https://www.packer.io/intro/getting-started/install.html](https://www.packer.io/intro/getting-started/install.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that Packer is widely supported in operating systems and third-party package
+    management tools—for example, on mac OS you can install Packer using the Brew
+    package manager by running `brew install packer`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a Packer template
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With Packer installed, you can now get started creating a Packer template that
+    will define how to build your custom machine image. Before you do this though,
+    I do recommend creating a separate repository for your Packer template, which
+    should always be placed under version control, just like application source code
+    and other infrastructure, as code repositories.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For this chapter, I will assume that you have created a repository called `packer-ecs`,
+    and you can refer to the `ch6` folder at [https://github.com/docker-in-aws/docker-in-aws](https://github.com/docker-in-aws/docker-in-aws),
+    which provides an example repository based upon the content in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packer template structure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Packer templates are JSON documents that provide a declarative description that
+    tells Packer how to build a machine image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Packer templates are organized around four common top-level parameters, as
+    demonstrated in the following example and described here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**variables**: An object that provides input variables for the build.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**builders**: A list of Packer builders, which define the target machine image
+    platform(s). In this chapter, you will be targeting a builder referred to as the
+    [EBS-backed AMI builder](https://www.packer.io/docs/builders/amazon-ebs.html),
+    which is the simplest and most popular builder for creating custom Amazon Machine
+    Images. Builders are responsible for ensuring the correct image format and publishing
+    the final image in a format suitable for deployment to the target machine platform.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**provisioners**: A list or array of Packer provisioners, which perform various
+    provisioning tasks as part of the image building process. The simplest provisioners
+    include file and shell provisioners, which copy files into the image and perform
+    shell tasks, such as installing packages.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**post-processors**: A list or array of Packer post-processors, which perform
+    post-processing tasks once the machine image has been built and published:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Packer template structure
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring a builder
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s get started configuring our Packer template by first creating a file
+    called `packer.json` at the root of the packer-ecs repository, and then defining
+    the builders section, as demonstrated in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Defining an EBS-backed AMI builder
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding example, a single object representing our builder is added
+    to the builders array. The `type` parameter defines the builder as an EBS-based
+    AMI builder, and the settings that follow are specific to this type of builder:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`access_key`: Defines the AWS access key ID used to authenticate access to
+    AWS when building and publishing the AMI.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`secret_key`: Defines the AWS secret access key used to authenticate access
+    to AWS when building and publishing the AMI.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`token`: Optionally defines the AWS session token used when authenticating
+    with temporary session credentials.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`region`: The target AWS region.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`source_ami`: The source AMI to build from. In this example, the source AMI
+    of the latest ECS-Optimized AMI for the us-east-1 region at the time of writing
+    is specified, for which you obtain an up-to-date list from [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`instance_type`: The instance type used to build the AMI.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ssh_username`: The SSH username that Packer should use when attempting to
+    connect to the temporary EC2 instance created as part of the Packer build process.
+    For Amazon Linux-based AMIs, such as the ECS-Optimized AMI, this must be specified
+    as the `ec2-user` user.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`associate_public_ip_address`: When set to true associates a public IP address
+    with the instance. This is required if you are using Packer over the internet
+    and don''t have private network access to the temporary EC2 instance created as
+    part of the Packer build process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ami_name`: A name for the AMI that will be created. This name must be unique
+    and a common approach to ensure uniqueness is by using the `{{timestamp}}` Go
+    template function, which will be automatically replaced with the current timestamp
+    by Packer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tags`: A list of tags to add to the created AMI. This allows you to attach
+    metadata, such as the source AMI of the image, the ECS agent version, Docker version,
+    or any other information that you might find useful. Notice that you can reference
+    a special template variable called `SourceAMI`, which is added by the Amazon EBS
+    builder and is based on the value of the `source_ami` variable.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: One point to note in the is that rather than hardcode your AWS credentials into
+    the template fail, you reference a Go template function called `{{user `<variable-name>`}}`,
+    and this will inject user variables defined in the top-level variables parameter
+    that we will configure shortly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Packer templates are processed using Go''s templating language, which you can
+    read more about at [https://golang.org/pkg/text/template/](https://golang.org/pkg/text/template/).
+    Go templates allow you to define your own template functions and Packer includes
+    a number of useful functions that are defined at [https://www.packer.io/docs/templates/engine.html](https://www.packer.io/docs/templates/engine.html).
+    Template functions are invoked through template expressions, which are expressed
+    in the handlebars style format: `{{<function> <parameters>}}`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring variables
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Variables are used to inject user-specific or environment-specific settings
+    into your templates at build time, which is useful for making your machine image
+    templates more generic and avoids the hardcoding of credentials in your templates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Back in the previous example, you referenced user variables when defining AWS
+    credential settings, and these must be defined in the variables section of your
+    Packer template, as demonstrated in the previous example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Defining variables
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, notice that you define each of the variables referenced
+    in the user functions for the AWS credential settings in the builders section.
+    For example, the builders section defines the `access_key` setting as `{{user
+    `aws_access_key_id`}}`, which in turn references the `aws_access_key_id` variable
+    defined in the variables section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each variable in turn references the `env` template function, which looks up
+    the value of the environment variable passed to this function. This means you
+    can control the value of each of the variables as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`aws_access_key_id`: Configured using the `AWS_ACCESS_KEY_ID` environment variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`aws_secret_access_key`: Configured using the `AWS_SECRET_ACCESS_KEY` environment
+    variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`aws_session_token`: Configured using the `AWS_SESSION_TOKEN` environment variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`timezone`: Configured with a default value of **US/Eastern**. You can override
+    the default variable when running the `packer build` command by setting the `-var
+    ''<variable>=<value>''` flag (for example, `-var ''timezone=US/Pacific''`)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Notice that we haven't defined the `timezone` variable yet in our Packer template,
+    as you will use this variable later on in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring provisioners
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Provisioners are the core of Packer templates, forming the various internal
+    provisioning actions that are performed when customizing and building your machine
+    images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packer supports a number of different types of provisioners, including popular
+    configuration management tools such as Ansible and Puppet, and you can read more
+    about the different types of provisioners at [https://www.packer.io/docs/provisioners/index.html](https://www.packer.io/docs/provisioners/index.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our machine image, we are only going use two of the most basic and fundamental
+    provisioners available:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Shell provisioner](https://www.packer.io/docs/provisioners/shell.html): Performs
+    provisioning of machine images using shell commands and scripts'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[File provisioner](https://www.packer.io/docs/provisioners/file.html): Copies
+    files into the machine image'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'As an introduction to provisioners, let''s define a simple shell provisioner
+    that updates the installed operating system packages, as demonstrated in the following
+    example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Defining an inline shell provisioner
+  prefs: []
+  type: TYPE_NORMAL
+- en: The provisioner defined in the preceding example, uses the `inline` parameter
+    to define a list of commands that will be executed during the provisioning stage.
+    In this case, you are running the `yum update` command, which is the default package
+    manager on Amazon Linux systems and updates all installed operation system packages.
+    To ensure you use the recommended and tested versions of Docker and ECS agent
+    packages included in the base ECS-Optimized AMI, you use the `-x` flag to exclude
+    packages that start with `docker` and `ecs`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, the yum command will be executed as `sudo yum -y -x
+    docker\* -x ecs\* update`. Because the back slash character (`\`) is used to as
+    an escape character in JSON, in the preceding example, a double backslash (for
+    example, `\\*`) is used to generate a literal back slash.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, notice that you must run all shell provisioning commands with the `sudo`
+    command, as Packer is provisioning the EC2 instance as the `ec2_user` user, as
+    defined in the builders section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring post-processors
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The final structural component of Packer templates we will introduce are [post-processors](https://www.packer.io/docs/post-processors/index.html),
+    which allow you to perform actions once your machine image has been provisioned
+    and built.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Post-processors can be used for a variety of different use cases that are outside
+    the scope of this book, however one simple example of a post-processor that I
+    like to use is the [Manifest post-processor](https://www.packer.io/docs/post-processors/manifest.html),
+    which outputs a JSON file listing all artifacts that Packer produces. This output
+    can be very useful when you create continuous delivery pipelines that first build
+    your Packer images, and then need to test and deploy your images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this scenario, a manifest file can be used as an output artifact of your
+    Packer build, describing the regions and AMI identifiers associated with your
+    new machine image, and as an example used as an input into a CloudFormation template
+    that deploys your new machine image into a test environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following example demonstrates adding a manifest post-processor to your
+    Packer template:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Defining a manifest post-processor
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see in the preceding example, the manifest post-processor if very
+    simple - the `output` parameter specifies the name of the file that the manifest
+    will be written to locally, while the `strip_path` parameter strips any local
+    filesystem path information for any built artifacts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a machine image
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: At this point, you have created a simple Packer image that performs not too
+    much in the way of customization, but nevertheless is a complete template that
+    is ready to build.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before you can actually run the build, you need to ensure your local environment
+    is configured correctly for the build to complete successfully. Recall in the
+    previous example, you defined variables for your template that reference environment
+    variables that configure your AWS credentials, and a common approach here would
+    be to set your local AWS access key ID and secret access key as environment variables.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In our use case however, I have assumed you are working with the best practice
+    approach of using the multi-factor authentication introduced in earlier chapters,
+    and hence your template is configured to use temporary session credentials as
+    evidenced by the `aws_session_token` input variable that need to be dynamically
+    generated and injected into your local environment before running your Packer
+    build.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generating dynamic session credentials
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To generate temporary session credentials, assuming you have configured an
+    appropriate profile using the `AWS_PROFILE` environment variable, you can run
+    the `aws sts assume-role` command to generate credentials:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Generating temporary session credentials
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, notice that you can use bash substitutions to dynamically
+    obtain the `role_arn` and `role_session_name` parameters from your AWS CLI profile
+    using the `aws configure get <parameter>` command, which are required inputs when
+    generating temporary session credentials.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The output from the preceding example includes a credentials object that includes
+    the following values that are mapped to the environment variables referenced in
+    your Packer template:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**AccessKeyId**: This value is exported as the `AWS_ACCESS_KEY_ID` environment
+    variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**SecretAccessKey**: This value is exported as the `AWS_SECRET_ACCESS_KEY`
+    environment variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**SessionToken**: This value is exported as the `AWS_SESSION_TOKEN` environment
+    variable'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Automating generation of dynamic session credentials
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Although you can use the approach demonstrated in the preceding example to
+    generate temporary session credentials as required, this approach will become
+    tiresome very quickly. There are many ways you can automate the injection of the
+    generated temporary session credentials into your environment, but given this
+    book uses Make as an automation tool, The following example demonstrates how you
+    can do this using a reasonably simple Makefile:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Generating temporary session credentials automatically using MakeEnsure all
+    indentation in your Makefile is performed using tabs rather than spaces.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding example, notice the introduction of a directive called `.ONESHELL`.
+    This directive configures Make to spawn a single shell for all commands defined
+    in a given Make recipe, meaning bash variable assignments and environment settings
+    can be reused across multiple lines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `build` task conditionally calls a function named `assume_role` if the current
+    environment is configured with `AWS_PROFILE`, and this approach is useful as it
+    means if you were running this Makefile on a build agent that was configured to
+    obtain AWS credentials in a different manner, the dynamic generation of temporary
+    session credentials would not take place.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a command is prefixed with the `@` symbol in a Makefile, the executed command
+    will not output to stdout, and instead only the output of the command will be
+    displayed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `assume_role` function uses an advanced JMESPath query expression (as specified
+    by the `--query` flag) to generate a set of `export` statements that reference
+    the various properties on the **Credentials** dictionary output of the command
+    you ran in the previous example and assign the values to the relevant environment
+    variables using the JMESPath join function ([http://jmespath.readthedocs.io/en/latest/specification.html#join](http://jmespath.readthedocs.io/en/latest/specification.html#join)).
+    This is wrapped in a command substitution, with the `eval` command used to execute
+    each output `export` statement. Don't worry too much if you don't understand this
+    query, but recognise that the AWS CLI does include a powerful query syntax that
+    can create some quite sophisticated one liners.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note in the preceding example that you can use back ticks ([PRE7]
+  prefs: []
+  type: TYPE_NORMAL
+- en: export AWS_PROFILE=docker-in-aws
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: make build
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: 'Enter MFA code for arn:aws:iam::385605022855:mfa/justin.menga: ******'
+  prefs: []
+  type: TYPE_NORMAL
+- en: packer build packer.json
+  prefs: []
+  type: TYPE_NORMAL
+- en: amazon-ebs output will be in this color.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Prevalidating AMI Name: docker-in-aws-ecs 1518934269'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Found Image ID: ami-5e414e24'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Creating temporary keypair: packer_5a8918fd-018d-964f-4ab3-58bff320ead5'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Creating temporary security group for this instance: packer_5a891904-2c84-aca1-d368-8309f215597d'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Authorizing access to port 22 from 0.0.0.0/0 in the temporary
+    security group...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Launching a source AWS instance...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Adding tags to source instance'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Adding tag: "Name": "Packer Builder"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Instance ID: i-04c150456ac0748aa'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Waiting for instance (i-04c150456ac0748aa) to become ready...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Waiting for SSH to become available...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Connected to SSH!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Provisioning with shell script: /var/folders/s4/1mblw7cd29s8xc74vr3jdmfr0000gn/T/packer-shell190211980'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Loaded plugins: priorities, update-motd, upgrade-helper'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Resolving Dependencies'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: --> Running transaction check'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package elfutils-libelf.x86_64 0:0.163-3.18.amzn1 will be
+    updated'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package elfutils-libelf.x86_64 0:0.168-8.19.amzn1 will be
+    an update'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package python27.x86_64 0:2.7.12-2.121.amzn1 will be updated'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package python27.x86_64 0:2.7.13-2.122.amzn1 will be an update'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package python27-libs.x86_64 0:2.7.12-2.121.amzn1 will be
+    updated'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ---> Package python27-libs.x86_64 0:2.7.13-2.122.amzn1 will be
+    an update'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: --> Finished Dependency Resolution'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Dependencies Resolved'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ================================================================================'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Package Arch Version Repository Size'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ================================================================================'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Updating:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: elfutils-libelf x86_64 0.168-8.19.amzn1 amzn-updates 313 k'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: python27 x86_64 2.7.13-2.122.amzn1 amzn-updates 103 k'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: python27-libs x86_64 2.7.13-2.122.amzn1 amzn-updates 6.8 M'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Transaction Summary'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: ================================================================================'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Upgrade 3 Packages'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Total download size: 7.2 M'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Downloading packages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: --------------------------------------------------------------------------------'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Total 5.3 MB/s | 7.2 MB 00:01'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Running transaction check'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Running transaction test'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Transaction test succeeded'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Running transaction'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Updating : python27-2.7.13-2.122.amzn1.x86_64 1/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Updating : python27-libs-2.7.13-2.122.amzn1.x86_64 2/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Updating : elfutils-libelf-0.168-8.19.amzn1.x86_64 3/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Cleanup : python27-2.7.12-2.121.amzn1.x86_64 4/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Cleanup : python27-libs-2.7.12-2.121.amzn1.x86_64 5/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Cleanup : elfutils-libelf-0.163-3.18.amzn1.x86_64 6/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : python27-libs-2.7.13-2.122.amzn1.x86_64 1/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : elfutils-libelf-0.168-8.19.amzn1.x86_64 2/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : python27-2.7.13-2.122.amzn1.x86_64 3/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : python27-libs-2.7.12-2.121.amzn1.x86_64 4/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : elfutils-libelf-0.163-3.18.amzn1.x86_64 5/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Verifying : python27-2.7.12-2.121.amzn1.x86_64 6/6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Updated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: elfutils-libelf.x86_64 0:0.168-8.19.amzn1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: python27.x86_64 0:2.7.13-2.122.amzn1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: python27-libs.x86_64 0:2.7.13-2.122.amzn1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Complete!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Stopping the source instance...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Stopping instance, attempt 1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Waiting for the instance to stop...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Creating the AMI: docker-in-aws-ecs 1518934269'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: AMI: ami-57415b2d'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Waiting for AMI to become ready...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Adding tags to AMI (ami-57415b2d)...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Tagging snapshot: snap-0bc767fd982333bf8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Tagging snapshot: snap-0104c1a352695c1e9'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Creating AMI tags'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Adding tag: "SourceAMI": "ami-5e414e24"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Adding tag: "DockerVersion": "17.09.1-ce"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Adding tag: "ECSAgentVersion": "1.17.0-2"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'amazon-ebs: Adding tag: "Name": "Docker in AWS ECS Base Image 2017.09.h"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Creating snapshot tags'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Terminating the source AWS instance...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Cleaning up any extra volumes...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: No volumes to clean up, skipping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Deleting temporary security group...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Deleting temporary keypair...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> amazon-ebs: Running post-processor: manifest'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Build 'amazon-ebs' finished.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '==> Builds finished. The artifacts of successful builds are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--> amazon-ebs: AMIs were created:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'us-east-1: ami-57415b2d'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: cat manifest.json
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builds": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"name": "amazon-ebs",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builder_type": "amazon-ebs",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"build_time": 1518934504,'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"files": null,'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"artifact_id": "us-east-1:ami-57415b2d",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"packer_run_uuid": "db07ccb3-4100-1cc8-f0be-354b9f9b021d"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"last_run_uuid": "db07ccb3-4100-1cc8-f0be-354b9f9b021d"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo manifest.json >> .gitignore
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "amazon-ebs",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"access_key": "{{user `aws_access_key_id`}}",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"secret_key": "{{user `aws_secret_access_key`}}",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"token": "{{user `aws_session_token`}}",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"region": "us-east-1",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"source_ami": "ami-5e414e24",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"instance_type": "t2.micro",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ssh_username": "ec2-user",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"associate_public_ip_address": "true",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ami_name": "docker-in-aws-ecs {{timestamp}}",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"launch_block_device_mappings": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"device_name": "/dev/xvdcy",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"volume_size": 20,'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"volume_type": "gp2",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"delete_on_termination": true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"tags": {'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Name": "Docker in AWS ECS Base Image 2017.09.h",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"SourceAMI": "ami-5e414e24",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"DockerVersion": "17.09.1-ce",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"ECSAgentVersion": "1.17.0-2"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: mkdir -p scripts
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: touch scripts/storage.sh
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: tree
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── Makefile
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── manifest.json
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── packer.json
+  prefs: []
+  type: TYPE_NORMAL
+- en: └── scripts
+  prefs: []
+  type: TYPE_NORMAL
+- en: └── storage.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: 1 directory, 4 files
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'echo "### Configuring Docker Volume Storage ###"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo mkdir -p /data
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo mkfs.ext4 -L docker /dev/xvdcy
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo -e "LABEL=docker\t/data\t\text4\tdefaults,noatime\t0\t0" | sudo tee -a
+    /etc/fstab
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo mount -a
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y install aws-cfn-bootstrap awslogs jq"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/time.sh",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"environment_vars": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"TIMEZONE={{user `timezone`}}"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y install aws-cfn-bootstrap awslogs jq"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure host to use timezone
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'echo "### Setting timezone to $TIMEZONE ###"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo tee /etc/sysconfig/clock << EOF > /dev/null
+  prefs: []
+  type: TYPE_NORMAL
+- en: ZONE="$TIMEZONE"
+  prefs: []
+  type: TYPE_NORMAL
+- en: UTC=true
+  prefs: []
+  type: TYPE_NORMAL
+- en: EOF
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo ln -sf /usr/share/zoneinfo/"$TIMEZONE" /etc/localtime
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use AWS NTP Sync service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "server 169.254.169.123 prefer iburst" | sudo tee -a /etc/ntp.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enable NTP
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: sudo chkconfig ntpd on
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/time.sh",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"environment_vars": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"TIMEZONE={{user `timezone`}}"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/cloudinit.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y install aws-cfn-bootstrap awslogs jq"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Disable cloud-init repo updates or upgrades
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'sudo sed -i -e ''/^repo_update: /{h;s/: .*/: false/};${x;/^$/{s//repo_update:
+    false/;H};x}'' /etc/cloud/cloud.cfg'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'sudo sed -i -e ''/^repo_upgrade: /{h;s/: .*/: none/};${x;/^$/{s//repo_upgrade:
+    none/;H};x}'' /etc/cloud/cloud.cfg'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/time.sh",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"environment_vars": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"TIMEZONE={{user `timezone`}}"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/cloudinit.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y install aws-cfn-bootstrap awslogs jq"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{ "type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/cleanup.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'echo "### Performing final clean-up tasks ###"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo stop ecs
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo docker system prune -f -a
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo service docker stop
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo chkconfig docker off
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo rm -rf /var/log/docker /var/log/ecs/*
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"variables": {...},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"builders": [...],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"provisioners": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/storage.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/time.sh",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"environment_vars": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"TIMEZONE={{user `timezone`}}"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/cloudinit.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"inline": ['
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y -x docker\\* -x ecs\\* update",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"sudo yum -y install aws-cfn-bootstrap awslogs jq"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ']'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "shell",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"script": "scripts/cleanup.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '},'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"type": "file",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"source": "files/firstrun.sh",'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"destination": "/home/ec2-user/firstrun.sh"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '],'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"post-processors": [...]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '}'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure ECS Agent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "ECS_CLUSTER=${ECS_CLUSTER}" > /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure ECS Agent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "ECS_CLUSTER=${ECS_CLUSTER}" > /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set HTTP Proxy URL if provided
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: if [ -n $PROXY_URL ]
+  prefs: []
+  type: TYPE_NORMAL
+- en: then
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo export HTTPS_PROXY=$PROXY_URL >> /etc/sysconfig/docker
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTPS_PROXY=$PROXY_URL >> /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo NO_PROXY=169.254.169.254,169.254.170.2,/var/run/docker.sock >> /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTP_PROXY=$PROXY_URL >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTPS_PROXY=$PROXY_URL >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo NO_PROXY=169.254.169.254 >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: fi
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure ECS Agent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "ECS_CLUSTER=${ECS_CLUSTER}" > /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set HTTP Proxy URL if provided
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: if [ -n $PROXY_URL ]
+  prefs: []
+  type: TYPE_NORMAL
+- en: then
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo export HTTPS_PROXY=$PROXY_URL >> /etc/sysconfig/docker
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTPS_PROXY=$PROXY_URL >> /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo NO_PROXY=169.254.169.254,169.254.170.2,/var/run/docker.sock >> /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTP_PROXY=$PROXY_URL >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo HTTPS_PROXY=$PROXY_URL >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo NO_PROXY=169.254.169.254 >> /etc/awslogs/proxy.conf
+  prefs: []
+  type: TYPE_NORMAL
+- en: fi
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs region
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: sudo tee /etc/awslogs/awscli.conf << EOF > /dev/null
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[plugins]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: cwlogs = cwlogs
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[default]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: region = ${AWS_DEFAULT_REGION}
+  prefs: []
+  type: TYPE_NORMAL
+- en: EOF
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs config
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: sudo tee /etc/awslogs/awslogs.conf << EOF > /dev/null
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[general]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: state_file = /var/lib/awslogs/agent-state
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/dmesg]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/dmesg
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/dmesg
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/messages]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/messages
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/messages
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: datetime_format = %b %d %H:%M:%S
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/docker]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/docker
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/docker
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: datetime_format = %Y-%m-%dT%H:%M:%S.%f
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/ecs/ecs-init.log]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/ecs/ecs-init.log*
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/ecs/ecs-init
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: datetime_format = %Y-%m-%dT%H:%M:%SZ
+  prefs: []
+  type: TYPE_NORMAL
+- en: time_zone = UTC
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/ecs/ecs-agent.log]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/ecs/ecs-agent.log*
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/ecs/ecs-agent
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: datetime_format = %Y-%m-%dT%H:%M:%SZ
+  prefs: []
+  type: TYPE_NORMAL
+- en: time_zone = UTC
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[/var/log/ecs/audit.log]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: file = /var/log/ecs/audit.log*
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_group_name = /${STACK_NAME}/ec2/${AUTOSCALING_GROUP}/var/log/ecs/audit.log
+  prefs: []
+  type: TYPE_NORMAL
+- en: log_stream_name = {instance_id}
+  prefs: []
+  type: TYPE_NORMAL
+- en: datetime_format = %Y-%m-%dT%H:%M:%SZ
+  prefs: []
+  type: TYPE_NORMAL
+- en: time_zone = UTC
+  prefs: []
+  type: TYPE_NORMAL
+- en: EOF
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure ECS Agent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "ECS_CLUSTER=${ECS_CLUSTER}" > /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set HTTP Proxy URL if provided
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs region
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs config
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Start services
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: sudo service awslogs start
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo chkconfig docker on
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo service docker start
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo start ecs
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: '#!/usr/bin/env bash'
+  prefs: []
+  type: TYPE_NORMAL
+- en: set -e
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configure ECS Agent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "ECS_CLUSTER=${ECS_CLUSTER}" > /etc/ecs/ecs.config
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set HTTP Proxy URL if provided
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs region
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write AWS Logs config
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Start services
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Health check
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Loop until ECS agent has registered to ECS cluster
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: echo "Checking ECS agent is joined to ${ECS_CLUSTER}"
+  prefs: []
+  type: TYPE_NORMAL
+- en: until [[ "$(curl --fail --silent http://localhost:51678/v1/metadata | jq '.Cluster
+    // empty' -r -e)" == ${ECS_CLUSTER} ]]
+  prefs: []
+  type: TYPE_NORMAL
+- en: do printf '.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: sleep 5
+  prefs: []
+  type: TYPE_NORMAL
+- en: done
+  prefs: []
+  type: TYPE_NORMAL
+- en: echo "ECS agent successfully joined to ${ECS_CLUSTER}"
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: tree
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: .
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── Makefile
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── files
+  prefs: []
+  type: TYPE_NORMAL
+- en: │   └── firstrun.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── manifest.json
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── packer.json
+  prefs: []
+  type: TYPE_NORMAL
+- en: └── scripts
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── cleanup.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── cloudinit.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: ├── storage.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: └── time.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: 2 directories, 8 files
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: sudo mount
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: proc on /proc type proc (rw,relatime)
+  prefs: []
+  type: TYPE_NORMAL
+- en: sysfs on /sys type sysfs (rw,relatime)
+  prefs: []
+  type: TYPE_NORMAL
+- en: /dev/xvda1 on / type ext4 (rw,noatime,data=ordered)
+  prefs: []
+  type: TYPE_NORMAL
+- en: devtmpfs on /dev type devtmpfs (rw,relatime,size=500292k,nr_inodes=125073,mode=755)
+  prefs: []
+  type: TYPE_NORMAL
+- en: devpts on /dev/pts type devpts (rw,relatime,gid=5,mode=620,ptmxmode=000)
+  prefs: []
+  type: TYPE_NORMAL
+- en: tmpfs on /dev/shm type tmpfs (rw,relatime)
+  prefs: []
+  type: TYPE_NORMAL
+- en: /dev/xvdcy on /data type ext4 (rw,noatime,data=ordered)
+  prefs: []
+  type: TYPE_NORMAL
+- en: none on /proc/sys/fs/binfmt_misc type binfmt_misc (rw,relatime)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: date
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: Wed Feb 21 06:45:40 EST 2018
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo service ntpd status
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: ntpd is running
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: cat /etc/cloud/cloud.cfg
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: 'WARNING: Modifications to this file may be overridden by files in'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: /etc/cloud/cloud.cfg.d
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: If this is set, 'root' will not be able to ssh in and they
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: will get a message to login instead as the default user (ec2-user)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'disable_root: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This will cause the set+update hostname module to not operate (if true)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'preserve_hostname: true'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'datasource_list: [ Ec2, None ]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'repo_upgrade: none'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'repo_upgrade_exclude:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- kernel'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- nvidia*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- cudatoolkit'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'mounts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- [ ephemeral0, /media/ephemeral0 ]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- [ swap, none, swap, sw, "0", "0" ]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: vim:syntax=yaml
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'repo_update: false'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: sudo service docker status
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: docker is stopped
+  prefs: []
+  type: TYPE_NORMAL
+- en: sudo chkconfig --list docker
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: docker 0:off 1:off 2:off 3:off 4:off 5:off 6:off
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: pwd
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: /home/ec2-user
+  prefs: []
+  type: TYPE_NORMAL
+- en: ls
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: firstrun.sh
+  prefs: []
+  type: TYPE_NORMAL
+- en: '```'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Verifying first-run script
+  prefs: []
+  type: TYPE_NORMAL
+- en: At this point, you have successfully verified that your ECS container instance
+    has been built as per your customizations, and you should now terminate the instance
+    from the EC2 console. You will notice that it is in an unconfigured state, your
+    ECS container instance actually can't do much given the Docker service is disabled,
+    and in the next chapter, you will learn how to use CloudFormation to leverage
+    the CloudFormation helper scripts you installed into your custom machine image
+    to configure your ECS container instances at instance creation and leverage the
+    customizations you have created.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned how to build your custom ECS container instance
+    machine image, using the popular open source tool called Packer. You learned how
+    to create a Packer template, and learned about the various sections that make
+    up a template including variables, builders, provisioners, and post-processors.
+    You were able to inject temporary session credentials required to authenticate
+    access to AWS as part of the image build process, using a combination of Packer
+    variables, environment variables, and a dash of Make automation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You successfully introduced a number of build-time customizations into your
+    ECS container instance image, including installing CloudFormation helper scripts
+    and the CloudWatch logs agent, and ensured the system was configured to run the
+    NTP service on startup with the correct time zone. You disabled automatic security
+    updates in the cloud-init configuration, which can cause problems if you are using
+    an HTTP proxy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, you created a first-run script designed to configure your ECS container
+    instances at instance creation and first boot. This script configures ECS cluster
+    membership, enables optional HTTP proxy support, configures the CloudWatch logs
+    agent for Docker and ECS agent system logs, and performs a health check to ensure
+    your instance has initialized successfully.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, you will learn how to use your custom AMI to build an ECS
+    cluster and an associated underlying EC2 autoscaling group, which will help you
+    understand the rationale for the various customizations you performed to your
+    custom machine image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Which section of a Packer template defines the EC2 instance type of the temporary
+    instance used during the Packer build process?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'True/False: Packer requires SSH access to a temporary instance during the Packer
+    build process.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What configuration file format do you use to define a Packer template?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'True/False: You must hardcode your AWS credentials into your Packer template.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'True/False: To capture the AMI ID created by Packer, you must parse the log
+    output of the Packer build process.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the default storage configuration of the ECS-Optimized AMI?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What type of Packer provisioner would you use to write a file to the /etc directory?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You create an EC2 instance from a custom AMI that takes a long time to boot.
+    The AMI is installed in a private subnet with no additional infrastructure configured
+    in the environment. What is a likely cause of the slow boot time?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You can check the following links for more information about the topics covered
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Packer Amazon EBS Builder documentation: [https://www.packer.io/docs/builders/amazon-ebs.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html),
+    [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Amazon ECS-Optimized AMI: [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Getting Started with CloudWatch logs: [https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_GettingStarted.html](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_GettingStarted.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'CloudFormation Helper Scripts Reference: [https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-helper-scripts-reference.html](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-helper-scripts-reference.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Using the ECS CLI: [https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ECS_CLI.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ECS_CLI.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

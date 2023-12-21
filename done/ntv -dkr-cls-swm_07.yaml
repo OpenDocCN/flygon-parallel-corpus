@@ -1,0 +1,1663 @@
+- en: Chapter 7. Scaling Up Your Platform
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 第7章。扩展您的平台
+- en: In this chapter, we're going to extend what we saw in [Chapter 6](ch06.html
+    "Chapter 6. Deploy Real Applications on Swarm"), *Deploy Real Applications on
+    Swarm*. Our goal is to deploy a realistic production-grade Spark cluster on top
+    of Swarm, add storage capacity, launch some Spark jobs and setup monitoring for
+    the underlying infrastructure.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将扩展我们在[第6章](ch06.html "第6章。在Swarm上部署真实应用程序")中所看到的内容，*在Swarm上部署真实应用程序*。我们的目标是在Swarm之上部署一个逼真的生产级别的Spark集群，增加存储容量，启动一些Spark作业，并为基础架构设置监控。
+- en: In order to do that, this chapter is mostly infrastructure-oriented. In fact,
+    we'll see how to coalesce **Libnetwork**, **Flocker**, and **Prometheus** with
+    Swarm.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了做到这一点，本章主要是面向基础架构的。事实上，我们将看到如何将**Libnetwork**、**Flocker**和**Prometheus**与Swarm结合起来。
+- en: For network, we'll use the basic Docker Network overlay system, based on Libnetwork.
+    There are a few great networking plugins out there, such as Weave and others,
+    but either they are not compatible with the new Docker Swarm Mode yet, or they
+    are made obsolete by Swarm-integrated routing mesh mechanisms.
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于网络，我们将使用基本的Docker网络覆盖系统，基于Libnetwork。有一些很棒的网络插件，比如Weave和其他插件，但它们要么还不兼容新的Docker
+    Swarm模式，要么被Swarm集成的路由网格机制所淘汰。
+- en: 'For storage, the situation is more prosperous, because there is much more choice
+    (refer to [https://docs.docker.com/engine/extend/plugins/](https://docs.docker.com/engine/extend/plugins/)).
+    We''ll go with Flocker. Flocker is the *grandfather* of Docker storage, and can
+    be configured with a vast plethora of storage backends, making it one of the best
+    choices for production loads. Scared by Flocker complexity? Unjustified: We''ll
+    see how to set up a multiple nodes Flocker cluster for any usage, in minutes.'
+  id: totrans-4
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 存储方面，情况更加繁荣，因为选择更多（参考[https://docs.docker.com/engine/extend/plugins/](https://docs.docker.com/engine/extend/plugins/)）。我们将选择Flocker。Flocker是Docker存储的*鼻祖*，可以配置各种各样的存储后端，使其成为生产负载的最佳选择之一。对Flocker的复杂性感到害怕吗？这是不必要的：我们将看到如何在几分钟内为任何用途设置多节点Flocker集群。
+- en: For monitoring, finally, we'll introduce Prometheus. It's the most promising
+    among the monitoring systems available for Docker nowadays, and its APIs may be
+    integrated into the Docker engine very soon.
+  id: totrans-5
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，对于监控，我们将介绍Prometheus。它是目前可用于Docker的最有前途的监控系统，其API可能很快就会集成到Docker引擎中。
+- en: 'So, what we''ll cover here:'
+  id: totrans-6
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因此，我们将在这里涵盖什么：
+- en: A Spark example over Swarm, ready for running any Spark job
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 一个准备好运行任何Spark作业的Swarm上的Spark示例
+- en: Automate the installation of Flocker for infrastructures at a scale
+  id: totrans-8
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 自动化安装Flocker以适应规模的基础设施
+- en: Demonstrate how to use Flocker locally
+  id: totrans-9
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 演示如何在本地使用Flocker
+- en: Use Flocker with Swarm Mode
+  id: totrans-10
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在Swarm模式下使用Flocker
+- en: Scale our Spark app
+  id: totrans-11
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 扩展我们的Spark应用程序
+- en: Monitor the health of this infrastructure with Prometheus
+  id: totrans-12
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用Prometheus监控这个基础架构的健康状况
+- en: The Spark example, again
+  id: totrans-13
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 再次介绍Spark示例
+- en: We're going to rearchitect the example of [Chapter 6](ch06.html "Chapter 6. Deploy
+    Real Applications on Swarm"), *Deploy Real Applications on Swarm*, so we'll deploy
+    Spark on Swarm, but this time with a realistic networking and storage setup.
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将重新设计[第6章](ch06.html "第6章。在Swarm上部署真实应用程序")中的示例，*在Swarm上部署真实应用程序*，因此我们将在Swarm上部署Spark，但这次是以逼真的网络和存储设置。
+- en: Spark storage backend usually runs on Hadoop, or on NFS when on filesystem.
+    For jobs not requiring storage, Spark will create local data on workers, but for
+    storage computations, you will need a shared filesystem on each node, which cannot
+    be guaranteed automatically by Docker volume plugins (at least, so far).
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark存储后端通常在Hadoop上运行，或者在文件系统上运行NFS。对于不需要存储的作业，Spark将在工作节点上创建本地数据，但对于存储计算，您将需要在每个节点上使用共享文件系统，这不能通过Docker卷插件自动保证（至少目前是这样）。
+- en: A possibility to achieve that goal on Swarm is to create NFS shares on each
+    Docker host, and then mount them transparently inside service containers.
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在Swarm上实现这个目标的一种可能性是在每个Docker主机上创建NFS共享，然后在服务容器内透明地挂载它们。
+- en: Our focus here is not to illustrate Spark job details and their storage organization,
+    but to introduce an opinionated storage option for Docker and give an idea of
+    how to organize and scale a fairly-complex service on Docker Swarm.
+  id: totrans-17
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的重点不是说明Spark作业的细节和它们的存储组织，而是为Docker引入一种主观的存储选项，并提供如何在Docker Swarm上组织和扩展一个相当复杂的服务的想法。
+- en: Docker plugins
+  id: totrans-18
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: Docker插件
+- en: For a detailed introduction on Docker plugins, we can suggest to read the official
+    documentation pages. Here is a starting point [https://docs.docker.com/engine/extend/](https://docs.docker.com/engine/extend/)and,
+    also, Docker will probably release a tool to get plugins with a single command,
+    refer to [https://docs.docker.com/engine/reference/commandline/plugin_install/](https://docs.docker.com/engine/reference/commandline/plugin_install/).
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 关于Docker插件的详细介绍，我们建议阅读官方文档页面。这是一个起点[https://docs.docker.com/engine/extend/](https://docs.docker.com/engine/extend/)，此外，Docker可能会发布一个工具，通过一个命令获取插件，请参阅[https://docs.docker.com/engine/reference/commandline/plugin_install/](https://docs.docker.com/engine/reference/commandline/plugin_install/)。
+- en: We recommend you to refer to *Extending Docker* book, Packt, if you want to
+    explore how to integrate new features into Docker. The book emphasis is on Docker
+    plugins, volume plugins, network plugins, and how to create your own plugins.
+  id: totrans-20
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果您想探索如何将新功能集成到Docker中，我们建议您参考Packt的*Extending Docker*书籍。该书的重点是Docker插件、卷插件、网络插件以及如何创建自己的插件。
+- en: For Flocker, **ClusterHQ** made available an automated deployment mechanism
+    to deploy a Flocker cluster on AWS with **CloudForm** templates, which you can
+    install using the **Volume Hub**. For registering and starting such a cluster,
+    go to [https://flocker-docs.clusterhq.com/en/latest/docker-integration/cloudformation.html](https://flocker-docs.clusterhq.com/en/latest/docker-integration/cloudformation.html).
+    For a step-by-step explanation of the detailed procedure, refer to Chapter 3 of *Extending
+    Docker*, Packt.
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于Flocker，ClusterHQ提供了一个自动化部署机制，可以使用CloudForm模板在AWS上部署Flocker集群，您可以使用Volume
+    Hub安装。要注册和启动这样一个集群，请访问[https://flocker-docs.clusterhq.com/en/latest/docker-integration/cloudformation.html](https://flocker-docs.clusterhq.com/en/latest/docker-integration/cloudformation.html)。有关详细过程的逐步解释，请参阅*Extending
+    Docker*的第3章，Packt。
+- en: Here we'll go manually, because we must integrate Flocker and Swarm.
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们将手动进行，因为我们必须集成Flocker和Swarm。
+- en: The lab
+  id: totrans-23
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 实验室
+- en: In this tutorial, we'll create the infrastructure on AWS. Ideally, for a production
+    environment, you would setup three or five Swarm managers and some workers, and
+    eventually add new worker nodes later depending on the load.
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本教程中，我们将在AWS上创建基础架构。理想情况下，对于生产环境，您将设置三个或五个Swarm管理器和一些工作节点，并根据负载情况随后添加新的工作节点。
+- en: Here we'll setup a Swarm cluster with three Swarm managers, six Swarm workers
+    and one Flocker control node with Machine, and won't add new workers.
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们将使用三个Swarm管理器、六个Swarm工作节点和一个带有Machine的Flocker控制节点设置一个Swarm集群，并不会添加新的工作节点。
+- en: Installing Flocker requires several manual steps, which can be automated (as
+    we'll see). So, to make the example as less complex as possible, we'll run all
+    these commands initially, in linear order, without repeating procedures to increase
+    the system capacity.
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 安装Flocker需要进行几个手动步骤，这些步骤可以自动化（正如我们将看到的）。因此，为了尽可能地减少示例的复杂性，我们将最初按线性顺序运行所有这些命令，而不重复程序以增加系统容量。
+- en: If you don't like Ansible, you can easily adapt the flow to your favorite tool,
+    be it **Puppet**, **Salt**, **Chef** or others.
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果您不喜欢Ansible，您可以轻松地将流程调整为您喜欢的工具，无论是Puppet、Salt、Chef还是其他工具。
+- en: A unique key
+  id: totrans-28
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 一个独特的关键
+- en: For simplicity, we will install our lab using an SSH key generated ad hoc, and
+    we'll install Docker Machines with this key copied to the host in `authorized_keys`.
+    The goal is to have a unique key to authenticate Ansible later, that we'll use
+    to automate the many steps that we should otherwise perform manually.
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为简单起见，我们将使用特定生成的SSH密钥安装我们的实验室，并将此密钥复制到`authorized_keys`中的主机上安装Docker Machines。目标是拥有一个唯一的密钥来验证后续使用的Ansible，我们将使用它来自动化许多我们否则应该手动执行的步骤。
+- en: 'So, we start by generating a `flocker` key and we''ll put it into the `keys/`
+    directory:'
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因此，我们首先生成一个`flocker`密钥，并将其放入`keys/`目录：
+- en: '[PRE0]'
+  id: totrans-31
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: Docker Machine
+  id: totrans-32
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: Docker Machine
+- en: 'To provision our Docker hosts, we''ll go with Docker Machine. These are the
+    system details for this tutorial:'
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了配置我们的Docker主机，我们将使用Docker Machine。这是本教程的系统详细信息：
+- en: 'AWS instances will be called from aws-101 to aws-110\. This standardized naming
+    will be important later when we''ll need to generate and create node certificates
+    for Flocker:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: AWS实例将被命名为aws-101到aws-110。这种标准化的命名在以后生成和创建Flocker节点证书时将非常重要：
+- en: Nodes aws-101, 102, 103 will our Swarm managers
+  id: totrans-35
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 节点aws-101、102、103将成为我们的Swarm管理器
+- en: Node aws-104 will be the Flocker control node
+  id: totrans-36
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 节点aws-104将成为Flocker控制节点
+- en: Nodes from aws-105 to aws-110 will be our Swarm workers.
+  id: totrans-37
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 从aws-105到aws-110的节点将成为我们的Swarm工作节点。
+- en: The instance type will be `t2.medium` (2 vCPUs, 4G memory, EBS storage)
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 实例类型将是`t2.medium`（2个vCPU，4G内存，EBS存储）
+- en: The flavor will be Ubuntu 14.04 Trusty (specified with the `--amazonec2-ami`
+    parameter)
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 口味将是Ubuntu 14.04 Trusty（使用`--amazonec2-ami`参数指定）
+- en: The security group will be the standard `docker-machine` (we'll summarize the
+    requirements again in a few seconds)
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 安全组将是标准的`docker-machine`（我们将在几秒钟内再次总结要求）
+- en: The Flocker version will be 1.15.
+  id: totrans-41
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Flocker版本将是1.15。
+- en: The exact AMI ID to use can be searched on [https://cloud-images.ubuntu.com/locator/ec2/](https://cloud-images.ubuntu.com/locator/ec2/).
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要使用的确切AMI ID可以在[https://cloud-images.ubuntu.com/locator/ec2/](https://cloud-images.ubuntu.com/locator/ec2/)上搜索。
+- en: The AWS calculator computes this setup's cost to roughly 380$ monthly, storage
+    usage excluded.
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: AWS计算器计算出这个设置的成本大约是每月380美元，不包括存储使用。
+- en: '![Docker Machine](images/image_07_001.jpg)'
+  id: totrans-44
+  prefs: []
+  type: TYPE_IMG
+  zh: '![Docker Machine](images/image_07_001.jpg)'
+- en: 'So, we create the infrastructure:'
+  id: totrans-45
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因此，我们创建基础设施：
+- en: '[PRE1]'
+  id: totrans-46
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: and running.
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 并运行。
+- en: After some time, we'll have it up and running.
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 过一段时间，我们将使其运行起来。
+- en: Security groups
+  id: totrans-49
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 安全组
+- en: 'Additionally, we''ll need open three additional new ports in the security Group
+    used for this project (`docker-machine`) in the EC2 console. There are ports used
+    by Flocker services:'
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，我们还需要在用于此项目的安全组（`docker-machine`）中在EC2控制台中打开三个额外的新端口。这些是Flocker服务使用的端口：
+- en: Port `4523/tcp`
+  id: totrans-51
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 端口`4523/tcp`
+- en: Port `4524/tcp`
+  id: totrans-52
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 端口`4524/tcp`
+- en: 'Also, the following is a port used by Swarm:'
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，以下是Swarm使用的端口：
+- en: Port `2377/tcp`![Security groups](images/image_07_003.jpg)
+  id: totrans-54
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 端口`2377/tcp`![安全组](images/image_07_003.jpg)
+- en: Networking configuration
+  id: totrans-55
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 网络配置
+- en: We use a standard configuration with an additional overlay network, called **Spark**.
+    Traffic data will pass through the spark network, making it possible to extend
+    the lab configuration with new hosts and workers running even on other providers,
+    such as **DigitalOcean** or **OpenStack**. When new Swarm workers join this cluster,
+    this network is propagated to them and made available for Swarm services.
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用标准配置和额外的覆盖网络，称为**Spark**。流量数据将通过spark网络传递，这样就可以通过新的主机和工作节点扩展实验室配置，甚至在其他提供商（如**DigitalOcean**或**OpenStack**）上运行。当新的Swarm工作节点加入此集群时，此网络将传播到它们，并对Swarm服务进行提供。
+- en: Storage configuration and architecture
+  id: totrans-57
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 存储配置和架构
+- en: 'As mentioned, we chose Flocker ([https://clusterhq.com/flocker/introduction/](https://clusterhq.com/flocker/introduction/)),
+    which is among the top Docker storage projects. ClusterHQ describes it as:'
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如前面提到的，我们选择了Flocker（[https://clusterhq.com/flocker/introduction/](https://clusterhq.com/flocker/introduction/)），它是顶级的Docker存储项目之一。ClusterHQ将其描述为：
+- en: '*Flocker is an open-source container data volume manager for your Dockerized
+    applications. By providing tools for data migrations, Flocker gives the ops teams
+    the tools they need to run containerized stateful services such as databases in
+    production. Unlike a Docker data volume that is tied to a single server, a Flocker
+    data volume, called a dataset, is portable and can be used with any container
+    in your cluster.*'
+  id: totrans-59
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+  zh: '*Flocker是一个为您的Docker化应用程序提供容器数据卷管理的开源工具。通过提供数据迁移工具，Flocker为运维团队提供了在生产环境中运行容器化有状态服务（如数据库）所需的工具。与绑定到单个服务器的Docker数据卷不同，称为数据集的Flocker数据卷是可移植的，并且可以与集群中的任何容器一起使用。*'
+- en: Flocker supports a very wide set of storage options, from AWS EBS to EMC, NetApp,
+    Dell, Huawei solutions, to OpenStack Cinder and Ceph, just to mention some.
+  id: totrans-60
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Flocker支持非常广泛的存储选项，从AWS EBS到EMC、NetApp、戴尔、华为解决方案，再到OpenStack Cinder和Ceph等。
+- en: 'Its design is straightforward: Flocker has a **control node**, which exposes
+    its service APIs to manage the Flocker cluster and Flocker volumes, and a **Flocker
+    Agent** alongside with the Docker plugin runs on each **node** of the cluster.'
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 它的设计很简单：Flocker有一个**控制节点**，它暴露其服务API以管理Flocker集群和Flocker卷，以及一个**Flocker代理**，与Docker插件一起在集群的每个**节点**上运行。
+- en: '![Storage configuration and architecture](images/image_07_004.jpg)'
+  id: totrans-62
+  prefs: []
+  type: TYPE_IMG
+  zh: '![存储配置和架构](images/image_07_004.jpg)'
+- en: 'To use Flocker, at the command line, you would need to run something like this
+    with Docker to read or write stateful data on a Flocker `myvolume` volume mounted
+    as `/data` inside the container:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要使用Flocker，在命令行上，您需要运行类似以下的Docker命令来读取或写入Flocker `myvolume`卷上的有状态数据，该卷被挂载为容器内的`/data`：
+- en: '[PRE2]'
+  id: totrans-64
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'Also, you can manage volume with the `docker volume` command:'
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，您可以使用`docker volume`命令管理卷：
+- en: '[PRE3]'
+  id: totrans-66
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: In this tutorial architecture, we'll install the Flocker control node on aws-104,
+    that will be hence dedicated, and flocker agents on all nodes (node-104 included).
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本教程架构中，我们将在aws-104上安装Flocker控制节点，因此将专用，以及在所有节点（包括node-104）上安装flocker代理。
+- en: Also, we'll install the Flocker client that used to interact with the Flocker
+    control node APIs in order to manage the cluster status and volumes. For our convenience,
+    we'll also use it from aws-104.
+  id: totrans-68
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，我们将安装Flocker客户端，用于与Flocker控制节点API交互，以管理集群状态和卷。为了方便起见，我们还将从aws-104上使用它。
+- en: Installing Flocker
+  id: totrans-69
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 安装Flocker
+- en: 'A series of operations are necessary to get a running Flocker cluster:'
+  id: totrans-70
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 需要一系列操作才能运行Flocker集群：
+- en: Install the `flocker-ca` utility to generate certificates.
+  id: totrans-71
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 安装`flocker-ca`实用程序以生成证书。
+- en: Generate the authority certificate.
+  id: totrans-72
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成授权证书。
+- en: Generate the control node certificate.
+  id: totrans-73
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成控制节点证书。
+- en: Generate the node certificates, one per node.
+  id: totrans-74
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为每个节点生成节点证书。
+- en: Generate the flocker plugin certificate.
+  id: totrans-75
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成flocker插件证书。
+- en: Generate the client certificate.
+  id: totrans-76
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成客户端证书。
+- en: Install some software from packages.
+  id: totrans-77
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 从软件包安装一些软件。
+- en: Distribute certificates to the Flocker cluster.
+  id: totrans-78
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 向Flocker集群分发证书。
+- en: Configure the installation, adding the main configuration file, `agent.yml`.
+  id: totrans-79
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 配置安装，添加主配置文件`agent.yml`。
+- en: Configure the packet filter on hosts.
+  id: totrans-80
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在主机上配置数据包过滤器。
+- en: Start and restart system services.
+  id: totrans-81
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 启动和重新启动系统服务。
+- en: You can execute them manually on a small cluster, but they are repetitive and
+    tedious, so we'll illustrate the procedure using some self-explanatory Ansible
+    playbooks published to [https://github.com/fsoppelsa/ansible-flocker](https://github.com/fsoppelsa/ansible-flocker).
+  id: totrans-82
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以在小集群上手动执行它们，但它们是重复和乏味的，因此我们将使用一些自解释的Ansible playbook来说明该过程，这些playbook已发布到[https://github.com/fsoppelsa/ansible-flocker](https://github.com/fsoppelsa/ansible-flocker)。
+- en: 'These plays are trivial and probably not production ready. There are also the
+    official ClusterHQ playbooks for Flocker roles (refer to [https://github.com/ClusterHQ/ansible-role-flocker](https://github.com/ClusterHQ/ansible-role-flocker)),
+    but for the linearity of the explanation, we''ll use the first repository, so
+    let''s clone it:'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些playbook可能很简单，可能还不够成熟。还有官方的ClusterHQ Flocker角色playbook（参考[https://github.com/ClusterHQ/ansible-role-flocker](https://github.com/ClusterHQ/ansible-role-flocker)），但为了解释的连贯性，我们将使用第一个存储库，所以让我们克隆它：
+- en: '[PRE4]'
+  id: totrans-84
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: Generating Flocker certificates
+  id: totrans-85
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 生成Flocker证书
+- en: For certificate generation, the `flocker-ca` utility is required. Instructions
+    on how to install it are available at [https://docs.clusterhq.com/en/latest/flocker-standalone/install-client.html](https://docs.clusterhq.com/en/latest/flocker-standalone/install-client.html).
+    For Linux distributions, it's a matter of installing a package. On Mac OS X, instead,
+    the tool can be pulled using Python's `pip` utility.
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于证书生成，需要`flocker-ca`实用程序。有关如何安装它的说明，请访问[https://docs.clusterhq.com/en/latest/flocker-standalone/install-client.html](https://docs.clusterhq.com/en/latest/flocker-standalone/install-client.html)。对于Linux发行版，只需安装一个软件包。而在Mac
+    OS X上，可以使用Python的`pip`实用程序来获取该工具。
+- en: '**On Ubuntu**:'
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**在Ubuntu上**：'
+- en: '[PRE5]'
+  id: totrans-88
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: '**On Mac OS X**:'
+  id: totrans-89
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**在Mac OS X上**：'
+- en: '[PRE6]'
+  id: totrans-90
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'Once in possess of this tool, we generate the required certificates. To make
+    the things simple, we''ll create the following certificate structure:'
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦拥有此工具，我们生成所需的证书。为了简化事情，我们将创建以下证书结构：
+- en: 'A directory `certs/` including all certificates and keys:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 包括所有证书和密钥的目录`certs/`：
+- en: '`cluster.crt` and `.key` are the authority certificate and key'
+  id: totrans-93
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`cluster.crt`和`.key`是授权证书和密钥'
+- en: '`control-service.crt` and `.key` are the control node certificate and key'
+  id: totrans-94
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`control-service.crt`和`.key`是控制节点证书和密钥'
+- en: '`plugin.crt` and `.key` are the Docker Flocker plugin certificate and key'
+  id: totrans-95
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`plugin.crt`和`.key`是Docker Flocker插件证书和密钥'
+- en: '`client.crt` and `.key` are the Flocker client certificate and key'
+  id: totrans-96
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`client.crt`和`.key`是Flocker客户端证书和密钥'
+- en: From `node-aws-101.crt` and `.key` to `node-aws-110.crt` and `.key` are the
+    node certificates and keys, one per node
+  id: totrans-97
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 从`node-aws-101.crt`和`.key`到`node-aws-110.crt`和`.key`是节点证书和密钥，每个节点一个
+- en: 'The following are the steps:'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是步骤：
+- en: 'Generate the authority certificate: `flocker-ca initialize cluster`'
+  id: totrans-99
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成授权证书：`flocker-ca initialize cluster`
+- en: 'Once in possess of the authority certificate and key, generate the control
+    node certificate in the same directory: `flocker-ca create-control-certificate
+    aws-101`'
+  id: totrans-100
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 一旦拥有授权证书和密钥，就在同一目录中生成控制节点证书：`flocker-ca create-control-certificate aws-101`
+- en: 'Then generate the plugin certificate: `flocker-ca create-api-certificate plugin`'
+  id: totrans-101
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后生成插件证书：`flocker-ca create-api-certificate plugin`
+- en: 'Then generate the client certificate: `flocker-ca create-api-certificate client`'
+  id: totrans-102
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后生成客户端证书：`flocker-ca create-api-certificate client`
+- en: 'Finally, generate each nodes'' certificate: `flocker-ca create-node-certificate
+    node-aws-X`'
+  id: totrans-103
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，生成每个节点的证书：`flocker-ca create-node-certificate node-aws-X`
+- en: 'Of course, we must cheat and use the `utility/generate_certs.sh` script available
+    in the `ansible-flocker` repository, which will do the work for us:'
+  id: totrans-104
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，我们必须欺骗并使用`ansible-flocker`存储库中提供的`utility/generate_certs.sh`脚本，它将为我们完成工作：
+- en: '[PRE7]'
+  id: totrans-105
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'After this script execution, we now have all our certificates available in
+    `certs/`:'
+  id: totrans-106
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在执行此脚本后，我们现在在`certs/`中有所有我们的证书：
+- en: '![Generating Flocker certificates](images/image_07_005.jpg)'
+  id: totrans-107
+  prefs: []
+  type: TYPE_IMG
+  zh: '![生成Flocker证书](images/image_07_005.jpg)'
+- en: Installing software
+  id: totrans-108
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 安装软件
+- en: 'On each Flocker node, we must perform the following steps:'
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在每个Flocker节点上，我们必须执行以下步骤：
+- en: Add the ClusterHQ Ubuntu repository to the APT source list.
+  id: totrans-110
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将ClusterHQ Ubuntu存储库添加到APT源列表中。
+- en: Update the packages cache.
+  id: totrans-111
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 更新软件包缓存。
+- en: 'Install these packages:'
+  id: totrans-112
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 安装这些软件包：
+- en: '`clusterhq-python-flocker`'
+  id: totrans-113
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`clusterhq-python-flocker`'
+- en: '`clusterhq-flocker-node`'
+  id: totrans-114
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`clusterhq-flocker-node`'
+- en: '`clusterhq-flocker-docker-plugin`'
+  id: totrans-115
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`clusterhq-flocker-docker-plugin`'
+- en: Create a directory `/etc/flocker`.
+  id: totrans-116
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 创建目录`/etc/flocker`。
+- en: Copy the Flocker configuration file `agent.yml` to `/etc/flocker`.
+  id: totrans-117
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将Flocker配置文件`agent.yml`复制到`/etc/flocker`。
+- en: Copy the certificates appropriate for that node to `/etc/flocker`.
+  id: totrans-118
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将适用于该节点的证书复制到`/etc/flocker`。
+- en: Configure security by enabling **ufw**, and opening TCP ports `2376`, `2377`,
+    `4523`, `4524`.
+  id: totrans-119
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 通过启用**ufw**配置安全性，并打开TCP端口`2376`、`2377`、`4523`、`4524`。
+- en: Start the system services.
+  id: totrans-120
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 启动系统服务。
+- en: Restart the docker daemon.
+  id: totrans-121
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 重新启动docker守护程序。
+- en: Once again, we love the machines to work for us, so let's setup this with Ansible
+    while we have a coffee.
+  id: totrans-122
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 再一次，我们喜欢让机器为我们工作，所以让我们在喝咖啡的时候用Ansible设置这个。
+- en: 'But, before, we must specify who will be the Flocker control node and who the
+    bare nodes, so we fill in the `inventory` file with the host IPs of nodes. The
+    file is in `.ini` format, and what''s required is just to specify the list of
+    nodes:'
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 但是，在此之前，我们必须指定谁将是Flocker控制节点，谁将是裸节点，因此我们在`inventory`文件中填写节点的主机IP。该文件采用`.ini`格式，所需的只是指定节点列表：
+- en: '![Installing software](images/image_07_006.jpg)'
+  id: totrans-124
+  prefs: []
+  type: TYPE_IMG
+  zh: '![安装软件](images/image_07_006.jpg)'
+- en: 'Then, we create the directory from where Ansible will take files, certificates,
+    and configurations to copy to the nodes:'
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们创建一个目录，Ansible将从中获取文件、证书和配置，然后复制到节点上：
+- en: '[PRE8]'
+  id: totrans-126
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'We now copy all our certificates we created previously, from the `certs/` directory
+    to `files/`:'
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们将之前创建的所有证书从`certs/`目录复制到`files/`中：
+- en: '[PRE9]'
+  id: totrans-128
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'Finally, we define the Flocker configuration file in `files/agent.yml` with
+    the following content, adapting the AWS region and modifying `hostname`, `access_key_id`,and
+    `secret_access_key`:'
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，我们在`files/agent.yml`中定义Flocker配置文件，内容如下，调整AWS区域并修改`hostname`、`access_key_id`和`secret_access_key`：
+- en: '[PRE10]'
+  id: totrans-130
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: This is the core Flocker configuration file, which will be in `/etc/flocker`
+    on every node. Here, you specify and configure the credentials of the backend
+    of choice. In our case, we go with the basic AWS option, EBS, so we include our
+    AWS credentials.
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是核心的Flocker配置文件，将在每个节点的`/etc/flocker`中。在这里，您可以指定和配置所选后端的凭据。在我们的情况下，我们选择基本的AWS选项EBS，因此我们包括我们的AWS凭据。
+- en: With inventory, `agent.yml` and all certificates ready in `files/`, we can proceed.
+  id: totrans-132
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了清单、`agent.yml`和所有凭据都准备好在`files/`中，我们可以继续了。
+- en: Installing the control node
+  id: totrans-133
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 安装控制节点
+- en: 'The playbook to install the control node is `flocker_control_install.yml`.
+    This play executes a software installation script, copies the cluster certificate,
+    the control node certificate and key, the node certificate and key, the client
+    certificate and key, the plugin certificate and key, configures the firewall opening
+    ports for SSH, Docker and Flocker, and starts these system services:'
+  id: totrans-134
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 安装控制节点的playbook是`flocker_control_install.yml`。此play执行软件安装脚本，复制集群证书、控制节点证书和密钥、节点证书和密钥、客户端证书和密钥、插件证书和密钥，配置防火墙打开SSH、Docker和Flocker端口，并启动这些系统服务：
+- en: '`flocker-control`'
+  id: totrans-135
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`flocker-control`'
+- en: '`flocker-dataset-agent`'
+  id: totrans-136
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`flocker-dataset-agent`'
+- en: '`flocker-container-agent`'
+  id: totrans-137
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`flocker-container-agent`'
+- en: '`flocker-docker-plugin`'
+  id: totrans-138
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`flocker-docker-plugin`'
+- en: Finally, it refreshes the `docker` service, restarting it.
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，刷新`docker`服务，重新启动它。
+- en: 'Let''s run it:'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们运行它：
+- en: '[PRE11]'
+  id: totrans-141
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: Installing the cluster nodes
+  id: totrans-142
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 安装集群节点
+- en: 'Similarly, we install the other nodes with another playbook, `flocker_nodes_install.yml`:'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 类似地，我们使用另一个playbook `flocker_nodes_install.yml` 安装其他节点：
+- en: '[PRE12]'
+  id: totrans-144
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: The steps are more or less the same as before, except that this playbook doesn't
+    copy some certificates and doesn't start the `flocker-control` service. Only the
+    Flocker agent and Flocker Docker plugin services run there. We wait for some time
+    until Ansible exits.
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 步骤与以前大致相同，只是这个playbook不复制一些证书，也不启动`flocker-control`服务。只有Flocker代理和Flocker Docker插件服务在那里运行。我们等待一段时间直到Ansible退出。
+- en: '![Installing the cluster nodes](images/image_07_007.jpg)'
+  id: totrans-146
+  prefs: []
+  type: TYPE_IMG
+  zh: '![安装集群节点](images/image_07_007.jpg)'
+- en: Testing whether everything is up and running
+  id: totrans-147
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 测试一切是否正常运行
+- en: 'To check that Flocker is installed correctly, we now log in to the control
+    node, check that the Flocker plugin is running (alas, it has the `.sock` file),
+    and then we install the `flockerctl` utility (refer to [https://docs.clusterhq.com/en/latest/flocker-features/flockerctl.html](https://docs.clusterhq.com/en/latest/flocker-features/flockerctl.html))
+    with the `curl` command:'
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了检查Flocker是否正确安装，我们现在登录到控制节点，检查Flocker插件是否正在运行（遗憾的是，它有`.sock`文件），然后我们使用`curl`命令安装`flockerctl`实用程序（参考[https://docs.clusterhq.com/en/latest/flocker-features/flockerctl.html](https://docs.clusterhq.com/en/latest/flocker-features/flockerctl.html)）：
+- en: '[PRE13]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: We now set some environment variables used by `flockerctl:`
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们设置一些`flockerctl`使用的环境变量：
+- en: '[PRE14]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'We can now list the nodes and volumes (we still have no volumes yet, of course):'
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在可以列出节点和卷（当然，我们还没有卷）：
+- en: '[PRE15]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: '![Testing whether everything is up and running](images/image_07_008.jpg)'
+  id: totrans-154
+  prefs: []
+  type: TYPE_IMG
+  zh: '![测试一切是否正常运行](images/image_07_008.jpg)'
+- en: 'Now, we can go to another node of the cluster to check the connectivity of
+    the Flocker cluster (especially if the plugin and the agent can reach and authenticate
+    to the control node), say `aws-108`, create a volume and write some data into
+    it:'
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们可以转到集群的另一个节点，检查Flocker集群的连接性（特别是插件和代理是否能够到达并对控制节点进行身份验证），比如`aws-108`，创建一个卷并向其中写入一些数据：
+- en: '[PRE16]'
+  id: totrans-156
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: '![Testing whether everything is up and running](images/image_07_009.jpg)'
+  id: totrans-157
+  prefs: []
+  type: TYPE_IMG
+  zh: '![测试一切是否正常运行](images/image_07_009.jpg)'
+- en: 'If we go back to the control node, `aws-104`, we can verify that volumes with
+    persistent data got created by listing them with the docker and `flockerctl` commands:'
+  id: totrans-158
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们回到控制节点`aws-104`，我们可以通过使用docker和`flockerctl`命令列出它们来验证已创建具有持久数据的卷：
+- en: '[PRE17]'
+  id: totrans-159
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: '![Testing whether everything is up and running](images/image_07_010.jpg)'
+  id: totrans-160
+  prefs: []
+  type: TYPE_IMG
+  zh: '![测试一切是否正常运行](images/image_07_010.jpg)'
+- en: 'Excellent! So now we can remove the exited containers, delete the test volume
+    dataset from Flocker, and then we are ready to install a Swarm:'
+  id: totrans-161
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 太棒了！现在我们可以删除已退出的容器，从Flocker中删除测试卷数据集，然后我们准备安装Swarm：
+- en: '[PRE18]'
+  id: totrans-162
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: Installing and configuring Swarm
+  id: totrans-163
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 安装和配置Swarm
+- en: We can now install a Swarm with our favorite method, as shown in the previous
+    chapters. We'll have **aws-101** to **aws-103** as managers, and the rest of nodes
+    except **aws-104**, workers. This cluster can be expanded even further. For practical
+    things, we'll keep it at 10-nodes size.
+  id: totrans-164
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们可以使用我们喜欢的方法安装Swarm，就像前几章中所示。我们将**aws-101**到**aws-103**作为管理者，除了**aws-104**之外的其他节点作为工作节点。这个集群甚至可以进一步扩展。对于实际的事情，我们将保持在10个节点的规模。
+- en: '![Installing and configuring Swarm](images/image_07_011.jpg)'
+  id: totrans-165
+  prefs: []
+  type: TYPE_IMG
+  zh: '![安装和配置Swarm](images/image_07_011.jpg)'
+- en: 'We now add a dedicated `spark` overlay VxLAN network:'
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们添加一个专用的`spark`覆盖VxLAN网络：
+- en: '[PRE19]'
+  id: totrans-167
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: A volume for Spark
+  id: totrans-168
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 一个用于Spark的卷
+- en: 'We now connect to any Docker host and create a `75G` sized volume to be used
+    to save some persistent Spark data:'
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们连接到任何Docker主机并创建一个`75G`大小的卷，用于保存一些持久的Spark数据：
+- en: '[PRE20]'
+  id: totrans-170
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'The option to discuss here is `profile`. This is a sort of flavor of storage
+    (speed, mostly). As explained in the link [https://docs.clusterhq.com/en/latest/flocker-features/aws-configuration.html#aws-dataset-backend](https://docs.clusterhq.com/en/latest/flocker-features/aws-configuration.html#aws-dataset-backend),
+    ClusterHQ maintains three available profiles for AWS EBS:'
+  id: totrans-171
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这里讨论的选项是 `profile`。这是一种存储的类型（主要是速度）。如链接 [https://docs.clusterhq.com/en/latest/flocker-features/aws-configuration.html#aws-dataset-backend](https://docs.clusterhq.com/en/latest/flocker-features/aws-configuration.html#aws-dataset-backend)
+    中所解释的，ClusterHQ 维护了三种可用的 AWS EBS 配置文件：
+- en: '**Gold**: EBS Provisioned IOPS / API named io1\. Configured for maximum IOPS
+    for its size - 30 IOPS/GB, with a maximum of 20,000 IOPS'
+  id: totrans-172
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 金牌：EBS Provisioned IOPS / API 名称 io1。配置为其大小的最大 IOPS - 30 IOPS/GB，最大为 20,000
+    IOPS
+- en: '**Silver**: EBS General Purpose SSD / API named gp2'
+  id: totrans-173
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 银牌：EBS 通用 SSD / API 名称 gp2
+- en: '**Bronze**: EBS Magnetic / API named standard'
+  id: totrans-174
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 青铜：EBS 磁盘 / API 名称标准
+- en: We can check on the Flocker control node whether this volume was generated,
+    with `flockerctl list`.
+  id: totrans-175
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以在 Flocker 控制节点上检查这个卷是否已生成，使用 `flockerctl list`。
+- en: Deploying Spark, again
+  id: totrans-176
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 再次部署 Spark
+- en: 'We choose a host where we want to run the Spark standalone manager, be `aws-105`,
+    and tag it as such:'
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们选择一个主机来运行 Spark 独立管理器，即 `aws-105`，并将其标记为这样：
+- en: '[PRE21]'
+  id: totrans-178
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: Other nodes will host our Spark workers.
+  id: totrans-179
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 其他节点将托管我们的 Spark 工作节点。
+- en: 'We start the Spark master on `aws-105`:'
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在 `aws-105` 上启动 Spark 主节点：
+- en: '[PRE22]'
+  id: totrans-181
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: First, the image. I discovered that there are some annoying things included
+    into the Google images (such as unsetting some environment variables, so making
+    a configuration from external, with `--env` switches, impossible). Thus, I created
+    myself a pair of Spark 1.6.2 master and worker images.
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先是镜像。我发现 Google 镜像中包含一些恼人的东西（例如取消设置一些环境变量，因此无法使用 `--env` 开关从外部进行配置）。因此，我创建了一对
+    Spark 1.6.2 主节点和工作节点镜像。
+- en: Then,  `--network`. Here we say to this container to attach to the user-defined
+    overlay network called spark.
+  id: totrans-183
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，`--network`。在这里，我们告诉这个容器连接到名为 spark 的用户定义的覆盖网络。
+- en: 'Finally, storage: `--mount`, which works with Docker volumes. We specify it
+    to:'
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，存储：`--mount`，它与 Docker 卷一起使用。我们将其指定为：
+- en: 'Work with a volume: `type=volume`'
+  id: totrans-185
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用卷：`type=volume`
+- en: 'Mount the volume inside the container on `/data`: `target=/data`'
+  id: totrans-186
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在容器内挂载卷到 `/data`：`target=/data`
+- en: 'Use the `spark` volume that we created previously: `source=spark`'
+  id: totrans-187
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用我们之前创建的 `spark` 卷：`source=spark`
+- en: Use Flocker as a `volume-driver`
+  id: totrans-188
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用 Flocker 作为 `volume-driver`
+- en: When you create a service and mount a certain volume, if volume does not exist,
+    it will get created.
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当您创建一个服务并挂载某个卷时，如果卷不存在，它将被创建。
+- en: Note
+  id: totrans-190
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The current releases of Flocker only support replicas of 1\. The reason being
+    that iSCSI/block level mounts cannot be attached across multiple nodes. So only
+    one service can use a volume at a given point of time with replica factor of 1\.
+    This makes Flocker more useful for storing and moving database data (which is
+    what it's used for, especially). But here we'll use it to show a tiny example
+    with persistent data in `/data` in the Spark master container.
+  id: totrans-191
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当前版本的 Flocker 只支持 1 个副本。原因是 iSCSI/块级挂载不能跨多个节点附加。因此，一次只有一个服务可以使用卷，副本因子为 1。这使得
+    Flocker 更适用于存储和移动数据库数据（这是它的主要用途）。但在这里，我们将用它来展示在 Spark 主节点容器中的持久数据的一个小例子。
+- en: 'So, with this configuration, let''s add the workhorses, three Spark workers:'
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因此，根据这个配置，让我们添加三个 Spark 工作节点：
+- en: '[PRE23]'
+  id: totrans-193
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: Here, we pass some environment variables into the container, to limit resources
+    usage to 1 core and 1G of memory per container.
+  id: totrans-194
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们将一些环境变量传递到容器中，以限制每个容器的资源使用量为 1 核心和 1G 内存。
+- en: 'After some minutes, this system is up, we connect to `aws-105`, port `8080`
+    and see this page:'
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 几分钟后，系统启动，我们连接到 `aws-105`，端口 `8080`，并看到这个页面：
+- en: '![Deploying Spark, again](images/image_07_012.jpg)'
+  id: totrans-196
+  prefs: []
+  type: TYPE_IMG
+  zh: 部署Spark，再次
+- en: Testing Spark
+  id: totrans-197
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 测试Spark
+- en: So, we access the Spark shell and run a Spark task to check if things are up
+    and running.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所以，我们访问Spark shell并运行一个Spark任务来检查是否一切正常。
+- en: 'We prepare a container with some Spark utilities, for example, `fsoppelsa/spark-worker`,
+    and run it to compute the value of Pi using the Spark binary `run-example`:'
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们准备一个带有一些Spark实用程序的容器，例如`fsoppelsa/spark-worker`，并运行它来使用Spark二进制文件`run-example`计算Pi的值：
+- en: '[PRE24]'
+  id: totrans-200
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'After a ton of output messages, Spark finishes the computation giving us:'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 经过大量输出消息后，Spark完成计算，给出：
+- en: '[PRE25]'
+  id: totrans-202
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: If we go back to the Spark UI, we can see that our amazing Pi application was
+    successfully completed.
+  id: totrans-203
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们回到Spark UI，我们可以看到我们惊人的Pi应用程序已成功完成。
+- en: '![Testing Spark](images/image_07_013.jpg)'
+  id: totrans-204
+  prefs: []
+  type: TYPE_IMG
+  zh: '![测试Spark](images/image_07_013.jpg)'
+- en: 'More interesting is running an interactive Scala shell connecting to the master
+    to execute Spark jobs:'
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 更有趣的是运行一个连接到主节点执行Spark作业的交互式Scala shell：
+- en: '[PRE26]'
+  id: totrans-206
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: '![Testing Spark](images/image_07_014.jpg)'
+  id: totrans-207
+  prefs: []
+  type: TYPE_IMG
+  zh: '![测试Spark](images/image_07_014.jpg)'
+- en: Using Flocker storage
+  id: totrans-208
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 使用Flocker存储
+- en: Only for the purpose of this tutorial, we now run an example using the spark
+    volume we created previously to read and write some persistent data from Spark.
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 仅用于本教程的目的，我们现在使用之前创建的spark卷来运行一个示例，从Spark中读取和写入一些持久数据。
+- en: 'In order to do that and because of Flocker limitation of the replica factor,
+    we kill the current set of three workers and create a set of only one, mounting
+    spark:'
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了做到这一点，并且由于Flocker限制了副本因子，我们终止当前的三个工作节点集，并创建一个只有一个的集合，挂载spark：
+- en: '[PRE27]'
+  id: totrans-211
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'We now gain the Docker credentials of host `aws-105` with:'
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在获得了主机`aws-105`的Docker凭据：
+- en: '[PRE28]'
+  id: totrans-213
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: We can try to write some data in `/data` by connecting to the Spark master container.
+    In this example, we just save some text data (The content of lorem ipsum, available
+    for example at [http://www.loremipsum.net](http://www.loremipsum.net/) ) to `/data/file.txt`.
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以尝试通过连接到Spark主容器在`/data`中写入一些数据。在这个例子中，我们只是将一些文本数据（lorem ipsum的内容，例如在[http://www.loremipsum.net](http://www.loremipsum.net/)上可用）保存到`/data/file.txt`中。
+- en: '[PRE29]'
+  id: totrans-215
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: '![Using Flocker storage](images/image_07_015.jpg)'
+  id: totrans-216
+  prefs: []
+  type: TYPE_IMG
+  zh: '![使用Flocker存储](images/image_07_015.jpg)'
+- en: 'Then, we connect to the Spark shell to execute a simple Spark job:'
+  id: totrans-217
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们连接到Spark shell执行一个简单的Spark作业：
+- en: Load `file.txt`.
+  id: totrans-218
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 加载`file.txt`。
+- en: Map the words it contains to the number of their occurrences.
+  id: totrans-219
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将其包含的单词映射到它们出现的次数。
+- en: 'Save the result in `/data/output`:'
+  id: totrans-220
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将结果保存在`/data/output`中：
+- en: '[PRE30]'
+  id: totrans-221
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: '![Using Flocker storage](images/image_07_016.jpg)'
+  id: totrans-222
+  prefs: []
+  type: TYPE_IMG
+  zh: '![使用Flocker存储](images/image_07_016.jpg)'
+- en: 'Now, let''s start a `busybox` container on any Spark node and check the content
+    of the `spark` volume, verifying that the output was written. We run the following
+    code:'
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们在任何Spark节点上启动一个`busybox`容器，并检查`spark`卷的内容，验证输出是否已写入。我们运行以下代码：
+- en: '[PRE31]'
+  id: totrans-224
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: '![Using Flocker storage](images/image_07_017.jpg)'
+  id: totrans-225
+  prefs: []
+  type: TYPE_IMG
+  zh: '![使用Flocker存储](images/image_07_017.jpg)'
+- en: The preceding screenshot shows the output, as expected. The interesting thing
+    about Flocker volume is that they can be even moved from one host to another.
+    A number of operations can be done in a reliable way. Flocker is a good idea if
+    one is looking for a good storage solution for Docker. For example, it's used
+    in production by the Swisscom Developer cloud ([http://developer.swisscom.com/](http://developer.swisscom.com/)),
+    which lets you provision databases such as **MongoDB** backed by Flocker technology.
+    Upcoming releases of Flocker will aim at slimming down the Flocker codebase and
+    making it more lean and durable. Items such as built in HA, snapshotting, certificate
+    distribution, and easily deployable agents in containers are some of things that
+    are up next. So, a bright future!
+  id: totrans-226
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的截图显示了预期的输出。关于Flocker卷的有趣之处在于它们甚至可以从一个主机移动到另一个主机。许多操作可以以可靠的方式完成。如果一个人正在寻找Docker的良好存储解决方案，那么Flocker是一个不错的选择。例如，它被Swisscom
+    Developer cloud（[http://developer.swisscom.com/](http://developer.swisscom.com/)）在生产中使用，该云平台可以通过Flocker技术提供**MongoDB**等数据库。即将推出的Flocker版本将致力于精简Flocker代码库，并使其更加精简和耐用。内置HA、快照、证书分发和容器中易于部署的代理等项目是接下来的计划。因此，前景一片光明！
+- en: Scaling Spark
+  id: totrans-227
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 扩展Spark
+- en: 'Now we illustrate the most amazing feature of Swarm Mode--the `scale` command.
+    We restore the configuration we had before trying Flocker, so we destroy the `spark-worker`
+    service and re-create it with a replica factor of `3`:'
+  id: totrans-228
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们来说明Swarm Mode最令人惊奇的功能--`scale`命令。我们恢复了在尝试Flocker之前的配置，因此我们销毁了`spark-worker`服务，并以副本因子`3`重新创建它：
+- en: '[PRE32]'
+  id: totrans-229
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'Now, we scale up the service with `30` Spark workers using the following code:'
+  id: totrans-230
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们使用以下代码将服务扩展到`30`个Spark工作节点：
+- en: '[PRE33]'
+  id: totrans-231
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'After some minutes, necessary to eventually pull the image, we check once again:'
+  id: totrans-232
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 经过几分钟，必要的时间来拉取镜像，我们再次检查：
+- en: '![Scaling Spark](images/image_07_018.jpg)'
+  id: totrans-233
+  prefs: []
+  type: TYPE_IMG
+  zh: '![扩展Spark](images/image_07_018.jpg)'
+- en: 'From the Spark web UI:'
+  id: totrans-234
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 从Spark web UI开始：
+- en: '![Scaling Spark](images/image_07_019.jpg)'
+  id: totrans-235
+  prefs: []
+  type: TYPE_IMG
+  zh: '![扩展Spark](images/image_07_019.jpg)'
+- en: Scale can be used to scale up or down the size of the replicas. So far, still
+    there are no automated mechanisms for auto-scaling or for distributing the load
+    to newly added nodes. But they can be implemented with custom utilities, or we
+    may even expect them to be integrated into Swarm soon day.
+  id: totrans-236
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`scale`可以用来扩展或缩小副本的大小。到目前为止，仍然没有自动扩展或将负载分配给新添加的节点的自动机制。但可以使用自定义工具来实现，或者甚至可以期待它们很快被集成到Swarm中。'
+- en: Monitoring Swarm hosting apps
+  id: totrans-237
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 监控Swarm托管的应用程序
+- en: I (Fabrizio) was following a thread on Reddit ([https://www.reddit.com/r/docker/comments/4zous1/monitoring_containers_under_112_swarm/](https://www.reddit.com/r/docker/comments/4zous1/monitoring_containers_under_112_swarm/))
+    in August 2016, where users complained that the new Swarm Mode is harder to monitor.
+  id: totrans-238
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我（Fabrizio）在2016年8月在Reddit上关注了一个帖子（[https://www.reddit.com/r/docker/comments/4zous1/monitoring_containers_under_112_swarm/](https://www.reddit.com/r/docker/comments/4zous1/monitoring_containers_under_112_swarm/)），用户抱怨新的Swarm
+    Mode更难监控。
+- en: 'If, for now, there are no official Swarm monitoring solutions, one of the most
+    popular combinations of emerging technologies is: Google''s **cAdvisor** to collect
+    data, **Grafana** to show graphs, and **Prometheus** as the data model.'
+  id: totrans-239
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果目前还没有官方的Swarm监控解决方案，那么最流行的新兴技术组合之一是：Google的**cAdvisor**用于收集数据，**Grafana**用于显示图形，**Prometheus**作为数据模型。
+- en: Prometheus
+  id: totrans-240
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: Prometheus
+- en: 'The team at Prometheus describes the product as:'
+  id: totrans-241
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Prometheus团队将该产品描述为：
+- en: '*Prometheus is an open-source systems monitoring and alerting toolkit originally
+    built at SoundCloud.*'
+  id: totrans-242
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+  zh: '*Prometheus是一个最初在SoundCloud构建的开源系统监控和警报工具包。*'
+- en: 'Prometheus''s main features are:'
+  id: totrans-243
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Prometheus的主要特点包括：
+- en: Multi-dimensional data model
+  id: totrans-244
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 多维数据模型
+- en: A flexible query language
+  id: totrans-245
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 灵活的查询语言
+- en: No reliance on distributed storage
+  id: totrans-246
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 不依赖分布式存储
+- en: Time series collection happens via a pull model
+  id: totrans-247
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 时间序列收集是通过拉模型进行的
+- en: Pushing time series is supported via a gateway
+  id: totrans-248
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 通过网关支持推送时间序列
+- en: Multiple modes of graphing and dashboarding support
+  id: totrans-249
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 支持多种图形和仪表板模式
+- en: There is a great presentation on [https://prometheus.io/docs/introduction/overview/](https://prometheus.io/docs/introduction/overview/) that
+    we will not repeat here. The top feature of Prometheus is, in our opinion, the
+    ease of installation and usage. Prometheus itself consists of just a single binary
+    built from Go code, plus a configuration file.
+  id: totrans-250
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在[https://prometheus.io/docs/introduction/overview/](https://prometheus.io/docs/introduction/overview/)上有一个很棒的介绍，我们就不在这里重复了。Prometheus的最大特点，在我们看来，是安装和使用的简单性。Prometheus本身只包括一个从Go代码构建的单个二进制文件，以及一个配置文件。
+- en: Installing a monitoring system
+  id: totrans-251
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 安装监控系统
+- en: Things are probably going to change very soon, so we just sketch a way to set
+    up a monitoring system for Swarm, tried on Docker version 1.12.3.
+  id: totrans-252
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 事情可能很快就会发生变化，所以我们只是勾勒了一种在Docker版本1.12.3上尝试设置Swarm监控系统的方法。
+- en: 'First, we create a new overlay network to not interfere with the `ingress`
+    or `spark` networks, called `monitoring`:'
+  id: totrans-253
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，我们创建一个新的覆盖网络，以免干扰`ingress`或`spark`网络，称为`monitoring`：
+- en: '[PRE34]'
+  id: totrans-254
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: 'Then, we start a cAdvisor service in mode `global`, meaning that a cAdvisor
+    container will run on each Swarm node. We mount some system paths inside the container
+    so that they can be accessed by cAdvisor:'
+  id: totrans-255
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们以`全局`模式启动cAdvisor服务，这意味着每个Swarm节点上都会运行一个cAdvisor容器。我们在容器内挂载一些系统路径，以便cAdvisor可以访问它们：
+- en: '[PRE35]'
+  id: totrans-256
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: 'Then we use `basi/prometheus-swarm` to set up Prometheus:'
+  id: totrans-257
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后我们使用`basi/prometheus-swarm`来设置Prometheus：
+- en: '[PRE36]'
+  id: totrans-258
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'And we add the `node-exporter` service (again `global`, must run on each node):'
+  id: totrans-259
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后我们添加`node-exporter`服务（再次`全局`，必须在每个节点上运行）：
+- en: '[PRE37]'
+  id: totrans-260
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: 'Finally, we start **Grafana** with one replica:'
+  id: totrans-261
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，我们以一个副本启动**Grafana**：
+- en: '[PRE38]'
+  id: totrans-262
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: Importing Prometheus in Grafana
+  id: totrans-263
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 在Grafana中导入Prometheus
+- en: 'When Grafana is available, to get impressive graphs of the Swarm health, we
+    login with these credentials on the node where Grafana runs, port `3000`:'
+  id: totrans-264
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当Grafana可用时，为了获得Swarm健康状况的令人印象深刻的图表，我们使用这些凭据登录Grafana运行的节点，端口为`3000`：
+- en: '[PRE39]'
+  id: totrans-265
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: 'As admins, we click on the Grafana logo, go to **Data Sources**, and add `Prometheus`:'
+  id: totrans-266
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作为管理员，我们点击Grafana标志，转到**数据源**，并添加`Prometheus`：
+- en: '![Importing Prometheus in Grafana](images/image_07_020.jpg)'
+  id: totrans-267
+  prefs: []
+  type: TYPE_IMG
+  zh: '![在Grafana中导入Prometheus](images/image_07_020.jpg)'
+- en: 'Some options will appear, but the mapping is already present, so it''s sufficient
+    to **Save & Test**:'
+  id: totrans-268
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 会出现一些选项，但映射已经存在，所以只需**保存并测试**：
+- en: '![Importing Prometheus in Grafana](images/image_07_021.jpg)'
+  id: totrans-269
+  prefs: []
+  type: TYPE_IMG
+  zh: '![在Grafana中导入Prometheus](images/image_07_021.jpg)'
+- en: 'Now we can go back to the Dashboard and click on **Prometheus**, so we will
+    be presented the Grafana main panel:'
+  id: totrans-270
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以返回仪表板，点击**Prometheus**，这样我们就会看到Grafana的主面板：
+- en: '![Importing Prometheus in Grafana](images/image_07_022.jpg)'
+  id: totrans-271
+  prefs: []
+  type: TYPE_IMG
+  zh: '![在Grafana中导入Prometheus](images/image_07_022.jpg)'
+- en: Once again, we took advantage of what the open source community released, and
+    glued different opinionated technologies with just some simple commands, to get
+    the desired result. Monitoring Docker Swarm and its applications is a field of
+    research that is completely open now, so we can expect an amazing evolution there
+    too.
+  id: totrans-272
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们再次利用了开源社区发布的内容，并用一些简单的命令将不同的技术粘合在一起，以获得期望的结果。监控Docker Swarm及其应用程序是一个完全开放的研究领域，因此我们也可以期待那里的惊人进化。
+- en: Summary
+  id: totrans-273
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, we added storage capacity to a Swarm infrastructure using Flocker,
+    and set a dedicated overlay network to make our example app, a Spark cluster,
+    to work on it and be easily extendible by adding new nodes (also on new providers,
+    such as DigitalOcean). After using our Spark installation and Flocker, we finally
+    introduced Prometheus and Grafana to monitor the Swarm health and status. We will
+    see new additional features that can be plugged into Swarm and how to secure a
+    Swarm infrastructure in the next two chapters.
+  id: totrans-274
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们使用Flocker为Swarm基础架构增加了存储容量，并设置了专用的覆盖网络，使我们的示例应用程序（一个Spark集群）能够在其上运行，并通过添加新节点（也可以是在新的提供者，如DigitalOcean上）轻松扩展。在使用了我们的Spark安装和Flocker之后，我们最终引入了Prometheus和Grafana来监控Swarm的健康和状态。在接下来的两章中，我们将看到可以插入Swarm的新附加功能，以及如何保护Swarm基础架构。

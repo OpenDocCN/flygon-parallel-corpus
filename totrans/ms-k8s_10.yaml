@@ -1,0 +1,1621 @@
+- en: Advanced Kubernetes Networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will examine the important topic of networking. Kubernetes,
+    as an orchestration platform, manages containers/pods running on different machines
+    (physical or virtual) and requires an explicit networking model. We will look
+    at the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Kubernetes networking model
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Standard interfaces that Kubernetes supports, such as EXEC, Kubenet, and, in
+    particular, CNI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Various networking solutions that satisfy the requirements of Kubernetes networking
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Network policies and load balancing options
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Writing a custom CNI plugin
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: At the end of this chapter, you will understand the Kubernetes approach to networking
+    and be familiar with the solution space for aspects such as standard interfaces,
+    networking implementations, and load balancing. You will even be able to write
+    your very own CNI plugin if you wish.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the Kubernetes networking model
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The Kubernetes networking model is based on a flat address space. All pods in
+    a cluster can directly see each other. Each pod has its own IP address. There
+    is no need to configure any NAT. In addition, containers in the same pod share
+    their pod's IP address and can communicate with each other through localhost.
+    This model is pretty opinionated, but, once set up, it simplifies life considerably
+    both for developers and administrators. It makes it particularly easy to migrate
+    traditional network applications to Kubernetes. A pod represents a traditional
+    node and each container represents a traditional process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Intra-pod communication (container to container)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A running pod is always scheduled on one (physical or virtual) node. That means
+    that all the containers run on the same node and can talk to each other in various
+    ways, such as the local filesystem, any IPC mechanism, or using localhost and
+    well-known ports. There is no danger of port collision between different pods
+    because each pod has its own IP address, and when a container in the pod uses
+    localhost, it applies to the pod's IP address only. So, if container 1 in pod
+    1 connects to port `1234`, which container 2 listens to on pod 1, it will not
+    conflict with another container in pod 2 running on the same node that also listens
+    on port `1234`. The only caveat is that if you're exposing ports to the host then
+    you should be careful about pod-to-node affinity. This can be handled using several
+    mechanisms, such as DaemonSet and pod anti-affinity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inter-pod communication (pod to pod)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Pods in Kubernetes are allocated a network-visible IP address (not private to
+    the node). Pods can communicate directly without the aid of network address translation,
+    tunnels, proxies, or any other obfuscating layer. Well-known port numbers can
+    be used for a configuration-free communication scheme. The pod's internal IP address
+    is the same as its external IP address that other pods see (within the cluster
+    network; not exposed to the outside world). This means that standard naming and
+    discovery mechanisms such as DNS work out of the box.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pod-to-service communication
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Pods can talk to each other directly using their IP addresses and well-known
+    ports, but that requires the pods to know each other''s IP addresses. In a Kubernetes
+    cluster, pods can be destroyed and created constantly. The service provides a
+    layer of indirection that is very useful because the service is stable even if
+    the set of actual pods that respond to requests is ever-changing. In addition,
+    you get automatic, highly-available load balancing because the Kube-proxy on each
+    node takes care of redirecting traffic to the correct pod:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/640c8105-160e-4829-80a6-2c1381eddd02.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: External access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Eventually, some containers need to be accessible from the outside world. The
+    pod IP addresses are not visible externally. The service is the right vehicle,
+    but external access typically requires two redirects. For example, cloud provider
+    load balancers are Kubernetes-aware, so they can't direct traffic to a particular
+    service directly to a node that runs a pod that can process the request. Instead,
+    the public load balancer just directs traffic to any node in the cluster and the
+    Kube-proxy on that node will redirect again to an appropriate pod if the current
+    node doesn't run the necessary pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows how all that the external load balancer on the
+    right side does is send traffic to all nodes that reach the proxy, which takes
+    care of further routing, if it''s needed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/44ed300f-4643-4e4c-93c5-db61ee64e1c7.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Kubernetes networking versus Docker networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Docker networking follows a different model, although over time it has gravitated
+    towards the Kubernetes model. In Docker networking, each container has its own
+    private IP address from the `172.xxx.xxx.xxx` address space confined to its own
+    node. It can talk to other containers on the same node via their own `172.xxx.xxx.xxx`
+    IP addresses. This makes sense for Docker because it doesn't have the notion of
+    a pod with multiple interacting containers, so it models every container as a
+    lightweight VM that has its own network identity. Note that with Kubernetes, containers
+    from different pods that run on the same node can't connect over localhost (except
+    by exposing host ports, which is discouraged). The whole idea is that, in general,
+    Kubernetes can kill and create pods anywhere, so different pods shouldn't rely,
+    in general, on other pods available on the node. Daemon sets are a notable exception,
+    but the Kubernetes networking model is designed to work for all use cases and
+    doesn't add special cases for direct communication between different pods on the
+    same node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How do Docker containers communicate across nodes? The container must publish
+    ports to the host. This obviously requires port coordination because if two containers
+    try to publish the same host port, they'll conflict with each other. Then containers
+    (or other processes) connect to the host's port that get channeled into the container.
+    A big downside is that containers can't self-register with external services because
+    they don't know what their host's IP address is. You could work around it by passing
+    the host's IP address as an environment variable when you run the container, but
+    that requires external coordination and complicates the process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows the networking setup with Docker. Each container
+    has its own IP address; Docker creates the `docker0` bridge on every node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/f8e87edb-e287-404f-a56b-4bcee0767eed.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Lookup and discovery
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In order for pods and containers to communicate with each other, they need to
+    find each other. There are several ways for containers to locate other containers
+    or announce themselves. There are also some architectural patterns that allow
+    containers to interact indirectly. Each approach has its own pros and cons.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Self-registration
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We've mentioned self-registration several times. Let's understand exactly what
+    it means. When a container runs, it knows its pod's IP address. Each container
+    that wants to be accessible to other containers in the cluster can connect to
+    some registration service and register its IP address and port. Other containers
+    can query the registration service for the IP addresses and port of all registered
+    containers and connect to them. When a container is destroyed (gracefully), it
+    will unregister itself. If a container dies ungracefully then some mechanism needs
+    to be established to detect that. For example, the registration service can periodically
+    ping all registered containers, or the containers are required periodically to
+    send a keepalive message to the registration service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The benefit of self-registration is that once the generic registration service
+    is in place (no need to customize it for different purposes), there is no need
+    to worry about keeping track of containers. Another huge benefit is that containers
+    can employ sophisticated policies and decide to unregister temporarily if they
+    are unavailable because of local conditions, such as if a container is busy and
+    doesn't want to receive any more requests at the moment. This sort of smart and
+    decentralized dynamic load balancing can be very difficult to achieve globally.
+    The downside is that the registration service is yet another non-standard component
+    that containers need to know about in order to locate other containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Services and endpoints
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kubernetes services can be considered as a registration service. Pods that belong
+    to a service are registered automatically based on their labels. Other pods can
+    look up the endpoints to find all the service pods or take advantage of the service
+    itself and directly send a message to the service that will get routed to one
+    of the backend pods. Although most of the time, pods will just send their message
+    to the service itself, which will forward it to one of the backing pods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Loosely coupled connectivity with queues
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'What if containers can talk to each other without knowing their IP addresses
+    and ports or even service IP addresses or network names? What if most of the communication
+    can be asynchronous and decoupled? In many cases, systems can be composed of loosely
+    coupled components that are not only unaware of the identities of other components,
+    but they are unaware that other components even exist. Queues facilitate such
+    loosely coupled systems. Components (containers) listen to messages from the queue,
+    respond to messages, perform their jobs, and post messages to the queue about
+    progress, completion status, and errors. Queues have many benefits:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Easy to add processing capacity without coordination; just add more containers
+    that listen to the queue
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Easy to keep track of overall load by queue depth
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Easy to have multiple versions of components running side by side by versioning
+    messages and/or topics
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Easy to implement load balancing as well as redundancy by having multiple consumers
+    process requests in different modes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The downsides of queues are the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Need to make sure that the queue provides appropriate durability and high availability
+    so it doesn't become a critical SPOF
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Containers need to work with the async queue API (could be abstracted away)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implementing request-response requires the somewhat cumbersome listening on
+    response queues
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overall, queues are an excellent mechanism for large-scale systems and they
+    can be utilized in large Kubernetes clusters to ease coordination.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Loosely coupled connectivity with data stores
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Another loosely coupled method is to use a data store (for example, Redis) to
+    store messages and then other containers can read them. While possible, this is
+    not the design objective of data stores and the result is often cumbersome, fragile,
+    and doesn't have the best performance. Data stores are optimized for data storage
+    and not for communication. That being said, data stores can be used in conjunction
+    with queues, where a component stores some data in a data store and then sends
+    a message to the queue that data is ready for processing. Multiple components
+    listen to the message and all start processing the data in parallel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes ingress
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kubernetes offers an ingress resource and controller that is designed to expose
+    Kubernetes services to the outside world. You can do it yourself, of course, but
+    many tasks involved in defining ingress are common across most applications for
+    a particular type of ingress, such as a web application, CDN, or DDoS protector.
+    You can also write your own ingress objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `ingress` object is often used for smart load balancing and TLS termination.
+    Instead of configuring and deploying your own NGINX server, you can benefit from
+    the built-in ingress. If you need a refresher, hop on to [Chapter 6](6502d8f5-5418-4f9e-9b61-ec3c38d2f018.xhtml),
+    *Using Critical Kubernetes Resources*, where we discussed the ingress resource
+    with examples.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes network plugins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kubernetes has a network plugin system, because networking is so diverse and
+    different people would like to implement it in different ways. Kubernetes is flexible
+    enough to support any scenario. The primary network plugin is CNI, which we will
+    discuss in depth. But Kubernetes also comes with a simpler network plugin called
+    Kubenet. Before we go over the details, let's get on the same page with the basics
+    of Linux networking (just the tip of the iceberg).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Basic Linux networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Linux, by default, has a single shared network space. The physical network interfaces
+    are all accessible in this namespace, but the physical namespace can be divided
+    into multiple logical namespaces, which is very relevant to container networking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: IP addresses and ports
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Network entities are identified by their IP address. Servers can listen to incoming
+    connections on multiple ports. Clients can connect (TCP) or send data (UDP) to
+    servers within their network.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Network namespaces
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Namespaces group a bunch of network devices such that they can reach other servers
+    in the same namespace, but not other servers even if they are physically on the
+    same network. Linking networks or network segments can be done through bridges,
+    switches, gateways, and routing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Subnets, netmasks, and CIDRs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Granular division of network segments is very useful when designing and maintaining
+    networks. Dividing networks in to smaller subnets with a common prefix is a common
+    practice. These subnets can be defined by bitmasks that represent the size of
+    the subnet (how many hosts it can contain). For example, a netmask of `255.255.255.0`
+    means that the first three octets are used for routing and only 256 (actually
+    254) individual hosts are available. The Classless Inter-Domain Routing (CIDR)
+    notation is often used for this purpose because it is more concise, encodes more
+    information, and also allows combining hosts from multiple legacy classes (A,
+    B, C, D, E). For example, `172.27.15.0/24` means that the first 24 bits (three
+    octets) are used for routing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Virtual Ethernet devices
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Virtual Ethernet** (**veth**) devices represent physical network devices.
+    When you create a `veth` that''s linked to a physical device, you can assign that
+    `veth` (and by extension the physical device) into a namespace in which devices
+    from other namespaces can''t reach it directly, even if physically they are on
+    the same local network.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bridges
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Bridges connect multiple network segments to an aggregate network, so all the
+    nodes can communicate with each other. Bridging is done at the L1 (physical) and
+    L2 (data link) layers of the OSI network model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Routing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Routing connects separate networks, typically based on routing tables that instruct
+    network devices how to forward packets to their destination. Routing is done through
+    various network devices, such as routers, bridges, gateways, switches, and firewalls,
+    including regular Linux boxes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Maximum transmission unit
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The **maximum transmission unit** (**MTU**) determines how big packets can be.
+    On Ethernet networks, for example, the MTU is 1,500 bytes. The bigger the MTU,
+    the better the ratio between payload and headers, which is a good thing. The downside
+    is that minimum latency is reduced because you have to wait for the entire packet
+    to arrive and, furthermore, if there's a failure, you have to retransmit the entire
+    packet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pod networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here is a diagram that describes the relationship between pod, host, and the
+    global internet at the networking level through `veth0`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/5cf26bd3-81f9-42df-b4ad-f004f50d5e6d.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Kubenet
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Back to Kubernetes. Kubenet is a network plugin; it's very rudimentary and just
+    creates a Linux bridge called `cbr0` and a `veth` for each pod. Cloud providers
+    typically use it to set up routing rules for communication between nodes, or in
+    single-node environments. The `veth` pair connects each pod to its host node using
+    an IP address from the host's IP address range.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The Kubenet plugin has the following requirements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The node must be assigned a subnet to allocate IP addresses for its pods
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The standard CNI bridge, `lo`, and host-local plugins are required for version
+    0.2.0 or greater
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Kubelet must be run with the `--network-plugin=kubenet` argument
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Kubelet must be run with the `--non-masquerade-cidr=<clusterCidr>` argument
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Setting the MTU
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The MTU is critical for network performance. Kubernetes network plugins such
+    as Kubenet make their best efforts to deduce optimal MTU, but sometimes they need
+    help. If an existing network interface (for example, the Docker `docker0` bridge)
+    sets a small MTU, then Kubenet will reuse it. Another example is IPSEC, which
+    requires lowering the MTU due to the extra overhead from IPSEC encapsulation overhead,
+    but the Kubenet network plugin doesn't take it into consideration. The solution
+    is to avoid relying on the automatic calculation of the MTU and just tell the
+    Kubelet what MTU should be used for network plugins through the `--network-plugin-mtu`
+    command-line switch, which is provided to all network plugins. However, at the
+    moment, only the Kubenet network plugin accounts for this command-line switch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Container Networking Interface (CNI)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'CNI is a specification as well as a set of libraries for writing network plugins
+    to configure network interfaces in Linux containers (not just Docker). The specification
+    actually evolved from the rkt network proposal. There is a lot of momentum behind
+    CNI and it''s on a fast track to become the established industry standard. Some
+    of the organizations that use CNI are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kurma
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cloud foundry
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Nuage
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: RedHat
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mesos
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The CNI team maintains some core plugins, but there are a lot of third-party
+    plugins too that contribute to the success of CNI:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Project Calico**: A layer 3 virtual network'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Weave**: A multi-host Docker network'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Contiv networking**: Policy-based networking'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Cilium**: BPF and XDP for containers'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Multus**: A Multi plugin'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**CNI-Genie**: A generic CNI network plugin'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Flannel**: A network fabric for containers, designed for Kubernetes'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Infoblox**: Enterprise IP address management for containers'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Container runtime
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: CNI defines a plugin spec for networking application containers, but the plugin
+    must be plugged into a container runtime that provides some services. In the context
+    of CNI, an application container is a network-addressable entity (has its own
+    IP address). For Docker, each container has its own IP address. For Kubernetes,
+    each pod has its own IP address and the pod is the CNI container and not the containers
+    within the pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Likewise, rkt's app containers are similar to Kubernetes pods in that they may
+    contain multiple Linux containers. If in doubt, just remember that a CNI container
+    must have its own IP address. The runtime's job is to configure a network and
+    then execute one or more CNI plugins, passing them the network configuration in
+    JSON format.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows a container runtime using the CNI plugin interface
+    to communicate with multiple CNI plugins:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/9298924f-10d1-4fdc-b16f-749c5674e1b2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: CNI plugin
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The CNI plugin's job is to add a network interface into the container network
+    namespace and bridge the container to the host via a `veth` pair. It should then
+    assign an IP address through an IPAM (IP address management) plugin and set up
+    routes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The container runtime (Docker, rkt, or any other CRI-compliant runtime) invokes
+    the CNI plugin as an executable. The plugin needs to support the following operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Add a container to the network
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Remove a container from the network
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Report version
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The plugin uses a simple command-line interface, standard input/output, and
+    environment variables. The network configuration in JSON format is passed to the
+    plugin through standard input. The other arguments are defined as environment
+    variables:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CNI_COMMAND`: Indicates the desired operation; `ADD`, `DEL`, or `VERSION`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CNI_CONTAINERID`: Container ID.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CNI_NETNS`: Path to network namespace file.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`*` `CNI_IFNAME`: Interface name to set up; the plugin must honor this interface
+    name or return an `error`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`*` `CNI_ARGS`: Extra arguments passed in by the user at invocation time. Alphanumeric
+    key-value pairs are separated by semicolons, for example, `FOO=BAR;ABC=123`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CNI_PATH`: List of paths to search for CNI plugin executables. Paths are separated
+    by an OS-specific list separator, for example, `:` on Linux and `;` on Windows.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the command succeeds, the plugin returns a zero exit code and the generated
+    interfaces (in the case of the `ADD` command) are streamed to standard output
+    as JSON. This low-tech interface is smart in the sense that it doesn't require
+    any specific programming language, or component technology, or binary API. CNI
+    plugin writers can use their favorite programming language too.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The result of invoking the CNI plugin with the `ADD` command is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The input network configuration contains a lot of information: `cniVersion`,
+    name, type, `args` (optional), `ipMasq` (optional), `ipam`, and `dns`. The `ipam`
+    and `dns` parameters are dictionaries with their own specified keys. Here is an
+    example of a network configuration:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Note that additional plugin-specific elements can be added. In this case, the
+    `bridge: cni0` element is a custom one that the specific `bridge` plugin understands.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `CNI spec` also supports network configuration lists where multiple CNI
+    plugins can be invoked in order. Later, we will dig into a fully-fledged implementation
+    of a CNI plugin.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes networking solutions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Networking is a vast topic. There are many ways to set up networks and connect
+    devices, pods, and containers. Kubernetes can't be opinionated about it. The high-level
+    networking model of a flat address space for pods is all that Kubernetes prescribes.
+    Within that space, many valid solutions are possible, with various capabilities
+    and policies for different environments. In this section, we'll examine some of
+    the available solutions and understand how they map to the Kubernetes networking
+    model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bridging on bare metal clusters
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The most basic environment is a raw bare-metal cluster with just an L2 physical
+    network. You can connect your containers to the physical network with a Linux
+    bridge device. The procedure is quite involved and requires familiarity with low-level
+    Linux network commands such as `brctl`, `ip addr`, `ip route`, `ip link`, `nsenter`,
+    and so on. If you plan to implement it, this guide can serve as a good start (search
+    for the *With Linux Bridge devices* section): [http://blog.oddbit.com/2014/08/11/four-ways-to-connect-a-docker/](http://blog.oddbit.com/2014/08/11/four-ways-to-connect-a-docker/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Contiv
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Contiv is a general-purpose network plugin for container networking and it
+    can be used with Docker directly, Mesos, Docker Swarm, and of course Kubernetes,
+    through a CNI plugin. Contiv is focused on network policies that overlap somewhat
+    with Kubernetes'' own network policy object. Here are some of the capabilities
+    of the Contiv net plugin:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Supports both libnetwork's CNM and the CNI specification
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A feature-rich policy model to provide secure, predictable application deployment
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Best-in-class throughput for container workloads
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Multi-tenancy, isolation, and overlapping subnets
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Integrated IPAM and service discovery
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'A variety of physical topologies:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Layer2 (VLAN)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Layer3 (BGP)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overlay (VXLAN)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cisco SDN solution (ACI)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: IPv6 support
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Scalable policy and route distribution
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Integration with application blueprints, including the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Docker-compose
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kubernetes deployment manager
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Service load balancing is built in east-west microservice load balancing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Traffic isolation for storage, control (for example, `etcd`/`consul`), network,
+    and management traffic
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Contiv has many features and capabilities. I'm not sure if it's the best choice
+    for Kubernetes due to its broad surface area and the fact that it caters to multiple
+    platforms.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Open vSwitch
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Open vSwitch is a mature software-based virtual switch solution endorsed by
+    many big players. The **Open Virtualization Network** (**OVN**) solution lets
+    you build various virtual networking topologies. It has a dedicated Kubernetes
+    plugin, but it is not trivial to set up, as demonstrated by this guide: [https://github.com/openvswitch/ovn-kubernetes](https://github.com/openvswitch/ovn-kubernetes).
+    The Linen CNI plugin may be easier to set up, although it doesn''t support all
+    the features of OVN: [https://github.com/John-Lin/linen-cni](https://github.com/John-Lin/linen-cni).
+    Here is a diagram of the Linen CNI plugin:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/24da1447-6f6c-4ab2-90a3-38cd607be551.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Open vSwitch can connect bare-metal servers, VMs, and pods/containers using
+    the same logical network. It actually supports both overlay and underlay modes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here are some of its key features:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Standard 802.1Q VLAN model with trunk and access ports
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NIC bonding with or without LACP on upstream switch
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NetFlow, sFlow(R), and mirroring for increased visibility
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: QoS (Quality of Service) configuration, plus policing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Geneve, GRE, VXLAN, STT, and LISP tunneling
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 802.1ag connectivity fault management
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: OpenFlow 1.0 plus numerous extensions
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Transactional configuration database with C and Python bindings
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: High-performance forwarding using a Linux kernel module
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Nuage networks VCS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The **Virtualized Cloud Services** (**VCS**) product from Nuage networks provides
+    a highly scalable policy-based **Software-Defined Networking** (**SDN**) platform.
+    It is an enterprise-grade offering that builds on top of the open source Open
+    vSwitch for the data plane along with a feature-rich SDN controller built on open
+    standards.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Nuage platform uses overlays to provide seamless policy-based networking
+    between Kubernetes Pods and non-Kubernetes environments (VMs and bare metal servers).
+    Nuage's policy abstraction model is designed with applications in mind and makes
+    it easy to declare fine-grained policies for applications. The platform's real-time
+    analytics engine enables visibility and security monitoring for Kubernetes applications.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In addition, all VCS components can be installed in containers. There are no
+    special hardware requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Canal
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Canal is a mix of two open source projects: Calico and Flannel. The name **Canal**
+    is a portmanteau of the project names. Flannel, by CoreOS, is focused on container
+    networking, and **Calico** is focused on network policy. Originally, they were
+    developed independently, but users wanted to use them together. The open source
+    Canal project is currently a deployment pattern to install both projects as separate
+    CNI plugins. **Tigera**—a company formed by Calico''s founders—is shepherding
+    both projects now and had plans for tighter integration, but since they released
+    their secure application connectivity solution for Kubernetes the focus seemed
+    to shift to contribute back to Flannel and Calico to ease configuration and integration
+    rather than providing a unified solution. The following diagram demonstrates the
+    present status of Canal and how it relates to container orchestrators such as
+    Kubernetes and Mesos:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/4e064c65-c47a-4e1f-ab9a-52c758784c94.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Note that when integrating with Kubernetes, Canal doesn't use `etcd` directly
+    anymore, instead it relies on the Kubernetes API server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Flannel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Flannel is a virtual network that gives a subnet to each host for use with container
+    runtimes. It runs a `flaneld` agent on each host, which allocates a subnet to
+    the node from a reserved address space stored in `etcd`. Forwarding packets between
+    containers and, ultimately, hosts is done by one of multiple backends. The most
+    common backend uses UDP over a TUN device that tunnels through port `8285` by
+    default (make sure it's open in your firewall).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram describes in detail the various components of Flannel,
+    the virtual network devices it creates, and how they interact with the host and
+    the pod through the `docker0` bridge. It also shows the UDP encapsulation of packets
+    and how they are transmitted between hosts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/a1fc953d-4572-4b46-a1b4-231d0251b7ca.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Other backends include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vxlan`: Uses in-kernel VXLAN to encapsulate the packets.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`host-gw`: Creates IP routes to subnets via remote machine IPs. Note that this
+    requires direct layer2 connectivity between hosts running Flannel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`aws-vpc`: Creates IP routes in an Amazon VPC route table.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`gce`: Creates IP routes in a Google compute engine network.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`alloc`: Only performs subnet allocation (no forwarding of data packets).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ali-vpc`: Creates IP routes in an alicloud VPC route table.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Calico project
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Calico is a versatile virtual networking and network security solution for containers.
+    Calico can integrate with all the primary container orchestration frameworks
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'and runtimes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes (CNI plugin)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mesos (CNI plugin)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Docker (libnework plugin)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: OpenStack (Neutron plugin)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Calico can also be deployed on-premises or on public clouds with its full feature
+    set. Calico's network policy enforcement can be specialized for each workload
+    and make sures that traffic is controlled precisely and packets always go from
+    their source to vetted destinations. Calico can automatically map network policy
+    concepts from orchestration platforms to its own network policy. The reference
+    implementation of Kubernetes' network policy is Calico.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Romana
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Romana is a modern cloud-native container networking solution. It operates at
+    layer 3, taking advantage of standard IP address management techniques. Whole
+    networks can become the unit of isolation as Romana uses Linux hosts to create
+    gateways and routes to the networks. Operating at layer 3 level means that no
+    encapsulation is needed. Network policy is enforced as a distributed firewall
+    across all endpoints and services. Hybrid deployments across cloud platforms and
+    on-premises deployments are easier as there is no need to configure virtual overlay
+    networks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: New Romana virtual IPs allow on-premise users to expose services on layer 2
+    LANs through external IPs and service specs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Romana claims that their approach brings significant performance improvements.
+    The following diagram shows how Romana eliminates a lot of the overhead associated
+    with VXLAN encapsulation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/8688357c-538c-4144-be52-aee50bb2e67c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Weave net
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Weave net is all about ease of use and zero configuration. It uses VXLAN encapsulation
+    under the covers and micro DNS on each node. As a developer, you operate at a
+    high abstraction level. You name your containers, and Weave net lets you connect
+    to and use standard ports for services. This helps you to migrate existing applications
+    into containerized applications and microservices. Weave net has a CNI plugin
+    for interfacing with Kubernetes (and Mesos). On Kubernetes 1.4 and higher, you
+    can integrate Weave net with Kubernetes by running a single command that deploys
+    a DaemonSet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The Weave net pods on every node will take care of attaching any new pod you
+    create to the Weave network. Weave net supports the network policy API as well
+    providing a complete yet easy-to-set-up solution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using network policies effectively
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The Kubernetes network policy is about managing network traffic to selected
+    pods and namespaces. In a world of hundreds of deployed and orchestrated microservices,
+    as is often the case with Kubernetes, managing networking and connectivity between
+    pods is essential. It's important to understand that it is not primarily a security
+    mechanism. If an attacker can reach the internal network, they will probably be
+    able to create their own pods that comply with the network policy in place and
+    communicate freely with other pods. In the previous section, we looked at different
+    Kubernetes networking solutions and focused on the container networking interface.
+    In this section, the focus is on network policy, although there are strong connections
+    between the networking solution and how network policy is implemented on top of
+    it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the Kubernetes network policy design
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A network policy is a specification of how selections of pods can communicate
+    with each other and other network endpoints. `NetworkPolicy` resources use labels
+    to select pods and define whitelist rules that allow traffic to the selected pods
+    in addition to what is allowed by the isolation policy for a given namespace.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Network policies and CNI plugins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There is an intricate relationship between network policies and CNI plugins.
+    Some CNI plugins implement both network connectivity and network policy, while
+    others implement just one aspect, but they can collaborate with another CNI plugin
+    that implements the other aspect (for example, Calico and Flannel).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring network policies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Network policies are configured through the `NetworkPolicy` resource. Here
+    is a sample network policy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Implementing network policies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'While the network policy API itself is generic and is part of the Kubernetes
+    API, the implementation is tightly coupled to the networking solution. That means
+    that on each node, there is a special agent or gatekeeper that does the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Intercepts all traffic coming into the node
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Verifies that it adheres to the network policy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Forwards or rejects each request
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Kubernetes provides the facility to define and store network policies through
+    the API. Enforcing the network policy is left to the networking solution or a
+    dedicated network policy solution that is tightly integrated with the specific
+    networking solution. Calico and Canal are good examples of this approach. Calico
+    has its own networking solution and a network policy solution that work together,
+    but it can also provide network policy enforcement on top of Flannel as part of
+    Canal. In both cases, there is tight integration between the two pieces. The following
+    diagram shows how the Kubernetes policy controller manages the network policies
+    and how agents on the nodes execute it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/fe40a1b6-1aa2-4d01-9d93-eebb58eb6d8e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Load balancing options
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Load balancing is a critical capability in dynamic systems such as a Kubernetes
+    cluster. Nodes, VMs, and pods come and go, but the clients can't keep track of
+    which individual entities can service their requests. Even if they could, it would
+    require a complicated dance of managing a dynamic map of the cluster, refreshing
+    it frequently, and handling disconnected, unresponsive, or just slow nodes. Load
+    balancing is a battle-tested and well-understood mechanism that adds a layer of
+    indirection that hides the internal turmoil from the clients or consumers outside
+    the cluster. There are options for external as well as internal load balancers.
+    You can also mix and match and use both. The hybrid approach has its own particular
+    pros and cons, such as performance versus flexibility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: External load balancer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: An external load balancer is a load balancer that runs outside the Kubernetes
+    cluster. There must be an external load balancer provider that Kubernetes can
+    interact with to configure the external load balancer with health checks, firewall
+    rules, and to get the external IP address of the load balancer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows the connection between the load balancer (in the
+    cloud), the Kubernetes API server, and the cluster nodes. The external load balancer
+    has an up-to-date picture of which pods run on which nodes, and it can direct
+    external service traffic to the right pods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/d05c30c7-b23a-45ce-a923-c55debcda637.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Configuring an external load balancer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: An external load balancer is configured via the service configuration file or
+    directly through Kubectl. We use a service type of `LoadBalancer` instead of using
+    a service type of `ClusterIP`, which directly exposes a Kubernetes node as a load
+    balancer. This depends on an external load balancer provider being properly installed
+    and configured in the cluster. Google's GKE is the most well-tested provider,
+    but other cloud platforms provide their integrated solution on top of their cloud
+    load balancer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Via configuration file
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here is an example service configuration file that accomplishes this goal:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Via Kubectl
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You can also accomplish the same result using a direct `kubectl` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The decision whether to use a `service` configuration file or `kubectl` command
+    is usually determined by the way you set up the rest of your infrastructure and
+    deploy your system. Configuration files are more declarative and arguably more
+    appropriate for production usage, where you want a versioned, auditable, and repeatable
+    way to manage your infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finding the load balancer IP addresses
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The load balancer will have two IP addresses of interest. The internal IP address
+    can be used inside the cluster to access the service. Clients outside the cluster
+    will use the external IP address. It''s a good practice to create a DNS entry
+    for the external IP address. To get both addresses, use the `kubectl describe`
+    command. The `IP` will denote the internal IP address. `LoadBalancer ingress`
+    will denote the external IP address:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Preserving client IP addresses
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Sometimes, the service may be interested in the source IP address of the clients.
+    Up until Kubernetes 1.5, this information wasn't available. In Kubernetes 1.5,
+    there is a beta feature available only on GKE through an annotation to get the
+    source IP address. In Kubernetes 1.7, the capability to preserve the original
+    client IP was added to the API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Specifying original client IP address preservation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You need to configure the following two fields of the service spec:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`service.spec.externalTrafficPolicy`: This field determines whether the service
+    should route external traffic to a node-local endpoint or a cluster-wide endpoint,
+    which is the default. The cluster option doesn''t reveal the client source IP
+    and might add a hop to a different node, but spreads the load well. The Local
+    option keeps the client source IP and doesn''t add an extra hop as long as the
+    service type is `LoadBalancer` or `NodePort`. Its downside is it might not balance
+    the load very well.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`service.spec.healthCheckNodePort`: This field is optional. If used, then the
+    service health check will use this port number. The default is the allocate node
+    port. It has an effect for services of type `LoadBalancer` whose `externalTrafficPolicy`
+    is set to `Local`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Understanding potential in even external load balancing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: External load balancers operate at the node level; while they direct traffic
+    to a particular pod, the load distribution is done at the node level. That means
+    that if your service has four pods, and three of them are on node A and the last
+    one is on node B, then an external load balancer is likely to divide the load
+    evenly between node A and node B. This will have the three pods on node A handle
+    half of the load (1/6 each) and the single pod on node B handle the other half
+    of the load on its own. Weights may be added in the future to address this issue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Service load balancer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Service load balancing is designed for funneling internal traffic within the
+    Kubernetes cluster and not for external load balancing. This is done by using
+    a service type of `clusterIP`. It is possible to expose a service load balancer
+    directly via a pre-allocated port by using service type of `NodePort` and use
+    it as an external load balancer, but it wasn't designed for that use case. For
+    example, desirable features such as SSL termination and HTTP caching will not
+    be readily available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows how the service load balancer (the yellow cloud)
+    can route traffic to one of the backend pods it manages (through labels, of course):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/6bee68dc-a3fc-4698-8b1a-07df51a7a14a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Ingress
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Ingress in Kubernetes is, at its core, a set of rules that allow inbound connections
+    to reach cluster services. In addition, some ingress controllers support the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Connection algorithms
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Request limits
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: URL rewrites and redirects
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: TCP/UDP load balancing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: SSL termination
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Access control and authorization
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Ingress is specified using an ingress resource and is serviced by an ingress
+    controller. It''s important to note that ingress is still in beta and it doesn''t
+    yet cover all of the necessary capabilities. Here is an example of an ingress
+    resource that manages traffic into two services. The rules map the externally
+    visible `http:// foo.bar.com/foo` to the `s1` service and `http://foo.bar.com/bar`
+    to the `s2` service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: There are two official ingress controllers right now. One of them is an L7 ingress
+    controller for GCE only, the other is a more general-purpose NGINX ingress controller
+    that lets you configure NGINX through a ConfigMap. The NGNIX ingress controller
+    is very sophisticated and brings to bear a lot of features that are not available
+    yet through the ingress resource directly. It uses the endpoints API to directly
+    forward traffic to pods. It supports Minikube, GCE, AWS, Azure, and bare-metal
+    clusters. For a detailed review, check out [https://github.com/kubernetes/ingress-nginx](https://github.com/kubernetes/ingress-nginx).
+  prefs: []
+  type: TYPE_NORMAL
+- en: HAProxy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We discussed using a cloud provider external load balancer using service type
+    of `LoadBalancer` and using the internal service load balancer inside the cluster
+    using `ClusterIP`. If we want a custom external load balancer, we can create a
+    custom external load balancer provider and use `LoadBalancer` or use the third
+    service type, `NodePort`. **High Availability** (**HA**) Proxy is a mature and
+    battle-tested load balancing solution. It is considered the best choice for implementing
+    external load balancing with on-premises clusters. This can be done in several
+    ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Utilize `NodePort` and carefully manage port allocations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implement custom load balancer provider interface
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Run HAProxy inside your cluster as the only target of your frontend servers
+    at the edge of the cluster (load balanced or not)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can use all approaches with HAProxy. Regardless, it is still recommended
+    to use ingress objects. The `service-loadbalancer` project is a community project
+    that implemented a load balancing solution on top of HAProxy. You can find it
+    at: [https://github.com/kubernetes/contrib/tree/master/service-loadbalancer](https://github.com/kubernetes/contrib/tree/master/service-loadbalancer).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Utilizing the NodePort
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Each service will be allocated a dedicated port from a predefined range. This
+    usually is a high range, such as 30,000 and above, to avoid clashing with other
+    applications using low known ports. HAProxy will run outside the cluster in this
+    case, and it will be configured with the correct port for each service. Then it
+    can just forward any traffic to any nodes and Kubernetes through the internal
+    service, and the load balancer will route it to a proper pod (double load balancing).
+    This is, of course, sub-optimal because it introduces another hop. The way to
+    circumvent it is to query the Endpoints API and dynamically manage for each service
+    the list of its backend pods and directly forward traffic to the pods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Custom load balancer provider using HAProxy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This approach is a little more complicated, but the benefit is that it is better
+    integrated with Kubernetes and can make the transition to/from on-premises from/to
+    the cloud easier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running HAProxy Inside the Kubernetes cluster
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this approach, we use the internal HAProxy load balancer inside the cluster.
+    There may be multiple nodes running HAProxy, and they will share the same configuration
+    to map incoming requests and load balance them across the backend servers (the
+    Apache servers in the following diagram):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](Images/0585274f-5df9-40ea-923b-788ba4f6168f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Keepalived VIP
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Keepalived **Virtual****IP** (**VIP**) is not necessarily a load balancing solution
+    of its own. It can be a complement to the NGINX ingress controller or the HAProxy-based
+    service `LoadBalancer`. The main motivation is that pods move around in Kubernetes,
+    including your load balancer(s). That creates a problem for clients outside the
+    network that require a stable endpoint. DNS is often not good enough due to performance
+    issues. Keepalived provides a high-performance virtual IP address that can serve
+    as the address to the NGINX ingress controller or the HAProxy load balancer. Keepalived
+    utilizes core Linux networking facilities such as IPVS (IP virtual server) and
+    implements high availability through **Virtual Redundancy Router Protocol** (**VRRP**).
+    Everything runs at layer 4 (TCP/UDP). It takes some effort and attention to detail
+    to configure it. Luckily, there is a Kubernetes `contrib` project that can get
+    you started, at [https://github.com/kubernetes/contrib/tree/master/keepalived-vip](https://github.com/kubernetes/contrib/tree/master/keepalived-vip).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Træfic
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Træfic is a modern HTTP reverse proxy and load balancer. It was designed to
+    support microservices. It works with many backends, including Kubernetes, to manage
+    its configuration automatically and dynamically. This is a game changer compared
+    to traditional load balancers. It has an impressive list of features:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's fast
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Single Go executable
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Tiny official Docker image
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Rest API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hot-reloading of configuration; no need to restart the process
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Circuit breakers, retry
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Round Robin, rebalancer load-balancers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Metrics (Rest, Prometheus, Datadog, Statsd, InfluxDB)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clean AngularJS Web UI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Websocket, HTTP/2, GRPC ready
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Access Logs (JSON, CLF)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's Encrypt support (Automatic HTTPS with renewal)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: High availability with cluster mode
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Writing your own CNI plugin
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this section, we will look at what it takes to actually write your own CNI
+    plugin. First, we will look at the simplest plugin possible – the loopback plugin.
+    Then, we will examine the plugin skeleton that implements most of the boilerplate
+    associated with writing a CNI plugin. Finally, we will review the implementation
+    of the bridge plugin. Before we dive in, here is a quick reminder of what a CNI
+    plugin is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A CNI plugin is an executable
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is responsible for connecting new containers to the network, assigning unique
+    IP addresses to CNI containers, and taking care of routing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A container is a network namespace (in Kubernetes, a pod is a CNI container)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Network definitions are managed as JSON files, but stream to the plugin through
+    standard input (no files are being read by the plugin)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Auxiliary information can be provided via environment variables
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: First look at the loopback plugin
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The loopback plugin simply adds the loopback interface. It is so simple that
+    it doesn''t require any network configuration information. Most CNI plugins are
+    implemented in Golang, and the loopback CNI plugin is no exception. The full source
+    code is available at:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/containernetworking/plugins/blob/master/plugins/main/loopback](https://github.com/containernetworking/plugins/blob/master/plugins/main/loopback)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at the imports first. There are multiple packages from the container
+    networking project on GitHub that provide many of the building blocks necessary
+    to implement CNI plugins and the `netlink` package for adding and removing interfaces,
+    as well as setting IP addresses and routes. We will look at the `skel` package
+    soon:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, the plugin implements two commands, `cmdAdd` and `cmdDel`, which are
+    called when a `container` is added to or removed from the network. Here is the
+    `cmdAdd` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The core of this function is setting the interface name to `lo` (for loopback)
+    and adding the link to the container''s network namespace. The `del` command does
+    the opposite:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `main` function simply calls the `skel` package, passing the command functions.
+    The `skel` package will take care of running the CNI plugin executable and will
+    invoke the `addCmd` and `delCmd` functions at the right time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building on the CNI plugin skeleton
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s explore the `skel` package and see what it does under the covers. Starting
+    with the `PluginMain()` entry point, it is responsible for invoking `PluginMainWithError()`,
+    catching errors, printing them to standard output, and exiting:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `PluginErrorWithMain()` instantiates a dispatcher, sets it up with all
+    the I/O streams and the environment, and invokes its `PluginMain()` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here is, finally, the main logic of the skeleton. It gets the `cmd` arguments
+    from the environment (which includes the configuration from standard input), detects
+    which `cmd` is invoked, and calls the appropriate `plugin` function (`cmdAdd`
+    or `cmdDel`). It can also return version information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Reviewing the bridge plugin
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The bridge plugin is more substantial. Let''s look at some of the key parts
+    of its implementation. The full source code is available at:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/containernetworking/plugins/blob/master/plugins/main/bridge](https://github.com/containernetworking/plugins/blob/master/plugins/main/bridge).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It defines a network configuration `struct` with the following fields:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We will not cover what each parameter does and how it interacts with the other
+    parameters due to space limitations. The goal is to understand the flow and have
+    a starting point if you want to implement your own CNI plugin. The configuration
+    is loaded from JSON through the `loadNetConf()` function. It is called at the
+    beginning of the `cmdAdd()` and `cmdDel()` functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here is the core of the `cmdAdd()` function. It uses information from network
+    configuration, sets up a `veth`, interacts with the IPAM plugin to add a proper
+    IP address, and returns the results:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: This is just part of the full implementation. There is also route setting and
+    hardware IP allocation. I encourage you to pursue the full source code, which
+    is quite extensive, to get the full picture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we covered a lot of ground. Networking is such a vast topic
+    and there are so many combinations of hardware, software, operating environments,
+    and user skills that coming up with a comprehensive networking solution that is
+    robust, secure, performs well, and is easy to maintain, is a very complicated
+    endeavor. For Kubernetes clusters, the cloud providers mostly solve these issues.
+    But if you run on-premise clusters or need a tailor-made solution, you get a lot
+    of options to choose from. Kubernetes is a very flexible platform, designed for
+    extension. Networking in particular is totally pluggable. The main topics we discussed
+    were the Kubernetes networking model (flat address space where pods can reach
+    others and shared localhost between all containers inside a pod), how lookup and
+    discovery work, the Kubernetes network plugins, various networking solutions at
+    different levels of abstraction (a lot of interesting variations), using network
+    policies effectively to control the traffic inside the cluster, the spectrum of
+    load balancing solutions, and finally we looked at how to write a CNI plugin by
+    dissecting a real-world implementation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At this point, you are probably overwhelmed, especially if you're not a subject-matter
+    expert. You should have a good grasp of the internals of Kubernetes networking,
+    be aware of all the interlocking pieces required to implement a fully-fledged
+    solution, and be able to craft your own solution based on trade-offs that make
+    sense for your system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In [Chapter 11](11dc34c4-beb4-4ec9-bc2a-fcd0f50bf74c.xhtml), *Running Kubernetes
+    on Multiple Clouds and Cluster Federation*, we will go even bigger and look at
+    running Kubernetes on multiple clusters, cloud providers, and federation. This
+    is an important part of the Kubernetes story for geo-distributed deployments and
+    ultimate scalability. Federated Kubernetes clusters can exceed local limitations,
+    but they bring a whole slew of challenges too.
+  prefs: []
+  type: TYPE_NORMAL

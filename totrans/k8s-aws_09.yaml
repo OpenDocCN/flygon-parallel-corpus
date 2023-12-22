@@ -1,0 +1,577 @@
+- en: Storing State
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter is all about utilizing the deep integration that Kubernetes has
+    with the AWS native storage solution **Elastic Block Store** (**EBS**). Amazon
+    EBS provides network attached storage as a service, and is the primary solution
+    used to provide block storage to EC2 instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nearly every EC2 instance launched is backed by an EBS root volume (created
+    from an AMI machine image). Because EBS storage is network attached, if an underlying
+    machine hosting an EC2 instance fails in some way, the data stored on the volume
+    is safe as it is automatically replicated across multiple physical storage devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In addition to being used to store the root filesystem of EC2 instances, additional
+    EBS volumes can be attached to EC2 instances and mounted on demand via the AWS
+    API. Kubernetes integration with AWS EBS makes use of this to provide persistent
+    volumes that can be used by your pods. If a pod is killed and is replaced by a
+    pod on another EC2 instance, Kubernetes will handle detaching the EBS volume from
+    the old EC2 instance and attaching it to the new instance, ready to be mounted
+    into the new pod as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we will start by looking at how we can configure our pods to
+    make use of additional volumes. We will then look at the abstractions Kubernetes
+    provides for dealing with storage that provides persistence (such as EBS). We
+    will look at how Kubernetes can automatically provision EBS volumes for us based
+    on the specifications requested in our pod configurations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you have mastered using Kubernetes to provision persistent storage for
+    your pods, in the second half of this chapter we will look at stateful sets, the
+    abstraction that Kubernetes provides to run a set of pods, each of which can have
+    its own attached storage and an identity that remains even if rescheduled to another
+    node. This is the final piece of the puzzle required if you want to run complex
+    stateful applications on your Kubernetes cluster, such as databases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Volumes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Storage classes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Stateful sets
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Volumes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's start by looking at how we can attach volumes to our pods. The simplest
+    kind of volume available `emptyDir` is just a temporary directory that is linked
+    to the life cycle of a pod. When the volume is created, it is empty as the name
+    suggests, and remains on the node until the pod is removed from the node. The
+    data you store inside the volume does persist between pod restarts on the same
+    node, so can be useful for processes that need to cache expensive computations
+    on the filesystem, or for processes that checkpoint their progress. In [Chapter
+    1](19821a2b-bb32-408d-9f21-256dce5d644e.xhtml), *Google's Infrastructure for the
+    Rest of Us*, we discussed some other possible uses for an `emptyDir` volume to
+    share files between different containers within a pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this example, we are going to make use of an `emptyDir` volume to deploy
+    an application that expects to write to the `/data` directory in a container where
+    the root filesystem has been made read-only.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This application has been designed to illustrate some of the properties of
+    volumes in Kubernetes. When it starts up, it writes to a random filename in the
+    `/data` directory. It then starts up a web server that shows the contents of that
+    directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Looking at this configuration, there are a few things you should note about
+    how we use volumes in a pod. These rules apply not only to `emptyDir` volumes,
+    but also to every other type of volume that you might encounter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each volume is defined at the top level of the pod spec. Even if a volume is
+    used by more than one container in a pod, we only need to define it once.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When you want to access a volume from within a container, you must specify a
+    volume mount, mounting that volume into the container's filesystem at a particular
+    point. When we mount a volume, we refer to it by the name we used when we defined
+    it in the `volumes` section.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Once you have deployed this example manifest, you should be able to use the
+    `kubectl port-forward` command to access the web server running inside the pod:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You should now be able to visit `http://localhost:3000` in your browser to
+    see a random file that was created when the container started up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/2ec3e254-b8ec-41e1-a6c3-42b261d94d2f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'If you delete this pod, then the deployment will recreate a new pod. Because
+    the contents of an `emptyDir` volume are lost whenever the pod is destroyed, the
+    file that was created when the first pod started will be gone, and a new file
+    with a different name will have been created:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You will need to rerun `kubectl port-forward` to select the new pod:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: '![](assets/cda09f41-f300-412e-a001-43f1baa830a9.png)A newly created file being
+    served'
+  prefs: []
+  type: TYPE_NORMAL
+- en: EBS volumes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Getting Kubernetes to attach an EBS volume and then mount it into a container
+    in our pod is almost as simple as using an `emptyDir` volume. The lowest level
+    and simplest way to mount an EBS volume is by using the `awsElasticBlockStore`
+    volume type. This volume type handles attaching the EBS volume to the node where
+    our pod will run and then mounting the volume into a path in our container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When using this volume type, Kubernetes does not handle actually creating the
+    volume for us, so we need to do this manually. We can do this using the AWS CLI:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Remember that EBS volumes are tied to a particular availability zone (just like
+    `ec2` instances) and can only be attached to instances in that same availability
+    zone, so you will need to create volume(s) in the same zone(s) as the instances
+    in your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here, we have updated the deployment we created in the last example to use
+    the `awsElasticBlockStore` volume type and attach the volume we just created to
+    our pod. The ID of the EBS volume is passed to the volume configuration as a parameter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: You will see that manually attaching an EBS volume in this way is very similar
+    to using the simpler `emptyDir` volume.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The special `failure-domain.beta.kubernetes.io/zone` label is added to each
+    node automatically by the AWS cloud provider. Here, we are using it in `nodeSelector`
+    of our pod definition to schedule the pod to a node in the same availability zone
+    as we created the volume in. There are several other labels that Kubernetes will
+    automatically add to the nodes in your cluster. You can read about them in the
+    Kubernetes documentation at [https://kubernetes.io/docs/reference/kubernetes-api/labels-annotations-taints/](https://kubernetes.io/docs/reference/kubernetes-api/labels-annotations-taints/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When you first submit this deployment, its behavior will be exactly the same
+    as the previous version. But when we delete the pod and it is replaced, you will
+    notice that the file(s) created on the previous runs of this container will remain,
+    and a new file will be added to the list every time it starts up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/dee678a3-6597-4cd5-ac44-c64a26143d86.png)When our application is
+    backed by an EBS volume, files survive pod rescheduling'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Persistent volumes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: While we certainly could manually create EBS volumes in this way and use their
+    IDs in our manifests, there are some problems with this approach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is unwieldy and time consuming for users who want to run their applications
+    on a cluster to first think about provisioning the EBS volumes that an application
+    needs before modifying the manifests to refer to hardcoded IDs. It means that
+    pod manifests will need to include a configuration that is specific to running
+    the application in question on AWS. Ideally, we would want as much of our configuration
+    as possible to be reusable between the different environments where we might deploy
+    it, to avoid the risk of introducing errors caused by having to modify configurations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Kubernetes provides two abstractions that will help us manage EBS volumes:
+    `PersistentVolume` and `PersistentVolumeClaim`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `PersistentVolume` object represents a physical piece of storage in your
+    cluster; on AWS this is an EBS volume, in much the same way that the `Node` object
+    represents an EC2 instance in your cluster. The object captures the details of
+    how the storage is implemented, so for an EBS volume it records its ID so that
+    Kubernetes can attach it to the correct node when a pod using the volume is scheduled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`PersistentVolumeClaim` is the Kubernetes object that allows us to express
+    a request for `PersistentVolume` to be used in a pod. When we request a persistent
+    volume, we only need to request the amount of storage we require and optionally
+    a storage class (see the next section). `PersistentVolumeClaim` is normally embedded
+    within a pod spec. When a pod is scheduled, its `PersistentVolumeClaim` is matched
+    to a particular `PersistentVolume` that is big enough to fulfill the requested
+    amount of storage. `PersistentVolume` is bound to its requesting `PersistentVolumeClaim`,
+    so that even if a pod is rescheduled, the same underlying volume will be attached
+    to the pod.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is a big improvement over manually provisioning EBS volumes and including
+    the volume ID in our configuration, because we don't need to modify our manifest
+    every time our pod is deployed to a new environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you were operating Kubernetes manually (for example, in a bare metal deployment)
+    the cluster administrator might pre-provision a pool of `PersistentVolume`, which
+    would then be matched against and bound to each `PersistentVolumeClaim` as they
+    are created. When using AWS, there is no need to pre-provision storage, as Kubernetes
+    dynamically creates `PersistentVolume` using the AWS API as they are required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Persistent volumes example
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's look at how we can use persistent volumes to simplify the deployment of
+    our example application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To avoid additional charges on your AWS account, you might want to delete the
+    EBS volume you created manually in the previous example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, delete the deployment that we created so Kubernetes can detach the volume:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`**$ kubectl delete deployment/randserver**`Then, you can use the AWS CLI to
+    delete the EBS volume:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`**$ aws ec2 delete-volume --volume-id vol-04e744aad50d4911**`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before you begin, make sure that you have added at least the general-purpose
+    storage class to your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Creating an EBS volume using Kubernetes dynamic volume provisioning is as simple
+    as creating any other resource with `kubectl`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you added the `storageclass.kubernetes.io/is-default-class` annotation to
+    a storage class in your cluster, you could omit the `storageClassName` field if
+    you wanted to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once you create `PersistantVolumeClaim` for a storage class using the `kubernetes.io/aws-ebs`
+    provisioner, Kubernetes will provision an EBS volume matching the size and storage
+    class parameters that you specified. Once this is completed, you can use `kubectl
+    describe` to view the claim; you can see that the status has been updated to `Bound`
+    and the `Volume` field shows the underlying `PersistentVolume` that the claim
+    has been bound to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we use `kubectl describe` to inspect this `PersistentVolume`, we can see
+    the details of the underlying EBS volume that was automatically provisioned:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In our deployment, we can update the `volumes` section of the pod spec to refer
+    to `PersistentVolumeClaim` by name:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Storage classes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On AWS, there are several different types of volume available that offer different
+    price and performance characteristics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In order to provide a simple way to choose the volume type (and some other settings)
+    when we provision a volume, we create a `StorageClass` object that we can then
+    refer to by name when we create `PersistentVolumeClaim`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Storage classes are created in the same way as any other Kubernetes objects,
+    by submitting manifests to the API using `kubectl`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: This manifest creates a storage class called `general-purpose` that creates
+    volumes with the `gp2` volume type. If you remember our discussion about EBS volume
+    types in [Chapter 6](cb29a916-0f55-4fa9-816d-2322a86e1ccc.xhtml), *Planning for
+    Production*, this SSD-backed volume type is suitable for most general-purpose
+    applications offering a good balance of performance and price.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will also notice the `storageclass.kubernetes.io/is-default-class` annotation
+    that makes `StorageClass` the default one to be used by any `PersistentVolumeClaim`
+    that doesn't specify a storage class. You should only apply this annotation to
+    a single `StorageClass`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `parameter` field accepts several different options.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The most important parameter field is `type`, that allows us to choose one of
+    `gp2` (the default), `io1` (provisioned IOPS), `sc1` (cold storage), or `st1`
+    (throughput optimized).
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you choose to use the `io1` type, you should also use the `iopsPerGB` parameter
+    to specify the number of IOPS that will be provisioned for each GB of disk storage
+    requested. The maximum IOPS/GB ratio supported by `io1` EBS volumes is 50:1.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bear in mind that the cost of provisioned IOPS makes the cost of `io1` volumes
+    much higher than the equivalent general-purpose volumes. An `io1` volume with
+    IOPS provisioned to provide similar throughput to a `gp2` volume of the same size
+    can be three times more expensive. So, you should only use `io1` volumes where
+    you require performance in excess of that provided by `gp2` volumes. One trick
+    that can optimize costs is to use `gp2` volumes larger than your application requires
+    to provide extra IO credits.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You could, for example, create several different classes using the `io1` type
+    to be used by applications with different performance requirements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that Kubernetes expects a string value for the `iopsPerGb` field, so you
+    will need to quote this value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you are using an application that is optimized to make sequential reads
+    and writes to the filesystem, then you might benefit from using the `st1` volume
+    type, which uses optimized magnetic storage to provide high throughput reads and
+    writes. It is not recommended to use this storage for general-purpose use, as
+    the performance when making random access reads or writes will be poor:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `sc1` volume type offers the very lowest cost storage available as an EBS
+    volume and is intended for infrequently accessed data. Like `st1` volumes, `sc1`
+    is optimized for sequential reads and writes, so will perform poorly on workloads
+    with random reads and writes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: It is a good idea to decide up front the different storage classes you want
+    to make available in your cluster, and then provide documentation about when each
+    class should be used to users of your cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You should think about submitting a list of storage classes to your cluster
+    as part of your provisioning process, as there are no storage classes created
+    by default when you provision an EKS cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: StatefulSet
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far, we have seen how we can use Kubernetes to automatically provision EBS
+    volumes for `PersistentVolumeClaim`. This can be very useful for a number of applications
+    where we need a single volume to provide persistence to a single pod.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We run into problems though, as soon as we try to scale our deployment up. Pods
+    running on the same node may end up sharing the volume. But as EBS volumes can
+    only be attached to a single instance at any one time, any pods scheduled to another
+    node will get stuck with the `ContainerCreating` status, waiting endlessly for
+    the EBS volume to be attached.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are running an application where you want each replica to have its own
+    unique volume, we can use a stateful set. Stateful sets have two key advantages
+    over deployments when we want to deploy applications where each replica needs
+    to have its own persistent storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Firstly, instead of referring to a single persistent volume by name, we can
+    provide a template to create a new persistent volume for each pod. This allows
+    us to provision an independent EBS volume for each pod replica, just by scaling
+    up the stateful set. If we wanted to achieve this with a deployment, we would
+    need to create a separate Deployment for each replica, each referring to a different
+    persistent volume by name.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Secondly, when a pod is scheduled by `StatefulSet`, each replica has a consistent
+    and persistent hostname that stays the same even if the pod is rescheduled to
+    another node. This is very useful when running software where each replica expects
+    to be able to connect to its peers at a specific address. Before stateful sets
+    were added to Kubernetes, deploying such software to Kubernetes often relied on
+    special plugins to perform service discovery using the Kubernetes API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To illustrate how stateful sets work, we are going to rewrite our example application
+    deployment manifest to use `StatefulSet`. Because each replica pod in `StatefulSet`
+    has a predictable hostname, we first need to create a service to allow traffic
+    to these hostnames to be routed to the underlying pods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: Each pod will be given a hostname constructed from the name of the stateful
+    set and the pod number in the set. The domain of the hostname is the name of the
+    service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, when we create a stateful set called `randserver` with three replicas.
+    The Pods in the set will be given the hostnames `randserver-0`, `randserver-1`,
+    and `randserver-2`. Other services running inside the cluster will be able to
+    connect to these pods by using the names `randserver-0.randserver`, `randserver-1.randserver`,
+    and `randserver-2.randserver`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The configuration for `StatefulSet` is very similar to the configuration for
+    a deployment. The key differences that should be noted are these:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `serviceName` field where we need to refer to the service used to provide
+    network access to the pods.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The `volumeClaimTemplates` field where we include a template for `PersistentVolumeClaim`
+    that will be created for each pod replica in `StatefulSet`. You can think of this
+    as an analog to the template field that provides a template for each pod that
+    is created:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once you have submitted `StatefulSet` to Kubernetes, you should be able to
+    see the pods that have successfully been scheduled to the cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that the name of each pod follows a predictable pattern, unlike pods created
+    with a deployment or replica set, which each have a random name.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Try deleting one of the pods in the stateful set, and notice that it is replaced
+    by a pod with exactly the same name as the one that was deleted:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If you look at the persistent volume claims, you will see that their names
+    also follow a predictable pattern where the name of a claim is formed from the
+    name given in the volume claim template metadata, the name of the stateful set,
+    and the pod number:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you delete (or scale down) a stateful set, then the associated persistent
+    volume claims remain. This is quite advantageous as it makes it harder to lose
+    the valuable data created by an application. If you later recreate (or scale up)
+    the stateful set, then by virtue of the predictable names used, the same volumes
+    are reused.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you do intend to fully remove a stateful set from your cluster, you may
+    also need to additionally remove the corresponding persistent volume claims:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we have learned about the rich set of tools that Kubernetes
+    provides to provision storage for your applications.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You should have learned the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to configure volumes for your pods
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to mount volumes into containers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to automatically provision EBS volumes with persistent volume claims
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to provision different EBS volume types by configuring storage classes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to dynamically provision a volume for each pod in a stateful set
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You should now have enough knowledge to deploy many types of applications to
+    your Kubernetes cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'If you want to learn more about how to utilize storage in Kubernetes, here
+    are some resources that you might find useful:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Kubernetes Helm Charts include many configuration examples for well-known
+    datastores that make extensive use of persistent volumes**: [https://github.com/helm/charts](https://github.com/helm/charts)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The Kubernetes documentation has detailed and extensive information about
+    using storage in Kubernetes**: [https://kubernetes.io/docs/concepts/storage/](https://kubernetes.io/docs/concepts/storage/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The Kubernetes EFS provisioner provides an add-on provisioner that can be
+    deployed to provision volumes backed by AWS Elastic File System (EFS). This can
+    be a useful tool if you want multiple pods to be able to read and write from the
+    same volume**: [https://github.com/kubernetes-incubator/external-storage/tree/master/aws/efs](https://github.com/kubernetes-incubator/external-storage/tree/master/aws/efs)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

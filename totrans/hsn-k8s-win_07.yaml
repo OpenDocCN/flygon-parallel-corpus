@@ -1,0 +1,1428 @@
+- en: Kubernetes Networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For container orchestration, there are two major challenges to be solved: managing
+    container hosts (nodes) and managing the networking between containers. If you
+    limited your container host cluster to only one node, networking would be fairly
+    simple—for Docker on Linux, you would use the default bridge network driver, which
+    creates a private network (internal to the host), allowing the containers to communicate
+    with each other. External access to the containers requires exposing and mapping
+    container ports as host ports. But now, if you consider a multi-node cluster,
+    this solution does not scale well—you have to use NAT and track which host ports
+    are used, and on top of that, the applications running in containers have to be
+    aware of the networking topology.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fortunately, Kubernetes provides a solution to this challenge by providing a
+    networking model that has specific, fundamental requirements—any networking solution
+    that complies with the specification can be used as the networking model implementation
+    in Kubernetes. The goal of this model is to provide transparent container-to-container
+    communication and external access to the containers, without containerized applications requiring any
+    knowledge about the underlying networking challenges. Throughout this chapter,
+    we will explain the assumptions of the Kubernetes networking model and how Kubernetes
+    networking issues can be solved in hybrid Linux/Windows clusters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes networking principles
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kubernetes CNI network plugins
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Windows server networking in Kubernetes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Choosing Kubernetes network modes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For this chapter, you will need the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows 10 Pro, Enterprise, or Education (version 1903 or later, 64-bit) installed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Docker Desktop for Windows 2.0.0.3 or later installed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Azure CLI installed if you would like to use the AKS cluster from the previous
+    chapter
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Installation of Docker Desktop for Windows and system requirements are covered
+    in [Chapter 1](deffbcf5-3a21-4690-ad42-ae5e4cd97dea.xhtml)*, Creating Containers*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For Azure CLI, you can find detailed installation instructions in [Chapter 2](43d5e48b-311c-462c-a68e-6a0b5c4224e8.xhtml)*, Managing
+    State in Containers**.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can download the latest code samples for this chapter from the official
+    GitHub repository: [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes networking principles
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As a container orchestrator, Kubernetes provides a networking model that consists
+    of a set of requirements that any given networking solution must fulfill. The
+    most important requirements are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pods running on a node must be able to communicate with all Pods on all nodes
+    (including the Pod's node) without NAT and explicit port mapping.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All Kubernetes components running on a node, for example kubelet or system daemons/services,
+    must be able to communicate with all Pods on that node.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These requirements enforce a flat, NAT-less network model, which is one of the
+    core Kubernetes concepts that make it so powerful, scalable, and easy to use.
+    From this perspective, Pods are similar to VMs running in a Hyper-V cluster—each
+    Pod has its own IP address assigned (IP-per-Pod model), and containers within
+    a Pod share the same network namespace (like processes on a VM), which means they
+    share the same localhost and need to be aware of port assignments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In short, networking in Kubernetes has the following challenges to overcome:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Intra-Pod communication between containers**: Handled by standard localhost
+    communication.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Pod-to-Pod communication**: Handled by underlying network implementation.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Pod-to-Service and External-to-Service communication**: Handled by Service
+    API objects, communication is dependent on the underlying network implementation.
+    We will cover this later in this section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Automation of networking setup by kubelet when a new Pod is created**: Handled
+    by **Container Network Interface** (**CNI**) plugins. We will cover this in the
+    next section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are numerous implementations of the Kubernetes networking model, ranging
+    from simple L2 networking (for example, Flannel with a host-gw backend) to complex,
+    high-performance **Software-Defined Networking** (**SDN**) solutions (for example,
+    Big Cloud Fabric). You can find a list of different implementations of the networking
+    model in the official documentation: [https://kubernetes.io/docs/concepts/cluster-administration/networking/#how-to-implement-the-kubernetes-networking-model](https://kubernetes.io/docs/concepts/cluster-administration/networking/#how-to-implement-the-kubernetes-networking-model).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this book, we will only focus on implementations that are relevant from
+    the Windows perspective:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: L2 network
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overlay network
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's begin with the L2 network, which is the simplest network implementation
+    available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: L2 network
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Layer 2** (**L2**) refers to the data link layer, which is the second level
+    in the seven-layer OSI reference model for network protocol design. This layer
+    is used to transfer data between nodes in the same local area network (so, think
+    of operating on MAC addresses and switch ports, not IP addresses, which belong
+    to L3). For Kubernetes, an L2 network with routing tables set up on each Kubernetes
+    node is the simplest network type that fulfills the Kubernetes networking model
+    implementation requirements. A good example is Flannel with a host-gw backend.
+    At a high level, Flannel (host-gw) provides networking for Pods in the following
+    way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each node runs a **flanneld** (or **flanneld.exe **for Windows) agent, which
+    is responsible for allocating a subnet lease from a larger, preconfigured address
+    space called **Pod CIDR** (**Classless Inter-Domain Routing**). In the following
+    diagram, Pod CIDR is `10.244.0.0/16`, whereas Node 1 has leased subnet `10.244.1.0/24`
+    and Node 2 has leased subnet `10.244.2.0/24`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In most cases, the Flannel agent is deployed as a **DaemonSet** during Pod
+    network installation in the cluster. An example DaemonSet definition can be found
+    here: [https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel.yml](https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel.yml).'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Flannel stores networking information and lease data using the Kubernetes API
+    or **etcd** directly, depending on its configuration.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When a new node joins the cluster, Flannel creates a `cbr0` bridge interface
+    for all Pods on a given node. Routing tablesin the operating system on nodes are
+    updated, containing one entry for each node in the cluster. For example, for Node
+    2 in the following diagram, the routing table has two entries, which route communication
+    to `10.244.1.0/24` via the `10.0.0.2` gateway (inter-node communication to Node
+    1) and communication to `10.244.2.0/24` via the local `cbr0` interface (local
+    communication between Pods on Node 1).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When a new Pod is created, a new **veth** device pair is created. An `eth0`
+    device is created in the Pod network namespace and a `vethX` device at the other
+    end of the pair in the host (root) namespace. A virtual Ethernet device is used
+    as a tunnel between network namespaces.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In order to trigger the preceding actions, kubelet uses CNI, which is implemented
+    by the Flannel CNI plugin:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](assets/fb8dbafa-cca9-4a1c-a8ed-0c7cae1ac530.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: All of the actions performed by Flannel could be performed manually using the
+    command line but, of course, the goal of Flannel is to automate the process of
+    new node registration and new Pod network creation transparently for Kubernetes
+    users.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s now quickly analyze what happens when a container in Pod 1, `10.244.1.2` (on
+    Node 1), would like to send a TCP packet to a container in Pod 4, `10.244.2.3` (on
+    Node 2):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pod 1 outbound packet will be sent to the `cbr0` bridge interface as it is set
+    as the default gateway for the `eth0` Pod interface.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet is forwarded to the `10.0.0.3` gateway due to the `10.244.2.0/24
+    → 10.0.0.3` routing table entry at Node 1.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet goes through the physical L2 network switch and is received by Node
+    2 at the `eth0` interface.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Node 2's routing table contains an entry that forwards traffic to the `10.244.2.0/24`
+    CIDR to the local `cbr0` bridge interface.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet is received by Pod 2.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Note that the preceding example uses Linux network interface naming and terminology.
+    The Windows implementation of this model is generally the same but differs on
+    OS-level primitives.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using an L2 network with routing tables is efficient and simple to set up;
+    however, it has some disadvantages, especially as the cluster grows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: L2 adjacency of nodes is required. In other words, all nodes must be in the
+    same local area network with no L3 routers in between.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Synchronizing routing tables between all nodes. When a new node joins, all nodes
+    need to update their routing tables.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Possible glitches and delays, especially for short-lived containers, due to
+    the way L2 network switches set up new MAC addresses in forwarding tables.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Flannel with a **host-gw** backend has stable support for Windows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generally, using Overlay networking is recommended, which allows creating a
+    virtual L2 network over an existing underlay L3 network.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Overlay network
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As a general concept, Overlay networking uses encapsulation in order to create
+    a new, tunneled, virtual network on top of an existing L2/L3 network, called an
+    underlay network. This network is created without any changes to the actual physical
+    network infrastructure for the underlay network. Network services in the Overlay
+    network are decoupled from the underlying infrastructure by encapsulation, which
+    is a process of enclosing one type of packet using another type of packet. Packets
+    that are encapsulated when entering a tunnel are then de-encapsulated at the other
+    end of the tunnel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Overlay networking is a broad concept that has many implementations. In Kubernetes,
+    one of the commonly used implementations is using the **Virtual Extensible LAN**
+    (**VXLAN) **protocol for tunneling L2 Ethernet frames via UDP packets. Importantly,
+    this type of Overlay network works both for Linux and Windows nodes. If you have
+    a Flannel network with a VXLAN backend, the networking for Pods is provided in
+    the following way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similarly to the host-gw backend, a flanneld agent is deployed on each node
+    as a DaemonSet.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When a new node joins the cluster, Flannel creates a `cbr0` bridge interface for
+    all Pods on a given node and an additional `flannel.<vni>` VXLAN device (a VXLAN
+    tunnel endpoint, or VTEP for short; VNI stands for VXLAN Network Identifier, in
+    this example, `1`). This device is responsible for the encapsulation of the traffic.
+    The IP routing table is updated only for the new node. Traffic to Pods running
+    on the same node is forwarded to the `cbr0` interface, whereas all the remaining
+    traffic to Pod CIDR is forwarded to the VTEP device. For example, for Node 2 in
+    the following diagram, the routing table has two entries that route the communication
+    to `10.244.0.0/16` via the `flannel.1` VTEP device (inter-node communication in
+    the Overlay network) and communication to `10.244.2.0/24` is routed via the local `cbr0` interface
+    (local communication between Pods on Node 1 without Overlay).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'When a new Pod is created, a newveth device pair is created, similar to the
+    case of the host-gw backend:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](assets/d1e6c841-ad79-4dd0-81fb-3bef9654e9c9.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Let''s now quickly analyze what happens when a container in Pod 1 `10.244.1.2` (on
+    Node 1) would like to send a TCP packet to a container in Pod 4, `10.244.2.3` (on
+    Node 2):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pod 1 outbound packet will be sent to the `cbr0` bridge interface as it is set
+    as the default gateway for the `eth0` Pod interface.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet is forwarded to the `flannel.1` VTEP device due to the `10.244.0.0/16
+    → flannel.1` routing table entry at Node 1.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`flannel.1` uses the MAC address of Pod 4 in the `10.244.0.0/16` Overlay network as
+    the inner packet destination address. This address is populated by the **flanneld**
+    agent in the **forwarding database** (**FDB**).'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`flannel.1 ` determines the IP address of the destination VTEP device at Node
+    2 using the FDB, and `10.0.0.3` is used as the destination address for the outer
+    encapsulating packet.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet goes through the physical L2/L3 network and is received by Node 2\.
+    The packet is de-encapsulated by the `flannel.1` VTEP device.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Node 2's routing table contains an entry that forwards traffic to the `10.244.2.0/24` CIDR
+    to the local `cbr0` bridge interface.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The packet is received by Pod 2.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: For Windows, Flannel with an Overlay backend is currently still in the alpha
+    feature stage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using a VXLAN backend over a host-gw backend for Flannel has several advantages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: No need for L2 adjacency of the nodes.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: L2 Overlay networks are not susceptible to spanning tree failures, which can
+    happen in the case of L2 domains spanning multiple logical switches.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The solution described earlier in this section is similar to Docker running
+    in **swarm mode**. You can read more about Overlay networks for swarm mode in
+    the official documentation: [https://docs.docker.com/network/Overlay/.](https://docs.docker.com/network/overlay/.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding two networking solutions are the most commonly used solutions
+    for hybrid Linux/Windows clusters, especially when running on-premises. For other
+    scenarios, it is also possible to use **Open Virtual Network** (**OVN**) and **L2
+    tunneling** for Azure-specific implementations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other solutions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In terms of Windows-supported networking solutions for Kubernetes, there are
+    two additional implementations that can be used:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Open Virtual Network** (**OVN**), for example, as part of a deployment on
+    OpenStack'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**L2 tunneling** for deployments on Azure'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: OVN is a network virtualization platform for implementing SDN that decouples
+    physical network topology from the logical one. Using OVN, users can define network
+    topologies consisting of logical switches and routers. Kubernetes supports OVN
+    integration using a dedicated CNI plugin **ovn-kubernetes** ([https://github.com/ovn-org/ovn-kubernetes](https://github.com/ovn-org/ovn-kubernetes)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: For Azure-specific scenarios, it is possible to leverage Microsoft Cloud Stack
+    features directly using the **Azure-CNI** plugin, which relies on the **L2Tunnel**
+    Docker network driver. In short, Pods are connected to the existing virtual network
+    resources and configurations, and all Pod packets are routed directly to the virtualization
+    host in order to apply Azure SDN policies. Pods get full connectivity in the virtual
+    network provided by Azure, which means that each Pod can be directly reached from
+    outside of the cluster. You can find more details about this solution in the official
+    AKS documentation: [https://docs.microsoft.com/bs-latn-ba/azure/aks/configure-azure-cni](https://docs.microsoft.com/bs-latn-ba/azure/aks/configure-azure-cni).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Services
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the previous chapter, we covered Services as API objects and explained how
+    they can be used together with Deployments. To briefly recap, Service API objects
+    enable network access to a set of Pods, based on label selectors. In terms of
+    Kubernetes networking, Services are a concept that''s built on top of the standard
+    networking model, which aims to do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enable reliable communication to a set of Pods using **Virtual IP** (**VIP**).
+    Client Pods do not need to know the current IP addresses of individual Pods, which
+    can change over time. External clients also do not need to know about current
+    IP addresses of Pods.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Load-balance network traffic (internal as well as external) to a set of Pods.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Enable service discovery in the cluster. This requires the DNS service add-on
+    to be running in the cluster.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There are four Service types available in Kubernetes, which can be specified
+    in the Service object specification:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ClusterIP
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NodePort
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: LoadBalancer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: ExternalName
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We will go through each type separately, but let''s first take a look at what
+    a **Service** looks like in the context of Deployments and Pods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/81db847a-1743-436c-a593-2c40163e4895.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The preceding diagram shows how the simplest internal Service of type ClusterIP
+    exposes an existing Deployment that manages three replicas of Pods labeled with
+    `environment: test`. The ClusterIP Service, with the same label selector, `environment:
+    test`, is responsible for monitoring the result of label selector evaluation and
+    updating **endpoint** API objects with the current set of alive and ready Pod
+    IPs. At the same time, kube-proxy is observing Service and endpoint objects in
+    order to create iptables rules on Linux nodes or HNS policies on Windows nodes,
+    which are used to implement a Virtual IP address with a value of ClusterIP specified
+    in the Service specification. Finally, when a client Pod sends a request to the
+    Virtual IP, it is forwarded using the rules/policies (set up by kube-proxy) to
+    one of the Pods in the Deployment. As you can see, kube-proxy is the central component
+    for implementing Services, and in fact it is used for all Service types, apart
+    from ExternalName.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ClusterIP
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The default type of Service in Kubernetes is ClusterIP, which exposes a service
+    using an internal VIP. This means that the Service will only be reachable from
+    within the cluster. Assuming that you are running the following `nginx` Deployment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All of the manifest files are available in the official GitHub repository for
+    this book: [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can deploy a Service of ClusterIP type using the following manifest file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Like for every Service type, the key part is the `selector` specification,
+    which has to match the Pods in the Deployment. You specify `type` as `ClusterIP`
+    and assign `8080` as a port on the Service, which is mapped to `targetPort: 80` on
+    the Pod. This means that client Pod would use the `nginx-deployment-example:8080`
+    TCP endpoint for communicating with nginx Pods. The actual ClusterIP address is
+    assigned dynamically, unless you explicitly specify one in the `spec`. The internal
+    DNS Service in a Kubernetes cluster is responsible for resolving `nginx-deployment-example`
+    to the actual ClusterIP address as a part of service discovery.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The diagrams in the rest of this section represent how the Services are implemented logically.
+    Under the hood, kube-proxy is responsible for managing all the forwarding rules
+    and exposing ports, as in the previous diagram.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This has been visualized in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/418727d5-dc7f-40bb-b753-5afd78678a49.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'ClusterIP Services are a base for the other types of Service that allow external
+    communication: NodePort and LoadBalancer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: NodePort
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The first type of Service allowing external ingress communication to Pods is
+    the NodePort Service. This type of Service is implemented as a ClusterIP Service
+    with the additional capability of being reachable using any cluster node IP address
+    and a specified port. In order to achieve that, kube-proxy exposes the same port
+    on each node in the range 30000-32767 (which is configurable) and sets up forwarding
+    so that any connections to this port will be forwarded to ClusterIP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can deploy a NodePort Service using the following manifest file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you do not specify `nodePort` in the Spec, it will be allocated dynamically
+    using the NodePort range. Note that the service still acts as a ClusterIP Service,
+    which means that it is internally reachable at its ClusterIP endpoint.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram visualizes the concept of a NodePort Service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/f843f656-4526-48b2-a0ca-b918b742410f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Using a NodePort Service is recommended when you would like to set up your own
+    load-balancing setup in front of the Service. You can also expose the NodePorts
+    directly, but bear in mind that such a solution is harder to secure and may pose
+    security risks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: LoadBalancer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The second type of Service that allows for external ingress communication is
+    LoadBalancer, which is available in Kubernetes clusters that can create external
+    load balancers, for example, managed Kubernetes offerings in the cloud. This type
+    of Service combines the approach of NodePort with an additional external load
+    balancer in front of it, which routes traffic to NodePorts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can deploy a LoadBalancer Service using the following manifest file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that in order to apply this manifest file, you need an environment that
+    supports external load balancers, for example, the AKS cluster that we created
+    in [Chapter 4](118e3c89-786e-4718-ba67-6c38928e2a42.xhtml), *Kubernetes Concepts
+    and Windows Support*. Katacoda Kubernetes Playground is also capable of creating
+    an "external" load balancer that can be accessed from the Playground terminal.
+    If you attempt to create a LoadBalancer Service in an environment that does not
+    support creating external load balancers, it will result in the load balancer
+    ingress IP address being in the *pending* state indefinitely.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order to obtain an external load balancer address, execute the following
+    command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `EXTERNAL-IP` column shows that the load balancer has the IP address `137.117.227.83`,
+    and in order to access your Service you have to communicate with the `137.117.227.83:8080`
+    TCP endpoint. Additionally, you can see that the Service has its own internal
+    ClusterIP , `10.0.190.215`, and NodePort `30141` is exposed. A LoadBalancer Service
+    running on AKS has been visualized in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/3bbb81f4-46df-4681-914d-c8d192f1d55c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'If you are interested in how the Azure Load Balancer in front of the Service
+    is configured, you need to go to [https://portal.azure.com](https://portal.azure.com)
+    and navigate to the load balancer resources, where you will find the Kubernetes
+    load balancer instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/ac15b906-1332-4ac6-8772-a7fb5d1069b5.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Now, let''s take a look at the last type of Service: ExternalName.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ExternalName
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In some cases, you need to define a Service that points to an external resource
+    that is not hosted in your Kubernetes cluster. This can include, for example,
+    cloud-hosted database instances. Kubernetes provides a way to abstract communication
+    to such resources and registers them in cluster service discovery by using an ExternalName
+    Service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ExternalName Services do not use selectors and are just a raw mapping of the
+    Service name to an external DNS name:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: During resolution of the Service DNS name (`externalname-example-service.default.svc.cluster.local`),
+    the internal cluster DNS will respond with a CNAME record with a value of `cloud.database.example.com`.
+    There is no actual traffic forwarding using kube-proxy rules involved—the redirection
+    happens at the DNS level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A good use case for the ExtenalName Service is providing different instances
+    of an external service, for example, a database, depending on the environment
+    type. From the Pods' point of view, this will not require any configuration or
+    connection string changes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ingress
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'LoadBalancer Services only provide L4 load balancing capabilities. This means
+    you cannot use the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: HTTPS traffic termination and offloading
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Name-based virtual hosting using the same load balancer for multiple domain
+    names
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Path-based routing to services, for example, as an API gateway
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To solve that, Kubernetes provides the Ingress API object (which is not a type
+    of Service), which can be used for L7 load balancing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ingress deployment and configuration is a broad topic and is out of scope of
+    this book. You can find more detailed information regarding Ingress and Ingress
+    controllers in the official documentation: [https://kubernetes.io/docs/concepts/services-networking/ingress/](https://kubernetes.io/docs/concepts/services-networking/ingress/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using Ingress requires first the deployment of an Ingress controller in your
+    Kubernetes cluster. An Ingress controller is a Kubernetes controller that is deployed
+    manually to the cluster, most often as a DaemonSet or a deployment that runs dedicated
+    Pods for handling ingress traffic load balancing and smart routing. A commonly
+    used Ingress controller for Kubernetes is **ingress-nginx** ([https://www.nginx.com/products/nginx/kubernetes-ingress-controller](https://www.nginx.com/products/nginx/kubernetes-ingress-controller)),
+    which is installed in the cluster as a Deployment of an nginx web host with a
+    set of rules for handling Ingress API objects. The Ingress controller is exposed
+    as a Service with a type that depends on the installation. For example, for an
+    AKS cluster that only has Linux nodes, a basic installation of ingress-nginx,
+    exposed as a LoadBalancer Service, can be performed using the following manifests:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: In general, the installation of the Ingress controller is dependent on the Kubernetes
+    cluster environment and configuration and has to be adjusted according to your
+    needs. For example, for AKS with Windows nodes, you need to ensure that proper node
+    selectors are used in order to schedule Ingress controller Pods properly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find the customized nginx Ingress controller definition for AKS with
+    Windows nodes, together with example Services and Ingress definitions, in the
+    official GitHub repository for this book: [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05/05_ingress-example](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter05/05_ingress-example).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When an Ingress controller has been installed in the cluster, the Ingress API
+    Objects may be created and will be handled by the controller. For example, assuming
+    that you have deployed two ClusterIP Services `example-service1` and `example-service2`,
+    the Ingress definition could look as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, when you perform a HTTP request to `https://<ingressServiceLoadBalancerIp>/service1`,
+    the traffic will be routed by nginx to `example-service1`. Note that you are using
+    only one cloud load balancer for this operation and the actual routing to Kubernetes
+    Services is performed by an Ingress controller using path-based routing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The principle of this design has been shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/e56b2286-fc83-40f0-8ee7-bd8c662ff394.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: For AKS, you can consider using the HTTP application routing add-on, which automates
+    the management of Ingress controllers and External-DNS controllers for your cluster. More
+    details can be found in the official documentation: [https://docs.microsoft.com/en-us/azure/aks/http-application-routing](https://docs.microsoft.com/en-us/azure/aks/http-application-routing).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A general rule of thumb for choosing whether to implement an Ingress or a Service
+    is to use an Ingress for exposing HTTP (and especially HTTPS) endpoints and to
+    use Services for other protocols.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes CNI network plugins
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we have already mentioned the terms **Container Network Interface**
+    (**CNI**) and **CNI plugins **in the context of Kubernetes networking setup. In
+    fact, CNI is not limited to Kubernetes—this concept originated from the Rkt container
+    runtime and was adopted as a CNCF project aiming to provide a simple and clear
+    interface between any container runtime and network implementation. Container
+    runtimes use CNI plugins in order to connect containers to the network and remove
+    them from the network when needed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the CNI project
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are three distinct parts of the CNI project:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CNI specification defines the architecture of a generic, plugin-based networking
+    solution for containers and the actual interface that CNI plugins must implement.
+    The specification can be found at [https://github.com/containernetworking/cni/blob/master/SPEC.md](https://github.com/containernetworking/cni/blob/master/SPEC.md).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Libraries for integrating CNI into applications, which is provided in the same
+    repository as the specification: [https://github.com/containernetworking/cni/tree/master/libcni](https://github.com/containernetworking/cni/tree/master/libcni).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CNI plugins reference implementation, which is in a dedicated repository: [https://github.com/containernetworking/plugins](https://github.com/containernetworking/plugins).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The specification of CNI is fairly straightforward, and can be summarized as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CNI plugins are implemented as stand-alone executables.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The container runtime is responsible for preparing a new network namespace (or
+    network compartment in the case of Windows) for the container, before interacting
+    with CNI plugins.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The CNI plugin is responsible for connecting the container to the network, as
+    specified by the network configuration.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Network configuration is supplied to CNI plugins by the container runtime in
+    JSON format, using standard input.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Arguments are provided to the CNI plugin using environment variables. For example,
+    the `CNI_COMMAND` variable specifies the operation type that the plugin should
+    perform. The set of commands is limited and consists of `ADD`, `DEL`, `CHECK`,
+    and `VERSION`; the most significant are `ADD` and `DEL`, which add a container
+    to the network and delete it from the network respectively.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For CNI plugins, there are three general types of plugin, which have different
+    responsibilities during network configuration:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interface-creating plugins
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**IP Address Management **(**IPAM**) plugins, which are responsible for IP
+    address allocation for containers'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Meta plugins, which may act as adapters for other CNI plugins or provide additional
+    configuration for other CNI plugins or transform their outputs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Currently, on Windows you can only use the following reference implementations:
+    the host-local IPAM plugin, the win-bridge and win-Overlay interface-creating
+    plugins, and the flannel meta plugin. Third-party plugins can be also used; for
+    example, Microsoft provides the Azure-CNI plugin for integrating containers with
+    Azure SDN ([https://github.com/Azure/azure-container-networking/blob/master/docs/cni.md](https://github.com/Azure/azure-container-networking/blob/master/docs/cni.md)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In Kubernetes, CNI plugins are used by kubelet when managing a Pod's life cycle
+    to ensure the connectivity and reachability of the Pod. The most basic operation
+    performed by Kubelet is executing the `ADD` CNI command when a Pod is created
+    and the `DELETE` CNI command when a Pod is destroyed. CNI plugins may be also
+    used for adjusting the kube-proxy configuration in some cases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing the CNI plugin and defining the network configuration for the CNI plugin
+    is performed during the Pod network add-on installation step when deploying a
+    new cluster. Most commonly, the installation is performed by the deployment of
+    a dedicated DaemonSet, which performs the installation of CNI plugins using init
+    containers and runs additional agent containers on each node if needed. A good
+    example of such an installation is the official Kubernetes manifest for Flannel: [https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel.yml](https://github.com/coreos/flannel/blob/master/Documentation/kube-flannel.yml).
+  prefs: []
+  type: TYPE_NORMAL
+- en: CoreOS Flannel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'When working with Linux/Windows hybrid Kubernetes clusters, especially on-premises,
+    you will usually install **Flannel** as a Pod network add-on ([https://github.com/coreos/flannel](https://github.com/coreos/flannel)).
+    Flannel is a minimalistic L2/L3 virtual network provider for multiple nodes, specifically
+    for Kubernetes and containers. There are three main components in Flannel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **flanneld** (or `flanneld.exe` on Windows machines) agent/daemon running
+    on each node in the cluster, usually deployed as a DaemonSet in Kubernetes. It
+    is responsible for allocating an exclusive subnet lease for each node out of a
+    larger Pod's CIDR. For example, in this chapter, we have been heavily using `10.244.0.0/16`
+    as the Pod CIDR in the cluster and `10.244.1.0/24` or `10.244.2.0/24` as subnet
+    leases for individual nodes. Lease information and node network configuration
+    is stored by `flanneld` using the Kubernetes API or directly in `etcd`. The main
+    responsibility of this agent is synchronizing subnet lease information, configuring
+    the Flannel backend, and exposing the configuration (as a file in the container
+    host filesystem) on the node for other components, such as the Flannel CNI plugin.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Flannel **backend**, which defines how the network between Pods is created.
+    Examples of backends supported on both Windows and Linux that we have already
+    used in this chapter are Vxlan and host-gw. You can find more about Flannel backends
+    at [https://github.com/coreos/flannel/blob/master/Documentation/backends.md](https://github.com/coreos/flannel/blob/master/Documentation/backends.md).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The Flannel **CNI plugin**, which is executed by kubelet when adding a Pod
+    to a network or removing a Pod from a network. The Flannel CNI plugin is a meta
+    plugin that uses other interface-creating and IPAM plugins to perform the operations.
+    Its responsibility is to read the subnet information provided by `flanneld`, generate
+    JSON configuration for an appropriate CNI plugin, and execute it. The target plugins
+    choice depends on which backend is used by Flannel; for example, for a vxlan backend
+    on Windows nodes, the Flannel CNI plugin will invoke the host-local IPAM plugin
+    and the win-Overlay plugin. You can find more about this meta plugin in the official
+    documentation: [https://github.com/containernetworking/plugins/tree/master/plugins/meta/flannel](https://github.com/containernetworking/plugins/tree/master/plugins/meta/flannel).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s take a look at what happens step by step on a Windows node with Flannel
+    running on a vxlan backend—from Flannel agent deployment to Pod creation by kubelet
+    (similar steps occur for Linux nodes but with different target CNI plugins being
+    executed):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `flanneld.exe` agent is deployed to the node as a DaemonSet or is started
+    manually (as the current documentation for Windows suggests).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'The agent reads the supplied `net-conf.json` file, which contains the Pod CIDR
+    and the vxlan backend configuration:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The agent acquires a new subnet lease, `10.244.1.0/24`, for the node. Lease
+    information is stored using the Kubernetes API. The `vxlan0` network is created,
+    VTEP devices are created, and routing tables and forwarding database are updated.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Information about the subnet lease is written to `C:\run\flannel\subnet.env`
+    in the node filesystem. Here''s an example:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Whenever a new node joins the cluster, the `flanneld.exe` agent performs any
+    additional reconfiguration to the routing tables and forwarding database.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Now, a new Pod is scheduled on this node and kubelet initializes the pod infra
+    container and executes the `ADD` command on the Flannel meta CNI plugin with the
+    configuration JSON, which delegates interface creation to the `win-Overlay` plugin
+    and IPAM management to the `host-local` plugin. The Flannel CNI plugin generates
+    the configuration JSON based on `subnet.env` and input configuration for these
+    plugins.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: A new IP is leased using the `host-local` IPAM plugin. Flannel is not responsible
+    for managing the IPAM, it just retrieves a new free IP address from a given subnet
+    on the current node.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `win-bridge` plugin configures the **Host Networking Service** (**HNS**)
+    endpoint for the Pod and effectively connects the Pod to the Overlay network.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: To summarize, Flannel automates the process of L2/Overlay network creation for
+    Pods and maintains the network as new Pods are created or new nodes join the cluster.
+    Currently, the L2 network (the host-gw backend) is considered stable on Windows,
+    whereas the Overlay network (the vxlan backend) on Windows is still in alpha—you
+    will find both of these backends useful when working with on-premises Kubernetes
+    clusters. For AKS and AKS-engine scenarios, the most effective way to install
+    Pod networking is to use the default Azure-CNI plugin.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows Server networking in Kubernetes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: At a high level, Kubernetes networking for Windows nodes is similar to Linux
+    nodes—kubelet is decoupled from networking operations by CNI. The main differences
+    are in the actual implementation of Windows container networking and in the terminology
+    that is used for Windows containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows container networking is set up similar to Hyper-V virtual machine networking,
+    and in fact it shares many of the internal services, especially **Host Networking
+    Service** (**HNS**), which cooperates with **Host Compute Service** (**HCS**),
+    which manages the containers' life cycles. When creating a new Docker container,
+    the container receives its own network namespace (compartment) and a **Virtual
+    Network Interface Controller **(**vNIC** or in the case of Hyper-V, isolated containers
+    or **vmNIC**) located in this namespace. The vNIC is then connected to a **Hyper-V
+    Virtual Switch** (**vSwitch**), which is also connected to the host default network
+    namespace using the host vNIC. You can loosely map this construct to the **container
+    bridge interface **(CBR) in the Linux container world. The vSwitch utilizes Windows
+    Firewall and the **Virtual Filtering Platform** (**VFP**) Hyper-V vSwitch extension
+    in order to provide network security, traffic forwarding, VXLAN encapsulation,
+    and load balancing. This component is crucial for kube-proxy to provide Services'
+    functionalities, and you can think of VFP as *iptables* from the Linux container
+    world. The vSwitch can be internal (not connected to a network adapter on the
+    container host) or external (connected to a network adapter on the container host);
+    it depends on the container network driver. In the case of Kubernetes, you will
+    be always using network drivers (L2Bridge, Overlay, Transparent) that create an
+    external vSwitch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: VFP utilizes Windows Kernel functionalities to filter and forward network traffic.
+    Until Kubernetes 1.8, VFP was not supported by kube-proxy, and the only way to
+    forward the traffic was to use **userspace** mode, which does all the traffic
+    management in the user space, not the kernel space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All of the preceding setup is performed by HNS while a container is being created. HNS
+    is in general responsible for the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating virtual networks and vSwitches
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating network namespaces (compartments)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating vNICs (endpoints) and placing them inside the container network namespace
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating vSwitch ports
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Managing VFP network policies (load-balancing, encapsulation)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In the case of Kubernetes, CNI plugins are the only way to set up container
+    networking (for Linux, it is possible not to use them). They perform the actual
+    communication with HNS and HCS in order to set up the selected networking mode.
+    Kubernetes'' networking setup has one significant difference when compared to
+    the standard Docker networking setup: the container vNIC is attached to the pod
+    infra container, and the network namespace is shared between all containers in
+    the Pod. This is the same concept as for Linux Pods.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These constructs are visualized in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/f7046c96-b38c-48fd-aace-8153927c5a66.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The architecture of Windows container networking for Kubernetes has one more
+    important concept: network drivers (modes). In the next section, we will go through
+    the options and see which of them fit Kubernetes, but first, let''s take a quick
+    look at the current limitations of Kubernetes networking on Windows.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Limitations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Windows container networking is constantly evolving, and the implementation of many features
+    is still in progress. Kubernetes has currently a few networking limitations on
+    the Windows platform:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Host networking mode is not available for Windows Pods.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Accessing NodePort from the node itself is not supported.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The IPv6 stack is not supported for L2Bridge, L2Tunnel, and Overlay network
+    drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: ICMP for external networks is not supported. In other words, you will not be
+    able to ping IP addresses outside of your Kubernetes cluster.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Flannel running on a vxlan backend is restricted to using VNI 4096 and UDP port
+    4789.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: IPsec encryption for container communication is not supported.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: HTTP proxies are not supported inside containers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For Ingress controllers running on Windows nodes, you have to choose a Deployment
+    that supports both Windows and Linux nodes.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can expect this list to get shorter because new releases of Windows Server
+    and Kubernetes are coming.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing Kubernetes network modes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Network modes (drivers) is a concept from Docker that is a part of the **Container
+    Network Model** (**CNM**). This specification was proposed by Docker to solve
+    container networking setup and management challenges in a modular, pluginable
+    way. Docker's libnetwork is the canonical implementation of the CNM specification.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, you are probably wondering how CNM relates to CNI, which solves
+    a similar problem. Yes, they are competing specifications for container networking!
+    For Linux containers, the implementations of Docker network drivers and CNI can
+    be considerably different. However, for Windows containers, network drivers implemented
+    in libnetwork are a simple shim for HNS that performs all the configuration tasks.
+    CNI plugins, such as win-bridge and win-Overlay, do exactly the same thing: call
+    the HNS API. This means that for Windows, Docker network drivers and CNI plugins
+    are in parity and fully depend on HNS and its native network configurations. If
+    you are interested, you can check out the libnetwork Windows driver implementation
+    and see how it interacts with HNS: [https://github.com/docker/libnetwork/blob/master/drivers/windows/windows.go](https://github.com/docker/libnetwork/blob/master/drivers/windows/windows.go).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CNI and CNM have a long history and some significant differences. In the early
+    days of Kubernetes, a decision was made not to use Docker's libnetwork in favor
+    of CNI as an abstraction for container networking management. You can read more
+    about this decision in this Kubernetes blog post: [https://kubernetes.io/blog/2016/01/why-kubernetes-doesnt-use-libnetwork/](https://kubernetes.io/blog/2016/01/why-kubernetes-doesnt-use-libnetwork/).
+    If you are interested in more details about CNI versus CNM, please refer to this
+    article: [https://thenewstack.io/container-networking-landscape-cni-coreos-cnm-docker/](https://thenewstack.io/container-networking-landscape-cni-coreos-cnm-docker/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general, for Windows containers, you can use the terms Docker network driver
+    and HNS network driver  interchangeably.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are five HNS network drivers that are currently supported by Windows
+    containers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: l2bridge
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: l2tunnel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overlay
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Transparent
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NAT (not used in Kubernetes)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can create a new Docker network manually using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Additional parameters are required for some of the network types; you can find
+    more details in the official documentation: [https://docs.microsoft.com/en-us/virtualization/windowscontainers/container-networking/network-drivers-topologies](https://docs.microsoft.com/en-us/virtualization/windowscontainers/container-networking/network-drivers-topologies).
+    The Microsoft SDN repository also provides a simple PowerShell module for interacting
+    with the HNS API, which you can use to analyze your network configuration: [https://github.com/microsoft/SDN/blob/master/Kubernetes/windows/hns.psm1](https://github.com/microsoft/SDN/blob/master/Kubernetes/windows/hns.psm1).
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find the officially supported networking configurations for Windows
+    containers in the support policy from Microsoft: [https://support.microsoft.com/da-dk/help/4489234/support-policy-for-windows-containers-and-docker-on-premises](https://support.microsoft.com/da-dk/help/4489234/support-policy-for-windows-containers-and-docker-on-premises).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's now go through each type of HNS network to understand how they fit Kubernetes,
+    when to use them, and how they relate to CNI plugins.
+  prefs: []
+  type: TYPE_NORMAL
+- en: L2Bridge
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In L2Bridge network mode, containers are connected to a shared external Hyper-V
+    vSwitch, which gives access to the underlay network. Containers also share the
+    same IP subnet as the container host, and the container IP addresses must be statically
+    assigned with the same prefix as the container host IP. MAC addresses are rewritten
+    on ingress and egress to the host's address (this requires MAC spoofing to be
+    enabled; remember this when testing Kubernetes clusters on local Hyper-V VMs).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following CNI plugins use an L2Bridge network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: win-bridge
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Azure-CNI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Flannel with a host-gw backend (as a meta plugin, it invokes win-bridge)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the advantages of L2Bridge:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: win-bridge and Flannel (host-gw) are easy to configure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Stable support in Windows
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Best performance
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the disadvantages of L2Bridge:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: L2 adjacency between nodes is required
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: L2Tunnel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: L2Tunnel network mode is a special case of L2Bridge in which *all* network traffic
+    from containers is forwarded to the virtualization host in order to apply SDN
+    policies. This network type is intended to be used in Microsoft Cloud Stack only.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following CNI plugins use L2Tunnel network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Azure-CNI
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the advantages of L2Tunnel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Used in AKS and AKS-engine on Azure, and there is stable support.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can leverage the features provided by Azure Virtual Network ([https://azure.microsoft.com/en-us/services/virtual-network/](https://azure.microsoft.com/en-us/services/virtual-network/)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the disadvantages of L2Tunnel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It can only be used on Azure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overlay
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Overlay network mode creates a VXLAN Overlay network using VFP at an external
+    Hyper-V vSwitch. Each Overlay network has its own IP subnet, determined by a customizable
+    IP prefix.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following CNI plugins use the Overlay network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: win-Overlay
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Flannel with a vxlan backend (as a meta plugin, it invokes win-Overlay)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the advantages of Overlay:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: No limitations in subnet organization.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: No need for L2 adjacency of nodes. You can use this mode in L3 networks.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Increased security and isolation from the underlay network.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the disadvantages of Overlay:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's currently in the alpha feature stage on Windows.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You are restricted to specific VNI (4096) and UDP port (4789).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Worse performance than L2Bridge.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Transparent
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The last HNS network type that is supported in Kubernetes on Windows is Transparent.
+    Containers attached to the Transparent network will be connected to external Hyper-V
+    vSwitch with statically or dynamically assigned IP addresses from the physical
+    network. In Kubernetes, this network type is used for supporting OVN where intra-Pod
+    communication is enabled by logical switches and routers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following CNI plugins use the Transparent network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ovn-kubernetes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'These are the disadvantages of the Transparent network:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you would like to use this network type in Kubernetes hosted on-premises,
+    you have to deploy OVN and Open vSwitches, which is a complex task on its own.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, you have learned about the principles of networking in Kubernetes.
+    We have introduced the Kubernetes networking model and the requirements that any
+    model implementation must fulfill. Next, we analyzed the two most important network
+    model implementations from a Windows perspective: the L2 network and Overlay network.
+    In the previous chapter, you were introduced to Service API objects, and in this
+    chapter, you gained a deeper insight into how Services are implemented with regard
+    to the networking model. And eventually, you learned about Kubernetes networking
+    on Windows nodes, CNI plugins, and when to use each plugin type.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter will focus on interacting with Kubernetes clusters from Windows
+    machines using Kubernetes command-line tools, namely **kubectl**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What are the requirements for implementing the Kubernetes network model?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When can you use Flannel with a host-gw backend in Kubernetes?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the difference between the ClusterIP and the NodePort Service?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are the benefits of using an Ingress controller over the LoadBalancer Service?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are CNI plugins and how are they used by Kubernetes?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the difference between internal and external Hyper-V vSwitches?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is the difference between the CNI plugin and a Docker network driver?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is an Overlay network?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You can find answers to these questions in *Assessments* in the back matter
+    of this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For more information regarding Kubernetes concepts and networking, please refer
+    to the following Packt books and resources:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Complete Kubernetes Guide ([https://www.packtpub.com/virtualization-and-cloud/complete-kubernetes-guide](https://www.packtpub.com/virtualization-and-cloud/complete-kubernetes-guide)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Getting Started with Kubernetes – Third Edition ([https://www.packtpub.com/virtualization-and-cloud/getting-started-kubernetes-third-edition](https://www.packtpub.com/virtualization-and-cloud/getting-started-kubernetes-third-edition)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kubernetes for Developers ([https://www.packtpub.com/virtualization-and-cloud/kubernetes-developers](https://www.packtpub.com/virtualization-and-cloud/kubernetes-developers)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hands-On Kubernetes Networking (video) ([https://www.packtpub.com/virtualization-and-cloud/hands-kubernetes-networking-video](https://www.packtpub.com/virtualization-and-cloud/hands-kubernetes-networking-video)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can also refer to the excellent official Kubernetes documentation ([https://kubernetes.io/docs/concepts/cluster-administration/networking/](https://kubernetes.io/docs/concepts/cluster-administration/networking/)),
+    which is always the most up-to-date source of knowledge about Kubernetes in general.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For Windows-specific networking scenarios, the official Microsoft Virtualization
+    documentation is recommended: [https://docs.microsoft.com/en-us/virtualization/windowscontainers/kubernetes/network-topologies](https://docs.microsoft.com/en-us/virtualization/windowscontainers/kubernetes/network-topologies)
+    for Kubernetes and [https://docs.microsoft.com/en-us/virtualization/windowscontainers/container-networking/architecture](https://docs.microsoft.com/en-us/virtualization/windowscontainers/container-networking/architecture)
+    for Windows container networking in general.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

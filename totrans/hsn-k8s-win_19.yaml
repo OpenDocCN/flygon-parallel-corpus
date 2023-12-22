@@ -1,0 +1,1048 @@
+- en: Disaster Recovery
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In every production system, **disaster recovery** (**DR**) and **business continuity**
+    (**BC**) are the key concepts that you will have to bear in mind in order to provide
+    the availability of your application workloads. You have to take them into account
+    at an early stage in planning your cluster architecture. The proverb *by failing
+    to prepare, you are preparing to fail *cannot be more true for operating distributed
+    systems, such as Kubernetes. This chapter will focus on DR when running Kubernetes
+    clusters. BC best practices, such as multiregion Deployments and asynchronous
+    replication of persistent volumes, are not included in the scope of the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Disaster recovery, in general, consists of a set of policies, tools, and procedures
+    to enable the recovery or continuation of vital technology infrastructure and
+    systems following a natural or human-induced disaster. You can read more about
+    the concepts involved in planning for DR in an excellent article from Google at [https://cloud.google.com/solutions/dr-scenarios-planning-guide](https://cloud.google.com/solutions/dr-scenarios-planning-guide).
+    The main difference between DR and BC is that DR focuses on getting the infrastructure
+    up and running following an outage, whereas BC deals with keeping business scenarios
+    running during a major incident. The important thing about DR in Kubernetes is
+    that you can essentially focus on data and state protectionfor your cluster: you
+    need to have a backup-and-restore strategy for the stateful components. In a Kubernetes
+    cluster, the most important stateful component is the etcd cluster, which is the
+    storage layer for the Kubernetes API server.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we are going to cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes cluster backup strategy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Backing up the etcd cluster
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Restoring the etcd cluster backup
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Automating backup
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Replacing a failed etcd cluster member
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For this chapter you will need the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Windows 10 Pro, Enterprise, or Education (version 1903 or later, 64-bit) installed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: SSH client installed on your Windows machine
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Azure account
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Multimaster Windows/Linux Kubernetes cluster deployed using AKS Engine or an
+    on-premise cluster (valid for some scenarios)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To follow along, you will need your own Azure account in order to create Azure
+    resources for Kubernetes clusters. If you haven't already created the account
+    for earlier chapters, you can read more about how to obtain a limited free account
+    for personal use at [https://azure.microsoft.com/en-us/free/](https://azure.microsoft.com/en-us/free/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying a Kubernetes cluster using AKS Engine has been covered in [Chapter
+    8](ab695a0d-05dc-48f8-8c41-bbd167cfbfa6.xhtml), *Deploying Hybrid Azure Kubernetes
+    Service Engine Cluster*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can download the latest code samples for this chapter from the official
+    GitHub repository at [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter15](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/tree/master/Chapter15).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kubernetes cluster backup strategy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Disaster recovery for Kubernetes essentially involves creating a cluster state
+    backup-and-restore strategy. Let''s first take a look at what stateful components
+    are in Kubernetes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Etcd cluster ([https://etcd.io/](https://etcd.io/)) that persists the state
+    for Kubernetes API server resources.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Persistent volumes used by pods.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: And surprisingly (or *not*), that is all! For the master node components and
+    pods running on worker nodes, you don't have any nonrecoverable state involved;
+    if you provision a new replacement node, Kubernetes can easily move the workload
+    to the new nodes, providing full business continuity. When your etcd cluster is
+    restored, Kubernetes will take care of reconciling the cluster component's state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's take a look at how to back up and restore persistent volumes. It all depends
+    on how your persistent volumes are provisioned. You can rely on standard filesystem
+    backups stored externally or, in the case of cloud-backed PVs, you can use disk
+    snapshots and manage them as part of the cloud services. There is also an interesting
+    snapshot-and-restore feature (currently in the alpha state) for PVs provisioned
+    using CSI plugins. This will provide better backup-and-restore integration directly
+    at the Kubernetes-cluster level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a general rule of thumb to keep your cluster workloads as stateless
+    as possible. Think about using external, managed services to store your data (for
+    example, Azure blob storage, Azure Cosmos DB) for which availability and data
+    reliability are guaranteed by SLAs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For an etcd cluster, the backup-and-recovery strategy depends on two factors:
+    how you store etcd data and what your high-availability topology for Kubernetes
+    masters is. In the case of etcd data storage, the situation is similar to persistent
+    volumes. If you mount the storage using a cloud volume, you can rely on disk snapshots
+    from your cloud service provider (which is the case for AKS Engine), and for self-managed
+    disks, you can employ standard filesystem backup strategies. In all cases, you
+    also have a third option: you can use the snapshot feature of etcd itself. We
+    will later show you how to perform a snapshot-and-restore of etcd using the `etcdctl`
+    command.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Regarding the high-availability topology for your Kubernetes masters, as mentioned
+    in [Chapter 4](118e3c89-786e-4718-ba67-6c38928e2a42.xhtml), *Kubernetes Concepts
+    and Windows Support*, you can run a **stacked** topology or an **external** topology
+    for etcd. In a stacked topology, the etcd member is running as a Kubernetes pod
+    on *every* master node. For the external topology, you run an etcd cluster outside
+    your Kubernetes cluster. It may be fully external, deployed on separate, dedicated
+    hosts, or it may share the same hosts as the master node. The latter is the case
+    for AKS Engine: it runs the external topology, but each master node hosts an etcd
+    member as a native Linux service. For both of these topologies, you can perform
+    backups in the same way; the only difference lies in how you perform the restore.
+    In the stacked topology, which is commonly used for **kubeadm** Deployments, you
+    need to perform a `kubeadm init` on a new node overriding the local etcd storage.
+    For an external topology, you can simply use the `etcdctl` command.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An external topology for an etcd cluster has more components but is generally
+    better at providing business continuity and disaster recovery.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Additionally, if you are running an AKS Engine cluster, you may consider using
+    an Azure Cosmos DB ([https://azure.microsoft.com/en-us/services/cosmos-db/](https://azure.microsoft.com/en-us/services/cosmos-db/))
+    instead of a self-managed etcd cluster. Cosmos DB supports exposing an etcd API
+    and can be used as the backing storage for Kubernetes in exactly the same way
+    as a local etcd cluster. In this way, you receive global distribution, high availability,
+    elastic scaling, and data reliability at the levels defined in the SLA. On top
+    of that, you have automatic, online backups with georeplication. You can learn
+    more about this feature and how to configure it in a cluster apimodel in the official
+    documentation at [https://github.com/Azure/aks-engine/tree/master/examples/cosmos-etcd](https://github.com/Azure/aks-engine/tree/master/examples/cosmos-etcd).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, we will take a look at how you can back up your etcd cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Backing up an etcd cluster
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The process of backing up an etcd cluster is straightforward, but there are
+    multiple ways that you can approach this task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Create a backup or snapshot of the storage disk for etcd. This is especially
+    valid in cloud scenarios where you can easily manage backups outside your Kubernetes
+    cluster.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Perform a manual snapshot of etcd using the `etcdctl` command. You need to
+    manage the backup files yourself: upload them to external storage, and apply a
+    retention policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use **Velero** (formerly Heptio Ark ([https://velero.io/](https://velero.io/))),
+    which can perform snapshots, manage them in external storage, and restore them
+    if needed. Additionally, it can be used to perform backups of persistent volumes
+    using **Restic** integration ([https://velero.io/docs/master/restic/](https://velero.io/docs/master/restic/)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use **etcd-operator** ([https://github.com/coreos/etcd-operator](https://github.com/coreos/etcd-operator))
+    to provision etcd clusters on top of Kubernetes. You can easily manage etcd clusters
+    and perform backup–restore operations. Use this approach if you plan to manage
+    multiple Kubernetes clusters in your environment.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We are going to demonstrate the second option, performing manual snapshots of
+    etcd—it is generally good to know what exactly is happening under the hood before
+    switching to advanced automations, such as Velero. For this task, you will need
+    a multimaster Kubernetes cluster; you can create one using AKS Engine. As in the
+    previous chapters, you can use a ready apimodel definition from the Github repository
+    at [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/01_multimaster-aks-engine/kubernetes-windows-template.json](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/01_multimaster-aks-engine/kubernetes-windows-template.json)
+    and deploy it using our usual PowerShell script ([https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/01_multimaster-aks-engine/CreateAKSEngineClusterWithWindowsNodes.ps1](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/01_multimaster-aks-engine/CreateAKSEngineClusterWithWindowsNodes.ps1)).
+    This definition will deploy three master nodes together with one Linux worker
+    node and one Windows node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Please make sure that you check the estimated costs of hosting a five-node Kubernetes
+    cluster on Azure. The price will depend on the region in which you deploy it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When your cluster is ready, deploy an application workload—for example, the
+    Voting application from the previous chapters. Then, go through the following
+    steps to create an etcd snapshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Open the PowerShell window and SSH into one of the master nodes using the following
+    command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Inspect your Kubernetes cluster configuration. Use the `kubectl cluster-info
+    dump` command to learn more about the etcd setup. You will see that each master
+    node is running its own  local instance (but external to the cluster) of etcd,
+    which is passed to the Kubernetes API server as arguments:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Use the `etcdctl` command to get the topology of the etcd cluster, which has
+    members on the master nodes:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can check that these are the private IP addresses of the master nodes in
+    the Azure Portal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Execute the following commands in order to create a snapshot of etcd:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After a short while, the backup should be finished. You can inspect the status
+    of the backup using the following command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Additionally, you should back up the certificates and keys used to access the
+    etcd cluster. In our scenario, it will not be needed because we are going to restore
+    the same master machines. For a general disaster-recovery scenario, you will need
+    them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the backup ready, let''s see how to upload the file to Azure blob storage.
+    Please note that you *shouldn''t* perform these operations directly on production
+    masters, especially when installing Azure CLI *the quick way*. We are demonstrating
+    this in order to later create a Kubernetes **CronJob**, which will run a Docker
+    container to execute these operations. Please go through the following steps for
+    your development cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Open a PowerShell window on your local machine and log in to Azure using the `az
+    login` command.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Create a service principal that we will use to upload the backup to the Azure
+    blob storage container:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Copy `appId`, `password`, and `tenant` for further use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Execute the following command to create a dedicated `aksenginebackups` storage
+    account to handle backups. Choose the same Azure location as your AKS Engine cluster:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'List the account keys for the new account and copy the value of `key1` for
+    further use:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Continue using the SSH session from the previous paragraph for your development
+    AKS Engine cluster master node. Execute the following command to install the Azure
+    CLI:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Log in to Azure using the `appId`, `password`, and `tenant` for your service
+    principal:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Create a new container for backups of our AKS Engine cluster. You can use any
+    name—for example, the DNS prefix for the cluster:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Create a blob with the backup that we created in the previous paragraph:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Remove the backup file from the local disk:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: For the creation of the service principal and storage account, we have provided
+    a PowerShell script in the GitHub repository at [https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/02_CreateBlobContainerForBackups.ps1](https://github.com/PacktPublishing/Hands-On-Kubernetes-on-Windows/blob/master/Chapter15/02_CreateBlobContainerForBackups.ps1).
+  prefs: []
+  type: TYPE_NORMAL
+- en: You have successfully created an etcd snapshot and uploaded it to the Azure
+    blob storage. Now, we will demonstrate how you can restore the backup that we
+    have just created.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Restoring the etcd cluster backup
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To demonstrate the restore scenario of etcd for an existing AKS Engine cluster,
+    we first need to modify some Kubernetes objects to later prove that the backup
+    restore has worked. Please note that all the commands shown in this section assume
+    that you are running AKS Engine where an external etcd topology is used with etcd
+    members running on the same machines that host Kubernetes master components. For
+    other clusters, such as an on-premise kubeadm setup, the structure of the directories
+    will be different.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, let''s introduce some changes to the cluster state. For example, if
+    you have our Voting application running, delete the associated `Deployment` object
+    using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: After a while, all the pods will be terminated—let's assume that this was our
+    **disaster event** that has left the cluster unuseable. We are going to restore
+    the backup named `kubernetes-etcd-snapshot_20191208_182555.db`, which we created
+    earlier and uploaded to Azure blob storage!
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you have deleted the SQL Server Deployment together with the PVCs, then the
+    restore will not be fully successful. As we mentioned in previous sections, for
+    PVs you need to have a separate backup strategy that is coordinated with etcd
+    backups. Then you can restore both the etcd snapshot and associated PV snapshots.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To perform the restore, you will need to connect to all three Kubernetes nodes
+    at once. This operation can be performed sequentially, but stopping and starting
+    the etcd service on the hosts must be performed simultaneously. Please go through
+    the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Open three PowerShell windows (try to have them all open and visible at the
+    same time to make issuing commands easier). Each window will be used for a separate
+    Kubernetes master.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the Azure Portal, find the private IPs of the master nodes. You can also
+    do this using the Azure CLI. They should follow the convention that master `0`
+    is `10.255.255.5`, master `1` is `10.255.255.6`, and master `2` is `10.255.255.7`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In the first PowerShell window, execute the following command to connect to
+    one of the master nodes (behind the Azure load balancer) and additionally use
+    port forwarding from your local port `5500` to the SSH port for master `0`, port `5501` to
+    the SSH port for master `1`, and port `5502` to the SSH port for master `2`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In this way, you can connect to any Kubernetes master you want from your local
+    machine. Check to see which master node you have already connected to and create
+    SSH connections to the *other two* nodes in the remaining PowerShell windows—for
+    example:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, you have a set of PowerShell windows where you can manage each master
+    node separately. The first step is installing the Azure CLI. Execute the following
+    command *on all masters*:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Log in to Azure using the `appId`, `password`, and `tenant` for your service
+    principal, as you did previously. Execute the following command *on all masters*:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Download the `kubernetes-etcd-snapshot_20191208_182555.db` snapshot file. Execute
+    the following command on all master nodes :'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All etcd members must be restored from the same snapshot file. This means that
+    you have to perform a similar operation on all nodes, just with different parameters.
+    On each master, determine the startup parameters for the etcd service (for AKS
+    Engine, it is running as a systemd service). Execute the following command to
+    get the parameters for each master:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You need to capture `--name`, `--initial-cluster`, `--initial-cluster-token`,
+    and `--initial-advertise-peer-urls` for each node. More precisely, `--initial-cluster` and `--initial-cluster-token`
+    will be the same for all masters. We will use these values to initialize a *new*
+    etcd member on each master—for example, for master `0` in our cluster, these parameters
+    are as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can proceed with restoring the data for each etcd cluster member. This restore
+    operation only creates a new data directory. The original data directory that
+    the cluster is currently using is `/var/lib/etcddisk` (which is mounted from a
+    cloud volume). We are going to restore the data to `/var/lib/etcdisk-restored` and
+    later swap the contents. Using the parameters from the previous step, execute
+    this command using matching parameters for each master:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: The snapshot data is ready to be used in a new etcd cluster. But first, we need
+    to gracefully stop the existing Kubernetes master components; otherwise, you will
+    arrive at an inconsistent state after the restore.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Kubelet observes the `/etc/kubernetes/manifests` directory where manifest files
+    for master components are stored. Any change to these manifests is applied by
+    kubelet to the cluster; this is how the Kubernetes master is bootstrapped when
+    there is no Kubernetes API server yet. To stop the master components, including
+    the Kubernetes API server, simply move the manifest files to a different directory
+    and execute the command on all masters:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: After a few seconds, you will see that the Docker containers for master components
+    are being stopped (use the `docker ps` command to see this).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, stop the etcd service on all masters:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Stop the kubelet service on all masters:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The final step in preparing the masters for the restore is to remove all other
+    Docker containers that run on the masters, but that are not started using the `/etc/kubernetes/manifests`
+    directory. Execute the following command on all masters:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Perform the actual data directory restore for etcd members. Execute the following
+    commands on all masters.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can now start bootstrapping the cluster with the restored snapshot. The
+    first step is starting the etcd cluster. Execute the following command on all
+    master nodes:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can verify the health of your etcd cluster using the `sudo -E etcdctl cluster-health`
+    command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Move the stopped manifest files back to their original location on all masters.
+    They will be picked up by kubelet once it starts:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, perform the last step: start the kubelet service on all masters:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can quickly verify that the containers for the master components are being
+    started using the `docker ps` command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can check in a new PowerShell window whether the cluster is already working
+    hard to reconcile the restored state:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Our Voting application Deployment is recreating. That is *great news*: the snapshot
+    restore has been *successful*. After a few minutes, all the pods will be ready
+    and you can navigate to the external IP in the web browser and enjoy the application
+    again.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Openshift** distribution of Kubernetes implements a native etcd snapshot
+    restore functionality. You can see the details in the scripts in the repository
+    at [https://github.com/openshift/machine-config-operator/blob/master/templates/master/00-master/_base/files/usr-local-bin-etcd-snapshot-restore-sh.yaml](https://github.com/openshift/machine-config-operator/blob/master/templates/master/00-master/_base/files/usr-local-bin-etcd-snapshot-restore-sh.yaml).
+    The steps there are roughly similar to what we have done in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see, the manual restore scenario is a bit complicated and can be
+    prone to error. In production scenarios, you should use this method when everything
+    else fails; generally, it is better to use automated backup controllers, such
+    as Velero ([https://velero.io/](https://velero.io/)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, you will learn how you can automate the backup procedure
+    on AKS Engine using Kubernetes CronJobs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Automating backup
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section, we will demonstrate how to automate the backup procedure for
+    an etcd cluster using Kubernetes CronJob. For this, we will need a Dockerfile
+    that has `etcdctl` and Azure CLI installed for the image in order to create the
+    snapshot and upload it to a selected Azure blob container—exactly as we demonstrated
+    in manual steps. All the configuration and service principal secrets will be injected
+    using environment variables that can be set using Kubernetes secret.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To create the Docker image for the etcd snapshot worker, go through the following
+    steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use a Linux machine or switch to the Linux containers in Docker Desktop for
+    Windows.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Open a new PowerShell window.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Create a new directory for your source code and navigate there.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Create a `Dockerfile` file with the following contents:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: This Dockerfile is based on the Ubuntu 18.04 Docker image and installs the `etcdctl`
+    command from the official release of etcd. Additionally, we install the Azure
+    CLI and set the `ENTRYPOINT` to a custom shell script that will perform the snapshot
+    operation when the container is started.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, create a `docker-entrypoint.sh` file with the following contents.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding script automates the steps that we have provided in the previous
+    sections. The idea here is that all configurations and credentials that are injected
+    using environment variables, certificates, and keys for accessing an etcd cluster
+    must be mounted as a host volume to the specified location: `/etc/kubernetes/certs/`.
+    For AKS Engine masters, this mapping will be one-to-one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Build the image using a tag containing your Docker ID—we will use `packtpubkubernetesonwindows/aks-engine-etcd-snapshot-azure-blob-job`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Tag the image with version `1.0.0` and push the image, along with all of the
+    tags, to Docker Hub:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can optionally test your Docker image by running it directly on the AKS
+    Engine master node in a development environment. SSH to the node and execute the
+    following command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: After a short while, the job will end and the snapshot will be uploaded to the
+    container that we created earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the Docker image ready, we can create a dedicated Kubernetes **CronJob**
+    to run this operation periodically. Please note that we are providing a minimal
+    setup for this job; you should consider using a dedicated service account and
+    set up RBAC in a production environment. Using a Helm chart to efficiently manage
+    this job is also recommended. To create the CronJob, please go through the following
+    steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Define a *local* file, `etcd-snapshot-secrets.txt`, that will be used to define
+    the secret object for your CronJob:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Create the `etcd-snapshot-azure-blob-job-secrets` secret object using the `etcd-snapshot-secrets.txt`
+    file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, create the `etcd-snapshot-cronjob.yaml` manifest file for the CronJob
+    itself:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this manifest file, the most important part is the part that defines an appropriate
+    `schedule` **(1)**. We use a `0 */6 * * *` cron expression that will perform the
+    snapshots *every 6 hours*. For testing purposes, you can set it to `* * * * *`
+    in order to schedule the job *every minute*. Next, we need to ensure that the
+    pod for the CronJob can be scheduled on the master node. We do this by using `tolerations`
+    for taints and a `nodeSelector` **(2)**. The reason for this is that we need access
+    to the etcd certificates and keys, which must be mounted from the master host
+    filesystem. We define the pod to use the `packtpubkubernetesonwindows/aks-engine-etcd-snapshot-azure-blob-job:1.0.0`
+    image that we have just created **(3)**. To populate the environment variables
+    for the container, we use `secretRef` for our secret object, `etcd-snapshot-azure-blob-job-secrets`
+    **(4)**. Lastly, we need to mount the *host* directory, `/etc/kubernetes/certs`,
+    to the pod container so that the worker can access the certificates and keys **(5)**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Apply the manifest file using the `kubectl apply -f .\etcd-snapshot-cronjob.yaml`
+    command.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Wait for the first job execution:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When the job is finished, you can check the logs for the associated pod and
+    also verify in Azure Portal ([https://portal.azure.com/](https://portal.azure.com/))
+    that the snapshots are uploaded to your Azure blob container:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](assets/88207fd0-d5f1-4773-8ce3-bb97fa40063c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: When working with multiple etcd clusters (for multiple Kubernetes Deployments)
+    you can achieve a similar result using the *etcd-operator* ([https://github.com/coreos/etcd-operator](https://github.com/coreos/etcd-operator)).
+    For a small cluster, such as the one in this demonstration, it doesn't make sense
+    to use such a complex solution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Congratulations! You have successfully set up an automated CronJob for creating
+    etcd cluster snapshots and automatically uploaded them to the Azure blob container.
+    Now, we are going to demonstrate how you can replace a failed etcd member in order
+    to restore the full operations of the etcd cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Replacing a failed etcd cluster member
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As a highly-available database, etcd tolerates minority failures, which means
+    a partial failure where the majority of cluster members are still available and
+    healthy; however, it is a good practice to replace the failed members as soon
+    as possible in order to improve the overall cluster health and minimize the risk
+    of majority failure. It is also highly recommended that you always keep the cluster
+    size greater than two members in production. In order to recover from a minority
+    failure, you need to perform two steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Remove the failed member from the cluster.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Add a new replacement member. If there is more than one failed member, replace
+    them sequentially.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The etcd documentation provides a list of use cases for runtime configuration
+    changes, as you can see at [https://etcd.io/docs/v3.3.12/op-guide/runtime-configuration/](https://etcd.io/docs/v3.3.12/op-guide/runtime-configuration/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The way that you create a new member depends on what exactly failed. If it is
+    a disk failure or data corruption on the machine that hosts the member, you may
+    consider reusing the same host but with the data directory on a *different* disk.
+    In the case of total host failure, you may need to provision a new machine and
+    use it as a new replacement member. We will demonstrate a case in AKS Engine where
+    we *reuse* the same host and create a member with a different data directory.
+    This is a rather specific use case, but the overall procedure will be the same
+    in all cases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, let''s simulate the failure of an etcd cluster member. To do that, go
+    through the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Connect to one of the Kubernetes master nodes using SSH:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: Let's assume that we connected to master `0` with the private IP `10.255.255.5`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Verify the cluster health:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Stop the etcd service on master `0` using the following command. This will
+    simulate our failure of a member in the cluster:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Check the cluster health again, but this time provide only the endpoints for
+    master `1` and master `2`, which are functioning properly:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: Take note of the failed member ID, which in our case is `b3a6773c0e93604`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Now, let''s demonstrate how to replace the failed member. Please go through
+    the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determine the ID of the failed member. We already have that information from
+    the previous commands, but in general you can use the `sudo etcdctl --endpoints=https://10.255.255.6:2379,https://10.255.255.7:2379
+    member list` command.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: SSH into the machine with the failed member.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Remove the failed member from the cluster using its ID:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Add a new member to the cluster with the name `k8s-master-50659983-0-replace-0`;
+    you can use any name, but in general it is good to follow a convention. In our
+    case, the member will have the same IP address as before:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, you need to modify the etcd service startup parameters in order to reflect
+    the change of the member on this machine. Open `/etc/default/etcd` as the root
+    using a text editor—for example, `vim`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Modify the `--name` parameter to `k8s-master-50659983-0-replace-0`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Modify the `--initial-cluster` parameter to `k8s-master-50659983-2=https://10.255.255.7:2380,k8s-master-50659983-1=https://10.255.255.6:2380,k8s-master-50659983-0-replace-0=https://10.255.255.5:2380`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Modify the `--initial-cluster-state` parameter to `existing`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Finally, modify the data directory parameter `--data-dir` to a different one—for
+    example, `/var/lib/etcddisk-replace-0`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Save the file.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Create the data directory, ensuring that it is owned by `etcd`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Start the etcd service:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After a while, check the cluster health:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: Success! The new member is `healthy` and the overall status of the cluster is
+    also `healthy`!
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you need to use a new machine with a *different* IP address for your etcd
+    replacement member, remember to change the `--etcd-servers` argument for the Kubernetes
+    API server and, if you use a load balancer in front of etcd, don't forget to update
+    the load balancer configuration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Congratulations! You have successfully performed the replacement of a failed
+    member in an etcd cluster. Even though the new member is hosted on the same virtual
+    machine, it has a new ID (`1f5a8b7d5b2a5b68`) and is treated as a completely new
+    member in the cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you have learned the key points you should bear in mind when
+    preparing for Kubernetes DR. You have learned about stateful components in the
+    whole Kubernetes cluster and the fact that they require a backup-and-restore strategy
+    using etcd clusters and persistent volumes. Next, you learned how to manually
+    perform a snapshot for your Kubernetes etcd cluster and upload it to an Azure
+    blob container. Then, we used this snapshot to restore a Kubernetes cluster to
+    a previous state and verified that the restore was successful. On top of this,
+    you utilized all your new knowledge in order to create a Docker image for a snapshot
+    worker that created a snapshot of etcd (for AKS Engine) and uploaded it to the
+    Azure blob container. We used this Docker image to create a Kubernetes CronJob for
+    performing backups, which is done every six hours. The last topic that we looked
+    at was how to replace a failed etcd member in AKS Engine. With this knowledge,
+    you should be able to create a reliable disaster-recovery plan for your Kubernetes
+    cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last chapter of this book will focus on production considerations for running
+    Kubernetes. You can treat this chapter as a set of loosely-coupled recommendations
+    and best practices for different production scenarios.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What is the difference between disaster recovery (DC) and business continuity
+    (BC) and how are they related?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Which components do you need to back up in Kubernetes to ensure the possibility
+    of recovering the cluster state?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is an etcd snapshot?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are Velero and etcd-operators and what are their use cases?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are high-level steps for recovering an etcd snapshot?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What is a Kubernetes CronJob and how can you use it to automate your backup
+    strategy for etcd clusters?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are high-level steps for replacing a failed etcd cluster member?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You can find answers to these questions in *Assessments* of this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For more information about Kubernetes features and disaster recovery in general,
+    please refer to the following Packt books:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*The Complete Kubernetes Guide* ([https://www.packtpub.com/virtualization-and-cloud/complete-kubernetes-guide](https://www.packtpub.com/virtualization-and-cloud/complete-kubernetes-guide)).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Getting Started with Kubernetes - Third Edition* ([https://www.packtpub.com/virtualization-and-cloud/getting-started-kubernetes-third-edition](https://www.packtpub.com/virtualization-and-cloud/getting-started-kubernetes-third-edition)).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Kubernetes for Developers* ([https://www.packtpub.com/virtualization-and-cloud/kubernetes-developers](https://www.packtpub.com/virtualization-and-cloud/kubernetes-developers)).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you are interested in the details about etcd itself and how to handle disaster
+    recovery, you can refer to the official documentation at [https://etcd.io/docs/v3.4.0/op-guide/recovery/](https://etcd.io/docs/v3.4.0/op-guide/recovery/).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Additionally, we recommend watching the following excellent webinars from the
+    **Cloud Native Computing Foundation** (**CNCF**) regarding Kubernetes backup strategies
+    using Velero, and operating etcd in production:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[https://www.cncf.io/webinars/kubernetes-backup-and-migration-strategies-using-project-velero/](https://www.cncf.io/webinars/kubernetes-backup-and-migration-strategies-using-project-velero/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[https://www.cncf.io/webinars/kubernetes-in-production-operating-etcd-with-etcdadm/](https://www.cncf.io/webinars/kubernetes-in-production-operating-etcd-with-etcdadm/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

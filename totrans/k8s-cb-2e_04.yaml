@@ -1,0 +1,769 @@
+- en: Building High-Availability Clusters
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following recipes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clustering etcd
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Building multiple masters
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introduction
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Avoiding a single point of failure is a concept we need to always keep in mind.
+    In this chapter, you will learn how to build components in Kubernetes with high
+    availability. We will also go through the steps to build a three-node etcd cluster
+    and masters with multinodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clustering etcd
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'etcd stores network information and states in Kubernetes. Any data loss could
+    be crucial. Clustering etcd is strongly recommended in a production environment.
+    etcd comes with support for clustering; a cluster of N members can tolerate up
+    to (N-1)/2 failures. Typically, there are three mechanisms for creating an etcd
+    cluster. They are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Static
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: etcd discovery
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: DNS discovery
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Static is a simple way to bootstrap an etcd cluster if we have all etcd members
+    provisioned before starting. However, it's more common if we use an existing etcd
+    cluster to bootstrap a new member. Then, the discovery method comes into play.
+    The discovery service uses an existing cluster to bootstrap itself. It allows
+    a new member in an etcd cluster to find other existing members. In this recipe,
+    we will discuss how to bootstrap an etcd cluster via static and etcd discovery
+    manually.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We learned how to use kubeadm and kubespray in [Chapter 1](4dd5324f-b753-4c80-b891-bd8e6013b2c1.xhtml),
+    *Building Your Own Kubernetes Cluster*. At the time of writing, HA work in kubeadm
+    is still in progress. Regularly backing up your etcd node is recommended in the
+    official documentation. The other tool we introduced, kubespray, on the other
+    hand, supports multi-nodes etcd natively. In this chapter, we'll also describe
+    how to configure etcd in kubespray.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting ready
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before we learn a more flexible way to set up an etcd cluster, we should know
+    etcd comes with two major versions so far, which are v2 and v3\. etcd3 is a newer
+    version that aims to be more stable, efficient, and reliable. Here is a simple
+    comparison to introduce the major differences in their implementation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '|  | **etcd2** | **etcd3** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Protocol** | http | gRPC |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Key expiration** | TTL mechanism | Leases |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Watchers** | Long polling over HTTP | Via a bidirectional gRPC stream |'
+  prefs: []
+  type: TYPE_TB
+- en: etcd3 aims to be the next generation of etcd2 . etcd3 supports the gRPC protocol
+    by default. gRPC uses HTTP2, which allows multiple RPC streams over a TCP connection.
+    In etcd2, however, a HTTP request must establish a connection in every request
+    it makes. For dealing with key expiration, in etcd2, a TTL attaches to a key;
+    the client should periodically refresh the keys to see if any keys have expired.
+    This will establish lots of connections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In etcd3, the lease concept was introduced. A lease can attach multiple keys;
+    when a lease expires, it'll delete all attached keys. For the watcher, the etcd2
+    client creates long polling over HTTP—this means a TCP connection is opened per
+    watch. However, etcd3 uses bidirectional gRPC stream implementation, which allows
+    multiple steams to share the same connection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although etcd3 is preferred. However, some deployments still use etcd2\. We'll
+    still introduce how to use those tools to achieve clustering, since data migration
+    in etcd is well-documented and smooth. For more information, please refer to the
+    upgrade migration steps at [https://coreos.com/blog/migrating-applications-etcd-v3.html](https://coreos.com/blog/migrating-applications-etcd-v3.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before we start building an etcd cluster, we have to decide how many members
+    we need. How big the etcd cluster should be really depends on the environment
+    you want to create. In the production environment, at least three members are
+    recommended. Then, the cluster can tolerate at least one permanent failure. In
+    this recipe, we will use three members as an example of a development environment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Name/hostname** | **IP address** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ip-172-31-3-80` | `172.31.3.80` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ip-172-31-14-133` | `172.31.14.133` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ip-172-31-13-239` | `172.31.13.239` |'
+  prefs: []
+  type: TYPE_TB
+- en: Secondly, the etcd service requires `port 2379` (`4001` for legacy uses) for
+    etcd client communication and `port 2380` for peer communication. These ports
+    have to be exposed in your environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to do it...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There are plenty of ways to provision an etcd cluster. Normally, you'll use
+    kubespray, kops (in AWS), or other provisioning tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here, we''ll simply show you how to perform a manual install. It''s fairly
+    easy as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This script will put `etcd` binary under `/etc/etcd` folder. You''re free to
+    put them in different place. We''ll need `sudo` in order to put them under `/etc`
+    in this case:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The version we''re using now is 3.3.0\. After we check the `etcd` binary work
+    on your machine, we can attach it to the default `$PATH` as follows. Then we don''t
+    need to include the`/etc/etcd` path every time we execute the `etcd` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: You also can put it into your `.bashrc` or `.bash_profile` to let it set by
+    default.
+  prefs: []
+  type: TYPE_NORMAL
+- en: After we have at least three etcd servers provisioned, it's time to make them
+    pair together.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Static mechanism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A static mechanism is the easiest way to set up a cluster. However, the IP address
+    of every member should be known beforehand. This means that if you bootstrap an
+    etcd cluster in a cloud provider environment, the static mechanism might not be
+    so practical. Therefore, etcd also provides a discovery mechanism to bootstrap
+    itself from the existing cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make etcd communications secure, etcd supports TLS channels to encrypt the
+    communication between peers, and also clients and servers. Each member needs to
+    have a unique key pair. In this section, we'll show you how to use automatically
+    generated certificates to build a cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In CoreOs GitHub, there is a handy tool we can use to generate self-signed
+    certificates ([https://github.com/coreos/etcd/tree/v3.2.15/hack/tls-setup](https://github.com/coreos/etcd/tree/v3.2.15/hack/tls-setup))
+    . After cloning the repo, we have to modify a configuration file under `config/req-csr.json`.
+    Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the next step we''ll need to have Go ([https://golang.org/](https://golang.org/))
+    installed and set up `$GOPATH`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Then the certs will be generated under `./certs/`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we''ll have to set a bootstrap configuration to declare what members
+    will be inside the cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In all three nodes, we''ll have to launch the etcd server separately:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, you''ll see the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s wake up the second `etcd` service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You''ll see similar logs in the console:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It starts pairing with our previous node (`25654e0e7ea045f8`). Let''s trigger
+    the following command in the third node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And the cluster is set. We should check to see if it works properly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Discovery  mechanism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Discovery provides a more flexible way to create a cluster. It doesn''t need
+    to know other peer IPs beforehand. It uses an existing etcd cluster to bootstrap
+    one. In this section, we''ll demonstrate how to leverage that to launch a three-node
+    etcd cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Firstly, we''ll need to have an existing cluster with three-node configuration.
+    Luckily, the `etcd` official website provides a discovery service (`https://discovery.etcd.io/new?size=n`);
+    n will be the number of nodes in your `etcd` cluster, which is ready to use:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we are able to use the URL to bootstrap a cluster easily. The command
+    line is pretty much the same as in the static mechanism. What we need to do is
+    `change –initial-cluster` to `–discovery`, which is used to specify the discovery
+    service URL:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a closer look at node1''s log:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can see that the first node waited for the other two members to join, and
+    added member to cluster, became the leader in the election at term 2:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you check the other server''s log, you might find a clue to the effect that
+    some members voted for the current leader:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can also use member lists to check the current leader:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we can confirm the current leader is `172.31.3.80`. We can also use `etcdctl`
+    to check cluster health:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we remove the current leader by `etcdctl` command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We may find that the current leader has been changed:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By using `etcd` discovery, we can set up a cluster painlessly `etcd` also provides
+    lots of APIs for us to use. We can leverage it to check cluster statistics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, use `/stats/leader` to check the current cluster view:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For more information about APIs, check out the official API document: [https://coreos.com/etcd/docs/latest/v2/api.html](https://coreos.com/etcd/docs/latest/v2/api.html).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a cluster in EC2
+  prefs: []
+  type: TYPE_NORMAL
+- en: CoreOS builds CloudFormation in AWS to help you bootstrap your cluster in AWS
+    dynamically. What we have to do is just launch a CloudFormation template and set
+    the parameters, and we're good to go. The resources in the template contain AutoScaling
+    settings and network ingress (security group). Note that these etcds are running
+    on CoreOS. To log in to the server, firstly you'll have to set your keypair name
+    in the KeyPair parameter, then use the command `ssh –i $your_keypair core@$ip `to
+    log in to the server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubeadm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: If you're using kubeadm ([https://github.com/kubernetes/kubeadm](https://github.com/kubernetes/kubeadm))
+    to bootstrap your Kubernetes cluster, unfortunately, at the time of writing, HA
+    support is still in progress (v.1.10). The cluster is created as a single master
+    with a single etcd configured. You'll have to back up etcd regularly to secure
+    your data. Refer to the kubeadm limitations at the official Kubernetes website
+    for more information ([https://kubernetes.io/docs/setup/independent/create-cluster-kubeadm/#limitations](https://kubernetes.io/docs/setup/independent/create-cluster-kubeadm/#limitations))).
+  prefs: []
+  type: TYPE_NORMAL
+- en: kubespray
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'On the other hand, if you''re using kubespray to provision your servers, kubespray
+    supports multi-node etcd natively. What you need to do is add multiple nodes in
+    the etcd section in the configuration file (`inventory.cfg`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then you are good to provision a cluster with three-node etcd:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: After the ansible playbook is launched, it will configure the role, create the
+    user, check if all certs have already been generated in the first master, and
+    generate and distribute the certs. At the end of the deployment, ansible will
+    check if every component is in a healthy state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kops
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Kops is the most efficient way to create Kubernetes clusters in AWS. Via the
+    kops configuration file, you can easily launch a custom cluster on the cloud.
+    To build an etcd multi-node cluster, you could use the following section inside
+    the kops configuration file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Normally, an instanceGroup means an auto-scaling group. You''ll have to declare
+    a related `intanceGroup my-master-us-east-1x` in the configuration file as well.
+    We''ll learn more about it in [Chapter 6](b7e1d803-52d0-493b-9123-5848da3fa9ec.xhtml),
+    *Building Kubernetes on AWS*. By default, kops still uses etcd2 at the time this
+    book is being written; you could add a version key inside the kops configuration
+    file, such as **version: 3.3.0**, under each `instanceGroup`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: See also
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '*Setting up Kubernetes clusters on Linux by using kubespray* in [Chapter 1](4dd5324f-b753-4c80-b891-bd8e6013b2c1.xhtml), *Building
+    Your Own Kubernetes Cluster*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*The Building multiple masters* section of  this chapter'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[Chapter 6](b7e1d803-52d0-493b-9123-5848da3fa9ec.xhtml), *Building Kubernetes
+    on AWS*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Working with etcd logs* in [Chapter 9](54bceded-1d48-4d1a-bdb3-e3d659940411.xhtml),
+    *Logging and Monitoring*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Building multiple masters
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The master node serves as a kernel component in the Kubernetes system. Its
+    duties include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pushing and pulling information from etcd servers
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Acting as the portal for requests
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Assigning tasks to nodes
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Monitoring the running tasks
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Three major daemons enable the master to fulfill the preceding duties; the
+    following diagram indicates the activities of the aforementioned bullet points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/a41c9c3b-78c3-4537-8cfd-93ba1c02d7aa.png)The interaction between
+    the Kubernetes master and other components'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see, the master is the communicator between workers and clients.
+    Therefore, it will be a problem if the master crashes. A multiple-master Kubernetes
+    system is not only fault tolerant, but also workload-balanced. It would not be
+    an issue if one of them crashed, since other masters would still handle the jobs.
+    We call this infrastructure design *high availability*, abbreviated to HA. In
+    order to support HA structures, there will no longer be only one API server for
+    accessing datastores and handling requests. Several API servers in separated master
+    nodes would help to solve tasks simultaneously and shorten the response time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting ready
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are some brief ideas you should understand about building a multiple-master
+    system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Add a load balancer server in front of the masters. The load balancer will become
+    the new endpoint accessed by nodes and clients.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Every master runs its own API server.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Only one scheduler and one controller manager are eligible to work in the system,
+    which can avoid conflicting directions from different daemons while managing containers.
+    To achieve this setup, we enable the `--leader-elect` flag in the scheduler and
+    controller manager. Only the one getting the lease can take duties.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In this recipe, we are going to build a two-master system via *kubeadm*, which
+    has similar methods while scaling more masters. Users may also use other tools
+    to build up HA Kubernetes clusters. Our target is to illustrate the general concepts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before starting, in addition to master nodes, you should prepare other necessary
+    components in the systems:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Two Linux hosts, which will be set up as master nodes later. These machines
+    should be configured as kubeadm masters. Please refer to the *Setting up Kubernetes
+    clusters on Linux by kubeadm recipe* in [Chapter 1](4dd5324f-b753-4c80-b891-bd8e6013b2c1.xhtml), *Building
+    Your Own Kubernetes Cluster*. You should finish the *Package installation and
+    System configuring prerequisites* parts on both hosts.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A LoadBalancer for masters. It would be much easier if you worked on the public
+    cloud, that's said EL*B* of AWS and Load balancing of GCE.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An etcd cluster. Please check the *Clustering* *etcd *recipe in this chapter.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to do it...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We will use a configuration file to run kubeadm for customized daemon execution.
+    Please follow the next sections to make multiple master nodes as a group.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up the first master
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'First, we are going to set up a master, ready for the HA environment. Like
+    the initial step, running a cluster by using kubeadm, it is important to enable
+    and start kubelet on the master at the beginning. It can then take daemons running
+    as pods in the `kube-system` namespace:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, let''s start the master services with the custom kubeadm configuration
+    file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This configuration file has multiple values required to match your environment
+    settings. The IP ones are straightforward. Be aware that you are now setting the
+    first master; the `<FIRST_MASTER_IP>` variable will be the physical IP of your
+    current location. `<ETCD_CLUSTER_ENDPOINT>` will be in a format like `"http://<IP>:<PORT>"`,
+    which will be the load balancer of the etcd cluster. `<CUSTOM_TOKEN>` should be
+    valid in the specified format (for example, `123456.aaaabbbbccccdddd`). After
+    you allocate all variables aligning to your system, you can run it now:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: You may get the Swap is not supported error message. Add an additional `--ignore-preflight-errors=Swap` flag
+    with `kubeadm init` to avoid this interruption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Make sure to update in both files of the masters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We need to complete client functionality via the following commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Like when running a single master cluster via kubeadm, without a container
+    network interface the add-on `kube-dns` will always have a pending status. We
+    will use CNI Calico for our demonstration. It is fine to apply the other CNI which
+    is suitable to kubeadm:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now it is OK for you to add more master nodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up the other master with existing certifications
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Similar to the last session, let''s start and enable `kubelet` first:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After we have set up the first master, we should share newly generated certificates
+    and keys with the whole system. It makes sure that the masters are secured in
+    the same manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You will have found that several files such as certificates or keys are copied
+    to the `/etc/kubernetes/pki/` directly, where they can only be accessed by the
+    root. However, we are going to remove the files  `apiserver.crt` and `apiserver.key`.
+    It is because these files should be generated in line with the hostname and IP
+    of the second master, but the shared client certificate `ca.crt` is also involved
+    in the generating process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Next, before we fire the master initialization command, please change the API
+    advertise address in the configuration file for the second master. It should be
+    the IP of the second master, your current host. The configuration file of the
+    second master is quite similar to the first master's.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The difference is that we should indicate the information of `etcd` server
+    and avoid creating a new set of them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Go ahead and fire the `kubeadm init` command, record the `kubeadm join` command
+    shown in the last line of the `init` command to add the node later, and enable
+    the client API permission:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, check the current nodes; you will find there are two master :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: Adding nodes in a HA cluster
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Once the masters are ready, you can add nodes into the system. This node should
+    be finished with the prerequisite configuration as a worker node in the kubeadm
+    cluster. And, in the beginning, you should start kubelet as the master ones:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After that, you can go ahead and push the join command you copied. However,
+    please change the master IP to the load balancer one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can then jump to the first master or second master to check the nodes''
+    status:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: How it works...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To verify our HA cluster, take a look at the pods in the namespace `kube-system`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'These pods are working as system daemons: Kubernetes system services such as
+    the API server, Kubernetes add-ons such as the DNS server, and CNI ones; here
+    we used Calico. But wait! As you take a closer look at the pods, you may be curious
+    about why the controller manager and scheduler runs on both masters. Isn''t there
+    just single one in the HA cluster?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we understood in the previous section, we should avoid running multiple
+    controller managers and multiple schedulers in the Kubernetes system. This is
+    because they may try to take over requests at the same time, which not only creates
+    conflict but is also a waste of computing power. Actually, while booting up the
+    whole system by using kubeadm, the controller manager and scheduler are started
+    with the `leader-elect` flag enabled by default:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You may find that the scheduler has also been set with `leader-elect.` Nevertheless,
+    why is there still more than one pod? The truth is, one of the pods with the same
+    role is idle. We can get detailed information by looking at system endpoints:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Take the endpoint for `kube-controller-manager`, for example: there is no virtual
+    IP of a pod or service attached to it (the same as `kube-scheduler`). If we dig
+    deeper into this endpoint, we find that the endpoint for `kube-controller-manager`
+    relies on `annotations` to record lease information; it also relies on `resourceVersion`
+    for pod mapping and to pass traffic. According to the annotation of the `kube-controller-manager`
+    endpoint, it is our first master that took control. Let''s check the controller
+    manager on both masters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, only one master works as a leader and handles the requests,
+    while the other one persists, acquires the lease, and does nothing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For a further test, we are trying to remove our current leader pod, to see
+    what happens. While deleting the deployment of system pods by a `kubectl` request,
+    a kubeadm Kubernetes would create a new one since it''s guaranteed to boot up
+    any application under the`/etc/kubernetes/manifests` directory.  Therefore, avoid
+    the automatic recovery by kubeadm, we remove the configuration file out of the
+    manifest directory instead. It makes the downtime long enough to give away the
+    leadership:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `/etc/kubernetes/manifests` directory is defined in kubelet by `--pod-manifest-path
+    flag`. Check `/etc/systemd/system/kubelet.service.d/10-kubeadm.conf`*,* which
+    is the system daemon configuration file for kubelet, and the help messages of
+    kubelet for more details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, it is the other node''s turn to wake up its controller manager and put
+    it to work. Once you put back the configuration file for the controller manager,
+    you find the old leader is now waiting for the lease:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: See also
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before you read this recipe, you should have mastered the basic concept of
+    single master installation by kubeadm. Refer to the related recipes mentioned
+    here to get an idea for how to build a multiple-master system automatically:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Setting up a Kubernetes cluster on Linux by kubeadm* in [Chapter 1](4dd5324f-b753-4c80-b891-bd8e6013b2c1.xhtml),
+    *Building Your Own Kubernetes Cluster*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clustering etcd
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

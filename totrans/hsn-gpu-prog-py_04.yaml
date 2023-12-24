@@ -1,0 +1,1106 @@
+- en: Kernels, Threads, Blocks, and Grids
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we'll see how to write effective **CUDA kernels***.* In GPU
+    programming, a**kernel **(which we interchangeably use with terms such as *CUDA
+    kernel* or *kernel function*) is a parallel function that can be launched directly
+    from the **host **(the CPU) onto the **device** (the GPU), while a** device function**
+    is a function that can only be called from a kernel function or another device
+    function. (Generally speaking, device functions look and act like normal serial
+    C/C++ functions, only they are running on the GPU and are called in parallel from
+    kernels.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll then get an understanding of how CUDA uses the notion of **threads**, **blocks**,
+    and **grids** to abstract away some of the underlying technical details of the
+    GPU (such as cores, warps, and streaming multiprocessors, which we'll cover later
+    in this book), and how we can use these notions to ease the cognitive overhead
+    in parallel programming. We'll learn about thread synchronization (both block-level
+    and grid-level), and intra-thread communication in CUDA using both **global**
+    and **shared** **memory**. Finally, we'll delve into the technical details of
+    how to implement our own parallel prefix type algorithms on the GPU (that is,
+    the scan/reduce type functions we covered in the last chapter), which allow us
+    to put all of the principles we'll learn in this chapter into practice.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The learning outcomes for this chapter are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the difference between a kernel and a device function
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to compile and launch a kernel in PyCUDA and use a device function within
+    a kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Effectively using threads, blocks, and grids in the context of launching a kernel
+    and how to use `threadIdx` and `blockIdx` within a kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How and why to synchronize threads within a kernel, using both `__syncthreads()`
+    for synchronizing all threads among a single block and the host to synchronize
+    all threads among an entire grid of blocks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to use device global and shared memory for intra-thread communication
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to use all of our newly acquired knowledge about kernels to properly implement
+    a GPU version of the parallel prefix sum
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A Linux or Windows 10 PC with a modern NVIDIA GPU (2016 onward) is required
+    for this chapter, with all necessary GPU drivers and the CUDA Toolkit (9.0 onward)
+    installed. A suitable Python 2.7 installation (such as Anaconda Python 2.7) with
+    the PyCUDA module is also required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This chapter''s code is also available on GitHub at:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/PacktPublishing/Hands-On-GPU-Programming-with-Python-and-CUDA](https://github.com/PacktPublishing/Hands-On-GPU-Programming-with-Python-and-CUDA)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For more information about the prerequisites, check the *Preface* of this book;
+    for the software and hardware requirements, check the `README` section in [https://github.com/PacktPublishing/Hands-On-GPU-Programming-with-Python-and-CUDA](https://github.com/PacktPublishing/Hands-On-GPU-Programming-with-Python-and-CUDA).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernels
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As in the last chapter, we'll be learning how to write CUDA kernel functions
+    as inline CUDA C in our Python code and launch them onto our GPU using PyCUDA.
+    In the last chapter, we used templates provided by PyCUDA to write kernels that
+    fall into particular design patterns; in contrast, we'll now see how to write
+    our own kernels from the ground up, so that we can write a versatile variety of
+    kernels that may not fall into any particular design pattern covered by PyCUDA,
+    and so that we may get a more fine-tuned control over our kernels. Of course,
+    these gains will come at the expense of greater complexity in programming; we'll
+    especially have to get an understanding of **threads**, **blocks**, and **grids**
+    and their role in kernels, as well as how to **synchronize** the threads in which
+    our kernel is executing, as well as understand how to exchange data among threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's start simple and try to re-create some of the element-wise operations
+    we saw in the last chapter, but this time without using the `ElementwiseKernel`
+    function; we'll now be using the `SourceModule` function. This is a very powerful
+    function in PyCUDA that allows us to build a kernel from scratch, so as usual
+    it's best to start simple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The PyCUDA SourceModule function
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We'll use the `SourceModule` function from PyCUDA to compile raw inline CUDA
+    C code into usable kernels that we can launch from Python. We should note that
+    `SourceModule` actually compiles code into a **CUDA module**, this is like a Python
+    module or Windows DLL, only it contains a collection of compiled CUDA code. This
+    means we'll have to "pull out" a reference to the kernel we want to use with PyCUDA's
+    `get_function`, before we can actually launch it. Let's start with a basic example
+    of how to use a CUDA kernel with `SourceModule`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As before, we''ll start with making one of the most simple kernel functions
+    possible—one that multiplies a vector by a scalar. We''ll start with the imports:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we can immediately dive into writing our kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, let''s stop and contrast this with how it was done in `ElementwiseKernel`.
+    First, when we declare a kernel function in CUDA C proper, we precede it with
+    the `__global__` keyword. This will distinguish the function as a kernel to the
+    compiler. We''ll always just declare this as a `void` function, because we''ll
+    always get our output values by passing a pointer to some empty chunk of memory
+    that we pass in as a parameter. We can declare the parameters as we would with
+    any standard C function: first we have `outvec`, which will be our output scaled
+    vector, which is of course a floating-point array pointer. Next, we have `scalar`,
+    which is represented with a mere `float`; notice that this is not a pointer! If
+    we wish to pass simple singleton input values to our kernel, we can always do
+    so without using pointers. Finally, we have our input vector, `vec`, which is
+    of course another floating-point array pointer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Singleton input parameters to a kernel function can be passed in directly from
+    the host without using pointers or allocated device memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's peer into the kernel before we continue with testing it. We recall that
+    `ElementwiseKernel` automatically parallelized over multiple GPU threads by a
+    value, `i`, which was set for us by PyCUDA; the identification of each individual
+    thread is given by the `threadIdx` value, which we retrieve as follows: `int i
+    = threadIdx.x;`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`threadIdx` is used to tell each individual thread its identity. This is usually
+    used to determine an index for what values should be processed on the input and
+    output data arrays. (This can also be used for assigning particular threads different
+    tasks than others with standard C control flow statements such as `if` or `switch`.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, we are ready to perform our scalar multiplication in parallel as before: `outvec[i]
+    = scalar*vec[i];`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s test this code: we first must *pull out* a reference to our compiled
+    kernel function from the CUDA module we just compiled with `SourceModule`. We
+    can get this kernel reference with Python''s `get_function` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, we have to put some data on the GPU to actually test our kernel. Let''s
+    set up a floating-point array of 512 random values, and then copy these into an
+    array in the GPU''s global memory using the `gpuarray.to_gpu` function. (We''re
+    going to multiply this random vector by a scalar both on the GPU and CPU, and
+    see if the output matches.) We''ll also allocate a chunk of empty memory to the
+    GPU''s global memory using the `gpuarray.empty_like` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We are now prepared to launch our kernel. We''ll set the scalar value as `2`.
+    (Again, since the scalar is a singleton, we don''t have to copy this value to
+    the GPU—we should be careful that we typecast it properly, however.) Here we''ll
+    have to specifically set the number of threads to `512` with the `block` and `grid`
+    parameters. We are now ready to launch:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can now check whether the output matches with the expected output by using
+    the `get` function in our `gpuarray` output object and comparing this to the correct
+    output with NumPy''s `allclose` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: (The code to this example is available as the `simple_scalar_multiply_kernel.py` file,
+    under `4` in the repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now we are starting to remove the training wheels of the PyCUDA kernel templates
+    we learned in the previous chapter—we can now directly write a kernel in pure
+    CUDA C and launch it to use a specific number of threads on our GPU. However,
+    we'll have to learn a bit more about how CUDA structures threads into collections
+    of abstract units known as **blocks** and **grids** before we can continue with
+    kernels.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threads, blocks, and grids
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far in this book, we have been taking the term **thread** for granted. Let's
+    step back for a moment and see exactly what this means—a thread is a sequence
+    of instructions that is executed on a single core of the GPU—*cores *and *threads* should
+    not be thought of as synonymous! In fact, it is possible to launch kernels that
+    use many more threads than there are cores on the GPU. This is because, similar
+    to how an Intel chip may only have four cores and yet be running hundreds of processes
+    and thousands of threads within Linux or Windows, the operating system's scheduler
+    can switch between these tasks rapidly, giving the appearance that they are running
+    simultaneously. The GPU handles threads in a similar way, allowing for seamless
+    computation over tens of thousands of threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Multiple threads are executed on the GPU in abstract units known as **blocks**.
+    You should recall how we got the thread ID from `threadIdx.x` in our scalar multiplication
+    kernel; there is an `x` at the end because there is also `threadIdx.y` and `threadIdx.z`.
+    This is because you can index blocks over three dimensions, rather than just one
+    dimension. Why do we do this? Let's recall the example regarding the computation
+    of the Mandelbrot set from [Chapter 1](f9c54d0e-6a18-49fc-b04c-d44a95e011a2.xhtml), *Why
+    GPU Programming?* and [Chapter 3](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml),
+    *Getting Started with PyCUDA*. This is calculated point-by-point over a two-dimensional
+    plane. It may therefore make more sense for us to index the threads over two dimensions
+    for algorithms like this. Similarly, it may make sense to use three dimensions
+    in some cases—in a physics simulation, we may have to calculate the positions
+    of moving particles within a 3D grid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Blocks are further executed in abstract batches known as **grids**, which are
+    best thought of as *blocks of blocks.* As with threads in a block, we can index
+    each block in the grid in up to three dimensions with the constant values that
+    are given by `blockIdx.x` , `blockIdx.y`, and `blockIdx.z`. Let's look at an example
+    to help us make sense of these concepts; we'll only use two dimensions here for
+    simplicity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Conway's game of life
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '*The Game of Life* (often called *LIFE* for short) is a cellular automata simulation
+    that was invented by the British mathematician John Conway back in 1970\. This
+    sounds complex, but it''s really quite simple—LIFE is a zero-player *game* that
+    consists of a two-dimensional binary lattice of *cells* that are either considered
+    *live* or *dead*. The lattice is iteratively updated by the following set of rules:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Any live cell with fewer than two live neighbors dies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Any live cell with two or three neighbors lives
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Any live cell with more than three neighbors dies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Any dead cell with exactly three neighbors comes to life
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These four simple rules give rise to a complex simulation with interesting mathematical
+    properties that is also aesthetically quite pleasing to watch when animated. However,
+    with a large number of cells in the lattice, it can run quite slowly, and usually
+    results in *choppy* animation when programmed in pure serial Python. However,
+    this is parallelizable, as it is clear that each cell in the lattice can be managed
+    by a single CUDA thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll now implement LIFE as a CUDA kernel and animate it as using the `matplotlib.animation`
+    module. This will be interesting to us right now because namely we'll be able
+    to apply our new knowledge of blocks and grids here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We''ll start by including the appropriate modules as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, let''s dive into writing our kernel via `SourceModule` . We''re going
+    to start by using the C language''s `#define` directive to set up some constants
+    and macros that we''ll use throughout our kernel. Let''s look at the first two
+    we''ll set up, `_X` and `_Y`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Let's first remember how `#define` works here—it will literally replace any
+    text of `_X` or `_Y` with the defined values (in the parentheses here) at compilation
+    time—that is, it creates macros for us. (As a matter of personal style, I usually
+    precede all of my C macros with an underscore.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: In C and C++, `#define` is used for creating **macros**. This means that `#define`
+    doesn't create any function or set up a proper constant variables—it just allows
+    us to write things shorthand in our code by swapping text out right before compilation
+    time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s talk about what `_X` and `_Y` mean specifically—these will be the
+    Cartesian *x* and *y* values of a single CUDA thread''s cell on the two-dimensional
+    lattice we are using for LIFE. We''ll launch the kernel over a two-dimensional
+    grid consisting of two-dimensional blocks that will correspond to the entire cell
+    lattice. We''ll have to use both thread and block constants to find the Cartesian
+    point on the lattice. Let''s look at some diagrams to make the point. A thread
+    residing in a two-dimensional CUDA block can be visualized as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/b18aaa4b-b830-44f1-9371-80c57b0ab285.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: At this point, you may be wondering why we don't launch our kernel over a single
+    block, so we can just set `_X` as `threadIdx.x` and `_Y` as `threadIdx.y` and
+    be done with it. This is due to a limitation on block size imposed on us by CUDA—currently,
+    only blocks consisting of at most 1,024 threads are supported. This means that
+    we can only make our cell lattice of dimensions 32 x 32 at most, which would make
+    for a rather boring simulation that might be better done on a CPU, so we'll have
+    to launch multiple blocks over a grid. (The dimensions of our current block will
+    be given by `blockDim.x` and `blockDim.y`, which will help us determine the objective
+    *x* and *y* coordinates, as we'll see.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Similarly, as before, we can determine which block we are in within a two-dimensional
+    grid with `blockIdx.x` and `blockIdx.y`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/45159b32-9f17-4a39-a50f-0e4bfb47b1f2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'After we think of the math a little bit, it should be clear that `_X` should
+    be defined as `(threadIdx.x + blockIdx.x * blockDim.x)` and `_Y` should be defined
+    as `( threadIdx.y + blockIdx.y * blockDim.y )`. (The parentheses are added so
+    as not to interfere with the order of operations when the macros are inserted
+    in the code.) Now, let''s continue defining the remaining macros:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `_WIDTH` and `_HEIGHT` macros will give us the width and height of our cell
+    lattice, respectively, which should be clear from the diagrams. Let's discuss
+    the `_XM` and `_YM` macros. In our implementation of LIFE, we'll have the endpoints
+    "wrap around" to the other side of the lattice—for example, we'll consider the
+    *x*-value of `-1` to be `_WIDTH - 1`, and a *y*-value of `-1` to be `_HEIGHT -
+    1`, and we'll likewise consider an *x*-value of `_WIDTH` to be `0` and a *y*-value
+    of `_HEIGHT` to be `0`. Why do we need this? When we calculate the number of living
+    neighbors of a given cell, we might be at some edge and the neighbors might be
+    external points—defining these macros to modulate our points will cover this for
+    us automatically. Notice that we have to add the width or height before we use
+    C's modulus operator—this is because, unlike Python, the modulus operator in C
+    can return negative values for integers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We now have one final macro to define. We recall that PyCUDA passes two-dimensional
+    arrays into CUDA C as one-dimensional pointers; two-dimensional arrays are passed
+    in **row-wise** from Python into one dimensional C pointers. This means that we''ll
+    have to translate a given Cartesian (*x*,*y*) point for a given cell on the lattice
+    into a one dimensional point within the pointer corresponding to the lattice.
+    Here, we can do so as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since our cell lattice is stored row-wise, we have to multiply the *y*-value
+    by the width to offset to the point corresponding to the appropriate row. We can
+    now finally begin with our implementation of LIFE. Let''s start with the most
+    important part of LIFE—counting the number of living neighbors a given cell has.
+    We''ll implement this using a CUDA **device function**, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: A device function is a C function written in serial, which is called by an individual
+    CUDA thread in kernel. That is to say, this little function will be called in
+    parallel by multiple threads from our kernel. We'll represent our cell lattice
+    as a collection of 32-bit integers (1 will represent a living cell and 0 will
+    represent a dead one), so this will work for our purposes; we just have to add
+    the values of the neighbors around our current cell.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A CUDA **device function** is a serial C function that is called by an individual
+    CUDA thread from within a kernel. While these functions are serial in themselves,
+    they can be run in parallel by multiple GPU threads. Device functions cannot by
+    themselves by launched by a host computer onto a GPU, only kernels.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We are now prepared to write our kernel implementation of LIFE. Actually, we''ve
+    done most of the hard work already—we check the number of neighbors of the current
+    thread''s cell, check whether the current cell is living or dead, and then use
+    the appropriate switch-case statements to determine its status for the next iteration
+    according to the rules of LIFE. We''ll use two integer pointer arrays for this
+    kernel—one will be in reference to the last iteration as input (`lattice`) and
+    the other in reference to the iteration that we''ll calculate as output (`lattice_out`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We remember to close off the inline CUDA C segment with the triple-parentheses,
+    and then get a reference to our CUDA C kernel with `get_function`. Since the kernel
+    will only update the lattice once, we''ll set up a short function in Python that
+    will cover for all of the overhead of updating the lattice for the animation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `frameNum` parameter is just a value that is required by Matplotlib's animation
+    module for update functions that we can ignore, while `img` will be the representative
+    image of our cell lattice that is required by the module that will be iteratively
+    displayed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's focus on the other three remaining parameters—`newLattice_gpu` and `lattice_gpu`
+    will be PyCUDA arrays that we'll keep persistent, as we want to avoid re-allocating
+    chunks of memory on the GPU when we can. `lattice_gpu` will be the current generation
+    of the cell array that will correspond to the `lattice` parameter in the kernel,
+    while `newLattice_gpu` will be the next generation of the lattice. `N` will indicate
+    the the height and width of the lattice (in other words, we'll be working with
+    an *N x N* lattice).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We launch the kernel with the appropriate parameters and set the block and
+    grid sizes as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: We'll set the block sizes as 32 x 32 with `(32, 32, 1)`; since we are only using
+    two dimensions for our cell lattice, we can just set the *z*-dimension as one.
+    Remember that blocks are limited to 1,024 threads—*32 x 32 = 1024*, so this will
+    work. (Keep in mind that there is nothing special here about 32 x 32; we could
+    use values such as 16 x 64 or 10 x 10 if we wanted to, as long as the total number
+    of threads does not exceed 1,024.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The number of threads in a CUDA block is limited to a maximum of 1,024.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We now look at grid value—here, since we are working with dimensions of 32,
+    it should be clear that *N* (in this case) should be divisible by 32\. That means
+    that in this case, we are limited to lattices such as 64 x 64, 96 x 96, 128 x
+    128, and 1024 x 1024\. Again, if we want to use lattices of a different size,
+    then we'll have to alter the dimensions of the blocks. (If this doesn't make sense,
+    then please look at the previous diagrams and review how we defined the width
+    and height macros in our kernel.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can now set up the image data for our animation after grabbing the latest
+    generated lattice from the GPU''s memory with the `get()` function. We finally
+    copy the new lattice data into the current data using the PyCUDA slice operator, `[:]`,
+    which will copy over the previously allocated memory on the GPU so that we don''t
+    have to re-allocate:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s set up a lattice of size 256 x 256\. We now will set up an initial state
+    for our lattice using the choice function from the `numpy.random` module. We''ll
+    populate a *N* x *N* graph of integers randomly with ones and zeros; generally,
+    if around 25% of the points are ones and the rest zeros, we can generate some
+    interesting lattice animations, so we''ll go with that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we can set up the lattices on the GPU with the appropriate `gpuarray`
+    functions and set up the Matplotlib animation accordingly, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can now run our program and enjoy the show (the code is also available as the `conway_gpu.py` file under
+    the `4` directory in the GitHub repository):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/bb012845-31d4-4511-a697-9eef0e2772b2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Thread synchronization and intercommunication
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We'll now discuss two important concepts in GPU programming—**thread synchronization**
+    and **thread intercommunication**. Sometimes, we need to ensure that every single
+    thread has reached the same exact line in the code before we continue with any
+    further computation; we call this thread synchronization. Synchronization works
+    hand-in-hand with thread intercommunication, that is, different threads passing
+    and reading input from each other; in this case, we'll usually want to make sure
+    that all of the threads are aligned at the same step in computation before any
+    data is passed around. We'll start here by learning about the CUDA `__syncthreads`
+    device function, which is used for synchronizing a single block in a kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the __syncthreads() device function
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In our prior example of Conway's *Game of Life*, our kernel only updated the
+    lattice once for every time it was launched by the host. There are no issues with
+    synchronizing all of the threads among the launched kernel in this case, since
+    we only had to work with the lattice's previous iteration that was readily available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now let's suppose that we want to do something slightly different—we want to
+    re-write our kernel so that it performs a certain number of iterations on a given
+    cell lattice without being re-launched over and over by the host. This may initially
+    seem trivial—a naive solution would be to just put an integer parameter to indicate
+    the number of iterations and a `for` loop in the inline `conway_ker` kernel, make
+    some additional trivial changes, and be done with it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, this raises the issue of **race conditions**; this is the issue of
+    multiple threads reading and writing to the same memory address and the problems
+    that may arise from that. Our old `conway_ker` kernel avoids this issue by using
+    two arrays of memory, one that is strictly read from, and one that is strictly
+    written to for each iteration. Furthermore, since the kernel only performs a single
+    iteration, we are effectively using the host for the synchronization of the threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We want to do multiple iterations of LIFE on the GPU that are fully synchronized;
+    we also will want to use a single array of memory for the lattice. We can avoid
+    race conditions by using a CUDA device function called `__syncthreads()`. This
+    function is a **block level synchronization barrier**—this means that every thread
+    that is executing within a block will stop when it reaches a `__syncthreads()`
+    instance and wait until each and every other thread within the same block reaches
+    that same invocation of `__syncthreads()` before the the threads continue to execute
+    the subsequent lines of code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '` __syncthreads()` can only synchronize threads within a single CUDA block,
+    not all threads within a CUDA grid!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s now create our new kernel; this will be a modification of the prior
+    LIFE kernel that will perform a certain number of iterations and then stop. This
+    means we''ll not represent this as an animation, just as a static image, so we''ll
+    load the appropriate Python modules in the beginning. (This code is also available
+    in the `conway_gpu_syncthreads.py` file, in the GitHub repository):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, let''s again set up our kernel that will compute LIFE:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Of course, our CUDA C code will go here, which will be largely the same as
+    before. We''ll have to only make some changes to our kernel. Of course, we can
+    preserve the device function, `nbrs`. In our declaration, we''ll use only one
+    array to represent the cell lattice. We can do this since we''ll be using proper
+    thread synchronization. We''ll also have to indicate the number of iterations
+    with an integer. We set the parameters as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We''ll continue similarly as before, only iterating with a `for` loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s recall that previously, we directly set the new cell lattice value directly
+    within the array. Here, we''ll hold the value in the `cell_value` variable until
+    all of the threads in the block are synchronized. We proceed similarly as before,
+    blocking execution with `__syncthreads` until all of the new cell values are determined
+    for the current iteration, and only then setting the values within the lattice
+    array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We''ll now launch the kernel as before and display the output, iterating over
+    the lattice 1,000,000 times. Note that we are using only a single block in our
+    grid, which is of a size of 32 x 32, due to the limit of 1,024 threads per block.
+    (Again, it should be emphasized that `__syncthreads` only works over all threads
+    in a block, rather than over all threads in a grid, which is why we are limiting
+    ourselves to a single block here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When we run the program, we''ll get the desired output as follows (this is
+    what a random LIFE lattice will converge to after one million iterations!):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/38be0537-84a4-447c-a25b-0f60c15726b1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Using shared memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We can see from the prior example that the threads in the kernel can intercommunicate
+    using arrays within the GPU's global memory; while it is possible to use global
+    memory for most operations, we can speed things up by using **shared memory**.
+    This is a type of memory meant specifically for intercommunication of threads
+    within a single CUDA block; the advantage of using this over global memory is
+    that it is much faster for pure inter-thread communication. In contrast to global
+    memory, though, memory stored in shared memory cannot directly be accessed by
+    the host—shared memory must be copied back into global memory by the kernel itself
+    first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s first step back for a moment before we continue and think about what
+    we mean. Let''s look at some of the variables that are declared in our iterative
+    LIFE kernel that we just saw. Let''s first look at `x` and `y`, two integers that
+    hold the Cartesian coordinates of a particular thread''s cell. Remember that we
+    are setting their values with the `_X` and `_Y` macros. (Compiler optimizations
+    notwithstanding, we want to store these values in variables to reduce computation
+    because directly using `_X` and `_Y` will recompute the `x` and `y` values every
+    time these macros are referenced in our code):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: We note that, for every single thread, there will be a unique Cartesian point
+    in the lattice that will correspond to `x` and `y`. Similarly, we use a variable, `n`,
+    which is declared with `int n = nbrs(x, y, lattice);`, to indicate the number
+    of living neighbors around a particular cell. This is because, when we normally
+    declare variables in CUDA, they are by default local to each individual thread.
+    Note that, even if we declare an array within a thread such as `int a[10];`, there
+    will be an array of size 10 that is local to each thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Local thread arrays (for example, a declaration of `int a[10];` within the kernel)
+    and pointers to global GPU memory (for example, a value passed as a kernel parameter
+    of the form `int * b`) may look and act similarly, but are very different. For
+    every thread in the kernel, there will be a separate `a` array that the other
+    threads cannot read, yet there is a single `b` that will hold the same values
+    and be equally accessible for all of the threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We are prepared to use shared memory. This allows us to declare variables and
+    arrays that are shared among the threads within a single CUDA block. This memory
+    is much faster than using global memory pointers (as we have been using till now),
+    as well as reduces the overhead of allocating memory in the case of pointers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's say we want a shared integer array of size 10\. We declare it as follows—`__shared__
+    int a[10] `. Note that we don't have to limit ourselves to arrays; we can make
+    shared singleton variables as follows: `__shared__ int x`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s rewrite a few lines of iterative version of LIFE that we saw in the
+    last sub-section to make use of shared memory. First, let''s just rename the input
+    pointer to `p_lattice`, so we can instead use this variable name on our shared
+    array, and lazily preserve all of the references to " lattice" in our code. Since
+    we''ll be sticking with a 32 x 32 cell lattice here, we set up the new shared
+    `lattice` array as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We''ll now have to copy all values from the global memory `p_lattice` array into
+    `lattice`. We''ll index our shared array exactly in the same way, so we can just
+    use our old `_INDEX` macro here. Note that we make sure to put `__syncthreads()`
+    after we copy, to ensure that all of the memory accesses to lattice are entirely
+    completed before we proceed with the LIFE algorithm:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The rest of the kernel is exactly as before, only we have to copy from the
+    shared lattice back into the GPU array. We do so as follows and then close off
+    the inline code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: We can now run this as before, with the same exact test code. (This example
+    can be seen in `conway_gpu_syncthreads_shared.py` in the GitHub repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The parallel prefix algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We'll now be using our new knowledge of CUDA kernels to implement the **parallel
+    prefix algorithm**, also known as the **scan design pattern**. We have already
+    seen simple examples of this in the form of PyCUDA's `InclusiveScanKernel` and
+    `ReductionKernel` functions in the previous chapter. We'll now look into this
+    idea in a little more detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The central motivation of this design pattern is that we have a binary operator ![](assets/9388a619-6713-4ea7-93d8-a85fc2fd8094.png) ,
+    that is to say a function that acts on two input values and gives one output value
+    (such as—+, ![](assets/362dcb88-5323-4213-8ea4-03a9785d4984.png), ![](assets/2abe6459-7144-4bdf-9569-b0a70726e422.png) (maximum), ![](assets/380e1f66-b930-42d9-b7d0-a565b74b858f.png) (minimum)),
+    and collection of elements, ![](assets/d10897a0-55d1-4a8f-9862-fd43a6f729ea.png),
+    and from these we wish to compute ![](assets/d1dace09-f460-4cee-abb6-81691be4dcf6.png) efficiently.
+    Furthermore, we make the assumption that our binary operator ![](assets/2c1163a9-8a0f-480d-be93-f5cbaa606034.png) is
+    **associative**—this means that, for any three elements, *x*, *y*, and *z*, we
+    always have:![](assets/7f9f94dd-6751-4a0e-abcc-32333a71812d.png) .
+  prefs: []
+  type: TYPE_NORMAL
+- en: We wish to retain the partial results, that is the *n - 1* sub-computations—![](assets/cadd1c5c-4dfa-45f8-bca5-e3e810c6187b.png).
+    The aim of the parallel prefix algorithm is to produce this collection of *n*
+    sums efficiently. It normally takes *O(n)* time to produce these *n* sums in a
+    serial operation, and we wish to reduce the time complexity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the terms "parallel prefix" or "scan" are used, it usually means an algorithm
+    that produces all of these *n* results, while "reduce"/"reduction" usually means
+    an algorithm that only yields the single final result, ![](assets/864d06dd-ccd8-48c3-8a0a-fd437cd6436e.png).
+    (This is the case with PyCUDA.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are actually several variations of the parallel prefix algorithm, and
+    we'll first start with the simplest (and oldest) version first, which is called
+    the naive parallel prefix algorithm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The naive parallel prefix algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The **naive parallel prefix algorithm** is the original version of this algorithm;
+    this algorithm is "naive" because it makes an assumption that given *n* input
+    elements, ![](assets/2a2cf114-8fcf-41ec-83de-66803d5c7345.png), with the further
+    assumption that *n* is *dyadic* (that is, ![](assets/f23d2bc1-c7c4-44fc-a947-ac7571697516.png) for
+    some positive integer, *k*), and we can run the algorithm in parallel over *n*
+    processors (or *n* threads). Obviously, this will impose strong limits on the
+    cardinality *n* of sets that we may process. However, given these conditions are
+    satisfied, we have a nice result in that its computational time complexity is
+    only *O(log n)*. We can see this from the pseudocode of the algorithm. Here, we''ll
+    indicate the input values with ![](assets/79ff2d6e-25d9-478d-8a3c-5fe79faa77cf.png) and
+    the output values as ![](assets/be8218cd-e2fd-4453-87fd-50f3cf71308c.png):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, we can clearly see that this will take *O(log n)* asymptotic time, as the
+    outer loop is parallelized over the `parfor` and the inner loop takes *log[2](n)*.
+    It should be easy to see after a few minutes of thought that the *y[i]* values
+    will yield our desired output.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now let's begin our implementation; here, our binary operator will simply be
+    addition. Since this example is illustrative, this kernel will be strictly over
+    1,024 threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s just set up the header and dive right into writing our kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, let''s look at what we have: we represent our input elements as a GPU array
+    of doubles, that is `double *vec`, and represent the output values with `double
+    *out`. We declare a shared memory `sum_buf` array that we''ll use for the calculation
+    of our output. Now, let''s look at the implementation of the algorithm itself:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Of course, there is no `parfor,` which is implicit over the `tid` variable, which
+    indicates the thread number. We are also able to omit the use of *log[2]* and
+    *2^i* by starting with a variable that is initialized to 1, and then iteratively
+    multiplying by 2 every iteration of i. (Note that if we want to be even more technical,
+    we can do this with the bitwise shift operators .) We bound the iterations of `i`
+    by 10, since *2^(10) = 1024*. Now we''ll close off our new kernel as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s now look at the test code following the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: We're only going to concern ourselves with the final sum in the output, which
+    we retrieve with `outvec_gpu[-1].get()`, recalling that the "-1" index gives the
+    last member of an array in Python. This will be the sum of every element in `vec`;
+    the partial sums are in the prior values of `outvec_gpu`. (This example can be
+    seen in the `naive_prefix.py` file in the GitHub repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: By its nature, the parallel prefix algorithm has to run over *n* threads, corresponding
+    to a size-n array, where *n* is dyadic (again, this means that *n* is some power
+    of 2). However, we can extend this algorithm to an arbitrary non-dyadic size assuming
+    that our operator has a **identity element** (or equivalently, **neutral element**)—that
+    is to say, that there is some value *e* so that for any *x* value, we have—![](assets/9a41546d-6056-4ca9-bfdd-0e9ec13ae195.png). 
+    In the case that our operator is + , the identity element is 0; in the case that
+    it is ![](assets/04590efc-4d27-477f-a7bb-96da2f050011.png), it is 1; all we do
+    then is just pad the elements ![](assets/f1e4ffaf-26a6-4f45-b9f4-20340837e38c.png) with
+    a series of *e* values so that we have the a dyadic cardinality of the new set
+    ![](assets/8c22f00e-f896-44d2-99f2-7d5ecc3b35eb.png).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inclusive versus exclusive prefix
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's stop for a moment and make a very subtle, but very important distinction.
+    So far, we have been concerned with taking inputs of the form ![](assets/cb300a9a-6dff-4df9-b962-91cb62ccd143.png) ,
+    and as output producing an array of sums of the form ![](assets/244e529c-37f3-46ba-a492-b34765482abb.png).
+    Prefix algorithms that produce output as such are called **inclusive**; in the
+    case of an **inclusive prefix algorithm**, the corresponding element at each index
+    is included in the summation in the same index of the output array. This is in
+    contrast to prefix algorithms that are **exclusive**. An **exclusive prefix algorithm**
+    differs in that it similarly takes *n* input values of the form ![](assets/1bba2db0-de4c-42d3-a676-d482b67584c2.png) and
+    produces the length-*n* output array ![](assets/c789f125-403d-4264-b4f4-a57d73c11977.png).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is important because some efficient variations of the prefix algorithm
+    are exclusive by their nature. We'll see an example of one in the next sub-section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the exclusive algorithm yields nearly the same output as the inclusive
+    algorithm, only it is right-shifted and omits the final value. We can therefore
+    trivially obtain the equivalent output from either algorithm, provided we keep
+    a copy of ![](assets/179c86ba-3a68-4b15-98bf-24d9e930e963.png).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A work-efficient parallel prefix algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before we continue with our new algorithm, we'll look at the naive algorithm
+    from two perspectives. In an ideal case, the computational time complexity is
+    *O(log n)*, but this is only when we have a sufficient number of processors for
+    our data set; when the cardinality (number of elements) of our dataset, *n*, is
+    much larger than the number of processors, we have that this becomes an *O(n log
+    n)* time algorithm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's define a new concept with relation to our binary operator ![](assets/b89f2449-e123-451e-a958-6a782b932821.png)—the
+    **work** performed by a parallel algorithm here is the number of invocations of
+    this operator across all threads for the duration of the execution. Similarly,
+    the **span** is the number of invocations a thread makes in the duration of execution
+    of the kernel; while the **span** of the whole algorithm is the same as the longest
+    span among each individual thread, which will tell us the total execution time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We seek to specifically reduce the amount of work performed by the algorithm
+    across all threads, rather than focus merely span. In the case of the naive prefix,
+    the additional work that is required costs a more time when the number of available
+    processors falls short; this extra work will just spill over into the limited
+    number of processors available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll present a new algorithm that is **work efficient**, and hence more suitable
+    for a limited number of processors. This consists of two separate two distinct
+    parts—the **up-sweep (or reduce) phase** and the **down-sweep phase**. We should
+    also note the algorithm we'll see is an exclusive prefix algorithm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **up-sweep phase** is similar to a single reduce operation to produce the
+    value that is given by the reduce algorithm, that is ![](assets/f380e618-5246-4853-b1eb-976537a28ab6.png) ;
+    in this case we retain the partial sums (![](assets/b739e65c-64e0-4a07-ae84-740401252763.png))
+    that are required the achieve the end result. The down-sweep phase will then operate
+    on these partial sums and give us the final result. Let's look at some pseudocode,
+    starting with the up-sweep phase. (The next subsection will then dive into the
+    implementation from the pseudocode immediately.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Work-efficient parallel prefix (up-sweep phase)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'This is the pseudocode for the up-sweep. (Notice the `parfor` over the `j` variable, which
+    means that this block of code can be parallelized over threads indexed by `j`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Work-efficient parallel prefix (down-sweep phase)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now let''s continue with the down-sweep, which will operate on the output of
+    the up-sweep:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: Work-efficient parallel prefix — implementation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As a capstone for this chapter, we'll write an implementation of this algorithm
+    that can operate on arrays of arbitrarily large size over 1,024\. This will mean
+    that this will operate over grids as well as blocks; that being such, we'll have
+    to use the host for synchronization; furthermore, this will require that we implement
+    two separate kernels for up-sweep and down-sweep phases that will act as the `parfor` loops
+    in both phases, as well as Python functions that will act as the outer `for` loop
+    for the up- and down-sweeps.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s begin with an up-sweep kernel. Since we''ll be iteratively re-launching
+    this kernel from the host, we''ll also need a parameter that indicates current
+    iteration (`k`). We''ll use two arrays for the computation to avoid race conditions—`x` (for
+    the current iteration) and `x_old` (for the prior iteration). We declare the kernel
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now let''s set the `tid` variable, which will be the current thread''s identification
+    among *all* threads in *all* *blocks* in the grid. We use the same trick as in
+    our original grid-level implementation of Conway''s *Game of Life* that we saw
+    earlier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We''ll now use C bit-wise shift operators to generate 2^k and 2^(k+1 )directly
+    from `k`. We now set `j` to be `tid` times `_2k1`—this will enable us to remove
+    the "if `j` is divisible by 2^(k+1)", as in the pseudocode, enabling us to only
+    launch as many threads as we''ll need:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: We can easily generate dyadic (power-of-2) integers in CUDA C with the left
+    bit-wise shift operator (`<<`). Recall that the integer 1 (that is 2⁰) is represented
+    as 0001, 2 (2¹) is represented as 0010, 4 (2² ) is represented as 0100, and so
+    on. We can therefore compute 2^k with the `1 << k` operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can now run the up-sweep phase with a single line, noting that `j` is indeed
+    divisible by 2^(k+1) by its construction:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: We're done writing our kernel! But this is not a full implementation of the
+    up-sweep, of course. We have to do the rest in Python. Let's get our kernel and
+    begin the implementation. This mostly speaks for itself as it follows the pseudocode
+    exactly; we should recall that we are updating `x_old_gpu` by copying from `x_gpu`
+    using `[:]`, which will preserve the memory allocation and merely copy the new
+    data over rather than re-allocate. Also note how we set our block and grid sizes
+    depending on how many threads we have to launch—we try to keep our block sizes
+    as multiples of size 32 (which is our rule-of-thumb in this text, we go into the
+    details why we use 32 specifically in [Chapter 11](e853faad-3ee4-4df7-9cdb-98f74e435527.xhtml),
+    *Performance Optimization in CUDA*). We should put `from __future__ import division` at
+    the beginning of our file, since we'll use Python 3-style division in calculating
+    our block and kernel sizes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One issue to mention is that we are assuming that `x` is of dyadic length 32
+    or greater—this can be modified trivially if you wish to have this operate on
+    arrays of other sizes by padding our arrays with zeros, however:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we''ll embark on writing the down-sweep. Again, let''s start with the kernel,
+    which will have the functionality of the inner `parfor` loop of the pseudocode.
+    It follows similarly as before—again, we''ll use two arrays, so using a `temp` variable
+    as in the pseudocode is unnecessary here, and again we use bit-shift operators
+    to obtain the values of 2^k and 2^(k+1). We calculate `j` similarly to before:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We now can write our Python function that will iteratively launch the kernel,
+    which corresponds to the outer `for` loop of the down-sweep phase. This is similar
+    to the Python function for the up-sweep phase. One important distinction from
+    looking at the pseudocode is that we have to iterate from the largest value in
+    the outer `for` loop to the smallest; we can just use Python''s `reversed` function
+    to do this. Now we can implement the down-sweep phase:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Having implemented both the up-sweep and down-sweep phases, our last task is
+    trivial to complete:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: We have now fully implemented a host-synchronized version of the work-efficient
+    parallel prefix algorithm! (This implementation is available in the `work-efficient_prefix.py`
+    file in the repository, along with some test code.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We started with an implementation of Conway's *Game of Life*, which gave us
+    an idea of how the many threads of a CUDA kernel are organized in a block-grid
+    tensor-type structure. We then delved into block-level synchronization by way
+    of the CUDA function, `__syncthreads()`, as well as block-level thread intercommunication
+    by using shared memory; we also saw that single blocks have a limited number of
+    threads that we can operate over, so we'll have to be careful in using these features
+    when we create kernels that will use more than one block across a larger grid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We gave an overview of the theory of parallel prefix algorithms, and we ended
+    by implementing a naive parallel prefix algorithm as a single kernel that could
+    operate on arrays limited by a size of 1,024 (which was synchronized with `___syncthreads`
+    and performed both the `for` and `parfor` loops internally), and with a work-efficient
+    parallel prefix algorithm that was implemented across two kernels and three Python
+    functions could operate on arrays of arbitrary size, with the kernels acting as
+    the inner `parfor` loops of the algorithm, and with the Python functions effectively
+    operating as the outer `for` loops and synchronizing the kernel launches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Change the random vector in `simple_scalar_multiply_kernel.py` so that it is
+    of a length of 10,000, and modify the `i` index in the definition of the kernel
+    so that it can be used over multiple blocks in the form of a grid. See if you
+    can now launch this kernel over 10,000 threads by setting block and grid parameters
+    to something like `block=(100,1,1)` and `grid=(100,1,1)`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the previous question, we launched a kernel that makes use of 10,000 threads
+    simultaneously; as of 2018, there is no NVIDIA GPU with more than 5,000 cores.
+    Why does this still work and give the expected results?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The naive parallel prefix algorithm has time complexity O(*log n*) given that
+    we have *n* or more processors for a dataset of size *n*. Suppose that we use
+    a naive parallel prefix algorithm on a GTX 1050 GPU with 640 cores. What does
+    the asymptotic time complexity become in the case that `n >> 640`?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Modify `naive_prefix.py` to operate on arrays of arbitrary size (possibly non-dyadic),
+    only bounded by 1,024.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `__syncthreads()` CUDA device function only synchronizes threads across
+    a single block. How can we synchronize across all threads in all blocks across
+    a grid?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You can convince yourself that the second prefix sum algorithm really is more
+    work-efficient than the naive prefix sum algorithm with this exercise. Suppose
+    that we have a dataset of size 32\. What is the exact number of "addition" operations
+    required by the first and second algorithm in this case?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the implementation of the work-efficient parallel prefix we use a Python
+    function to iterate our kernels and synchronize the results. Why can't we just
+    put a `for` loop inside the kernels with careful use of `__syncthreads()` instead?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Why does it make more sense to implement the naive parallel prefix within a
+    single kernel that handles its own synchronization within CUDA C, than it makes
+    more sense to implement the work-efficient parallel prefix using both kernels
+    and Python functions and have the host handle the synchronization?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL

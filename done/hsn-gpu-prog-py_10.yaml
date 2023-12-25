@@ -1,0 +1,1165 @@
+- en: Working with Compiled GPU Code
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用已编译的GPU代码
+- en: Throughout the course of this book, we have generally been reliant on the PyCUDA
+    library to interface our inline CUDA-C code for us automatically, using just-in-time
+    compilation and linking with our Python code. We might recall, however, that sometimes
+    the compilation process can take a while. In [Chapter 3](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml),
+    *Getting Started With PyCUDA*, we even saw in detail how the compilation process
+    can contribute to slowdown, and how it can even be somewhat arbitrary as to when
+    inline code will be compiled and retained. In some cases, this may be inconvenient
+    and cumbersome given the application, or even unacceptable in the case of a real-time
+    system.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本书的过程中，我们通常依赖PyCUDA库自动为我们接口我们的内联CUDA-C代码，使用即时编译和与Python代码的链接。然而，我们可能还记得，有时编译过程可能需要一段时间。在[第3章](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml)中，*使用PyCUDA入门*，我们甚至详细看到编译过程如何导致减速，以及内联代码何时被编译和保留可能是相当随意的。在某些情况下，这可能会给应用程序带来不便，或者在实时系统的情况下甚至是不可接受的。
+- en: To this end, we will finally see how to use pre-compiled GPU code from Python.
+    In particular, we will look at three distinct ways to do this. First, we will
+    look at how we can do this by writing a host-side CUDA-C function that can indirectly
+    launch a CUDA kernel. This method will involve invoking the host-side function
+    with the standard Python Ctypes library. Second, we will compile our kernel into
+    what is known as a PTX module, which is effectively a DLL file containing compiled
+    binary GPU. We can then load this file with PyCUDA and launch our kernel directly.
+    Finally, we will end this chapter by looking at how to write our own full-on Ctypes
+    interface to the CUDA Driver API. We can then use the appropriate functions from
+    the Driver API to load our PTX file and launch a kernel.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为此，我们最终将看到如何从Python使用预编译的GPU代码。特别是，我们将看看三种不同的方法来做到这一点。首先，我们将看看如何通过编写一个主机端CUDA-C函数来间接启动CUDA内核。这种方法将涉及使用标准Python
+    Ctypes库调用主机端函数。其次，我们将把我们的内核编译成所谓的PTX模块，这实际上是一个包含已编译二进制GPU的DLL文件。然后，我们可以使用PyCUDA加载此文件并直接启动我们的内核。最后，我们将通过查看如何编写我们自己的完整Ctypes接口来结束本章，以使用CUDA
+    Driver API。然后，我们可以使用Driver API中的适当函数加载我们的PTX文件并启动内核。
+- en: 'The learning outcomes for this chapter are as follows:'
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的学习成果如下：
+- en: Launching compiled (host-side) code with the Ctypes module
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用Ctypes模块启动编译后（主机端）的代码
+- en: Using host-side CUDA C wrappers with Ctypes to launch a kernel from Python
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用Ctypes使用主机端CUDA C包装器从Python启动内核
+- en: How to compile a CUDA C module into a PTX file
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如何将CUDA C模块编译为PTX文件
+- en: How to load a PTX module into PyCUDA to launch pre-compiled kernels
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如何将PTX模块加载到PyCUDA中以启动预编译的内核
+- en: How to write your own custom Python interface to the CUDA Driver API
+  id: totrans-8
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如何编写自定义Python接口以使用CUDA Driver API
+- en: Launching compiled code with Ctypes
+  id: totrans-9
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用Ctypes启动编译后的代码
+- en: We will now give a brief overview of the Ctypes module from the Python Standard
+    Library. Ctypes is used for calling functions from the Linux `.so` (shared object)
+    or Windows. DLL (Dynamically Linked Library) pre-compiled binaries. This will
+    allow us to break out of the world of pure Python and interface with libraries
+    and code that have been written in compiled languages, notably C and C++—it just
+    so happens that Nvidia only provides such pre-compiled binaries for interfacing
+    with our CUDA device, so if we want to sidestep PyCUDA, we will have to use Ctypes.
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将简要概述Python标准库中的Ctypes模块。Ctypes用于调用来自Linux`.so`（共享对象）或Windows.DLL（动态链接库）预编译二进制文件的函数。这将使我们摆脱纯Python的世界，并与已用编译语言编写的库和代码进行接口，特别是C和C++
+    - 恰好Nvidia只为与我们的CUDA设备进行接口提供这样的预编译二进制文件，因此如果我们想绕过PyCUDA，我们将不得不使用Ctypes。
+- en: 'Let''s start with a very basic example: we will show you how to call `printf`
+    directly from Ctypes. Open up an instance of IPython and type `import ctypes`.
+    We are now going to look at how to call the standard `printf` function from Ctypes.
+    First, we will have to import the appropriate library: in Linux, load the LibC
+    library by typing `libc = ctypes.CDLL(''libc.so.6'')` (in Windows, replace `''libc.so.6''`
+    with `''msvcrt.dll''`). We can now directly call `printf` from the IPython prompt
+    by typing `libc.printf("Hello from ctypes!\n")`. Try it for yourself!'
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们从一个非常基本的例子开始：我们将向您展示如何直接从Ctypes调用`printf`。打开一个IPython实例，键入`import ctypes`。现在我们将看看如何从Ctypes调用标准的`printf`函数。首先，我们必须导入适当的库：在Linux中，通过键入`libc
+    = ctypes.CDLL('libc.so.6')`加载LibC库（在Windows中，将`'libc.so.6'`替换为`'msvcrt.dll'`）。现在我们可以通过在IPython提示符中键入`libc.printf("Hello
+    from ctypes!\n")`直接调用`printf`。自己试试吧！
+- en: 'Now let''s try something else: type `libc.printf("Pi is approximately %f.\n",
+    3.14)` from IPython; you should get an error. This is because the `3.14` was not
+    appropriately typecast from a Python float variable to a C double variable—we
+    can do this with Ctypes like so:'
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们试试其他东西：从IPython键入`libc.printf("Pi is approximately %f.\n", 3.14)`；您应该会收到一个错误。这是因为`3.14`没有适当地从Python浮点变量转换为C双精度变量
+    - 我们可以使用Ctypes这样做：
+- en: '[PRE0]'
+  id: totrans-13
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: The output should be as expected. As in the case of launching a CUDA kernel
+    from PyCUDA, we have to be equally careful to typecast inputs into functions with
+    Ctypes.
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输出应该如预期那样。与从PyCUDA启动CUDA内核的情况一样，我们必须同样小心地将输入转换为Ctypes函数。
+- en: 'Always be sure to appropriately typecast inputs into any function that you
+    call with Ctypes from Python to the appropriate C datatypes (in Ctypes, these
+    are preceded by c_: `c_float`, `c_double`, `c_char`, `c_int`, and so on).'
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请务必确保将任何从Python使用Ctypes调用的函数的输入适当地转换为适当的C数据类型（在Ctypes中，这些类型以c_开头：`c_float`、`c_double`、`c_char`、`c_int`等）。
+- en: The Mandelbrot set revisited (again)
+  id: totrans-16
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 再次重温Mandelbrot集
+- en: Let's revisit the Mandelbrot set that we looked at in [Chapter 1](f9c54d0e-6a18-49fc-b04c-d44a95e011a2.xhtml),
+    *Why GPU Programming?*, and [Chapter 3](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml),
+    *Getting Started with PyCUDA*. First, we will write a full-on CUDA kernel that
+    will compute the Mandelbrot set, given a particular set of parameters, along with
+    an appropriate host-side wrapper function that we may interface to from Ctypes
+    later. We will first be writing these functions into a single CUDA-C `.cu` source
+    file and then compile this into a DLL or `.so` binary with the NVCC compiler.
+    Finally, we will write some Python code so that we can run our binary code and
+    display the Mandelbrot set.
+  id: totrans-17
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们重新审视一下我们在[第1章](f9c54d0e-6a18-49fc-b04c-d44a95e011a2.xhtml)和[第3章](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml)中看到的Mandelbrot集合，*为什么使用GPU编程？*和*使用PyCUDA入门*。首先，我们将编写一个完整的CUDA核函数，它将根据一组特定的参数计算Mandelbrot集合，以及一个适当的主机端包装函数，我们稍后可以从Ctypes接口调用。我们将首先将这些函数编写到一个单独的CUDA-C`.cu`源文件中，然后使用NVCC编译成DLL或`.so`二进制文件。最后，我们将编写一些Python代码，以便我们可以运行我们的二进制代码并显示Mandelbrot集合。
+- en: We will now apply our knowledge of Ctypes to launch a pre-compiled CUDA kernel
+    from Python without any assistance from PyCUDA. This will require us to write
+    a host-side *k**ernel launcher* wrapper function in CUDA-C that we may call directly,
+    which itself has been compiled into a dynamic library binary with any necessary
+    GPU code—that is, a Dynamically Linked Library (DLL) binary on Windows, or a shared-object
+    (so) binary on Linux.
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将运用我们对Ctypes的知识，从Python中启动一个预编译的CUDA核函数，而不需要PyCUDA的任何帮助。这将要求我们在CUDA-C中编写一个主机端*核函数启动器*包装函数，我们可以直接调用，它本身已经编译成了一个动态库二进制文件，其中包含任何必要的GPU代码——即在Windows上的动态链接库（DLL）二进制文件，或者在Linux上的共享对象（so）二进制文件。
+- en: 'We will start, of course, by writing our CUDA-C code, so open up your favorite
+    text editor and follow along. We will begin with the standard `include` statements:'
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，我们将首先编写我们的CUDA-C代码，所以打开你最喜欢的文本编辑器并跟着做。我们将从标准的`include`语句开始：
+- en: '[PRE1]'
+  id: totrans-20
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'We''ll now jump directly into writing our kernel. Notice `extern "C"` in the
+    code, which will allow us to link to this function externally:'
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将直接开始编写我们的核函数。请注意代码中的`extern "C"`，这将允许我们在外部链接到这个函数：
+- en: '[PRE2]'
+  id: totrans-22
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'Let''s think for a minute about how this will work: we will use a single one-dimensional
+    array for both the real and imaginary components called `lattice`, which is of
+    length `lattice_size`. We will use this to compute a two-dimensional Mandelbrot
+    graph of the shape (`lattice_size`, `lattice_size`) into the pre-allocated array, `mandelbrot_graph`.
+    We will specify the number of iterations to check for divergence at each point
+    with `max_iters`, specifying the maximum upper bound as before by providing its
+    squared value with `upper_bound_squared`. (We''ll look at the motivation for using
+    the square in a second.)'
+  id: totrans-23
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们思考一分钟关于这将如何工作：我们将使用一个单一的一维数组来存储实部和虚部，称为`lattice`，其长度为`lattice_size`。我们将使用这个数组来计算一个形状为(`lattice_size`,
+    `lattice_size`)的二维Mandelbrot图形，存储在预先分配的数组`mandelbrot_graph`中。我们将指定每个点检查发散的迭代次数为`max_iters`，通过使用`upper_bound_squared`提供其平方值来指定之前的最大上限值。（我们稍后会看一下使用平方的动机。）
+- en: 'We will launch this kernel over a one-dimensional grid/block structure, with
+    each thread corresponding to a single point in the graph image of the Mandelbrot
+    set. We can then determine the real/imaginary lattice values for the corresponding
+    point, like so:'
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将在一维网格/块结构上启动这个核函数，每个线程对应于Mandelbrot集合图像中的一个点。然后我们可以确定相应点的实部/虚部lattice值，如下所示：
+- en: '[PRE3]'
+  id: totrans-25
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: Let's talk about this for a minute. First, remember that we may have to use
+    slightly more threads than necessary, so it's important that we check that the
+    thread ID will correspond to some point in the output image with the `if` statement.
+    Let's also remember that the output array, `mandelbrot_graph`, will be stored
+    as a one-dimensional array that represents a two-dimensional image stored in a
+    row-wise format, and that we will be using `tid` as the index to write in this
+    array. We will use `i` and `j`, as well as the `x` and `y` coordinates of the
+    graph on the complex plane. Since lattice is a series of real values sorted from
+    small to large, we will have to reverse their order to get the appropriate imaginary
+    values. Also, notice that we will be using plain floats here, rather than some
+    structure or object to represent a complex value. Since there are real and imaginary
+    components in every complex number, we will have to use two floats here to store
+    the complex number corresponding to this thread's lattice point (`c_re` and `c_im`).
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们花一分钟来谈谈这个。首先，记住我们可能需要使用稍多于必要的线程，所以重要的是我们检查线程ID是否对应于输出图像中的某个点，使用`if`语句。让我们还记住，输出数组`mandelbrot_graph`将以按行方式存储为一维数组，表示为二维图像，我们将使用`tid`作为写入该数组的索引。我们将使用`i`和`j`，以及复平面上图形的`x`和`y`坐标。由于lattice是一系列从小到大排序的实值，我们将不得不颠倒它们的顺序以获得适当的虚值。另外，请注意，我们将在这里使用普通的浮点数，而不是某种结构或对象来表示复数值。由于每个复数中都有实部和虚部，我们将在这里使用两个浮点数来存储与该线程的lattice点对应的复数（`c_re`和`c_im`）。
+- en: 'We will set up two more variables to handle the divergence check, `z_re` and
+    `z_im`, and set the initial value of this thread''s point on the graph to `1`
+    before we check for divergence:'
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将设置两个更多的变量来处理发散检查，`z_re`和`z_im`，并在检查发散之前将该线程的图上的点的初始值设置为`1`：
+- en: '[PRE4]'
+  id: totrans-28
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'Now we will do our check for divergence; if it does diverge after `max_iters`
+    iterations, we set the point to `0`. Otherwise, it is left at 1:'
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们将检查发散；如果在`max_iters`次迭代后发散，我们将把点设置为`0`。否则，它将保持为1：
+- en: '[PRE5]'
+  id: totrans-30
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: Let's talk about this chunk of code for a minute before we continue. Let's remember that
+    each iteration of a Mandelbrot set is computed with complex multiplication and
+    addition for example, `z_new = z*z + c`. Since we are not working with a class
+    that will handle complex values for us, the preceding operation is exactly what
+    we need to do to compute the new real and imaginary values of `z`. We also need
+    to compute the absolute value and see if it exceeds a particular value—remember
+    that the absolute value of a complex number, *c = x + iy*, is computed with *√(x²+y²)*.
+    It will actually save us some time here to compute the square of the upper bound
+    and then plug that into the kernel, since it will save us the time of computing
+    the square root of `z_re*z_re + z_im*z_im` for each iteration here.
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们继续之前，让我们谈一分钟关于这一块代码。让我们记住，曼德勃罗集的每次迭代都是通过复数乘法和加法来计算的，例如，`z_new = z*z + c`。由于我们不是使用将为我们处理复数值的类，前面的操作正是我们需要做的，以计算`z`的新的实部和虚部值。我们还需要计算绝对值并查看是否超过特定值——记住，复数的绝对值，`c
+    = x + iy`，是用*√(x²+y²)*来计算的。在这里计算上限的平方然后将其插入内核中，实际上会节省我们一些时间，因为这样可以节省我们在每次迭代中计算`z_re*z_re
+    + z_im*z_im`的平方根的时间。
+- en: 'We''re now pretty much done with this kernel—we just need to close off the
+    `if` statement and return from the kernel, and we''re done:'
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在基本上已经完成了这个内核——我们只需要关闭`if`语句并从内核返回，然后我们就完成了：
+- en: '[PRE6]'
+  id: totrans-33
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'However, we are not completely finished just yet. We need to write a host-side
+    wrapper function with only `extern "C"` in the case of Linux, and `extern "C"
+    __declspec(dllexport)` in the case of Windows. (In contrast to a compiled CUDA
+    kernel, this extra word is necessary if we want to be able to access a host-side
+    function from Ctypes in Windows.) The parameters that we put into this function
+    will correspond directly to those that go into the kernel, except these will be
+    stored on the host:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然而，我们还没有完全完成。我们需要编写一个只有`extern "C"`的主机端包装函数，在Linux的情况下，以及在Windows的情况下，只有`extern
+    "C" __declspec(dllexport)`。 （与编译的CUDA内核相反，如果我们想要能够从Ctypes在Windows中访问主机端函数，这个额外的单词是必要的。）我们放入这个函数的参数将直接对应于进入内核的参数，除了这些参数将存储在主机上：
+- en: '[PRE7]'
+  id: totrans-35
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'Now, the first task we will have to do is allocate sufficient memory to store
+    the lattice and output on the GPU with `cudaMalloc`, and then copy the lattice
+    to the GPU with `cudaMemcpy`:'
+  id: totrans-36
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们将需要分配足够的内存来存储在GPU上的晶格和输出，然后使用`cudaMemcpy`将晶格复制到GPU上：
+- en: '[PRE8]'
+  id: totrans-37
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'Like many of our other kernels, we will launch this over one-dimensional blocks
+    of size 32 over a one-dimensional grid. We will take the ceiling value of the
+    number of output points to compute, divided by 32, to determine the grid size,
+    like so:'
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 像我们的许多其他内核一样，我们将在一维网格上启动大小为32的一维块。我们将取输出点数除以32的上限值，以确定网格大小，如下所示：
+- en: '[PRE9]'
+  id: totrans-39
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'Now we are ready to launch our kernel by using the traditional CUDA-C triple-triangle
+    brackets to specify grid and block size. Notice how we square the upper bound
+    beforehand here:'
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们准备使用传统的CUDA-C三角形括号来启动我们的内核，以指定网格和块大小。请注意，我们在这里提前求出了上限的平方：
+- en: '[PRE10]'
+  id: totrans-41
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'Now we just need to copy the output to the host after this is done, and then
+    call `cudaFree` on the appropriate arrays. Then we can return from this function:'
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们只需要在完成这些操作后将输出复制到主机上，然后在适当的数组上调用`cudaFree`。然后我们可以从这个函数返回：
+- en: '[PRE11]'
+  id: totrans-43
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: And with that, we are done with all of the CUDA-C code that we will need. Save
+    this to a file named `mandelbrot.cu`, and let's continue to the next step.
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这个，我们已经完成了所有需要的CUDA-C代码。将其保存到名为`mandelbrot.cu`的文件中，然后继续下一步。
+- en: You can also download this file from [https://github.com/btuomanen/handsongpuprogramming/blob/master/10/mandelbrot.cu](https://github.com/btuomanen/handsongpuprogramming/blob/master/10/mandelbrot.cu).
+  id: totrans-45
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您还可以从[https://github.com/btuomanen/handsongpuprogramming/blob/master/10/mandelbrot.cu](https://github.com/btuomanen/handsongpuprogramming/blob/master/10/mandelbrot.cu)下载此文件。
+- en: Compiling the code and interfacing with Ctypes
+  id: totrans-46
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 编译代码并与Ctypes进行接口
+- en: 'Now let''s compile the code we just wrote into a DLL or `.so` binary. This
+    is actually fairly painless: if you are a Linux user, type the following into
+    the command line to compile this file into `mandelbrot.so`:'
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们将刚刚编写的代码编译成DLL或`.so`二进制文件。这实际上相当简单：如果你是Linux用户，请在命令行中输入以下内容将此文件编译成`mandelbrot.so`：
+- en: '[PRE12]'
+  id: totrans-48
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'If you are a Windows user, type the following into the command line to compile
+    the file into `mandelbrot.dll`:'
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果你是Windows用户，请在命令行中输入以下内容将文件编译成`mandelbrot.dll`：
+- en: '[PRE13]'
+  id: totrans-50
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'Now we can write our Python interface. We will start with the appropriate import
+    statements, excluding PyCUDA completely and using just Ctypes. For ease of use,
+    we''ll just import all of the classes and functions from Ctypes directly into
+    the default Python namespace, like so:'
+  id: totrans-51
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以编写我们的Python接口。我们将从适当的导入语句开始，完全排除PyCUDA，只使用Ctypes。为了方便使用，我们将直接从Ctypes导入所有类和函数到默认的Python命名空间中，如下所示：
+- en: '[PRE14]'
+  id: totrans-52
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'Let''s set up an interface for the `launch_mandelbrot` host-side function using
+    Ctypes. First, we will have to load our compiled DLL or `.so` file as such (Linux
+    users will, of course, have to change the file name to `mandelbrot.so`):'
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们使用Ctypes为`launch_mandelbrot`主机端函数设置一个接口。首先，我们将不得不加载我们编译的DLL或`.so`文件，Linux用户当然需要将文件名更改为`mandelbrot.so`：
+- en: '[PRE15]'
+  id: totrans-54
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'Now we can get a reference to `launch_mandelbrot` from the library, like so;
+    we''ll call it `mandel_c` for short:'
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以从库中获取对`launch_mandelbrot`的引用，就像这样；我们将简称它为`mandel_c`：
+- en: '[PRE16]'
+  id: totrans-56
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'Now before we call a function with Ctypes, we will have to make Ctypes aware
+    of what the input types are. Let''s remember that for `launch_mandelbrot`, the
+    inputs were `float-pointer`, `float-pointer`, `integer`, `float`, and `integer`.
+    We set this up with the `argtypes` parameter, using the appropriate Ctypes datatypes
+    (`c_float`, `c_int`), as well as the Ctypes `POINTER` class:'
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，在使用Ctypes调用函数之前，我们将不得不让Ctypes知道输入类型是什么。让我们记住，对于`launch_mandelbrot`，输入是`float-pointer`，`float-pointer`，`integer`，`float`和`integer`。我们使用`argtypes`参数设置这一点，使用适当的Ctypes数据类型（`c_float`，`c_int`），以及Ctypes的`POINTER`类：
+- en: '[PRE17]'
+  id: totrans-58
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'Now let''s write a Python function that will run this for us. We will specify
+    the width and height of the square output image with `breadth`, and the minimum
+    and maximum values in the complex lattice for both the real and imaginary components.
+    We will also specify the maximum number of iterations, as well as the upper bound:'
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们编写一个Python函数来为我们运行这个。我们将使用`breadth`指定正方形输出图像的宽度和高度，并且在复杂格的实部和虚部中指定最小和最大值。我们还将指定最大迭代次数以及上限：
+- en: '[PRE18]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'Now, we will create our lattice array with NumPy''s `linspace` function, like
+    so:'
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们将使用NumPy的`linspace`函数创建我们的格点数组，就像这样：
+- en: '[PRE19]'
+  id: totrans-62
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'Let''s remember that we will have to pass a pre-allocated float array to `launch_mandelbrot`
+    to get the output in the form of an output graph. We can do this by calling NumPy''s
+    `empty` command to set up an array of the appropriate shape and size, which will
+    act as a C `malloc` call here:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们记住，我们将不得不传递一个预先分配的浮点数组给`launch_mandelbrot`，以便以输出图的形式得到输出。我们可以通过调用NumPy的`empty`命令来设置一个适当形状和大小的数组，这将充当C的`malloc`调用：
+- en: '[PRE20]'
+  id: totrans-64
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'Now, we are ready to compute the Mandelbrot graph. Notice that we can pass
+    the NumPy arrays to C by using their `ctypes.data_as` method with the appropriate
+    corresponding types. After we have done this, we can return the output; that is,
+    the Mandelbrot graph in the form of a two-dimensional NumPy array:'
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们准备计算Mandelbrot图。请注意，我们可以通过使用它们的`ctypes.data_as`方法和相应的类型将NumPy数组传递给C。在我们这样做之后，我们可以返回输出；也就是说，Mandelbrot图以二维NumPy数组的形式：
+- en: '[PRE21]'
+  id: totrans-66
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'Now, let''s write our main function to compute, time, and view the Mandelbrot
+    graph with Matplotlib:'
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们编写我们的主函数来计算、计时和使用Matplotlib查看Mandelbrot图：
+- en: '[PRE22]'
+  id: totrans-68
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'We will now try running this. You should get an output that looks exactly like
+    the Mandelbrot graph from [Chapter 1](f9c54d0e-6a18-49fc-b04c-d44a95e011a2.xhtml), *Why
+    GPU Programming?* and [Chapter 3,](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml)
+    *Getting Started with PyCUDA*:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将尝试运行这个。您应该会得到一个看起来与[第1章](f9c54d0e-6a18-49fc-b04c-d44a95e011a2.xhtml)的Mandelbrot图以及[第3章](6ab0cd69-e439-4cfb-bf1a-4247ec58c94e.xhtml)的*为什么使用GPU编程*和*使用PyCUDA入门*中的图形完全相同的输出：
+- en: '![](assets/0620985f-949b-4f6b-bba4-1be7b0bf7eff.png)'
+  id: totrans-70
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](assets/0620985f-949b-4f6b-bba4-1be7b0bf7eff.png)'
+- en: The code for this Python example is also available as the file `mandelbrot_ctypes.py` in
+    the GitHub repository.
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个Python示例的代码也可以在GitHub存储库的`mandelbrot_ctypes.py`文件中找到。
+- en: Compiling and launching pure PTX code
+  id: totrans-72
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 编译和启动纯PTX代码
+- en: We have just seen how to call a pure-C function from Ctypes. In some ways, this
+    may seem a little inelegant, as our binary file must contain both host code as
+    well as the compiled GPU code, which may seem cumbersome. Can we just use pure,
+    compiled GPU code and then launch it appropriately onto the GPU without writing
+    a C wrapper each and every time? Fortunately, we can.
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们刚刚看到了如何从Ctypes调用纯C函数。在某些方面，这可能看起来有点不够优雅，因为我们的二进制文件必须包含主机代码以及编译后的GPU代码，这可能看起来很麻烦。我们是否可以只使用纯粹的编译后的GPU代码，然后适当地将其启动到GPU上，而不是每次都编写一个C包装器？幸运的是，我们可以。
+- en: The NVCC compiler compiles CUDA-C into **PTX** (**Parallel Thread Execution**),
+    which is an interpreted pseudo-assembly language that is compatible across NVIDIA 's
+    various GPU architectures. Whenever you compile a program that uses a CUDA kernel
+    with NVCC into an executable EXE, DLL, `.so`, or ELF file, there will be PTX code
+    for that kernel contained within the file. We can also directly compile a file
+    with the extension PTX, which will contain only the compiled GPU kernels from
+    a compiled CUDA .cu file. Luckily for us, PyCUDA includes an interface to load
+    a CUDA kernel directly from a PTX, freeing us from the shackles of just-in-time
+    compilation while still allowing us to use all of the other nice features from
+    PyCUDA.
+  id: totrans-74
+  prefs: []
+  type: TYPE_NORMAL
+  zh: NVCC编译器将CUDA-C编译为**PTX**（**Parallel Thread Execution**），这是一种解释的伪汇编语言，与NVIDIA的各种GPU架构兼容。每当您使用NVCC将使用CUDA核心的程序编译为可执行的EXE、DLL、`.so`或ELF文件时，该文件中将包含该核心的PTX代码。我们还可以直接编译具有PTX扩展名的文件，其中将仅包含从编译后的CUDA
+    .cu文件中编译的GPU核心。幸运的是，PyCUDA包括一个接口，可以直接从PTX加载CUDA核心，使我们摆脱了即时编译的枷锁，同时仍然可以使用PyCUDA的所有其他好功能。
+- en: 'Now let''s compile the Mandelbrot code we just wrote into a PTX file; we don''t
+    need to make any changes to it. Just type the following into the command line
+    in either Linux or Windows:'
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们将刚刚编写的Mandelbrot代码编译成一个PTX文件；我们不需要对它进行任何更改。只需在Linux或Windows的命令行中输入以下内容：
+- en: '[PRE23]'
+  id: totrans-76
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'Now let''s modify the Python program from the last section to use PTX code
+    instead. We will remove `ctypes` from the imports and add the appropriate PyCUDA
+    imports:'
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们修改上一节的Python程序，以使用PTX代码。我们将从导入中删除`ctypes`并添加适当的PyCUDA导入：
+- en: '[PRE24]'
+  id: totrans-78
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'Now let''s load the PTX file using PyCUDA''s `module_from_file` function, like
+    so:'
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们使用PyCUDA的`module_from_file`函数加载PTX文件，就像这样：
+- en: '[PRE25]'
+  id: totrans-80
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'Now we can get a reference to our kernel with `get_function`, just like did
+    with PyCUDA''s `SourceModule`:'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以使用`get_function`来获取对我们的核心的引用，就像我们用PyCUDA的`SourceModule`一样：
+- en: '[PRE26]'
+  id: totrans-82
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: 'We can now rewrite the Mandelbrot function to handle using this kernel with
+    the appropriate `gpuarray` objects and `typecast` inputs. (We won''t go over this
+    one line-by-line since its functionality should be obvious at this point.):'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在可以重写Mandelbrot函数，以处理使用适当的`gpuarray`对象和`typecast`输入的核心。（我们不会逐行讨论这个，因为在这一点上它的功能应该是显而易见的。）：
+- en: '[PRE27]'
+  id: totrans-84
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'The `main` function will be exactly the same as in the last section:'
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`main`函数将与上一节完全相同：'
+- en: '[PRE28]'
+  id: totrans-86
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: Now, try running this to ensure that the output is correct. You may also notice
+    some speed improvements over the Ctypes version.
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，尝试运行这个来确保输出是正确的。您可能还会注意到与Ctypes版本相比的一些速度改进。
+- en: This code is also available in the `mandelbrot_ptx.py` file under the "10" directory
+    in this book's GitHub repository.
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这段代码也可以在本书GitHub存储库的“10”目录下的`mandelbrot_ptx.py`文件中找到。
+- en: Writing wrappers for the CUDA Driver API
+  id: totrans-89
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 为CUDA Driver API编写包装器
+- en: We will now look at how we can write our very own wrappers for some pre-packaged
+    binary CUDA library functions using Ctypes. In particular, we will be writing
+    wrappers for the CUDA Driver API, which will allow us to perform all of the necessary
+    operations needed for basic GPU usage—including GPU initialization, memory allocation/transfers/deallocation,
+    kernel launching, and context creation/synchronization/destruction. This is a
+    very powerful piece of knowledge; it will allow us to use our GPU without going
+    through PyCUDA, and also without writing any cumbersome host-side C-function wrappers.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们将看看如何使用Ctypes编写我们自己的包装器，用于一些预打包的二进制CUDA库函数。特别是，我们将为CUDA驱动程序API编写包装器，这将允许我们执行所有基本GPU使用所需的操作，包括GPU初始化、内存分配/传输/释放、内核启动和上下文创建/同步/销毁。这是一个非常强大的知识；它将允许我们在不经过PyCUDA的情况下使用GPU，也不需要编写任何繁琐的主机端C函数包装器。
+- en: We will now write a small module that will act as a wrapper library for the
+    **CUDA Driver API**. Let's talk about what this means for a minute. The Driver
+    API is slightly different and a little more technical than the **CUDA Runtime
+    API**, the latter being what we have been working within this text from CUDA-C.
+    The Driver API is designed to be used with a regular C/C++ compiler rather than
+    with NVCC, with some different conventions like using the `cuLaunchKernel` function
+    to launch a kernel rather than using the `<<< gridsize, blocksize >>>` bracket
+    notation. This will allow us to directly access the necessary functions that we
+    need to launch a kernel from a PTX file with Ctypes.
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们将编写一个小模块，它将作为**CUDA驱动程序API**的包装库。让我们谈一分钟这对我们意味着什么。驱动程序API与**CUDA Runtime
+    API**略有不同，技术性稍高，后者是我们在CUDA-C文本中一直在使用的。驱动程序API旨在与常规C/C++编译器一起使用，而不是与NVCC一起使用，具有一些不同的约定，如使用`cuLaunchKernel`函数启动内核，而不是使用`<<<
+    gridsize, blocksize >>>`括号表示法。这将允许我们直接访问使用Ctypes从PTX文件启动内核所需的函数。
+- en: 'Let''s start writing this module by importing all of the Ctypes into the module''s
+    namespace, and then importing the sys module. We will make our module usable from
+    both Windows and Linux by loading the proper library file (either `nvcuda.dll`
+    or `libcuda.so`) by checking the system''s OS with `sys.platform`, like so:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们通过将所有Ctypes导入模块的命名空间，并导入sys模块来开始编写此模块。我们将通过使用`sys.platform`检查系统的操作系统（`nvcuda.dll`或`libcuda.so`）来加载适当的库文件，使我们的模块可以在Windows和Linux上使用。
+- en: '[PRE29]'
+  id: totrans-93
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: We have successfully loaded the CUDA Driver API, and we can now begin writing
+    wrappers for the necessary functions for basic GPU usage. We will look at the
+    prototypes of each Driver API function as we go along, which is generally necessary
+    to do when you are writing Ctypes wrappers.
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们已经成功加载了CUDA驱动程序API，现在我们可以开始为基本GPU使用编写必要函数的包装器。随着我们的进行，我们将查看每个驱动程序API函数的原型，这通常是在编写Ctypes包装器时必要的。
+- en: 'The reader is encouraged to look up all of the functions we will be using in
+    this section in the official Nvidia CUDA Driver API Documentation, which is available
+    here: [https://docs.nvidia.com/cuda/cuda-driver-api/](https://docs.nvidia.com/cuda/cuda-driver-api/).'
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 鼓励读者在官方Nvidia CUDA驱动程序API文档中查找我们将在本节中使用的所有函数，该文档可在此处找到：[https://docs.nvidia.com/cuda/cuda-driver-api/](https://docs.nvidia.com/cuda/cuda-driver-api/)。
+- en: 'Let''s start with the most fundamental function from the Driver API, `cuInit`,
+    which will initialize the Driver API. This takes an unsigned integer used for
+    flags as an input parameter and returns a value of type CUresult, which is actually
+    just an integer value. We can write our wrapper like so:'
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们从驱动程序API中最基本的函数`cuInit`开始，它将初始化驱动程序API。这需要一个用于标志的无符号整数作为输入参数，并返回类型为CUresult的值，实际上只是一个整数值。我们可以这样编写我们的包装器：
+- en: '[PRE30]'
+  id: totrans-97
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'Now let''s start on the next function, `cuDeviceCount`, which will tell us
+    how many NVIDIA GPUs we have installed on our computer. This takes in an integer
+    pointer as its single input, which is actually a single integer output value that
+    is returned by reference. The return value is another CUresult integer—all of
+    the functions will use CUresult, which is a standardization of the error values
+    for all of the Driver API functions. For instance, if any function we see returns
+    a `0`, this means the result is `CUDA_SUCCESS`, while non-zero results will always
+    mean an error or warning:'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们开始下一个函数`cuDeviceCount`，它将告诉我们在计算机上安装了多少个NVIDIA GPU。它以整数指针作为其唯一输入，实际上是通过引用返回的单个整数输出值。返回值是另一个CUresult整数——所有函数都将使用CUresult，这是所有驱动程序API函数的错误值的标准化。例如，如果我们看到任何函数返回`0`，这意味着结果是`CUDA_SUCCESS`，而非零结果将始终意味着错误或警告：
+- en: '[PRE31]'
+  id: totrans-99
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'Now let''s write a wrapper for `cuDeviceGet`, which will return a device handle
+    by reference in the first input. This will correspond to the ordinal GPU given
+    in the second input. The first parameter is of the type `CUdevice *`, which is
+    actually just an integer pointer:'
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们为`cuDeviceGet`编写一个包装器，它将通过引用在第一个输入中返回设备句柄。这将对应于第二个输入中给定的序号GPU。第一个参数的类型是`CUdevice
+    *`，实际上只是一个整数指针：
+- en: '[PRE32]'
+  id: totrans-101
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: Let's remember that every CUDA session will require at least one CUDA Context,
+    which can be thought of as analogous to a process running on the CPU. Since this
+    is handled automatically with the Runtime API, here we will have to create a context
+    manually on a device (using a device handle) before we can use it, and we will
+    have to destroy this context when our CUDA session is over.
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们记住，每个CUDA会话都需要至少一个CUDA上下文，可以将其类比为在CPU上运行的进程。由于Runtime API会自动处理这一点，在这里我们将不得不在使用设备之前手动在设备上创建上下文（使用设备句柄），并且在CUDA会话结束时销毁此上下文。
+- en: 'We can create a CUDA context with the `cuCtxCreate` function, which will, of
+    course, create a context. Let''s look at the prototype listed in the documentation:'
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以使用`cuCtxCreate`函数创建一个CUDA上下文，它当然会创建一个上下文。让我们看看文档中列出的原型：
+- en: '[PRE33]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'Of course, the return value is `CUresult`. The first input is a pointer to
+    a type called `CUcontext`, which is actually itself a pointer to a particular
+    C structure used internally by CUDA. Since our only interaction with `CUcontext`
+    from Python will be to hold onto its value to pass between other functions, we
+    can just store `CUcontext` as a C `void *` type, which is used to store a generic
+    pointer address for any type. Since this is actually a pointer to a CU context
+    (again, which is itself a pointer to an internal data structure—this is another
+    pass-by-reference return value), we can set the type to be just a plain `void
+    *`, which is a `c_void_p` type in Ctypes. The second value is an unsigned integer,
+    while the final value is the device handle on which to create the new context—let''s
+    remember that this is itself just an integer. We are now prepared to create our
+    wrapper for `cuCtxCreate`:'
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，返回值是`CUresult`。第一个输入是指向名为`CUcontext`的类型的指针，实际上它本身是CUDA内部使用的特定C结构的指针。由于我们从Python对`CUcontext`的唯一交互将是保持其值以在其他函数之间传递，我们可以将`CUcontext`存储为C
+    `void *`类型，用于存储任何类型的通用指针地址。由于这实际上是指向CU上下文的指针（再次，它本身是指向内部数据结构的指针——这是另一个按引用返回值），我们可以将类型设置为普通的`void
+    *`，这是Ctypes中的`c_void_p`类型。第二个值是无符号整数，而最后一个值是要在其上创建新上下文的设备句柄——让我们记住这实际上只是一个整数。我们现在准备为`cuCtxCreate`创建包装器：
+- en: '[PRE34]'
+  id: totrans-106
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: You can always use the `void *` type in C/C++ (`c_void_p` in Ctypes) to point
+    to any arbitrary data or variable—even structures and objects whose definition
+    may not be available.
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以始终在C/C++（Ctypes中的`c_void_p`）中使用`void *`类型指向任意数据或变量，甚至结构和对象，其定义可能不可用。
+- en: 'The next function is `cuModuleLoad`, which will load a PTX module file for
+    us. The first argument is a CUmodule by reference (again, we can just use a `c_void_p` here),
+    and the second is the file name, which will be a typical null-terminated C-string—this
+    is a `char *`, or `c_char_p` in Ctypes:'
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一个函数是`cuModuleLoad`，它将为我们加载一个PTX模块文件。第一个参数是一个CUmodule的引用（同样，我们可以在这里使用`c_void_p`），第二个是文件名，这将是一个典型的以空字符结尾的C字符串——这是一个`char
+    *`，或者在Ctypes中是`c_char_p`：
+- en: '[PRE35]'
+  id: totrans-109
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: 'The next function is for synchronizing all launched operations over the current
+    CUDA context, and is called `cuCtxSynchronize` (this takes no arguments):'
+  id: totrans-110
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一个函数用于同步当前CUDA上下文中的所有启动操作，并称为`cuCtxSynchronize`（不带参数）：
+- en: '[PRE36]'
+  id: totrans-111
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'The next function is used for retrieving a kernel function handle from a loaded
+    module so that we may launch it onto the GPU, which corresponds exactly to PyCUDA''s
+    `get_function` method, which we''ve seen many times at this point. The documentation
+    tells us that the prototype is `CUresult cuModuleGetFunction ( CUfunction* hfunc,
+    CUmodule hmod, const char* name )`. We can now write the wrapper:'
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一个函数用于从加载的模块中检索内核函数句柄，以便我们可以将其启动到GPU上，这与PyCUDA的`get_function`方法完全对应，这一点我们已经看过很多次了。文档告诉我们原型是`CUresult
+    cuModuleGetFunction ( CUfunction* hfunc, CUmodule hmod, const char* name )`。现在我们可以编写包装器：
+- en: '[PRE37]'
+  id: totrans-113
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: 'Now let''s write the wrappers for the standard dynamic memory operations; these
+    will be necessary since we won''t have the vanity of using PyCUDA gpuarray objects.
+    These are practically the same as the CUDA runtime operations that we have worked
+    with before; that is, `cudaMalloc`, `cudaMemcpy`, and `cudaFree`:'
+  id: totrans-114
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们为标准动态内存操作编写包装器；这些将是必要的，因为我们将不再有使用PyCUDA gpuarray对象的虚荣。这些实际上与我们之前使用过的CUDA运行时操作几乎相同；也就是说，`cudaMalloc`，`cudaMemcpy`和`cudaFree`：
+- en: '[PRE38]'
+  id: totrans-115
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: 'Now, we will write a wrapper for the `cuLaunchKernel` function. Of course,
+    this is what we will use to launch a CUDA kernel onto the GPU, provided that we
+    have already initialized the CUDA Driver API, set up a context, loaded a module,
+    allocated memory and configured inputs, and have extracted the kernel function
+    handle from the loaded module. This one is a little more complex than the other
+    functions, so we will look at the prototype:'
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们将为`cuLaunchKernel`函数编写一个包装器。当然，这是我们将用来在GPU上启动CUDA内核的函数，前提是我们已经初始化了CUDA
+    Driver API，设置了上下文，加载了一个模块，分配了内存并配置了输入，并且已经从加载的模块中提取了内核函数句柄。这个函数比其他函数复杂一些，所以我们将看一下原型：
+- en: '[PRE39]'
+  id: totrans-117
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: 'The first parameter is a handle to the kernel function we want to launch, which
+    we can represent as `c_void_p`. The six `gridDim` and `blockDim` parameters are
+    used to indicate the grid and block dimensions. The unsigned integer, `sharedMemBytes`,
+    is used to indicate how many bytes of shared memory will be allocated for each
+    block upon kernel launch. `CUstream hStream` is an optional parameter that we
+    can use to set up a custom stream, or set to NULL (0) if we wish to use the default
+    stream, which we can represent as `c_void_p` in Ctypes. Finally, the `kernelParams`
+    and `extra` parameters are used to set the inputs to a kernel; these are a little
+    involved, so for now just know that we can also represent these as `c_void_p`:'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一个参数是我们要启动的内核函数的句柄，我们可以表示为`c_void_p`。六个`gridDim`和`blockDim`参数用于指示网格和块的维度。无符号整数`sharedMemBytes`用于指示在内核启动时为每个块分配多少字节的共享内存。`CUstream
+    hStream`是一个可选参数，我们可以使用它来设置自定义流，或者如果希望使用默认流，则设置为NULL（0），我们可以在Ctypes中表示为`c_void_p`。最后，`kernelParams`和`extra`参数用于设置内核的输入；这些有点复杂，所以现在只需知道我们也可以将这些表示为`c_void_p`：
+- en: '[PRE40]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: 'Now we have one last function to write a wrapper for, `cuCtxDestroy`. We use
+    this at the end of a CUDA session to destroy a context on the GPU. The only input
+    is a `CUcontext` object, which is represented by `c_void_p`:'
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们还有最后一个函数要为`cuCtxDestroy`编写一个包装器。我们在CUDA会话结束时使用它来销毁GPU上的上下文。唯一的输入是一个`CUcontext`对象，由`c_void_p`表示：
+- en: '[PRE41]'
+  id: totrans-121
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE41]'
+- en: Let's save this into the `cuda_driver.py` file. We have now completed our Driver API
+    wrapper module! Next, we will look at how to load a PTX module and launch a kernel
+    using only our module and our Mandelbrot PTX.
+  id: totrans-122
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们把这个保存到`cuda_driver.py`文件中。我们现在已经完成了Driver API包装器模块！接下来，我们将看看如何仅使用我们的模块和Mandelbrot
+    PTX加载一个PTX模块并启动一个内核。
+- en: This example is also available as the `cuda_driver.py` file in this book's GitHub
+    repository.
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个示例也可以在本书的GitHub存储库中的`cuda_driver.py`文件中找到。
+- en: Using the CUDA Driver API
+  id: totrans-124
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用CUDA Driver API
+- en: 'We will now translate our little Mandelbrot generation program so that we can
+    use our wrapper library. Let''s start with the appropriate import statements;
+    notice how we load all of our wrappers into the current namespace:'
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将翻译我们的小曼德布洛特生成程序，以便我们可以使用我们的包装库。让我们从适当的导入语句开始；注意我们如何将所有的包装器加载到当前命名空间中：
+- en: '[PRE42]'
+  id: totrans-126
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE42]'
+- en: 'Let''s put all of our GPU code into the `mandelbrot` function, as we did previously.
+    We will start by initializing the CUDA Driver API with `cuInit` and then checking
+    if there is at least one GPU installed on the system, raising an exception otherwise:'
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们把所有的GPU代码放到`mandelbrot`函数中，就像以前一样。我们将从使用`cuInit`初始化CUDA Driver API开始，然后检查系统上是否安装了至少一个GPU，否则会引发异常：
+- en: '[PRE43]'
+  id: totrans-128
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE43]'
+- en: 'Notice the `byref` here: this is the Ctypes equivalent of the reference operator
+    (`&`) from C programming. We''ll now apply this idea again, remembering that the
+    device handle and CUDA context can be represented as `c_int` and `c_void_p` with
+    Ctypes:'
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 注意这里的`byref`：这是Ctypes中引用操作符(`&`)的等价物。我们现在将再次应用这个想法，记住设备句柄和CUDA上下文可以用Ctypes表示为`c_int`和`c_void_p`：
+- en: '[PRE44]'
+  id: totrans-130
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE44]'
+- en: 'We will now load our PTX module, remembering to typecast the filename to a
+    C string with `c_char_p`:'
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将加载我们的PTX模块，记得要使用`c_char_p`将文件名转换为C字符串：
+- en: '[PRE45]'
+  id: totrans-132
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE45]'
+- en: 'Now we will set up the lattice on the host side, as well as a NumPy array of
+    zeros called `graph` that will be used to store the output on the host side. We
+    will also allocate memory on the GPU for both the lattice and the graph output,
+    and then copy the lattice to the GPU with `cuMemcpyHtoD`:'
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们将在主机端设置晶格，以及一个名为`graph`的用于在主机端存储输出的全零NumPy数组。我们还将为晶格和图形输出在GPU上分配内存，然后使用`cuMemcpyHtoD`将晶格复制到GPU上：
+- en: '[PRE46]'
+  id: totrans-134
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE46]'
+- en: 'Now we will get a handle to the Mandelbrot kernel with `cuModuleGetFunction`
+    and set up some of the inputs:'
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们将使用`cuModuleGetFunction`获取Mandelbrot内核的句柄，并设置一些输入：
+- en: '[PRE47]'
+  id: totrans-136
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE47]'
+- en: The next step is a little complex to understand. Before we continue, we have
+    to understand how the parameters are passed into a CUDA kernel with `cuLaunchKernel`.
+    Let's see how this works in CUDA-C first.
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一步有点复杂。在继续之前，我们必须了解参数是如何通过`cuLaunchKernel`传递到CUDA内核中的。让我们先看看CUDA-C中是如何工作的。
+- en: 'We express the input parameters in `kernelParams` as an array of `void *` values,
+    which are, themselves, pointers to the inputs we desire to plug into our kernel.
+    In the case of our Mandelbrot kernel, it would look like this:'
+  id: totrans-138
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将输入参数在`kernelParams`中表达为一个`void *`值的数组，它们本身是指向我们希望插入内核的输入的指针。对于我们的曼德布洛特内核，它看起来像这样：
+- en: '[PRE48]'
+  id: totrans-139
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE48]'
+- en: 'Now let''s see how we can express this in Ctypes, which isn''t immediately
+    obvious. First, let''s put all of our inputs into a Python list, in the proper
+    order:'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们看看如何在Ctypes中表达这一点，这并不是立即显而易见的。首先，让我们将所有的输入放入一个Python列表中，按正确的顺序：
+- en: '[PRE49]'
+  id: totrans-141
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE49]'
+- en: 'Now we need pointers to each of these values, typecast to the `void *` type.
+    Let''s use the Ctypes function `addressof` to get the address of each Ctypes variable
+    here (which is similar to `byref`, only not bound to a particular type), and then
+    typecast it to `c_void_p`. We''ll store these values in another list:'
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们需要每个值的指针，将其类型转换为`void *`类型。让我们使用Ctypes函数`addressof`来获取每个Ctypes变量的地址（类似于`byref`，只是不绑定到特定类型），然后将其转换为`c_void_p`。我们将这些值存储在另一个列表中：
+- en: '[PRE50]'
+  id: totrans-143
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE50]'
+- en: 'Now let''s use Ctypes to convert this Python list to an array of `void *` pointers,
+    like so:'
+  id: totrans-144
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在让我们使用Ctypes将这个Python列表转换成一个`void *`指针数组，就像这样：
+- en: '[PRE51]'
+  id: totrans-145
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE51]'
+- en: 'We can now set up our grid''s size, as we did previously, and launch our kernel
+    with this set of parameters using `cuLaunchKernel`. We then synchronize the context
+    afterward:'
+  id: totrans-146
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以设置网格的大小，就像以前一样，并使用`cuLaunchKernel`启动我们的内核，使用这组参数。然后我们在之后同步上下文：
+- en: '[PRE52]'
+  id: totrans-147
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE52]'
+- en: 'We will now copy the data from the GPU into our NumPy array using `cuMemcpyDtoH`
+    with the NumPy `array.ctypes.data` member, which is a C pointer that will allow
+    us to directly access the array from C as a chunk of heap memory. We will typecast
+    this to `c_void_p` using the Ctypes typecast function `cast`:'
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将使用`cuMemcpyDtoH`将数据从GPU复制到我们的NumPy数组中，使用NumPy的`array.ctypes.data`成员，这是一个C指针，将允许我们直接从C中访问数组作为堆内存的一部分。我们将使用Ctypes的类型转换函数`cast`将其转换为`c_void_p`：
+- en: '[PRE53]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE53]'
+- en: 'We are now done! Let''s free the arrays we allocated on the GPU and end our
+    GPU session by destroying the current context. We will then return the graph NumPy
+    array to the calling function:'
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在完成了！让我们释放在GPU上分配的数组，并通过销毁当前上下文来结束我们的GPU会话。然后我们将把图形NumPy数组返回给调用函数：
+- en: '[PRE54]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE54]'
+- en: 'Now we can set up our `main` function exactly as before:'
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以像以前一样设置我们的`main`函数：
+- en: '[PRE55]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE55]'
+- en: Now try running this function to ensure that it yields the same output as the
+    other Mandelbrot programs we just wrote.
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在尝试运行这个函数，确保它产生与我们刚刚编写的其他曼德布洛特程序相同的输出。
+- en: Congratulations—you've just written a direct interface to the low-level CUDA
+    Driver API and successfully launched a kernel with it!
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 恭喜你——你刚刚编写了一个直接接口到低级CUDA Driver API，并成功使用它启动了一个内核！
+- en: This program is also available as the `mandelbrot_driver.py` file under the
+    directory in this book's GitHub repository.
+  id: totrans-156
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个程序也可以在本书的GitHub存储库中的目录下的`mandelbrot_driver.py`文件中找到。
+- en: Summary
+  id: totrans-157
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: We started this chapter with a brief overview of the Python Ctypes library,
+    which is used to interface directly with compiled binary code, and particularly
+    dynamic libraries written in C/C++. We then looked at how to write a C-based wrapper
+    with CUDA-C that launches a CUDA kernel, and then used this to indirectly launch
+    our CUDA kernel from Python by writing an interface to this function with Ctypes.
+    We then learned how to compile a CUDA kernel into a PTX module binary, which can
+    be thought of as a DLL but with CUDA kernel functions, and saw how to load a PTX
+    file and launch pre-compiled kernels with PyCUDA. Finally, we wrote a collection
+    of Ctypes wrappers for the CUDA Driver API and saw how we can use these to perform
+    basic GPU operations, including launching a pre-compiled kernel from a PTX file
+    onto the GPU.
+  id: totrans-158
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们从简要概述Python Ctypes库开始了本章，该库用于直接与编译的二进制代码进行接口，特别是用C/C++编写的动态库。然后，我们看了如何使用CUDA-C编写一个启动CUDA内核的基于C的包装器，然后使用这个包装器间接地从Python启动我们的CUDA内核，方法是使用Ctypes编写一个对这个函数的接口。然后，我们学习了如何将CUDA内核编译成PTX模块二进制文件，可以将其视为一个带有CUDA内核函数的DLL，并看到如何使用PyCUDA加载PTX文件并启动预编译的内核。最后，我们编写了一系列CUDA
+    Driver API的Ctypes包装器，并看到我们如何使用这些包装器执行基本的GPU操作，包括从PTX文件启动预编译的内核到GPU上。
+- en: 'We will now proceed to what will arguably be the most technical chapter of
+    this book: Chapter 11, *Performance Optimization in CUDA*. In this chapter, we
+    will learn about some of the technical ins and outs of NVIDIA GPUs that will assist
+    us in increasing performance levels in our applications.'
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在将进入本书中可能是最技术性的一章：第11章，《CUDA性能优化》。在本章中，我们将学习关于NVIDIA GPU的一些技术细节，这将帮助我们提高应用程序的性能水平。
+- en: Questions
+  id: totrans-160
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 问题
+- en: Suppose that you use `nvcc` to compile a single `.cu` file containing both host
+    and kernel code into an EXE file, and also into a PTX file. Which file will contain
+    the host functions, and which file will contain the GPU code?
+  id: totrans-161
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 假设您使用`nvcc`将包含主机和内核代码的单个`.cu`文件编译成EXE文件，还编译成PTX文件。哪个文件将包含主机函数，哪个文件将包含GPU代码？
+- en: Why do we have to destroy a context if we are using the CUDA Driver API?
+  id: totrans-162
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果我们使用CUDA Driver API，为什么要销毁上下文？
+- en: At the beginning of this chapter when we first saw how to use Ctypes, notice
+    that we had to typecast the floating point value 3.14 to a Ctypes `c_double` object
+    in a call to `printf` before it would work. Yet we can see many working cases
+    of not typecasting to Ctypes in this chapter. Why do you think `printf` is an
+    exception here?
+  id: totrans-163
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在本章开始时，当我们首次看到如何使用Ctypes时，请注意在调用`printf`之前，我们必须将浮点值3.14强制转换为Ctypes的`c_double`对象。然而，在本章中我们可以看到许多不需要将类型转换为Ctypes的工作案例。你认为为什么`printf`在这里是一个例外呢？
+- en: Suppose you want to add functionality to our Python CUDA Driver interface module
+    to support CUDA streams. How would you represent a single stream object in Ctypes?
+  id: totrans-164
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 假设您想要向我们的Python CUDA Driver接口模块添加功能以支持CUDA流。您将如何在Ctypes中表示单个流对象？
+- en: Why do we use `extern "C"` for functions in `mandelbrot.cu`?
+  id: totrans-165
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为什么在`mandelbrot.cu`中的函数要使用`extern "C"`？
+- en: Look at `mandelbrot_driver.py` again. Why do we *not* use the `cuCtxSynchronize`
+    function after GPU memory allocations and host/GPU memory transfers, and only
+    after the single kernel invocation?
+  id: totrans-166
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 再次查看`mandelbrot_driver.py`。为什么我们在GPU内存分配和主机/GPU内存传输之后*不*使用`cuCtxSynchronize`函数，而只在单个内核调用之后使用？

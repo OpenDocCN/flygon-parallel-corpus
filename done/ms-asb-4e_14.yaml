@@ -1,0 +1,1443 @@
+- en: '*Chapter 11*: Minimizing Downtime with Rolling Deployments'
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: '*第11章*：通过滚动部署最小化停机时间'
+- en: Ansible is well suited to the task of upgrading or deploying applications in
+    a live service environment. Of course, application deployments and upgrades can
+    be approached with a variety of different strategies. The best approach depends
+    on the application itself, the capabilities of the infrastructure the application
+    runs on, and any promised **service-level agreements** (**SLAs**) with the users
+    of the application. Whatever the approach, it is vital that the application deployment
+    or upgrade is controlled, predictable, and repeatable in order to ensure that
+    users experience a stable service while automated deployments occur in the background.
+    The last thing anyone wants is an outage caused by unexpected behavior from their
+    automation tool; an automation tool should be trustworthy and not an additional
+    risk factor.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Ansible非常适合在实时服务环境中升级或部署应用程序的任务。当然，可以采用多种不同的策略来处理应用程序的部署和升级。最佳方法取决于应用程序本身、应用程序运行的基础设施的能力以及与应用程序用户承诺的服务级别协议（SLA）。无论采用何种方法，都必须控制、可预测和可重复地进行应用程序部署或升级，以确保用户在自动部署后体验到稳定的服务。任何人都不希望由其自动化工具的意外行为导致中断；自动化工具应该是可信赖的，而不是额外的风险因素。
+- en: 'Although there is a myriad of choices, some deployment strategies are more
+    common than others, and in this chapter, we''ll walk through a couple of the more
+    common ones. In doing so, we will showcase the Ansible features that will be useful
+    within those strategies. We''ll also discuss a couple of other deployment considerations
+    that are common across both deployment strategies. To achieve this, we will delve
+    into the details of the following subjects, in the context of a rolling Ansible
+    deployment:'
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽管有很多选择，但有些部署策略比其他策略更常见，在本章中，我们将介绍一些更常见的部署策略。在这样做的过程中，我们将展示在这些策略中有用的Ansible功能。我们还将讨论一些在两种部署策略中都常见的其他部署考虑因素。为了实现这一点，我们将在滚动Ansible部署的背景下深入讨论以下主题的细节：
+- en: In-place upgrades
+  id: totrans-3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 原地升级
+- en: Expanding and contracting
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 扩展和收缩
+- en: Failing fast
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 快速失败
+- en: Minimizing disruptions
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 最小化中断
+- en: Serializing single tasks
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 串行单个任务
+- en: Technical requirements
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 技术要求
+- en: To follow the examples presented in this chapter, you will need a Linux machine
+    running **Ansible 4.3** or a newer version. Almost any flavor of Linux should
+    do—for those interested in specifics, all the code presented in this chapter was
+    tested on **Ubuntu Server 20.04 Long-Term Support (LTS)** unless stated otherwise,
+    and on Ansible 4.3\. The example code that accompanies this chapter can be downloaded
+    from GitHub at [https://github.com/PacktPublishing/Mastering-Ansible-Fourth-Edition/tree/main/Chapter11](https://github.com/PacktPublishing/Mastering-Ansible-Fourth-Edition/tree/main/Chapter11).
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要按照本章中提供的示例，您需要一台运行**Ansible 4.3**或更新版本的Linux机器。几乎任何Linux版本都可以使用——对于感兴趣的人，本章中提供的所有代码都是在**Ubuntu
+    Server 20.04长期支持版（LTS）**上测试的，除非另有说明，并且在Ansible 4.3上进行了测试。本章附带的示例代码可以从GitHub上下载：[https://github.com/PacktPublishing/Mastering-Ansible-Fourth-Edition/tree/main/Chapter11](https://github.com/PacktPublishing/Mastering-Ansible-Fourth-Edition/tree/main/Chapter11)。
+- en: 'Check out the following video to see the code in action: [https://bit.ly/3lZ6Y9W](https://bit.ly/3lZ6Y9W)'
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查看以下视频，以查看代码的运行情况：[https://bit.ly/3lZ6Y9W](https://bit.ly/3lZ6Y9W)
+- en: In-place upgrades
+  id: totrans-11
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 原地升级
+- en: The first type of deployment that we'll cover is in-place upgrades. This style
+    of deployment operates on an infrastructure that already exists, in order to upgrade
+    the existing application. This model is a traditional model that was used when
+    the creation of new infrastructure was a costly endeavor, in terms of both time
+    and money.
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将要介绍的第一种部署类型是原地升级。这种部署方式在已经存在的基础设施上进行，以升级现有的应用程序。这种模式是一种传统模式，当创建新基础设施是一项耗时和昂贵的工作时使用。
+- en: A general design pattern to minimize the downtime during this type of upgrade
+    is to deploy the application across multiple hosts, behind a load balancer. The
+    load balancer will act as a gateway between users of the application and the servers
+    that run the application. Requests for the application will come to the load balancer,
+    and, depending on the configuration, the load balancer will decide which backend
+    server to direct the requests to.
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这种类型的升级过程中，最小化停机时间的一般设计模式是将应用程序部署在多个主机上，负载平衡器后面。负载平衡器将充当应用程序用户和运行应用程序的服务器之间的网关。应用程序的请求将发送到负载平衡器，根据配置，负载平衡器将决定将请求发送到哪个后端服务器。
+- en: To perform a rolling in-place upgrade of an application deployed with this pattern,
+    each server (or a small subset of the servers) will be disabled at the load balancer,
+    upgraded, and then re-enabled to take on new requests. This process will be repeated
+    for the remaining servers in the pool until all servers have been upgraded. As
+    only a portion of the available application servers is taken offline to be upgraded,
+    the application as a whole remains available for requests. Of course, this assumes
+    that an application can perform well with mixed versions running at the same time.
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要执行使用此模式部署的应用程序的滚动原地升级，将禁用每个服务器（或一小部分服务器）在负载平衡器上，进行升级，然后重新启用以接受新请求。这个过程将重复进行，直到池中的其余服务器都升级完毕。由于只有部分可用的应用程序服务器被下线进行升级，整个应用程序仍然可用于请求。当然，这假设应用程序可以在同时运行的不同版本下表现良好。
+- en: Let's build a playbook to upgrade a fictional application. Our fictional application
+    will run on servers `foo-app01` through `foo-app08`, which exist in the `foo-app`
+    group. These servers will have a simple website that's served via the `nginx` web
+    server, with the content coming from a `foo-app` Git repository, defined by the `foo-app.repo` variable.
+    A load-balancer server, `foo-lb`, running the `haproxy` software, will front these
+    app servers.
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们创建一个用于升级虚构应用程序的playbook。我们的虚构应用程序将在`foo-app01`到`foo-app08`服务器上运行，这些服务器存在于`foo-app`组中。这些服务器将有一个简单的网站，通过`nginx`
+    Web服务器提供，内容来自`foo-app` Git存储库，由`foo-app.repo`变量定义。一个运行`haproxy`软件的负载均衡器服务器`foo-lb`将为这些应用服务器提供前端服务。
+- en: 'In order to operate on a subset of our `foo-app` servers, we need to employ
+    the `serial` mode. This mode changes how Ansible will execute a play. By default,
+    Ansible will execute the tasks of a play across each host in the order that the
+    tasks are listed. Ansible executes each task of the play on every host before
+    it moves on to the next task in the play. If we were to use the default method,
+    our first task would remove every server from the load balancer, which would result
+    in the complete outage of our application. Instead, the `serial` mode lets us
+    operate on a subset so that the application as a whole stays available, even if
+    some of the members are offline. In our example, we''ll use a serial count of
+    `2` in order to keep the majority of the application members online:'
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了在我们的`foo-app`服务器子集上操作，我们需要使用`serial`模式。这种模式改变了Ansible执行play的方式。默认情况下，Ansible将按照任务列出的顺序在每个主机上执行play的任务。Ansible在继续执行play中的下一个任务之前，会在每个主机上执行play的每个任务。如果我们使用默认方法，我们的第一个任务将从负载均衡器中移除每个服务器，这将导致我们的应用程序完全中断。相反，`serial`模式让我们可以在子集上操作，以便整个应用程序保持可用，即使一些成员处于离线状态。在我们的示例中，我们将使用`2`的串行计数，以保持大多数应用程序成员在线：
+- en: '[PRE0]'
+  id: totrans-17
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: Important Note
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 重要提示
+- en: 'Ansible 2.2 introduced the concept of serial batches: a list of numbers that
+    can increase the number of hosts addressed serially each time through the play.
+    This allows the size of the hosts addressed to increase as confidence increases.
+    Where a batch of numbers is provided to the `serial` keyword, the last number
+    provided will be the size of any remaining batch, until all hosts in the inventory
+    have been completed.'
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Ansible 2.2引入了`serial`批处理的概念：一个可以增加每次通过play串行处理的主机数量的数字列表。这允许在信心增加时增加处理的主机数量。如果`serial`关键字提供了一组数字，那么提供的最后一个数字将是任何剩余批次的大小，直到清单中的所有主机都已完成。
+- en: 'Now, we can start to create our tasks. The first task will be to disable the
+    host from the load balancer. The load balancer runs on the `foo-lb` host; however,
+    we''re operating on the `foo-app` hosts. Therefore, we need to delegate the task
+    by using the `delegate_to` task operator. This operator redirects where Ansible
+    will connect to in order to execute the task, but it keeps all of the variable
+    contexts of the original host. We''ll use the `community.general.haproxy` module
+    to disable the current host from the `foo-app` backend pool. The code is illustrated
+    in the following snippet:'
+  id: totrans-20
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们可以开始创建我们的任务。第一个任务将是从负载均衡器中禁用主机。负载均衡器运行在`foo-lb`主机上；但是，我们正在操作`foo-app`主机。因此，我们需要使用`delegate_to`任务运算符委派任务。该运算符重定向Ansible将连接到以执行任务的位置，但它保留了原始主机的所有变量上下文。我们将使用`community.general.haproxy`模块来禁用当前主机的`foo-app`后端池。代码如下所示：
+- en: '[PRE1]'
+  id: totrans-21
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'With the host disabled, we can now update the `foo-app` content. We''ll use
+    the `ansible.builtin.git` module to update the content path with the desired version,
+    defined as `foo-version`. We''ll add a `notify` handler to this task to reload
+    the `nginx` server if the content update results in a change. This restart can
+    be done every time, but we''re also using this as an example usage of `notify`.
+    You can view the code in the following snippet:'
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在主机禁用的情况下，我们现在可以更新`foo-app`内容。我们将使用`ansible.builtin.git`模块将所需版本定义为`foo-version`的内容路径进行更新。我们将为此任务添加一个`notify`处理程序，以便在内容更新导致更改时重新加载`nginx`服务器。这种重启可以每次都进行，但我们也将其用作`notify`的示例用法。您可以在下面的代码片段中查看代码：
+- en: '[PRE2]'
+  id: totrans-23
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'Our next step would be to re-enable the host in the load balancer; however,
+    if we did that task next, we''d put the old version back in place, as our notified
+    handler hasn''t run yet. So, we need to trigger our handlers early, by way of
+    the `meta: flush_handlers` call, which you learned about in [*Chapter 10*](B17462_10_Final_JC_ePub.xhtml#_idTextAnchor183),
+    *Extending Ansible*. You can see this again here:'
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '我们的下一步将是重新启用负载均衡器中的主机；但是，如果我们下一步执行该任务，我们会将旧版本放回原位，因为我们的通知处理程序尚未运行。因此，我们需要通过`meta:
+    flush_handlers`调用提前触发我们的处理程序，你在[*第10章*](B17462_10_Final_JC_ePub.xhtml#_idTextAnchor183)中学到了这一点，*扩展Ansible*。你可以在这里再次看到这一点：'
+- en: '[PRE3]'
+  id: totrans-25
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: 'Now, we can re-enable the host in the load balancer. We can just enable it
+    right away and rely on the load balancer to wait until the host is healthy before
+    sending requests to it. However, because we are running with a reduced number
+    of available hosts, we need to ensure that all of the remaining hosts are healthy.
+    We can make use of an `ansible.builtin.wait_for` task to wait until the `nginx` service
+    is once again serving connections. The `ansible.builtin.wait_for` module will
+    wait for a condition on either a port or a file path. In the following example,
+    we will wait for port `80` and the condition that the port should be in. If it
+    is started (the default), that means it is accepting connections:'
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们可以重新启用负载均衡器中的主机。我们可以立即启用它，并依赖负载均衡器等待主机健康后再发送请求。但是，由于我们正在使用较少数量的可用主机，我们需要确保所有剩余的主机都是健康的。我们可以利用`ansible.builtin.wait_for`任务来等待`nginx`服务再次提供连接。`ansible.builtin.wait_for`模块将等待端口或文件路径上的条件。在下面的示例中，我们将等待端口`80`，并且端口应该在其中的条件。如果它已启动（默认情况下），这意味着它正在接受连接：
+- en: '[PRE4]'
+  id: totrans-27
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'Finally, we can re-enable the member within `haproxy`. Once again, we''ll delegate
+    the task to `foo-lb`, as illustrated in the following code snippet:'
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，我们可以重新启用`haproxy`中的成员。再次，我们将将任务委派给`foo-lb`，如下面的代码片段所示：
+- en: '[PRE5]'
+  id: totrans-29
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'Of course, we still need to define our `reload nginx` handler. We can do this
+    by running the following code:'
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，我们仍然需要定义我们的`reload nginx`处理程序。我们可以通过运行以下代码来实现这一点：
+- en: '[PRE6]'
+  id: totrans-31
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: This playbook, when run, will now perform a rolling in-place upgrade of our
+    application. Of course, it's not always desirable to run an upgrade in place—there's
+    always the chance that this could be service-impacting, especially if the service
+    comes under unexpected load. An alternate strategy that prevents this, expanding
+    and contracting, is explored in the next section.
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当运行此剧本时，现在将执行我们应用程序的滚动就地升级。当然，并不总是希望进行就地升级 - 总是有可能会影响服务，特别是如果服务遇到意外负载。在下一节中，将探讨一种可以防止这种情况发生的替代策略，即扩张和收缩。
+- en: Expanding and contracting
+  id: totrans-33
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 扩张和收缩
+- en: 'An alternative to the in-place upgrade strategy is the **expand and contract** strategy.
+    This strategy has become popular of late, thanks to the self-service nature of
+    on-demand infrastructures, such as cloud computing or virtualization pools. The
+    ability to create new servers on-demand from a large pool of available resources
+    means that every deployment of an application can happen on brand new systems.
+    This strategy avoids a host of issues, such as a buildup of cruft on long-running
+    systems, such as the following:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 扩张和收缩策略是对就地升级策略的一种替代方案。由于自助服务性质的按需基础设施（如云计算或虚拟化池）的流行，这种策略近来变得流行起来。可以从大量可用资源池中按需创建新服务器的能力意味着每次应用程序的部署都可以在全新的系统上进行。这种策略避免了一系列问题，例如长时间运行系统上的积累问题，例如以下问题：
+- en: Configuration files that are no longer managed by Ansible being left behind
+  id: totrans-35
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 不再由Ansible管理的配置文件被遗留下来
+- en: Runaway processes consuming resources in the background
+  id: totrans-36
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 后台运行的进程消耗资源
+- en: Changes being made to the server manually by human beings without updating the
+    Ansible playbooks
+  id: totrans-37
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 对服务器进行人工手动更改而不更新Ansible剧本
+- en: Starting fresh each time also removes the differences between initial deployment
+    and an upgrade. The same code path can be used, reducing the risk of surprises
+    when upgrading an application. This type of installation can also make it extremely
+    easy to roll back if the new version does not perform as expected. In addition
+    to this, as new systems are created to replace old systems, the application does
+    not need to go into a degraded state during the upgrade.
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每次重新开始也消除了初始部署和升级之间的差异。可以使用相同的代码路径，减少升级应用程序时出现意外的风险。这种类型的安装也可以使回滚变得非常容易，如果新版本的表现不如预期。除此之外，随着新系统被创建来替换旧系统，在升级过程中应用程序不需要降级。
+- en: 'Let''s re-approach our previous upgrade playbook with the expand and contract
+    strategy. Our pattern will be to create new servers, deploy our application, verify
+    our application, add new servers to the load balancer, and remove old servers
+    from the load balancer. Let''s start by creating new servers. For this example,
+    we''ll make use of an OpenStack compute cloud to launch new instances:'
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们重新使用扩张和收缩策略来重新处理我们之前的升级剧本。我们的模式将是创建新服务器，部署我们的应用程序，验证我们的应用程序，将新服务器添加到负载均衡器，并从负载均衡器中删除旧服务器。让我们从创建新服务器开始。在这个例子中，我们将利用OpenStack计算云来启动新实例：
+- en: '[PRE7]'
+  id: totrans-40
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'In this task, we''re looping over a count of `8`, using the new `loop` with
+    `range` syntax that was introduced in Ansible 2.5\. For each iteration of the
+    loop, the `item` variable will be replaced by a number. This allows us to create
+    eight new server instances with names based on the version of our application
+    and the number of the loop. We''re also assuming a prebuilt image to us so that
+    we do not need to do any further configuration on the instance. In order to use
+    the servers in future plays, we need to add their details to the inventory. To
+    accomplish this, we register the results of the run in the `launch` variable,
+    which we''ll use to create runtime inventory entries. The code is illustrated
+    in the following snippet:'
+  id: totrans-41
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这个任务中，我们正在循环遍历`8`的计数，使用在Ansible 2.5中引入的新的`loop`和`range`语法。对于循环的每次迭代，`item`变量将被一个数字替换。这使我们能够创建基于应用程序版本和循环次数的八个新服务器实例。我们还假设有一个预构建的镜像，这样我们就不需要对实例进行任何进一步的配置。为了在将来的剧本中使用这些服务器，我们需要将它们的详细信息添加到清单中。为了实现这一点，我们将运行结果注册到`launch`变量中，然后使用它来创建运行时清单条目。代码如下所示：
+- en: '[PRE8]'
+  id: totrans-42
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: This task will create new inventory items with the same names as those of our
+    server instance. To help Ansible know how to connect, we'll set `ansible_ssh_host` to
+    the **Internet Protocol** (**IP**) address that our cloud provider assigned to
+    the instance (this is assuming that the address is reachable by the host running
+    Ansible). Finally, we'll add the hosts to the `new-foo-app` group. As our `launch` variable
+    comes from a task with a loop, we need to iterate over the results of that loop
+    by accessing the `results` key. This allows us to loop over each launch action
+    to access the data specific to that task.
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此任务将创建具有与我们服务器实例相同名称的新清单项目。为了帮助Ansible知道如何连接，我们将`ansible_ssh_host`设置为云提供商分配给实例的**IP**地址（假设该地址可以被运行Ansible的主机访问）。最后，我们将主机添加到`new-foo-app`组中。由于我们的`launch`变量来自一个带有循环的任务，我们需要通过访问`results`键来迭代该循环的结果。这使我们能够循环遍历每个`launch`操作以访问特定于该任务的数据。
+- en: 'Next, we''ll operate on the servers to ensure that the new service is ready
+    for use. We''ll use `ansible.builtin.wait_for` again, just as we did earlier,
+    as a part of a new play operating on our `new-foo-app` group. The code is illustrated
+    in the following snippet:'
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将在服务器上操作，以确保新服务已经准备好供使用。我们将再次使用`ansible.builtin.wait_for`，就像之前一样，作为在`new-foo-app`组上操作的新任务的一部分。代码如下所示：
+- en: '[PRE9]'
+  id: totrans-45
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'Once they''re all ready to go, we can reconfigure the load balancer to make
+    use of our new servers. For the sake of simplicity, we will assume a template
+    for the `haproxy` configuration that expects hosts in a `new-foo-app` group, and
+    the end result will be a configuration that knows all about our new hosts and
+    forgets about our old hosts. This means that we can simply call an `ansible.builtin.template`
+    task on the load-balancer system itself, rather than attempting to manipulate
+    the running state of the balancer. The code is illustrated in the following snippet:'
+  id: totrans-46
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦它们都准备就绪，我们可以重新配置负载均衡器以利用我们的新服务器。为了简单起见，我们将假设`haproxy`配置的模板期望`new-foo-app`组中的主机，并且最终的结果将是一个了解我们的新主机并忘记我们的旧主机的配置。这意味着我们可以在负载均衡器系统本身上简单地调用`ansible.builtin.template`任务，而不是尝试操纵负载均衡器的运行状态。代码如下所示：
+- en: '[PRE10]'
+  id: totrans-47
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: Once the new configuration file is in place, we can issue a reload of the `haproxy` service.
+    This will parse the new configuration file and start a new listening process for
+    new incoming connections. The existing connections will eventually close, and
+    the old processes will terminate. All new connections will be routed to the new
+    servers running our new application version.
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦新的配置文件就位，我们可以重新加载`haproxy`服务。这将解析新的配置文件并为新的传入连接启动一个新的监听进程。现有的连接最终会关闭，旧进程将终止。所有新的连接将被路由到运行我们新应用程序版本的新服务器。
+- en: This playbook can be extended to decommission the old version of the servers,
+    or that action may happen at a different time when it has been decided that a
+    rollback to the old-version capability is no longer necessary.
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个playbook可以扩展到退役旧版本的服务器，或者当决定不再需要回滚到旧版本时，该操作可能会在不同的时间发生。
+- en: The expand and contract strategy can involve more tasks, and even separate playbooks
+    for creating a golden image set, but the benefits of a fresh infrastructure for
+    every release far outweigh the extra tasks or added complexity of creation followed
+    by deletion.
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 扩展和收缩策略可能涉及更多的任务，甚至为创建一个黄金镜像集而单独创建playbooks，但是每次发布都为新基础架构带来的好处远远超过了额外的任务或创建后删除的复杂性。
+- en: Failing fast
+  id: totrans-51
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 快速失败
+- en: When performing an upgrade of an application, it may be desirable to fully stop
+    the deployment at any sign of an error. A partially upgraded system with mixed versions may
+    not work at all, so continuing with part of the infrastructure while leaving the
+    failed systems behind can lead to big problems. Fortunately, Ansible provides
+    a mechanism to decide when to reach a fatal-error scenario.
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在升级应用程序时，可能希望在出现错误的迹象时完全停止部署。具有混合版本的部分升级系统可能根本无法工作，因此在留下失败的系统的同时继续部分基础架构可能会导致重大问题。幸运的是，Ansible提供了一种机制来决定何时达到致命错误的情况。
+- en: By default, when Ansible is running through a playbook and encounters an error,
+    it will remove the failed host from the list of play hosts and continue with the
+    tasks or plays. Ansible will stop executing either when all the requested hosts
+    for a play have failed or when all the plays have been completed. To change this
+    behavior, there are a couple of play controls that can be employed. Those controls
+    are `any_errors_fatal`, `max_fail_percentage`, and `force_handlers`, and these
+    are discussed next.
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 默认情况下，当Ansible通过playbook运行并遇到错误时，它将从play主机列表中删除失败的主机，并继续执行任务或play。当所有play的请求主机都失败或所有play都已完成时，Ansible将停止执行。要更改此行为，可以使用一些play控件。这些控件是`any_errors_fatal`，`max_fail_percentage`和`force_handlers`，下面将讨论这些控件。
+- en: The any_errors_fatal option
+  id: totrans-54
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: any_errors_fatal选项
+- en: 'This setting instructs Ansible to consider the entire operation fatal and to
+    stop executing immediately if any host encounters an error. To demonstrate this,
+    we''ll edit our `mastery-hosts` inventory, defining a pattern that will expand
+    up to 10 new hosts, as illustrated in the following code snippet:'
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此设置指示Ansible将整个操作视为致命错误，并在任何主机遇到错误时立即停止执行。为了演示这一点，我们将编辑我们的`mastery-hosts`清单，定义一个可以扩展到10个新主机的模式，如下面的代码片段所示：
+- en: '[PRE11]'
+  id: totrans-56
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'Then, we''ll create a play on this group with `any_errors_fatal` set to `true`.
+    We''ll also turn off fact-gathering since these hosts do not exist. The code is
+    illustrated in the following snippet:'
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们将在这个组上创建一个play，将`any_errors_fatal`设置为`true`。我们还将关闭事实收集，因为这些主机不存在。代码如下所示：
+- en: '[PRE12]'
+  id: totrans-58
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'We want a task that will fail for one of the hosts but not the others. Then,
+    we''ll want a second task as well, just to demonstrate how it will not run. Here''s
+    the code we need to execute:'
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们希望有一个任务会对其中一个主机失败，但不会对其他主机失败。然后，我们还希望有第二个任务，仅仅是为了演示它不会运行。这是我们需要执行的代码：
+- en: '[PRE13]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'We now execute the playbook using the following command:'
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们将使用以下命令执行playbook：
+- en: '[PRE14]'
+  id: totrans-62
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'When we do this, we''ll see one host fail, but the entire play will stop after
+    the first task, and the `ansible.builtin.debug` task is never attempted, as illustrated
+    in the following screenshot:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当我们这样做时，我们会看到一个主机失败，但整个play将在第一个任务后停止，并且`ansible.builtin.debug`任务从未尝试，如下面的屏幕截图所示：
+- en: '![Figure 11.1 – Failing an entire playbook early when just one host in the
+    inventory fails'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.1 - 当清单中的一个主机失败时提前失败整个playbook'
+- en: '](Images/B17462_11_01.jpg)'
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_01.jpg)'
+- en: Figure 11.1 – Failing an entire playbook early when just one host in the inventory
+    fails
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.1 - 当清单中的一个主机失败时提前失败整个playbook
+- en: We can see that just one host failed; however, Ansible reported `NO MORE HOSTS
+    LEFT` (implying that all hosts failed) and aborted the playbook before getting
+    to the next play.
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以看到只有一个主机失败；但是，Ansible报告了`NO MORE HOSTS LEFT`（暗示所有主机都失败了），并在进入下一个play之前中止了playbook。
+- en: The max_fail_percentage option
+  id: totrans-68
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: max_fail_percentage选项
+- en: 'This setting allows play developers to define a percentage of hosts that can
+    fail before the whole operation is aborted. At the end of each task, Ansible will
+    perform a calculation to determine the number of hosts targeted by the play that
+    have reached a failure state, and if that number is greater than the number allowed,
+    Ansible will abort the playbook. This is similar to `any_errors_fatal`; in fact,
+    `any_errors_fatal` just internally expresses a `max_fail_percentage` parameter
+    of `0`, where any failure is considered fatal. Let''s edit our play from the preceding
+    section and remove `any_errors_fatal`, replacing it with the `max_fail_percentage`
+    parameter set to `20`, as follows:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个设置允许play开发人员定义可以失败的主机的百分比，然后整个操作就会中止。在每个任务结束时，Ansible将进行计算，以确定play所针对的主机中达到失败状态的数量，如果该数量大于允许的数量，Ansible将中止playbook。这类似于`any_errors_fatal`；实际上，`any_errors_fatal`内部只是表示`max_fail_percentage`参数为`0`，其中任何失败都被视为致命。让我们编辑上一节的play，并删除`any_errors_fatal`，将其替换为设置为`20`的`max_fail_percentage`参数，如下所示：
+- en: '[PRE15]'
+  id: totrans-70
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'By making that change and running our playbook with the same command as we
+    used previously, our play should complete both tasks without aborting, as the
+    following screenshot shows:'
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过进行这种更改并使用与之前相同的命令运行我们的playbook，我们的play应该能够完成两个任务而不会中止，如下面的截图所示：
+- en: '![Figure 11.2 – Demonstrating our previous failure-test playbook proceeding
+    with fewer than 20 percent failed hosts'
+  id: totrans-72
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.2 - 演示我们之前的失败测试playbook在失败主机少于20％的情况下继续进行'
+- en: '](Images/B17462_11_02.jpg)'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_02.jpg)'
+- en: Figure 11.2 – Demonstrating our previous failure-test playbook proceeding with
+    fewer than 20 percent failed hosts
+  id: totrans-74
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.2 - 演示我们之前的失败测试playbook在失败主机少于20％的情况下继续进行
+- en: 'Now, if we change the condition on our first task so that we deliberately fail
+    on over `20` percent of the hosts, we''ll see the playbook abort early:'
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，如果我们更改我们第一个任务的条件，以便故意在超过`20`％的主机上失败，我们将看到playbook提前中止：
+- en: '[PRE16]'
+  id: totrans-76
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'We''re deliberately setting up three hosts to fail, which will give us a failure
+    rate of greater than `20` percent. The `max_fail_percentage` setting is the maximum
+    allowed, so our setting of `20` would allow two out of the ten hosts to fail.
+    With three hosts failing, we will see a fatal error before the second task is
+    allowed to execute, as the following screenshot illustrates:'
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们故意设置三个主机失败，这将使我们的失败率超过`20`％。 `max_fail_percentage`设置是允许的最大值，因此我们的设置为`20`将允许十个主机中的两个失败。由于有三个主机失败，我们将在第二个任务被允许执行之前看到致命错误，如下面的截图所示：
+- en: '![Figure 11.3 – Demonstrating the max_fail_percentage operation failing a play
+    when the percentage is exceeded'
+  id: totrans-78
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.3 - 当百分比超过限制时，演示max_fail_percentage操作导致play失败'
+- en: '](Images/B17462_11_03.jpg)'
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_03.jpg)'
+- en: Figure 11.3 – Demonstrating the max_fail_percentage operation failing a play
+    when the percentage is exceeded
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.3 - 当百分比超过限制时，演示max_fail_percentage操作导致play失败
+- en: With this combination of parameters, we can easily set up and control **fail-fast** conditions
+    on a group of hosts, which is incredibly valuable if our goal is to maintain the
+    integrity of an environment during an Ansible deployment.
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过这些参数的组合，我们可以轻松设置和控制一组主机上的**快速失败**条件，这在Ansible部署期间维护环境的完整性方面非常有价值。
+- en: Forcing handlers
+  id: totrans-82
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 强制处理程序
+- en: Normally, when Ansible fails a host, it stops executing anything on that host.
+    This means that any pending handlers will not be run. This can be undesirable,
+    and there is a play control that will force Ansible to process pending handlers
+    for failed hosts. This play control is `force_handlers`, which must be set to
+    the `true` Boolean value.
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通常，当Ansible失败时，它会停止在该主机上执行任何操作。这意味着任何未决的处理程序都不会运行。这可能是不希望的，有一个play控制可以强制Ansible处理失败的主机的未决处理程序。这个play控制是`force_handlers`，必须设置为`true`布尔值。
+- en: 'Let''s modify our preceding example a little in order to demonstrate this functionality.
+    We''ll remove our `max_fail_percentage` parameter and add a new first task. We
+    need to create a task that will return successfully with a change. This is possible
+    with the `ansible.builtin.debug` module, using the `changed_when` task control,
+    as this module will never register a change otherwise. We''ll revert our `ansible.builtin.fail` task
+    conditional to our original one, as well. The code is illustrated in the following
+    snippet:'
+  id: totrans-84
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们稍微修改上一个示例，以演示这个功能。我们将删除我们的`max_fail_percentage`参数，并添加一个新的第一个任务。我们需要创建一个任务，它将返回成功的更改。这可以通过`ansible.builtin.debug`模块实现，使用`changed_when`任务控制，因为这个模块否则永远不会注册更改。我们将将我们的`ansible.builtin.fail`任务条件恢复到原始状态。代码如下所示：
+- en: '[PRE17]'
+  id: totrans-85
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'Our third task remains unchanged, but we will define our critical handler,
+    as follows:'
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的第三个任务保持不变，但我们将定义我们的关键处理程序，如下所示：
+- en: '[PRE18]'
+  id: totrans-87
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'Let''s run this new play to show the default behavior of the handler not being
+    executed. In the interest of reduced output, we''ll limit execution to just one
+    of the hosts with the following command:'
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们运行这个新的play来展示处理程序不被执行的默认行为。为了减少输出，我们将限制执行到其中一个主机，使用以下命令：
+- en: '[PRE19]'
+  id: totrans-89
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'Note that although the handler is referenced in the play output, it is not
+    actually run, as evidenced by the lack of any debug message, which the following
+    screenshot clearly shows:'
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，尽管处理程序在play输出中被引用，但实际上并没有运行，这可以从缺少任何调试消息来证明，如下面的截图清楚地显示：
+- en: '![Figure 11.4 – Demonstrating how handlers are not run even when notified if
+    a play fails'
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.4 - 即使在play失败时也不运行处理程序的演示'
+- en: '](Images/B17462_11_04.jpg)'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_04.jpg)'
+- en: Figure 11.4 – Demonstrating how handlers are not run even when notified if a
+    play fails
+  id: totrans-93
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.4 - 演示即使在play失败时也不运行处理程序的情况
+- en: 'Now, we add the `force_handlers` play control and set it to `true`, as follows:'
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们添加`force_handlers` play控制并将其设置为`true`，如下所示：
+- en: '[PRE20]'
+  id: totrans-95
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'This time, when we run the playbook (using the same command as before), we
+    should see the handler run even for the failed hosts, as demonstrated in the following
+    screenshot:'
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这次，当我们运行playbook（使用与之前相同的命令）时，我们应该看到即使对于失败的主机，处理程序也会运行，如下面的截图所示：
+- en: '![Figure 11.5 – Demonstrating that handlers can be forced to run, even for
+    failed hosts in a failed play'
+  id: totrans-97
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.5-演示处理程序可以被强制运行，即使在失败的play中也是如此'
+- en: '](Images/B17462_11_05.jpg)'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_05.jpg)'
+- en: Figure 11.5 – Demonstrating that handlers can be forced to run, even for failed
+    hosts in a failed play
+  id: totrans-99
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.5-演示处理程序可以被强制运行，即使在失败的play中也是如此
+- en: Important Note
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 重要提示
+- en: Forcing handlers can be a runtime decision as well, using the `--force-handlers` command-line
+    argument on `ansible-playbook`. It can also be set globally, as a parameter in `ansible.cfg`.
+  id: totrans-101
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 强制处理程序也可以是一个运行时决定，可以在`ansible-playbook`上使用`--force-handlers`命令行参数。它也可以作为`ansible.cfg`中的参数进行全局设置。
+- en: Forcing handlers to run can be really useful for repeated playbook runs. The
+    first run may result in some changes, but if a fatal error is encountered before
+    the handlers are flushed, those handler calls will be lost. Repeated runs will
+    not result in the same changes, so the handler will never run without manual interaction.
+    Forcing handlers ensures that those handler calls are not lost, and so the handlers
+    are always run regardless of the task outcomes. Of course, the whole objective
+    of any upgrade strategy is to keep the impact on any given service as low as possible—can
+    you imagine your favorite retail site going down for someone to upgrade software?
+    It is unthinkable in this day and age! In the next section, we explore ways to
+    minimize potentially disruptive actions using Ansible.
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 强制处理程序运行对于重复的playbook运行非常有用。第一次运行可能会导致一些更改，但如果在刷新处理程序之前遇到致命错误，那些处理程序调用将丢失。重复运行不会导致相同的更改，因此处理程序将永远不会在没有手动交互的情况下运行。强制处理程序可以确保这些处理程序调用不会丢失，因此无论任务结果如何，处理程序始终会运行。当然，任何升级策略的整体目标是尽可能降低对任何给定服务的影响-您能想象您最喜欢的零售网站因为有人升级软件而宕机吗？在当今这个时代是不可想象的！在下一节中，我们将探讨使用Ansible来最小化潜在的破坏性行为的方法。
+- en: Minimizing disruptions
+  id: totrans-103
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 最小化中断
+- en: During deployment, there are often tasks that can be considered disruptive or
+    destructive. These tasks may include restarting services, performing database
+    migrations, and so on. Disruptive tasks should be clustered together to minimize
+    the overall impact on an application, while destructive tasks should only be performed
+    once. The next two subsections explore how you can meet both these targets using
+    Ansible.
+  id: totrans-104
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在部署过程中，通常有一些可以被视为具有破坏性或破坏性的任务。这些任务可能包括重新启动服务，执行数据库迁移等。破坏性任务应该被集中在一起，以最小化对应用程序的整体影响，而破坏性任务应该只执行一次。接下来的两个小节将探讨如何使用Ansible来实现这两个目标。
+- en: Delaying a disruption
+  id: totrans-105
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 延迟中断
+- en: Restarting services for a new configuration or code version is a very common
+    requirement. When viewed in isolation, a single service can be restarted whenever
+    the code and configuration for the application have changed, without concern for
+    the overall distributed system health. Typically, a distributed system will have
+    roles for each part of the system, and each role will essentially operate in isolation
+    on the hosts targeted to perform those roles. When deploying an application for
+    the first time, there is no existing uptime of the whole system to worry about,
+    so services can be restarted at will. However, during an upgrade, it may be desirable
+    to delay all service restarts until every service is ready, to minimize interruptions.
+  id: totrans-106
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 重新启动服务以适应新的配置或代码版本是一个非常常见的需求。当单独查看时，只要应用程序的代码和配置发生了变化，就可以重新启动单个服务，而不必担心整个分布式系统的健康状况。通常，分布式系统将为系统的每个部分分配角色，每个角色将在目标主机上独立运行。首次部署应用程序时，无需担心整个系统的运行时间，因此可以随意重新启动服务。然而，在升级过程中，可能希望延迟所有服务的重新启动，直到每个服务都准备就绪，以最小化中断。
+- en: The reuse of role code is strongly encouraged, as opposed to designing a completely
+    separate upgrade code path. To accommodate a coordinated reboot, the role code
+    for a particular service needs protection around the service restart. A common
+    pattern is to put a conditional statement on the disruptive tasks that check a
+    variable's value. When performing an upgrade, the variable can be defined at runtime
+    to trigger this alternative behavior. This variable can also trigger a coordinated
+    restart of services at the end of the main playbook once all of the roles have
+    been completed, in order to cluster the disruption and minimize the total outage.
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 强烈鼓励重用角色代码，而不是设计完全独立的升级代码路径。为了适应协调的重启，特定服务的角色代码需要在服务重新启动周围进行保护。一个常见的模式是在破坏性任务上放置一个条件语句，检查变量的值。在执行升级时，可以在运行时定义变量以触发这种替代行为。这个变量也可以在主playbook完成所有角色后触发协调的服务重启，以便对中断进行集群化处理并最小化总的中断时间。
+- en: 'Let''s create a fictional application upgrade that involves two roles with
+    simulated service restarts. We''ll call these roles `microA` and `microB`. The
+    code is illustrated in the following snippet:'
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们创建一个虚构的应用程序升级，其中涉及两个角色，模拟服务的重新启动。我们将这些角色称为`microA`和`microB`。代码如下所示：
+- en: '[PRE21]'
+  id: totrans-109
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'For both roles, we''ll have a simple debug task that simulates the installation
+    of a package. We''ll notify a handler to simulate the restart of a service, and
+    to ensure that the handler will trigger, we''ll force the task to always register
+    as changed. The following code snippet shows the content of `roles/microA/tasks/main.yaml`:'
+  id: totrans-110
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于这两个角色，我们将有一个简单的调试任务，模拟安装软件包。我们将通知一个处理程序来模拟服务的重新启动，并确保处理程序将触发，我们将强制任务始终注册为更改。以下代码片段显示了`roles/microA/tasks/main.yaml`的内容：
+- en: '[PRE22]'
+  id: totrans-111
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'The content of `roles/microB/tasks/main.yaml` is shown here:'
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`roles/microB/tasks/main.yaml`的内容如下所示：'
+- en: '[PRE23]'
+  id: totrans-113
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'The handlers for these roles will be debug actions as well, and we''ll attach
+    a conditional statement to the handler task to only restart if the upgrade variable
+    evaluates to the `false` Boolean value. We''ll also use the default filter to
+    give this variable a default value of `false`. The content of `roles/microA/handlers/main.yaml`
+    is shown here:'
+  id: totrans-114
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些角色的处理程序也将是调试操作，并且我们将附加一个条件语句到处理程序任务，只有当升级变量评估为`false`布尔值时才重新启动。我们还将使用默认过滤器为这个变量赋予默认值`false`。`roles/microA/handlers/main.yaml`的内容如下所示：
+- en: '[PRE24]'
+  id: totrans-115
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'The content of `roles/microB/handlers/main.yaml` is shown here:'
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`roles/microB/handlers/main.yaml`的内容如下所示：'
+- en: '[PRE25]'
+  id: totrans-117
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'For our top-level playbook, we''ll create four plays (remember that a playbook
+    can consist of one or more plays). The first two plays will apply each of the
+    micro roles, and the last two plays will do the restarts. The last two plays will
+    only be executed if performing an upgrade; so, they will make use of the `upgrade`
+    variable as a condition. Let''s take a look at the following code snippet (called `micro.yaml`):'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于我们的顶层playbook，我们将创建四个play（记住playbook可以由一个或多个play组成）。前两个play将应用每个微服务角色，最后两个play将进行重新启动。只有在执行升级时，最后两个play才会被执行；因此，它们将使用`upgrade`变量作为条件。让我们看一下以下代码片段（名为`micro.yaml`）：
+- en: '[PRE26]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: 'We execute this playbook without defining the `upgrade` variable, using the
+    following command:'
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在不定义`upgrade`变量的情况下执行这个playbook，使用以下命令：
+- en: '[PRE27]'
+  id: totrans-121
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'When we do this, we will see the execution of each role, and the handlers within.
+    The final two plays will have skipped tasks, as the following screenshot shows:'
+  id: totrans-122
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当我们这样做时，我们将看到每个角色的执行，以及其中的处理程序。最后两个play将有跳过的任务，如下截图所示：
+- en: '![Figure 11.6 – Demonstrating a role-based playbook for installing a microservice
+    architecture'
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.6 - 演示了安装微服务架构的基于角色的playbook'
+- en: '](Images/B17462_11_06.jpg)'
+  id: totrans-124
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_06.jpg)'
+- en: Figure 11.6 – Demonstrating a role-based playbook for installing a microservice
+    architecture
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.6 - 演示了安装微服务架构的基于角色的playbook
+- en: 'Now, let''s execute the playbook again; this time, we''ll define the `upgrade`
+    variable as `true` at runtime, using the `-e` flag as follows:'
+  id: totrans-126
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们再次执行playbook；这次，我们将在运行时将`upgrade`变量定义为`true`，使用`-e`标志如下：
+- en: '[PRE28]'
+  id: totrans-127
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: 'This time, the results should look like this:'
+  id: totrans-128
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这次，结果应该是这样的：
+- en: '![Figure 11.7 – Demonstrating the same playbook, but in an upgrade scenario'
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.7 - 演示相同的playbook，但在升级场景中'
+- en: with all restarts batched at the end
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所有重新启动都在最后批处理
+- en: '](Images/B17462_11_07.jpg)'
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_07.jpg)'
+- en: Figure 11.7 – Demonstrating the same playbook, but in an upgrade scenario with
+    all restarts batched at the end
+  id: totrans-132
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.7 - 演示相同的playbook，但在升级场景中所有重新启动都集中在最后
+- en: This time, we can see that our handlers are skipped, but the final two plays
+    have tasks that execute. In a real-world scenario, where many more things are
+    happening in the `microA` and `microB` roles (and, potentially, other microservice
+    roles on other hosts), the difference could be of many minutes or more. Clustering
+    the restarts at the end can reduce the interruption period significantly.
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这次，我们可以看到我们的处理程序被跳过，但最后两个play有执行的任务。在一个真实的场景中，在`microA`和`microB`角色中发生了更多的事情（可能还有其他主机上的其他微服务角色），这种差异可能会达到几分钟甚至更长。将重新启动集中在最后可以显著减少中断时间。
+- en: Running destructive tasks only once
+  id: totrans-134
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 仅运行破坏性任务一次
+- en: Destructive tasks come in many flavors. They can be one-way tasks that are extremely
+    difficult to roll back, one-time tasks that cannot be rerun easily, or race-condition
+    tasks that, if performed in parallel, would result in catastrophic failure. For
+    these reasons and more, it is essential that these tasks be performed only once,
+    from a single host. Ansible provides a mechanism to accomplish this by way of
+    the `run_once` task control.
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 破坏性任务有很多种。它们可以是极其难以回滚的单向任务，无法轻易重新运行的一次性任务，或者如果并行执行会导致灾难性失败的竞争条件任务。因此，非常重要的是这些任务只能从单个主机执行一次。Ansible通过`run_once`任务控制提供了一种实现这一点的机制。
+- en: The `run_once` task control will ensure that the task only executes a single
+    time from a single host, regardless of how many hosts happen to be in a play.
+    While there are other methods to accomplish this goal, such as using a conditional
+    statement to make the task execute only on the first host of a play, the `run_once`
+    control is the most simple and direct way to express this wish. Additionally,
+    any variable data registered from a task controlled by `run_once` will be made
+    available to all hosts of the play, not just the host that was selected by Ansible
+    to perform the action. This can simplify later retrieval of the variable data.
+  id: totrans-136
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`run_once`任务控制将确保任务只从单个主机执行一次，而不管play中有多少个主机。虽然还有其他方法可以实现这个目标，比如使用条件语句使任务只在play的第一个主机上执行，但`run_once`控制是表达这个愿望最简单直接的方式。此外，从`run_once`控制的任务注册的任何变量数据将对play的所有主机可用，而不仅仅是由Ansible选择执行操作的主机。这可以简化后续变量数据的检索。'
+- en: 'Let''s create an example playbook to demonstrate this functionality. We''ll
+    reuse our `failtest` hosts that were created in an earlier example, in order to
+    have a pool of hosts, and we''ll select two of them by using a host pattern. We''ll
+    create an `ansible.builtin.debug` task set to `run_once` and register the results,
+    then we''ll access the results in a different task with a different host. The
+    code is as follows:'
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们创建一个示例playbook来演示这个功能。我们将重用之前创建的`failtest`主机，以便有一个主机池，然后我们将通过主机模式选择其中的两个。我们将创建一个设置为`run_once`的`ansible.builtin.debug`任务并注册结果，然后我们将在不同的任务中使用不同的主机访问结果。代码如下：
+- en: '[PRE29]'
+  id: totrans-138
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'We run this play with the following command:'
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用以下命令运行这个play：
+- en: '[PRE30]'
+  id: totrans-140
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'When we do this, we''ll pay special attention to the hostnames listed for each
+    task operation shown in the following screenshot:'
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当我们这样做时，我们将特别关注每个任务操作中列出的主机名，如下截图所示：
+- en: '![Figure 11.8 – Demonstrating the use of the run_once task parameter, and the
+    availability of variable data from that task on other hosts in the play'
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.8 - 演示了run_once任务参数的使用，以及该任务在播放中其他主机上的变量数据的可用性'
+- en: '](Images/B17462_11_08.jpg)'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_08.jpg)'
+- en: Figure 11.8 – Demonstrating the use of the run_once task parameter, and the
+    availability of variable data from that task on other hosts in the play
+  id: totrans-144
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.8 - 演示了使用run_once任务参数以及在剧本中的其他主机上可用的变量数据的使用
+- en: We can see that the `do a thing` task is executed on the `failer01` host, while
+    the `what is groot` task, which examines the data from the `do a thing` task,
+    operates on the `failer02` host. Of course, while you can reduce the risk of disruption
+    to your production services using the techniques we have discussed here, there
+    is even more we can do, such as limiting the number of times a task is run or
+    the number of hosts it is run against. We will explore this very topic in the
+    next section of this chapter.
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以看到`do a thing`任务在`failer01`主机上执行，而检查来自`do a thing`任务的数据的`what is groot`任务在`failer02`主机上操作。当然，通过使用我们在这里讨论的技术，您可以减少对生产服务的干扰风险，还有更多的事情可以做，比如限制任务运行的次数或运行的主机数量。我们将在本章的下一节中探讨这个话题。
+- en: Serializing single tasks
+  id: totrans-146
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 序列化单个任务
+- en: Certain applications that run multiple copies of a service may not react well
+    to all of those services being restarted at once. Typically, when upgrading this
+    type of application, a `serial` play is used. However, if the application is of
+    a large enough scale, serializing the entire play may be wildly inefficient. A
+    different approach can be used, which is to serialize only the sensitive tasks
+    (often the handlers to restart services).
+  id: totrans-147
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 运行多个服务副本的某些应用程序可能对所有这些服务同时重新启动作出不良反应。通常，在升级此类应用程序时，会使用`serial`剧本。但是，如果应用程序规模足够大，序列化整个剧本可能会非常低效。可以使用不同的方法，即仅对敏感任务（通常是重新启动服务的处理程序）进行序列化。
+- en: To serialize a specific handler task, we can make use of a built-in variable, `play_hosts`.
+    This variable holds a list of hosts that should be used for a given task as a
+    part of the play. It is kept up to date with hosts that have failed or are unreachable.
+    Using this variable, we can construct a loop to iterate over each host that could
+    potentially run a handler task. Instead of using the `item` value in the module
+    arguments, we'll use the `item` value in a `when` conditional and a `delegate_to` directive.
+    In this manner, handler tasks that get notified within the playbook can be delegated
+    to a host in the aforementioned loop, rather than the original host. However,
+    if we just use this as the list for a `loop` directive, we'll end up executing
+    the task for every host that triggers a handler. That's obviously unwanted, so
+    we can use a task directive, `run_once`, to change the behavior. The `run_once`
+    directive instructs Ansible to only execute the task for one host, instead of
+    for every host that it would normally target. Combining `run_once` and our loop
+    of `play_hosts` creates a scenario where Ansible will run through the loop only
+    once. Finally, we want to wait a small amount of time between each loop so that
+    the restarted service can become functional before we restart the next one. We
+    can make use of a `loop_control` parameter called `pause` (introduced in Ansible
+    version 2.2) to insert a pause between each iteration of the loop.
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要对特定的处理程序任务进行序列化，我们可以使用内置变量`play_hosts`。该变量保存应作为剧本的一部分用于给定任务的主机列表。它会随着失败或不可达的主机而更新。使用此变量，我们可以构建一个循环，以便遍历每个可能运行处理程序任务的主机。我们将使用`when`条件和`delegate_to`指令中的`item`值，而不是在模块参数中使用`item`值。通过这种方式，剧本中通知的处理程序任务可以被委派到上述循环中的主机，而不是原始主机。但是，如果我们将其作为`loop`指令的列表使用，我们将会为触发处理程序的每个主机执行任务。这显然是不希望的，因此我们可以使用任务指令`run_once`来改变行为。`run_once`指令指示Ansible仅为一个主机执行任务，而不是通常会目标的每个主机。结合`run_once`和我们的`play_hosts`循环，就会创建一种情况，即Ansible只会通过循环运行一次。最后，我们希望在每个循环之间等待一小段时间，以便重新启动的服务在我们重新启动下一个服务之前可以正常运行。我们可以使用一个名为`pause`的`loop_control`参数（在Ansible版本2.2中引入）在循环的每次迭代之间插入暂停。
+- en: 'To demonstrate how this serialization will work, we''ll write a play using
+    a few hosts from our `failtest` group, with a task that creates a change and registers
+    the output so that we can check this output in the handler task we notify, called `restart
+    groot`. We then create a serialized handler task itself at the bottom of the playbook.
+    The code is illustrated as follows:'
+  id: totrans-149
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了演示这种序列化的工作原理，我们将编写一个使用我们`failtest`组中的一些主机的剧本，其中包含一个创建更改并注册输出的任务，以便我们可以在我们通知的处理程序任务中检查此输出，称为`restart
+    groot`。然后我们在剧本底部创建一个序列化的处理程序任务本身。代码如下所示：
+- en: '[PRE31]'
+  id: totrans-150
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'Upon execution of this playbook, we can see the handler notification (thanks
+    to double verbosity using the following command):'
+  id: totrans-151
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在执行此剧本时，我们可以看到处理程序通知（通过使用以下命令进行双重详细度）：
+- en: '[PRE32]'
+  id: totrans-152
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'In the handler task, we can see the loop, conditional, and delegation, as the
+    following screenshot shows:'
+  id: totrans-153
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在处理程序任务中，我们可以看到循环、条件和委托，如下面的屏幕截图所示：
+- en: '![Figure 11.9 – A playbook with a serialized handler routing for the restart
+    of services'
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图11.9 - 一个带有序列化处理程序路由的剧本，用于重新启动服务'
+- en: '](Images/B17462_11_09.jpg)'
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](Images/B17462_11_09.jpg)'
+- en: Figure 11.9 – A playbook with a serialized handler routing for the restart of
+    services
+  id: totrans-156
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图11.9 - 一个带有序列化处理程序路由的剧本，用于重新启动服务
+- en: If you have tried this code out for yourself, you will notice the delay between
+    each handler run, just as we specified in the `loop_control` part of the task.
+    Using these techniques, you can confidently roll out updates and upgrades to your
+    environment while keeping disruption to a minimum. It is hoped that this chapter
+    has given you the tools and techniques to confidently perform such actions on
+    your environment.
+  id: totrans-157
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果您自己尝试了这段代码，您会注意到每个处理程序运行之间的延迟，就像我们在任务的`loop_control`部分中指定的那样。使用这些技术，您可以自信地推出更新和升级到您的环境，同时将干扰降到最低。希望本章为您提供了在您的环境中自信地执行此类操作的工具和技术。
+- en: Summary
+  id: totrans-158
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: Deployment and upgrade strategies are a matter of taste. Each strategy comes
+    with distinct advantages and disadvantages. Ansible does not declare an opinion
+    about which is better, and therefore it is well suited to perform deployments
+    and upgrades regardless of the strategy. Ansible provides features and design
+    patterns that facilitate a variety of styles with ease. Understanding the nature
+    of each strategy and how Ansible can be tuned for that strategy will empower you
+    to decide on and design deployments for each of your applications. Task controls
+    and built-in variables provide methods to efficiently upgrade large-scale applications
+    while treating specific tasks carefully.
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 部署和升级策略是一种品味。每种策略都有明显的优势和劣势。Ansible不会对哪种更好发表意见，因此它非常适合执行部署和升级，无论采用哪种策略。Ansible提供了功能和设计模式，可以轻松地促进各种风格。了解每种策略的性质以及如何调整Ansible以适应该策略将使你能够决定并设计每个应用的部署。任务控制和内置变量提供了有效升级大规模应用程序的方法，同时小心处理特定任务。
+- en: In this chapter, you learned how to use Ansible to perform in-place upgrades
+    and some different methodologies for these, including techniques such as expanding
+    and contracting an environment. You learned about failing fast to ensure that
+    playbooks don't cause extensive damage if an early part of a play goes wrong,
+    and how to minimize both disruptive and destructive actions. Finally, you learned
+    about serializing single tasks to minimize disruption to running services by taking
+    nodes out of service in a minimal controlled manner. This ensures that services
+    remain operational while maintenance work (such as an upgrade) occurs behind the
+    scenes.
+  id: totrans-160
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，你学会了如何使用Ansible进行就地升级以及一些不同的方法论，包括扩展和收缩环境等技术。你了解了快速失败以确保playbook在play的早期出现问题时不会造成严重损害，以及如何最小化破坏性和破坏性行为。最后，你学会了对单个任务进行串行化，以最小化对正在运行的服务的干扰，通过以最小受控的方式将节点脱离服务来确保服务在维护工作（如升级）进行时仍然保持运行。这确保了服务在维护工作（如升级）进行时仍然保持运行。
+- en: In the next chapter, we'll go into detail about using Ansible to work with cloud
+    infrastructure providers and container systems in order to create an infrastructure
+    to manage.
+  id: totrans-161
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，我们将详细介绍如何使用Ansible与云基础设施提供商和容器系统合作，以创建一个用于管理的基础设施。
+- en: Questions
+  id: totrans-162
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 问题
+- en: What is a valid strategy for minimizing disruption when in-place upgrades are
+    performed?
+  id: totrans-163
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在进行就地升级时，最小化干扰的有效策略是什么？
+- en: a) Use the `serial` mode to alter how many hosts Ansible performs the upgrade
+    on at one time.
+  id: totrans-164
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) 使用`serial`模式来改变Ansible一次执行升级的主机数量。
+- en: b) Use the `limit` parameter to alter how many hosts Ansible performs the upgrade
+    on at one time.
+  id: totrans-165
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) 使用`limit`参数来改变Ansible一次执行升级的主机数量。
+- en: c) Have lots of small inventories, each with just a few hosts in.
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) 拥有许多小清单，每个清单中只有少量主机。
+- en: d) Revoke access to the hosts by Ansible.
+  id: totrans-167
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) 撤销Ansible对主机的访问权限。
+- en: What is a key benefit of expanding and contracting as an upgrade strategy?
+  id: totrans-168
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 扩展和收缩作为升级策略的一个关键好处是什么？
+- en: a) Reduced cloud operating costs.
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) 减少云操作成本。
+- en: b) It fits well with a **development-operations** (**DevOps**) culture.
+  id: totrans-170
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) 它与**开发运维**（DevOps）文化相契合。
+- en: c) All hosts are newly built for each application deployment or upgrade, reducing
+    the possibility of stale libraries and configurations.
+  id: totrans-171
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) 每次应用部署或升级都会为所有主机新建，减少了过期库和配置的可能性。
+- en: d) It provides flexibility in your approach to upgrades.
+  id: totrans-172
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) 它为升级的方法提供了灵活性。
+- en: Why would you want to fail fast?
+  id: totrans-173
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为什么你想要快速失败？
+- en: a) So that you know about your playbook errors as soon as possible.
+  id: totrans-174
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) 这样你就可以尽快了解你的playbook错误。
+- en: b) So that you minimize the damage or disruption caused by a failed play.
+  id: totrans-175
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) 这样你就可以最小化失败play造成的损害或中断。
+- en: c) So that you can debug your code.
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) 这样你就可以调试你的代码。
+- en: d) So that you can be agile in your deployments.
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) 这样你就可以在部署中灵活应对。
+- en: Which Ansible play option would you use to ensure that your play stops executing
+    early in the event of errors on any single host?
+  id: totrans-178
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 你会使用哪个Ansible play选项来确保你的play在任何单个主机出现错误时提前停止执行？
+- en: a) `ansible.builtin.fail`
+  id: totrans-179
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) `ansible.builtin.fail`
+- en: b) `any_errors_fatal`
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) `any_errors_fatal`
+- en: 'c) `when: failed`'
+  id: totrans-181
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'c) `when: failed`'
+- en: 'd) `max_fail_percentage: 50`'
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'd) `max_fail_percentage: 50`'
+- en: Which Ansible play option would you use to ensure that your play stops executing
+    early in the event of errors on more than 30 percent of the hosts in your inventory?
+  id: totrans-183
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 你会使用哪个Ansible play选项来确保在清单中超过30%的主机出现错误时，你的play会提前停止执行？
+- en: a) `any_errors_fatal`
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) `any_errors_fatal`
+- en: 'b) `max_fail_percentage: 30%`'
+  id: totrans-185
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'b) `max_fail_percentage: 30%`'
+- en: 'c) `max_fail_percentage: 30`'
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'c) `max_fail_percentage: 30`'
+- en: 'd) `max_fail: 30%`'
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'd) `max_fail: 30%`'
+- en: Which play-level option can you specify to ensure that your handlers are run
+    even if your play fails?
+  id: totrans-188
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 你可以指定哪个play级选项来确保即使play失败，也会运行handlers？
+- en: a) `handlers_on_fail`
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) `handlers_on_fail`
+- en: b) `handlers_on_failure`
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) `handlers_on_failure`
+- en: c) `always_handlers`
+  id: totrans-191
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) `always_handlers`
+- en: d) `force_handlers`
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) `force_handlers`
+- en: Why might you want to delay the running of handlers to the end of your play?
+  id: totrans-193
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为什么你可能希望延迟运行handlers到play的最后？
+- en: a) It could save time on the execution of the play as a whole.
+  id: totrans-194
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) 这可能会节省play执行的时间。
+- en: b) It makes the operation more predictable.
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) 它使操作更可预测。
+- en: c) It reduces the risk of downtime.
+  id: totrans-196
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) 它减少了停机的风险。
+- en: d) It might help increase your chances of a successful upgrade.
+  id: totrans-197
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) 这可能有助于增加升级成功的机会。
+- en: Which task-level parameter can you use to ensure that a task does not get executed
+    more than once, even when you have multiple hosts in your inventory?
+  id: totrans-198
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 你可以使用哪个任务级参数来确保任务不会在清单中有多个主机时执行多次？
+- en: a) `task_once`
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) `task_once`
+- en: b) `run_once`
+  id: totrans-200
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) `run_once`
+- en: 'c) `limit: 1`'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'c) `limit: 1`'
+- en: 'd) `run: once`'
+  id: totrans-202
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'd) `run: once`'
+- en: Which `loop_control` parameter can insert a delay between iterations of a loop
+    in Ansible?
+  id: totrans-203
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 哪个`loop_control`参数可以在Ansible的循环迭代之间插入延迟？
+- en: a) `pause`
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: a) `pause`
+- en: b) `sleep`
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: b) `sleep`
+- en: c) `delay`
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: c) `delay`
+- en: d) `wait_for`
+  id: totrans-207
+  prefs: []
+  type: TYPE_NORMAL
+  zh: d) `wait_for`
+- en: Which task conditional could you use to ensure you only run a task on the first
+    four hosts in an inventory?
+  id: totrans-208
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 你可以使用哪个任务条件来确保只在清单中的前四个主机上运行任务？
+- en: 'a) `when: inventory_hostname in play_hosts[0:3]`'
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'a) `when: inventory_hostname in play_hosts[0:3]`'
+- en: 'b) `when: inventory_hostname in play_hosts[1:4]`'
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'b) `when: inventory_hostname in play_hosts[1:4]`'
+- en: 'c) `when: inventory_hostname[0:3]`'
+  id: totrans-211
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'c) `when: inventory_hostname[0:3]`'
+- en: 'd) `when: play_hosts[0:3]`'
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 'd) `when: play_hosts[0:3]`'

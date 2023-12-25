@@ -1,0 +1,1580 @@
+- en: The Artisan Gateway Service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In order to implement the end user and Gateway-daemon communications, we need
+    to examine and make some decisions on several operational aspects of the daemon –
+    how it's going to work, how data gets sent and received, and how that data is
+    acted upon. In this chapter, we'll examine that in detail, and write code to implement
+    processes based on those decisions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The chapter covers the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Defining what the data structure (messages) being sent back and forth looks
+    like, and what it needs to provide, including a signed-message implementation
+    that should work no matter what mechanism is used to send the data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Examining two fundamental options for sending and receiving data: message queues
+    and web services'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How messages will be handled, independently of the transmission mechanism
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The basic structures needed to implement a message-queue-based transmission
+    mechanism
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What variations would be encountered (and how to deal with them) in a web-service-based
+    approach
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What the traffic to and from the Artisan Gateway will look like
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A minimal integration of those traffic patterns into existing data objects'
+    current processes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overview and goal
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the context of the `hms_sys` system, the Artisan Gateway has been only loosely
+    defined thus far – it''s been described as acting as a central contact point for
+    communication between Artisans and the Central Office, especially with respect
+    to the `Product` and `Order` objects – what its role is, in effect. The specifics
+    of how it works, and when, haven''t really been touched upon, though at least
+    some of the latter are probably very obvious, following a simple rule that might
+    be stated as changes made (by whomever) need to propagate to all relevant parties
+    as soon as is feasible. Those changes are largely dependent on who is making them.
+    At a minimum, the following processes feel likely:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Artisans can create new `Product` data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Artisans can update current `Product` data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Artisans can delete a `Product` outright
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Central Office staff can mark a `Product` as available – which is just a specialized
+    variant of a `Product` update process
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Central Office staff can also make content changes to Products – also an update
+    variant – with some constraints on what can be altered
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Customer end users can indirectly create `Order` objects, which need to propagate
+    out to Artisans in some fashion
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Artisans can update Orders as part of the process of fulfilling them
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All of these processes are variants of CRUD operations on the `Product` and/or
+    `Order` objects, and will probably not need much more functionality than is already
+    provided by the `_create` or `_update` methods of the related classes within each
+    subsystem. They should cover most, perhaps all, of how the data changes are actually
+    stored.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The transmission of those data changes, no matter what the timing or protocol
+    ends up looking like, has some common factors as well, with a process that will
+    need to handle the role-specific variations of the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A data change (create, update, or delete) is made locally, in one of the user-level
+    applications
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The data change is validated, to assure that the data is well formed and conforms
+    to data-structure requirements
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The data change is stored locally (if applicable)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The data change is serialized and transmitted to the Artisan Gateway service,
+    where whatever actions need to be undertaken are executed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These steps do not address the possibility of conflicting changes, such as an
+    Artisan and someone in the Central Office making different changes to the same
+    data in the same data-change timeframe. A strategy for dealing with that possibility
+    may not even be necessary, depending on the specific data-change business rules
+    in play, but will have to be examined as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: That leaves only the decision about the transmission method itself to be made.
+    Since the individual users that will be making changes to data are not expected
+    to be in the same physical location, we need a network-transmission protocol of
+    some sort – a web service or message-queue-based process, as discussed in [Chapter
+    15](26ce9de7-eb44-4e33-afa2-fccb17e75aa8.xhtml), *Anatomy of a Service*. A web
+    service, if it were written from scratch, would probably be a significantly larger
+    undertaking, potentially requiring code to handle authentication, authorization,
+    and processes for handling specific HTTP methods and tying them to specific CRUD
+    operations against individual data object types. There's enough complexity between
+    those alone to warrant looking at an existing service-capable framework, such
+    as Flask or Django, rather than writing (and having to test) all of the relevant
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Given that the system only needs to be concerned with the seven actions identified
+    earlier (Artisan: create, update, or delete Products, and so on), it feels simpler
+    to write those seven functions, and allow messages in a queue-based protocol to
+    simply call them when necessary. The potential concerns around authentication
+    and authorization can be mitigated significantly by assigning each Artisan its
+    own distinct queue, and perhaps signing each message originating with an Artisan.
+    Between those two approaches, an Artisan''s identity can be determined simply
+    by the fact that a message is coming in from a given queue that''s associated
+    with them. Coupling that with a signature on each message, as long as it can be
+    generated by the Artisan''s application and verified by the Artisan Gateway service
+    without transmitting any secret data with the message, provides a reasonably robust
+    authentication mechanism. Authorization concerns in this context are nearly trivial –
+    any given channel, given that it can be associated with a user type, or even a
+    specific user, can simply be allowed access to (and thus execution of) the operations
+    that are relevant to that user or type only.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At a high level, the data flows for Artisan/Product operations, no matter which
+    transmission mechanism is selected, would look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/34162167-3cac-4fc6-8676-1552cfd5f1bf.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Where:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The various messages (**Create Product**, **Update Product**, and **Delete Product**)
+    with their respective **{payload}** data (or a **{product_id}** for deletion operations)
+    are created by the local **Artisan Application**, transmitted to the **Artisan
+    Gateway** service
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Those messages are read, validated, and used to determine which service method
+    (`artisan_create_product`, and so on) should be called
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The relevant method deals with whatever data storage is needed in the **Artisan
+    Gateway Datastore** during execution
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Similar data flows would exist for all of the operations that Central Office
+    users could execute against `Product` objects, and for `Artisan` and `Order` object
+    interactions, at a minimum. In addition, there may well be related operations
+    that need to be made available for more specific data-object operations in more
+    specific Central Office roles. The Central Office staff will need to be able to
+    manage `Artisan` objects, at a minimum, and maybe `Order` objects as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iteration stories
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Although there are at least *some* aspects of many of these stories that rely
+    on some UI implementation that hasn''t been examined yet, there are non-UI functional
+    aspects to each of them that can be usefully examined and worked. With that in
+    mind, the stories relevant for this iteration, at least initially, are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to send data changes to the Artisan Gateway
+    so that those changes can be propagated and acted upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Central Office user, I need to be able to send data changes to the Artisan
+    Gateway so that those changes can be propagated and acted upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan Manager, I need to be able to create `Artisan` objects so that
+    I can manage Artisans
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan Manager, I need to be able to delete `Artisan` objects so that
+    I can manage Artisans
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan Manager, I need to be able to update `Artisan` objects so that
+    I can manage Artisans
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to create `Product` objects so that I can manage
+    my Product offerings
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to delete `Product` objects so that I can manage
+    my Product offerings
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to update `Order` objects so that I can indicate
+    to the Central Office when my part of an Order is fulfilled
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to update `Product` objects so that I can manage
+    my Product offerings
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to update my own `Artisan` object so that I
+    can manage my information at HMS Central Office
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Product Manager, I need to be able to activate `Product` objects so that
+    I can manage Product availability
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Product Manager, I need to be able to deactivate `Product` objects so that
+    I can manage Product availability
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Product Manager, I need to be able to update `Product` objects so that
+    I can manage Product information that an Artisan can't
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As any user sending messages across, to, or from the Artisan Gateway service,
+    I need those messages to be signed so that they can be validated before being
+    acted upon
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'With the exception of the last item, these have been grouped more or less in
+    the order that they would need to be executed in a real use case: Central Office
+    users (acting as Artisan Managers) would need to create objects representing Artisans
+    before those Artisans could be expected to do anything, and Artisans have to be
+    able to create `Product` objects before Central Office users (acting as Product
+    Managers) could be expected to do anything with those objects.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Messages
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before taking a serious look at the transmission-mechanism options, it would
+    be beneficial to have a solid definition of what, exactly, constitutes a message
+    being transmitted. At a minimum, given what the data flows coming into the Artisan
+    Gateway service look like, and with some idea of what the actual data for a typical
+    data object being transmitted entails, it''s apparent that a message needs to
+    be able to handle structured data. Internally, that''s probably best represented
+    by a `dict`, if only because they are easy to serialize and un-serialize into
+    at least two different formats that are easily transmissible: JSON and YAML. We''ve
+    already established data dictionary structures for the objects whose state data
+    can be stored. A `Product`, for example, from an Artisan''s perspective, whose
+    data dictionary has been rendered into JSON looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: This provides all of the data needed for any create or update operation of a
+    `Product` initiated by an Artisan, but doesn't specify what operation needs to
+    be performed with the data. It also doesn't have any signature data associated
+    with it, which we'll want to provide to complete the last of the iteration stories
+    noted earlier. Both of those items, operation and signature, need to be added
+    to the message, but not to the message data, so that creating an instance of the
+    `Product` object on the receiving end doesn't have to deal with removing non-product
+    data from the incoming data structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the context of a message, they are both metadata: data about the data, in
+    this case describing what is to be done with the real data, and what signature
+    should be used to verify the integrity of the message. A more complete message,
+    intended to update an existing product (providing a description and summary, and
+    making the item available) would look something like this (assuming that all product-data
+    is transmitted during an update operation):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'That data structure as an output goal gives us enough information to implement
+    a `DaemonMessage` class to represent any message going to or coming from the Artisan
+    Gateway service. `DaemonMessage` is a concrete class, and lives in the `hms_core.daemons`
+    module. It starts with a typical class declaration, and has a class constant defined
+    that will be used later for encoding string values into byte values, in both instance
+    and class methods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Most of the properties of `DaemonMessage` follow the standard getter, setter,
+    and deleter method/property-declaration pattern we''ve been using so far. One
+    of them, the `signature` property, needs to return a calculated value every time
+    it''s called, and simply has a getter method definition – `_get_signature`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `_get_signature` method has several noteworthy aspects in its implementation.
+    First, since a signature should only be available if there is data to sign, and
+    a signing key value to sign the data with, it actively checks for those values,
+    raising `RuntimeError` if either is not set. Secondly, its return value has to
+    ensure that hashes of the data structure will always be the same for the same
+    data structure. Python's `dict` data structures do not guarantee the same sequence
+    of keys across multiple `dict` values, even if the same keys exist across them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since the hashing mechanism requires a `bytes` value, and rendering a `dict`
+    into `bytes` (using a `str()` conversion as an intermediate translation mechanism)
+    will not always return the same `bytes` sequence to be hashed, some mechanism
+    for ensuring the instance's `data dict` is always rendered into a consistent `str`/`bytes` sequence
+    is needed. Since the value going into the hashing process for generating the signature
+    could start as a string, and since `json.dumps` provides a mechanism for recursively
+    sorting the output's keys, that was a quick and simple solution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The selection of `json.dumps` was made based on simplicity and convenience.
+    It might be better in the long run to create an `OrderedDict` instance (from the
+    `collections` module), add each element, in order, to the new instance, then hash
+    the string value of that instead. If nothing else, that would alleviate any potential
+    concerns with data structures to be hashed containing values that cannot be serialized
+    into JSON. Another option would be to hash a YAML value instead, since it deals
+    with data types that aren't directly serialize-able in a cleaner fashion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The property setter and deleter methods are typical-enough implementations that
+    they don't warrant much in the way of explanation, though the setter method corresponding
+    to the operation property (`_set_operation`) checks the incoming value against
+    a limited set of options.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One significant deviation from the typical properties pattern we''ve used so
+    far is that `DaemonMessage` exposes most of its properties as settable and deletable.
+    The rationale behind that decision is that it seems likely that the `data`, `operation`,
+    and `signing_key` values of a message may not all be known when the message first
+    needs to be created, or they may even need to be altered before the message is
+    being sent by some other process. Allowing them to be set or deleted on the fly
+    alleviates any such concerns in later implementations that use instances of `DaemonMessage`.
+    In combination with the on-the-fly, calculated-value implementation of signature
+    (and its checking for required property-values before returning), this allows
+    as much flexibility as we should need later, while still preserving the type-
+    and value-checking of those properties:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Accordingly, the initialization of a `DaemonMessage` doesn''t require any of
+    those properties to be supplied to construct an instance, but it allows all of
+    them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since the purpose of the `DaemonMessage` class is to provide a simple, consistent
+    way to generate messages serialized into JSON, and that requires a `dict` value
+    to serialize from, we provide methods to do both:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Similarly, we''ll need a way to unserialize messages from JSON, with an intermediate
+    from dictionary method. These are implemented as class methods, allowing a message
+    instance to be created and validated with a signing key. The critical aspects
+    of that functionality all reside in the `from_message_dict` class method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Typical type- and value-checking is performed against the incoming arguments
+    first:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A new `DaemonMessage` instance is created from the data and operation values
+    of the incoming `message_dict`, and from the `signing_key` argument after ensuring
+    that all data is present and well formed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once the new `DaemonMessage` instance exists, provided that its data has the
+    same keys and values, and that the local `signing_key` used to generate the signature
+    is the same as the `signing_key` that was used to create the original message
+    before it was transmitted, the signature values of both messages should be identical.
+    If they aren''t, then there is something suspect with the message. There are not
+    many possible causes for a signature failure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `data` in the message has gotten corrupted/altered in some fashion
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The local and remote `signing_key` values are different
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In either case, no action should be taken – either the data itself is suspect,
+    or the authenticity of the message cannot be verified. In any signature-failure
+    condition, we raise a custom error, `InvalidMessageError`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The conversion from a JSON-serialized message to a `DaemonMessage` instance
+    simply decodes the incoming JSON, then feeds the resultant `dict` data structure
+    into `from_message_dict`, returning the resultant object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Serializing messages to and from JSON doesn't impact our options for how the
+    Artisan Gateway service actually transmits those messages. Both of the options
+    mentioned, web service and message queue approaches, can handle JSON message formats –
+    so this message strategy is *very* portable in that respect.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The signing process of `DaemonMessage` relies heavily on the idea of creating
+    and managing signing keys for messages – messages cannot be sent or read without
+    them – and there are some significant considerations that should be discussed
+    before moving on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like any cryptographic process, hash-based signatures rely on a secret value
+    (`signing_key`, in this case) that has to be created and secured. With respect
+    to creating a `signing_key`, there are several factors to bear in mind, but the
+    two most significant areas follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The longer the value is, the harder it will be to crack
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The more varied the characters in it are, the harder it will be to crack
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The math underlying these is fairly straightforward: it takes less time to
+    iterate over 10 values than it does over 100, so the more variations that are
+    possible in a secret value of any kind, the longer it will take to iterate over
+    them all. The number of possible values can be expressed mathematically as (the
+    number of values per character)^((the number of characters in the string)), so
+    a 128-character `signature_key`, with 255 possible characters would entail 255^(128)
+    possible values, or about 1.09 × 10^(308) combinations that would have to be checked
+    to guarantee the calculation of a `signature_key` of that size and scope. At one
+    billion such calculations per second, or about 3.15 × 10^(16) calculations per
+    year, it''s still technically/mathematically possible to crack such a `signing_key`,
+    but assuming that the hashing algorithm doesn''t have any significant flaws that
+    can be exploited, it''s impractical, at best.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The creation of a `signature_key` of whatever length is desired is fairly straightforward.
+    Python''s `os` module provides a function, `urandom`, that returns a character
+    sequence (as a `bytes` object) suitable for cryptographic use, and of whatever
+    length is desired, so generation of even a very long key is as simple as calling
+    the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The results can be converted to a hexadecimal string value for storage, if
+    needed, and converted back from that hexadecimal string with `bytes.fromhex()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Securing secret values is usually concerned with some combination of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Assuring that they are encrypted at rest, so that even if the data store that
+    secrets reside in is compromised, the secrets themselves cannot be easily used
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Assuring that they are encrypted in motion, to prevent man-in-the-middle exploits
+    from being able to access easily usable keys
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changing (rotating) them on a reasonably frequent basis, to reduce the likelihood
+    that a captured secret can be compromised before it's no longer useful
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The creation and management of `signing_key` values for Artisans (and perhaps
+    for Central Office-to-Artisan communications as well), and the possibility of
+    implementing some sort of key-rotation process will be examined in more detail
+    in [Chapter 17](b21d33e8-90c4-4a67-af0e-9fc0211d8e3a.xhtml), *Handling Service
+    Transactions*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ensuring that they are encrypted in motion could be a significant factor in
+    deciding how messages will be transmitted, though. In-flight encryption will require
+    the creation of an encryption certificate for either a web-service or locally
+    hosted message-queue implementation. A message-queue approach may allow a private
+    certificate to be used, while a web service might require a certificate from a
+    public Certificate Authority.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encryption in motion should always be implemented when transmitting any secret
+    information, and a `signing_key` definitely falls into that category!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encryption at rest feels like it might be overkill for a system of this scope,
+    though it could be implemented in code with libraries such as PyCrypto, and/or
+    by configuring the MongoDB engine to use its Encrypted Storage Engine (available
+    in MongoDB Enterprise). It would also add more complexity to the system than seems
+    warranted at this point, including (again) key-creation and management.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deciding on a message-transmission mechanism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With the structure of the messages being passed now resolved, it''s a good
+    time to take a deeper look at the options for how those messages could be transmitted.
+    Ultimately, a decision needs to be made regarding how to implement a process to
+    deal with the stories:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to send Product and Order data changes to the
+    Artisan Gateway so that those changes can be propagated and acted upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Central Office user, I need to be able to send Artisan and Product data
+    changes to the Artisan Gateway so that those changes can be propagated and acted
+    upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Of the two options discussed earlier (web service or message-queue-based implementations),
+    using message queues feels like a better fit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Given the limited number of operations expected, a queue-based approach would
+    involve less development effort, and probably less complexity than a web-service
+    implementation:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There's no need to handle any of the protocol-level details (HTTP methods, variations
+    of data-payload structures, and so on) that would have to be dealt with in implementing
+    a web service
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There's no need to write a full-blown HTTP server (either from the ground up,
+    or using one of the server classes provided by the `http.server` package), or
+    to integrate functionality/code with any of several web-framework options (Flask,
+    or the Django REST Framework, for example)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Messages can be sent and will simply wait in their queues until they are retrieved
+    and acted upon, so:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All end users can continue to use their applications without interruption so
+    long as the queue server is accessible
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Artisan Gateway itself could be taken down (for maintenance, updating, or
+    even to be moved to a different server) at any point
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There are some caveats/trade-offs to this approach, though:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Messages that contain conflicting data changes, though they will still be retrieved
+    and processed, could require additional manual attention to reconcile those changes.
+    The same thing could happen in a web-service context, but it's at least somewhat
+    more likely with message queues.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Message-retrieval, as an active process over a network, could take somewhat
+    longer than simply reading an incoming request made directly to the Artisan Gateway.
+    As a result, service throughput may be impacted, but even if a complete message-operation
+    cycle took 10 seconds, that would allow for 360 operations per hour (over 8,600
+    operations per day, or 3,1000,000 over the course of a year), assuming they were
+    not performed in parallel.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the message-queue provider goes down, preventing messages from being delivered
+    in the first place, that could interrupt end user application usage.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Allocation of message queues will have to be given some consideration:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If each Artisan has their own queues, into and out of the Artisan Gateway, at
+    least some data about those queues has to be stored and managed, and each Artisan-to-Gateway
+    queue will have to be checked individually
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If all Artisans share one inbound queue to the Artisan Gateway, identification
+    of which Artisan a given message originated with will have to be implemented for
+    each operation
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Since there is no implicit response requirement in the message protocol to indicate
+    that it has been acted upon (or couldn't be because of an error), any response
+    to a message that needs to be sent to a user will have to be actively/independently
+    sent.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an Artisan, I need a message queue created for and assigned to me so that
+    I can send my data changes to the Artisan Gateway.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Message-queue implementation with RabbitMQ
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `hms_sys` projects will use RabbitMQ as its message-queue provider. RabbitMQ
+    is actively maintained, and is a zero-cost solution, with paid support and consultation
+    options, making it a good low-budget choice. Additionally, there is a ready-to-roll
+    Python library, `pika` (installed with `pip install pika`) that provides all the
+    critical functionality needed to send and receive messages from a RabbitMQ server,
+    without having to get too far into the weeds implementing a solution from scratch.
+    The makers of RabbitMQ, Pivotal Software, also offer a commercial version that
+    includes additional management features along with support agreements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are other options available for message-queue implementations, including
+    cloud-based solutions from Amazon (SQS), Microsoft (Azure Service Bus), and Google
+    (Cloud Pub/Sub), all of which have corresponding Python libraries available for
+    use. Locally installable options include Apache Kafka and ActiveMQ, and Kestrel.
+    There is also a general-purpose AMQP library available (`amqp`) that should allow
+    connection to and interaction with any message queue service that uses at least
+    a basic AMQP protocol.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Sending a message to a RabbitMQ instance with `pika` is fairly straightforward.
+    Here''s a simple example, using the `DaemonMessage` class to generate and sign
+    messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since we''re transmitting a `DaemonMessage`, we need to generate a signing
+    key and message data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we create the message:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we establish a connection to the RabbitMQ server:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then the message is sent, and the connection is closed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Executing this script doesn''t generate any output, but verification that the
+    message has been sent can be performed with the `rabbitmqctl` command-line tool:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/c817168b-6d30-4c6e-ae3e-b6afc0782782.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Running the script a second time, and then the `rabbitmqctl list_queues` tool,
+    shows another message ready and waiting in the queue:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/1cea8516-8d32-4bfe-bf16-3e6b40d4d652.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'RabbitMQ requires the provision of a channel (or perhaps queue name is as good
+    a description) that provides organizational grouping for messages on the server,
+    and that we''ll consider using to segregate messages by specific Artisans later
+    on. Consider the following queue-name declarations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, the preceding queue-name declarations are changed to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When we review the queues and message counts with `rabbitmqctl list_queues`,
+    we see that a new queue (`queue_name`) has appeared, with one message in it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/0c45be17-bafa-44ee-904b-0353ab8c6c29.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Reading messages from a queue is a bit more complex, but not significantly
+    so. An example script to read the messages sent to our queue by the previous runs
+    of the `rabbitmq-sender.py` script starts much the same way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We need to use the same signing-key value, otherwise the messages being retrieved
+    won''t be allowed to be read:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Message-handling is dealt with by providing a callback function that accepts
+    all of the message properties that are returned by the process of fetching a message
+    from the queue:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It''s important that we wrap functionality for message-handling in a `try` ... `except`
+    block, so that if something does go awry during the message-handling process,
+    it doesn''t kill the main message-polling loop that we''ll set up later. In this
+    case, at least one error could be raised: the `InvalidMessageError` error we defined
+    earlier—it gets thrown if a `DaemonMessage` cannot be created because of an invalid
+    signature:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The processes for creating a connection, and associating a channel or queue
+    name to it, are the same:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In this case, though, we''re consuming messages, rather than sending them,
+    so we need to set that up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we can start listening for messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On execution, this script sets up its own event loop, listening for messages
+    on the queue/channel specified. This is approximately equivalent to the event
+    loop that `BaseDaemon.main` requires of derived daemon classes, though an actual
+    daemon implementation might not use it. As soon as this script is run, it reads
+    and outputs the content of the two messages sent earlier by the first script:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/aee59828-f4b3-49d9-a3b2-341dd020bd5c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: This also allows us to verify that the signatures of the two messages, with
+    identical content and using the same signing key, are identical. This is expected
+    behavior, given that message data and the signing key input did not change between
+    sending the two messages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Imagine we change the signing key:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then rerun the same script; we get different results from our message listener:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/018a6a4a-3292-475b-8a5a-c12c3829351f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: This serves as additional verification that the message-signing process will
+    work as expected: Not allowing messages with invalid signatures to be created,
+    and thus not being acted upon.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That message-handling functionality, with one minor change, can serve as the
+    basis for the `main` loop of the main class for the Artisan Gateway:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We still need a message-handling function, but now it''s defined as a method
+    of the service class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `main` loop of the `ArtisanGatewayDaemon` class can start as a simple re-casting
+    of the original functionality from the receiver script:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Initially, just to establish that the functionality needed is viable, we''ll
+    use the same `signing_key`, `connection`, and `channel` values established earlier.
+    Eventually, these will depend on configuration values – specifying the signing
+    key, or at least where or how to get it – and depending on whether the final implementation
+    goes down the path of having individual Artisan queues, there might be several
+    queue-names/channels, or just the one. For now, having just the one that was used
+    in the earlier script allows us to establish basic queue-reading functionality:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: The base structure of the loop that `main` executes is similar to the structure
+    of the main loop from the `testdaemon` of [Chapter 15](26ce9de7-eb44-4e33-afa2-fccb17e75aa8.xhtml), *Anatomy
+    of a Service* – so long as the class' internal `_running` flag is `True`, the
+    loop continues, performing the queue check and processing incoming messages. Once
+    the loop is terminated, whether by the `stop` method of the class or by one of
+    the signals that was registered during the execution of `BaseDaemon.__init__`
+    by `ArtisanGatewayDaemon.__init__`, control exits and the `cleanup` method of
+    the class is called before it terminates completely.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The primary difference, as should be expected, is what actually happens during
+    each iteration through the loop. In this case, the `channel` is polled for the
+    next available message, and if one is detected, it''s read, converted to a `DaemonMessage`,
+    acknowledged, and handed off to the message-handler method defined earlier. It
+    requires the same sort of `connection` and `channel`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once those are established, the `main` loop is very straightforward:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In order to test this, a quick, basic configuration file was assembled, mostly
+    for logging information, and an instance of the new class was created with that
+    configuration and started. The log output from startup to shutdown, including
+    sending a good message, a bad message, then another good message, shows that everything
+    operates as expected:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/47cc5788-d105-4bb8-94a2-f2549d060e10.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The quick, basic configuration for this daemon instance is very simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The queue parameters should reside in the configuration file as well, and be
+    acquired by the daemon instance. The additional configuration values end up looking
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The process for loading those values involves the addition of some instance
+    properties that mostly follow the normal pattern in use thus far:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`connection_params`: A dict value whose values are retrieved from the connection
+    section of the config file that is used to create the RabbitMQ connection'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`queue_name`: A string, it is the queue-name/channel that the instance will
+    listen to'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`signing_key`: A `bytes` or `str` value, it is the signing key that the instance
+    will use to create `DaemonMessage` instances sent on or received from its queue'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Actually getting and storing those values involves nothing more than adding
+    to the `_on_configuration_loaded` method of the class. Originally, all it did
+    was call the same method of the `BaseDaemon` parent class in order to set up logging
+    capabilities, and that remains the same:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Queue-specific items are retrieved next. Although there''s no expectation at
+    this point that other queue systems will be needed, we can''t rule out that possibility
+    in the future, so the code starts with the assumption that we''ll want to allow
+    for that in the future:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The signing key is also in the configuration file, so acquiring and storing
+    it comes next:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: At least for the time being, that takes care of all of the configuration needed
+    to remove the hardcoded values that were in use in main, while keeping the class
+    functional. Execution of a variant of the original message-sending script (in
+    `scratch-space/rabbitmq-sender-daemon-queue.py` of the chapter code) showed that
+    the daemon still functioned as expected with these changes – listening for and
+    acting upon valid messages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handling messages
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In order to actually do something with the data of a message, we''ll need to
+    define what a well-formed command message actually looks like, implement methods
+    to execute the commands that are allowed, and implement functionality that knows
+    how to call those methods, given a well-formed and verified message to do so.
+    The first item from that list is quite simple, but could have a lot of different
+    valid implementation patterns. Consider that, at this point, we''re allowed to
+    transmit four different operation actions by `DaemonMessage`: `''create''`, `''update''`,
+    `''delete''`, and `''response''`. These operation actions correspond directly
+    to standard CRUD operations, except for the `''response''` value, though even
+    that is, perhaps, roughly equivalent to a `read` operation. For any given data
+    object type, those operations would, respectively, need to execute the same processes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Create a new instance of the relevant class, populated with state data from
+    the message, using the `from_data_dict` class method (or a new equivalent class
+    method, perhaps), and `save` the new instance
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Retrieve an existing instance of the relevant class, using the `get` class method,
+    update any of that instance's state data with new values from the message (which
+    would probably benefit from having a new method created, perhaps `update_from_message`),
+    and `save` the instance
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Find and delete the instance specified by the message data with the `delete`
+    class method
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Retrieve and return the data dict representation of the instance specified by
+    the message data, using the `get` class method to perform the retrieval, and the
+    `to_data_dict` method of the found instance to generate the data structure of
+    the message
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'The daemon, then, needs to have as many as 16 `{action}_{object}` methods,
+    one for each action/object combination, just to ensure that all of the combinations
+    are accounted for. For each object type (Artisans, Customers, Orders, and Products),
+    the set of methods would look something like this (the method names are self-explanatory):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`create_artisan`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`update_artisan`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`delete_artisan`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`response_artisan`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The one critical piece of data that isn''t yet accounted for, and is needed
+    to determine which of those methods to execute on receipt of a command message,
+    is the object type. The `DaemonMessage` class doesn''t have a specific property
+    for object types, because the initial thought was that doing so could needlessly
+    limit future uses of it to messages that have both an `operation` and an object
+    type. Revising `DaemonMessage` to allow an object-type specification wouldn''t
+    be difficult. It would involve little more than adding an optional property, allowing
+    another optional argument in the `__init__` method, and any other methods that
+    call it, and accounting for it in the dictionary output methods. Going to those
+    lengths, though, seems unnecessary: the messages themselves, as structured data,
+    can just as easily contain the necessary data. As an example, consider a "create
+    Artisan" message that looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If any command message has an operation and indicates in its data an object
+    type (the `target` value) with the properties to be used in the operation as a
+    standard structure, that would work just as well. Similar data structures will
+    also work for update operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For delete operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As well as for response operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Determining which method to call based on the message''s operation and `data.target`
+    values is simply a long chain of `if…elif…else` decisions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since we''ll need the target (for decision-making later) and the properties
+    (to pass as arguments to the method), get those first:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each combination of `operation` and `target` looks very much like the others.
+    Starting with `create` operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the target is one of the known, allowed types, then we can just call the
+    appropriate method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the `target` is not known, we want to throw an error:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The other operations work much the same way – `update` operations, for example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `delete` and `response` operations are similar enough that there''s little
+    point in reproducing them here, but they are present in the code. Finally, we
+    also capture cases where the operation isn''t recognized, and raise an error in
+    those cases as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The actual operation methods are, as a result of the data object design/structure
+    and the structure of the incoming messages, relatively simple. Creation of an
+    `Artisan`, for example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Update of an `Artisan`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Deletion of an `Artisan`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`Artisan` response:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: Queues and related Artisan properties
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Since Artisans will communicate with the Gateway over specific queues, and those
+    queues have to be identified and consistently associated with their respective
+    Artisans, we'll need to have mechanisms in the various code bases to store queue
+    identifiers, and to associate them with their Artisan owners.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The queue specifications themselves can be implemented simply by adding a property
+    (`queue_id`) to the `Artisan` objects'' classes. Since the Artisan objects at
+    both the Gateway service and Artisan application will make use of `queue_id`,
+    it makes sense to implement that in the `hms_core.business_objects.BaseArtisan`
+    class, where it will be inherited everywhere it''s needed. The property getter
+    and deleter methods are typical implementations, as is the `property` declaration,
+    though it follows a read-only property pattern. The setter method is pretty typical
+    also:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Artisans will also need to keep track of a signing key property that is unique
+    to each Artisan, but exists in both the local `Artisan` objects at the Artisan
+    Application side of the message-transmission process and at the Artisan Gateway
+    side. Signing keys, as `bytes` values, may not be easily stored in their native
+    value types, though: `bytes` values are not natively JSON-serializable, which
+    is problematic for the local Artisan data storage already implemented, and could
+    be problematic for the MongoDB storage in use elsewhere.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Fortunately, the `bytes` type provides instance and class methods to serialize
+    and unserialize values to and from hexadecimal string values. Serializing a byte''s
+    value is as simple as calling the `hex()` method of the value, and creating a
+    bytes value from a hex string is accomplished by calling `bytes.fromhex(hex_string)`.
+    A simple example of a complete serialization/unserialization of a bytes value
+    using `hex()`/`fromhex()` shows that the value is preserved as needed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The output of this code will look like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/6e5794ea-6adf-401d-91a9-7782d7c5fd24.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The corresponding property of the Artisan classes (`signing_key`) follows the
+    typical read-only property structure too, and apart from its setter method, is
+    nothing unusual. The setter method has to allow both raw `bytes` values and hex
+    string representations of `bytes` values, and *stores* a `bytes` value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE58]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If it''s passed a string, it tries to convert that using `bytes.fromhex()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE59]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It also enforces a minimum length of the signing key, arbitrarily set to `64`
+    bytes (512 bits):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE60]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The corresponding final `Artisan` objects have to account for these new properties
+    in their `to_data_dict` methods and `__init__` methods. The `to_data_dict` changes
+    look the same – using `hms_core.co_objects.Artisan` as an example, and showing
+    the new properties added to the end of the dict result returned, they end up looking
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE61]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The changes to the `__init__` methods vary somewhat: since the new `queue_id`
+    and `signing_key` properties are assigned as `BaseArtisan.__init__` executes,
+    that method has to actually call the deleter and setter methods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE62]'
+  prefs: []
+  type: TYPE_PRE
+- en: Since `queue_id` and `signing_key` are technically required properties, if time
+    allowed, moving them into the required-arguments portion of the `__init__` signature,
+    between `address` and `company_name`, would be the right thing to do. In this
+    case, it's more a matter of space constraints than time, so they're being added
+    into the signature at an easy location to deal with instead, rather than having
+    to review, modify, and reshow all of the various `BaseArtisan.__init__` calls
+    that already exist in the code. They'll still work as required properties, though,
+    since the setter methods won't accept the default `None` values, and they're being
+    called without the sort of checking that `company_name` and `website` use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `__init__` methods of `co_objects.Artisan` and `artisan_objects.Artisan`
+    only have to be updated to include the new arguments in their signatures and pass
+    those along to their `BaseArtisan.__init__` calls. The revisions to `co_objects.Artisan.__init__`
+    look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE63]'
+  prefs: []
+  type: TYPE_PRE
+- en: Requirements for a web-service-based daemon
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: If we were to pursue a web-service-based implementation for the Artisan Gateway
+    instead, there are several common factors, and a few hurdles that would have to
+    be overcome. Arguably the most significant hurdle would be in implementing the
+    full set of `HTTP` methods – `POST`, `GET`, `PUT`, and `DELETE` – the official
+    and standards-compliant methods that correspond to the `Create`, `Read`, `Update`,
+    and `Delete` CRUD operations we're expecting to use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If the medium that commands are transmitted in is to remain the serialized
+    and signature-bearing message output of the `DaemonMessage` class, we''d need
+    to be able to pass a complete, signed message in at least two different ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a query string format for the `GET` and `DELETE` operations: GET isn''t
+    intended to support the same sort of payload capabilities that `POST` and `PUT`
+    methods allow, and though there doesn''t seem to be any official stance as to
+    whether `DELETE` should or should not support it, it''s probably safest to assume
+    that it won''t, and write code accordingly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In as many as two different payload formats for POST and PUT operations. Thus
+    far, we haven''t addressed any of the Product data in any detail; even if there
+    is no requirement to support the transmission of product images, it''s just a
+    matter of time until one would surface. The `HTTP POST` and `PUT` operations allow
+    a payload to be sent in the request body, and allow that payload to be sent in
+    two different formats (encodings) in a standard web form request context:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a key-value string list that looks very much like the equivalent in a `GET`
+    request
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a more detailed encoding, where each field in the request has the same name
+    and data as the key-value list, but also allows fields to specify that they contain
+    specific data types – Files, for example, with other data, such as the filename
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The latter encoding is seen in web pages that allow file uploads as an `enctype="multipart/form-data"`
+    attribute in the relevant `<form>` tag. Submitting such a form, with two files
+    included in the payload, will generate an `HTTP` request that might look something
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](assets/0cb06097-c8d9-4427-a023-f4fdc885b6b5.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'In this example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`{field-separator}` is a random string that uniquely identifies the beginning
+    of each field''s dataset'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{content-length}` is the total size of the payload'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{field-name}` is the name of the field whose data is wrapped in the section'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{field-value}` is text data from a field that is not a file-upload field'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{file-name}` is the name of the file being uploaded, as it existed on the
+    client machine'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{MIME-type}` is an indicator of the type of file being transmitted, for example
+    `image/png`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`{file-data}` is the data of the file corresponding to the field'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In order to support a payload with just these three chunks of data, we'd have
+    to find or create code that can reliably parse out each data section and handle
+    each data chunk that gets spat back out. While there is at least one such library,
+    `requests-toolbelt`, there are known issues with it in certain core Python versions
+    (3.3.0 and 3.3.1), so it may or may not be a viable option depending on what Python
+    version is in play. Writing (and testing) code from scratch to deal with `multipart/form-data`
+    payloads would be a time-consuming process at best.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Assuming that all of that is dealt with, although it's not difficult to write
+    network listeners that would be able to capture and handle an incoming request,
+    that too could involve a fair chunk of time, particularly on the testing side
+    of things, just to be able to reliably (and provably) handle incoming requests.
+    In a web service scenario, it would almost certainly be a better option to start
+    with one of the well-established web application packages that already deals with
+    all of those needs and requirements, and write code that simply maps incoming
+    requests to the handler methods, in much the same way that the message-queue implementation
+    does. On the plus side, the signed messages should be usable in that context,
+    and the underlying operation methods would likely not have to be modified to any
+    significant degree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traffic to and from the service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The message-receiving aspect of the communication chain by the service is already
+    in place, in the `main` method of `ArtisanGateway`, but no message-sending functionality
+    has been implemented yet, apart from the bits and pieces focused around message
+    generation. Each data object type, when modified, created, or deleted, is going
+    to need to send a relevant command message to its counterpart subsystem. For example,
+    if an Artisan creates a new Product, the act of creating that `Product` object
+    needs to send a "create product" message to the Gateway service. Likewise, if
+    a change is made to a Product by Central Office staff, the Gateway service needs
+    to send an "update product" message to the appropriate Artisan Application instance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the Artisan Application side of those scenarios, all of the queue parameters
+    needed to send any message are going to be constant. They will always send messages
+    to the same queue server, on the same port, using the same connection and channel.
+    Rather than requiring all of the message-queue settings to be passed to all of
+    the various data objects during initialization, which could complicate them significantly,
+    and make the code difficult to deal with if a different message-transport mechanism
+    were needed later on, we can create another class that contains all of those and
+    provides a method for sending arbitrary messages to the queue server: `RabbitMQSender`.
+    In the process of defining that class, we can also leverage certain aspects of
+    Python class/instance relationships to make the creation of sender instances considerably
+    easier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An instance of a Python class that has defined class attributes also has instance
+    attributes with the same name and value. That is, if `RabbitMQSender` has a class
+    attribute named `_host`, with a value of localhost, all instances of `RabbitMQSender`
+    will, when created, have a `_host` attribute with the same localhost value.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changing an instance attribute's value will have no effect on the class attribute's
+    value.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changing a class attribute's value will also change the corresponding instance
+    values, provided that they haven't been explicitly set in those instances. So,
+    if an instance of `RabbitMQSender` is created, then `RabbitMQSender._host` is
+    changed, and the `_host` value of the instance will be updated accordingly.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Taken together, and with some caution in design when applied, these allow `RabbitMQSender`
+    to be defined so that the *class* can be configured, allowing a usable instance
+    of the class to be created with nothing more than the most basic of calls, along
+    the lines of `my_sender = RabbitMQSender()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a different message-transport mechanism were to be needed later, it would
+    probably be a good idea to introduce a layer of abstraction that `RabbitMQSender`
+    would derive from – `BaseMessageSender`, perhaps – that would require the message-sending
+    method and all of the relevant transport-mechanism properties. That would provide
+    a common interface for all transport mechanisms, and make it a lot easier to switch
+    between them if/as needed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`RabbitMQSender`, then, starts as a typical class-definition, with the various
+    connection properties and any other message-transmission constants defined as
+    protected class attributes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE64]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The properties that correspond to those have only getter methods, so that they
+    cannot be easily/accidentally altered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE65]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'They are associated with property names in a typical read-only property structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE66]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `connection` and `channel` properties follow a typical lazy-instantiation
+    pattern, being created on the first request for either of them, and are also exposed
+    as read-only properties:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE67]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE68]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are no property-setter or -deleter methods needed, nor is there any functionality
+    needed in `__init__` for the class. All of an instance''s properties will effectively
+    refer back to the class attribute values, which can be set with a single class
+    method call:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE69]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the context of an Artisan Application, all that needs to be done to preconfigure all
+    instances of `RabbitMQSender` is to call `RabbitMQSender.configure` with the appropriate
+    settings, probably taken from the configuration file of the Artisan Application
+    instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE70]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, the process of sending messages is provided by a single method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE71]'
+  prefs: []
+  type: TYPE_PRE
+- en: On the Artisan Application side of the message-transfer processes, the creation
+    of a `RabbitMQSender` instance and calling its `send_message` method should take
+    care of the actual message transmission we'll need. On the Artisan Gateway side,
+    when sending messages to Artisan Application instances, the process will be similar –
+    simplified in some ways, possibly not needing the `RabbitMQSender` (or an equivalent)
+    class, or perhaps needing a similar variant in order to better handle multiple
+    outgoing queues. We'll integrate the Artisan-side processes and examine the Gateway
+    needs in more detail in [Chapter 17](b21d33e8-90c4-4a67-af0e-9fc0211d8e3a.xhtml), *Handling
+    Service Transactions*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Impacts on testing and deployment
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: At this point in the iteration, apart from standard unit-testing for various
+    properties and methods that aren't involved in any message transmission, there's
+    not much that can be done from a testing standpoint. We have yet to integrate
+    messaging with data changes, which we'll examine in [Chapter 17](b21d33e8-90c4-4a67-af0e-9fc0211d8e3a.xhtml), *Handling
+    Service Transactions*, and without a complete send-and-receive process available,
+    in either direction, there's not much that can be done, even from a manual-testing
+    perspective, that hasn't already been explored.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It also feels premature to work out any deployment details for the Artisan Gateway
+    daemon just yet, for similar reasons, though at this point, it feels like a very
+    basic `setup.py/Makefile` arrangement will probably handle everything we'll need.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Although we now have all the foundations needed to work through and close the
+    14 stories that the iteration stated with, only three are even potentially closed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an Artisan, I need to be able to send data changes to the Artisan Gateway
+    so that those changes can be propagated and acted upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a Central Office user, I need to be able to send data changes to the Artisan
+    Gateway so that those changes can be propagated and acted upon as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As any user sending messages across to or from the Artisan Gateway service,
+    I need those messages to be signed so that they can be validated before being
+    acted upon
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Those foundations include, however, a functional (if untested) Artisan Gateway
+    daemon/service, a mechanism for generating command messages that can be acted
+    upon by that service and the remote applications, and the basic processes for
+    actually transmitting those command messages. Between those accomplishments, the
+    odds are good that we've actually closed these three stories, but until they are
+    tested, we cannot prove that they can be.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The requisite testing to prove closure, and the balance of the stories still
+    to be implemented, all rely on integrating the various CRUD operations at the
+    data-object level in the Artisan and Central Office applications with the requisite
+    messaging to propagate those data changes to the Artisan Gateway, and (where needed)
+    from the Gateway to the remote Artisan and Central Office applications, which
+    we'll address in the next chapter.
+  prefs: []
+  type: TYPE_NORMAL

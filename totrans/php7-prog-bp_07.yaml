@@ -1,0 +1,1392 @@
+- en: Chapter 7. Building an Asynchronous Microservice Architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we will build an application consisting of a set of small and
+    independent components that communicate with each other over network protocols.
+    Often, these so-called **Microservice architectures** are built using HTTP-based
+    communication procotols, often in the form of RESTful APIs, which we've already
+    implemented in [Chapter 5](ch05.html "Chapter 5.  Creating a RESTful Web Service"),
+    *Creating a RESTful Web Service*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Instead of focusing on REST, in this chapter we will explore an alternative
+    communication protocol that focuses on asynchronicity, loose coupling, and high
+    performance: **ZeroMQ**. We will use ZeroMQ to build a simple**checkout service**
+    for an (entirely fictional) e-commerce scenario that will handle a wide range
+    of concerns, beginning with e-mail messaging, order processing, inventory management,
+    and more.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The target architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The central service of our Microservice architecture will be the checkout service.
+    This service will offer an API for a checkout process that is common to many e-commerce
+    systems. For each checkout process, we will require the following input data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **cart** that can contain an arbitrary number of articles
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The customer's **contact data**
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The checkout service will then be responsible for executing the actual checkout
+    process, which will involve a number of additional services, each handling a single
+    step or concern of the checkout process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our fictional e-commerce venture will handle physical goods (or more abstract
+    goods, of which we can only have a limited quantity in stock). So, for each article
+    in a cart, the checkout service will need to ensure that the desired quantity
+    of said article is actually in stock, and if possible, reduce the available stock
+    by that amount. This will be the responsibility of the **inventory service**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After successfully completing a checkout process, the user needs to be notified
+    via e-mail about the successful checkout. This will be the responsibility of the
+    **mailing service**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Also, after completing the checkout process, the order has to be forwarded to
+    a shipping service that starts the shipping for this order.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'The following diagram shows a high-level view of the desired target architecture
+    for this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In this chapter, the focus will be on using ZeroMQ for implementing the communication
+    patterns between the different services. We will not implement the entire business
+    logic that would be required for such a checkout process to actually work (as
+    you could very well fill another book with this). Instead, we will implement the
+    actual services as simple stubs that offer the APIs that we want them to implement,
+    but contain only a prototypical implementation of the actual business logic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The target architecture](graphics/image_07_001.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The target architecture of our application
+  prefs: []
+  type: TYPE_NORMAL
+- en: The labels beside the depicted interfaces (**RES** and **PUB**) are the different
+    ZeroMQ socket types that you'll learn about in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ZeroMQ patterns
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you will learn about the basic communication patterns that
+    are supported by ZeroMQ. Do not worry if all that sound a bit theoretical; you
+    will implement all of these patterns yourself throughout the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Request/reply pattern
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The ZeroMQ library supports a variety of different communication patterns. For
+    each of these, you will need different ZeroMQ socket types. The easiest communication
+    pattern is the Request/reply pattern, in which a client opens an REQ socket and
+    connects to a server listening on an REP socket. The client sends a request that
+    is then replied to by the server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Request/reply pattern](graphics/image_07_002.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: ZeroMQ Request/Reply sockets
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to know that REQ and REP sockets are always *synchronous*. Each
+    REQ socket can be sending requests to a single REP socket at a time, and more
+    importantly, each REP socket can also only be connected to a single REQ socket
+    at a time. The ZeroMQ library even enforces this on the protocol level and triggers
+    errors when an REQ socket tries to receive new requests before replying to the
+    current one. There are advanced communication patterns to work around this limitation
+    that we'll work with later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Publish/subscribe pattern
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The publish/subscribe pattern consists of a PUB socket on which messages can
+    be published. To this socket, any number of SUB sockets can be connected. When
+    a new message is published on a PUB socket, it will be forwarded to all connected
+    SUB sockets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Publish/subscribe pattern](graphics/image_07_003.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Publish/subscribe sockets
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each subscriber in a PUB/SUB architecture needs to specify at least one subscription
+    - a string that works as a filter for each message. Messages will be filtered
+    by the publisher so that each subscriber only receives messages that they have
+    subscribed to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Publish/Subscribe works strictly in one direction. Publishers cannot receive
+    messages from the subscribers, and subscribers cannot send messages back to the
+    publishers. However, just as multiple SUB sockets can be connected to a single
+    PUB socket, a single SUB socket can also be connected to multiple PUB sockets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Push/pull pattern
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The push/pull pattern works similar to the publish/subscribe pattern. A PUSH
+    socket is used to publish messages to any number of PULL sockets (just like with
+    PUB/SUB, a single PULL sockets can also be connected to any number of PUSH sockets).
+    In contrast to publish/subscribe patterns, however, each message that is sent
+    on a PUSH socket is dispatched to only one of the connected PULL sockets. This
+    behavior makes the PUSH/PULL patterns are ideal to implement worker pools that
+    you can, for example, use to distribute tasks to any number of workers to process
+    in parallel. Similarly, a PULL socket may also be used to collect results from
+    any number of PUSH sockets (which may in turn be results that are sent back from
+    a worker pool).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using a PUSH/PULL socket to distribute tasks to a worker pool and then using
+    a second PUSH/PULL layer to collect results from that pool in a single socket
+    is also called *fan-out/fan-in*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Push/pull pattern](graphics/image_07_004.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Using PUSH and PULL sockets to implement a fan-out/fan-in architecture
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bootstrapping the project
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As usual, we will begin by bootstrapping our project for this chapter. For
+    using the ZeroMQ library in PHP applications, you will need the **php-zmq extension**
+    that you can install via PECL. You will also need the `libzmq-dev` package that
+    contains the C header files for the ZeroMQ library. You can install it via your
+    operating system''s package manager. The following commands will work on both
+    Ubuntu and Debian Linux:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: As usual, we will be using composer to manage our PHP dependencies and Docker
+    for managing the required system libraries. As our application will consist of
+    multiple services that run in multiple processes, we will be working with multiple
+    composer projects and multiple Docker images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are using Windows and want to run your ZeroMQ/PHP applications natively
+    without using Docker, you can download the ZeroMQ extension from the PECL website
+    ([https://pecl.php.net/package/zmq/1.1.3/windows](https://pecl.php.net/package/zmq/1.1.3/windows))
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All of our services will use the same software (PHP with the ZeroMQ extension
+    installed). We''ll start by implementing the inventory service, but you will be
+    able to use the same Docker image (or at least the same Dockerfile) for all services
+    that we will be creating in this example. Start by creating an `inventory/Dockerfile`
+    file in your project directory with the following contents:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: You'll notice that we're also installing the `pcntl` and `ev` extensions. You've
+    already worked with the `ev` extension in [Chapter 6](ch06.html "Chapter 6.  Building
+    a Chat Application"), *Building a Chat Application*. It offers an asynchronous
+    event loop that works well with the `react/zmq` library that we will be using
+    later in this chapter. The `pcntl` extension offers some features that will help
+    you control the process state of long-running PHP processes later on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make life easier, you can also create a `docker-compose.yml` file in your
+    project directory in order to use Docker compose to manage the multitude of containers
+    in your application. We'll get to that once you have the first service that you
+    can run in a container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building the inventory service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We will start by implementing the inventory service, as it will use a simple
+    request/reply pattern for communication and it does not have any other dependencies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting started with ZeroMQ REQ/REP sockets
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Start by creating the service''s `composer.json` file in the `inventory/` directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: After creating the `composer.json` file, install the project's dependencies
+    using the `composer install` command on a command line within the `inventory/`
+    directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's start by creating a `server.php` file for the inventory. Just like the
+    Ratchet application from [Chapter 6](ch06.html "Chapter 6.  Building a Chat Application"),
+    *Building a Chat Application*, this file will later be our main server process
+    - remember, in this example, we're not even using HTTP as a communication protocol,
+    so there's no web server and no FPM involved anywhere.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The starting point of each ZeroMQ application is the context. The context stores
+    all kind of states that the ZeroMQ library needs for maintaining sockets and communicating
+    with other sockets. You can then use this context to create a new socket and bind
+    this context to a port:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This code creates a new ZeroMQ REP socket (a socket that can reply to requests)
+    and binds this socket to a configurable TCP port (5557 by default). You can now
+    receive messages on this socket and reply to them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, this loop will poll infinitely for new messages and then respond
+    to them. The socket's `recv()` method will block the script execution until a
+    new message has been received (you can later use the `react/zmq` library to easily
+    implement non-blocking sockets, but this will suffice for now).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order to test your ZeroMQ server, you can create a second file, `client.php`,
+    in your `inventory/` directory in which you can use an REQ socket to send requests
+    to the server:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: When your server script is running, you can simply run the `client.php` script
+    to connect to the server's REP socket, send a request, and wait for the server's
+    reply. Just like with the REP socket, the REQ socket's `recv` method will also
+    block until a reply has been received from the server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you are using Docker compose to manage the multitude of containers in your
+    development environment (currently, it''s only one, but there will be more), add
+    the following section to your `docker-compose.yml` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After adding the inventory service to the `docker-compose.yml` configuration
+    file, you can start the container by simply running the following command on a
+    command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using JsonRPC for communication
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now we have a server that can receive text messages from a client and then send
+    responses back to that client. However, in order to build a working and maintainable
+    Microservice architecture, we'll need some kind of protocol and format that these
+    messages can follow and all services can agree upon. Often in Microservice architectures,
+    this common denominator is HTTP, whose rich protocol semantics can be used to
+    easily build REST web services. However, ZeroMQ as a protocol is much more low-level
+    and does not concern itself with different request methods, headers, caching,
+    and all the other features that come *for free* with HTTP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Instead of a RESTful service, we will implement the inventory service as a
+    simple **Remote Procedure Call** (**RPC**) service. A quick and easy format that
+    can be used for this is JSON-RPC, which implements RPCs with JSON messages. Using
+    JSON-RPC, a client can send a method call using the following JSON format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The server can then respond to this message using the following format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Or alternatively, when an error occurred during processing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This protocol is relatively simple and we can easily implement it on top of
+    ZeroMQ. For this, start by creating a new `Packt\Chp7\Inventory\JsonRpcServer`
+    class. This server will need a ZeroMQ socket and also an object that provides
+    the methods that clients should be able to invoke using RPCs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can now implement a method that receives messages from the socket, tries
+    to parse them as JSON-RPC messages, and invokes the respective method on the `$server`
+    object and returns that method''s result value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As in the previous example, this method will run infinitely and will process
+    any number of requests. Now, let''s have a look at the `handleMessage` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: This method checks if the `$this->server` object has a callable method with
+    the same name as the `method` property of the JSON-RPC request. If so, this method
+    is invoked with the request's `param` property as arguments and the return value
+    is incorporated into the JSON-RPC response.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Currently, this method is still missing some basic exception handling. As a
+    single unhandled exception, a fatal error can terminate the entire server process,
+    so we need to be extra careful here. First, we need to make sure that the incoming
+    message is really a valid JSON string:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Also, make sure that you catch anything that might be thrown from the actual
+    service function. As we''re working with PHP 7, remember that regular PHP errors
+    are now also thrown, so it''s important to not only catch exceptions, but errors
+    as well. You can catch both exceptions and errors by using the `Throwable` interface
+    in your `catch` clause:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can now continue by implementing the actual service containing the inventory
+    service business logic. As we''ve spent a fair amount of time with low-level protocols
+    until now, let''s recapitulate the requirements for this service: the inventory
+    service manages the inventories of articles in stock. During the checkout process,
+    the inventory service needs to check if the required amount of an article is in
+    stock, and if possible, reduce the inventory amount by the given amount.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will implement this logic in the `Packt\Chp7\Inventory\InventoryService`
+    class. Note that we''ll try to keep the example simple and manage our article
+    inventories simply in-memory. In a production setup, you''d probably use a database
+    management system for storing your article data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, we're starting off with three articles with the article numbers
+    `1000` to `1002`. The `checkArticle` function tests if the required amount of
+    a given article is in stock. The `takeArticle` function attempts to reduce the
+    amount of articles by the required amount, if possible. If this was successful,
+    the function returns `true`. If the required amount is not in stock, or the article
+    is not known at all, the function will return `false`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We now have a class that implements a JSON-RPC server and another class containing
+    the actual business logic for our inventory service. We can now put both of these
+    classes together in our `server.php` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To test this service, at least until you have a first version of the checkout
+    service up and running, you can adjust the `client.php` script that you''ve created
+    in the previous section to also send and receive JSON-RPC messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each call of this script will remove two items of article #1001 from your inventory.
+    In our example, we''re working with a locally managed inventory that is always
+    initialized with four items of this article, so the first two invocations of the
+    `client.php` script will return true as a result, and all subsequent invocations
+    will return false.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Making the inventory service multithreaded
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Currently, the inventory service works in a single thread, and with a blocking
+    socket. This means that it can handle only one request at a time; if a new request
+    is received while other requests are being processed, the client will have to
+    wait until all previous requests have finished processing. Obviously, this does
+    not scale very well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In order to implement a server that can handle multiple requests in parallel,
+    you can employ ZeroMQ's **ROUTER**/**DEALER** pattern. A ROUTER is a special kind
+    of ZeroMQ socket that behaves very much like a regular REP socket, with the only
+    difference being that multiple REQ sockets can connect to in parallel. Likewise,
+    a DEALER socket is another kind of socket that is similar to an REQ socket, only
+    that it can be connected to multiple REP sockets. This allows you to construct
+    a load balancer that simply consists of one ROUTER and one DEALER socket that
+    pipes packages from a set of multiple clients to a set of multiple servers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Making the inventory service multithreaded](graphics/image_07_005.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The ROUTER/DEALER pattern
+  prefs: []
+  type: TYPE_NORMAL
+- en: As PHP does not support multithreading (at least, not very well), we will resort
+    to using multiple processes in this example. Our multithreaded server will consist
+    of one master process that handles the ROUTER and DEALER sockets, and multiple
+    worker processes that each work with one REP socket. To implement this, you can
+    fork a number of worker processes using the `pcntl_fork` function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: For the `pcntl_fork` function to work, you need the `pcntl` extension enabled.
+    In nearly all distributions, this extension is enabled by default; in the Dockerfile
+    that you have built in the previous section, it is also explicitly installed.
+    If you compiled PHP yourself, you will need the -- `enable-pcntl` flag when calling
+    the `configure` script.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this example, our inventory service will consist of multiple ZeroMQ sockets:
+    first a multitude of worker processes, each listening on a RES socket that responds
+    to requests, and a master process with each ROUTER and DEALER socket that accepts
+    and dispatches these requests. Only the ROUTER socket will be visible to outside
+    services and reachable via TCP; for all other sockets, we will use UNIX sockets
+    for communicating - they are faster and not reachable via network.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Start by implementing a worker function; create a new file called `server_multithreaded.php`
+    for this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `worker()` function creates a new REP socket and connects this socket to
+    the UNIX socket `ipc://workers.ipc` (this will be created by the master process
+    later). It then runs the usual `JsonRpcServer` that you've already worked with
+    before.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can now start any number (in this case, four) of these worker processes
+    using the `pcntl_fork` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In case you''re not familiar with the `fork` function: it duplicates the currently
+    running process. The forked process will continue to run at the same code location
+    at which it was forked. However, in the parent process, the return value of `pcntl_fork()`
+    will return the process ID of the newly created process. However, within the new
+    process, this value will be 0\. In this case, the child processes now become our
+    worker processes and the actual master process will pass the loop without exiting.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After this, you can start the actual load balancer by creating a ROUTER and
+    a DEALER socket:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: The ROUTER socket is bound to the actual network address at which the service
+    is intended to be reachable (in this case, a TCP socket, allowing the service
+    to be reached via a network). The DEALER socket, on the other hand, is bound to
+    a local UNIX socket that will not be exposed to the outside world. The only purpose
+    of the UNIX socket `ipc://workers.ipc` is that the worker processes can connect
+    their REP sockets to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After having created both the ROUTER and the DEALER socket, you can use the
+    `ZMQDevice` class to pipe incoming packages from the ROUTER socket to the DEALER
+    socket, which will then distribute equally to all connected REP sockets. Response
+    packages that are sent back from the REP sockets will also be dispatched back
+    to the original clients:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Changing the inventory service this way does not require any modification of
+    the client code; the ROUTER socket that the load balancer is listening on behaves
+    very much like a REP socket, and any REQ socket can connect to it in exactly the
+    same way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building the checkout service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We now have a service that manages the inventory stock of your small, fictional
+    e-commerce venture. In the next step, we will now implement a first version of
+    the actual checkout service. The checkout service will offer an API for completing
+    a checkout process, using a cart consisting of multiple articles and basic customer
+    contact data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using react/zmq
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: For this, the checkout service will offer a simple REP ZeroMQ socket (or a ROUTER
+    socket, in a concurrent setup). After receiving a checkout order, the checkout
+    service will then communicate with the inventory service to check if the required
+    items are available and to reduce the stock amount by the item amounts in the
+    cart. If that was successful, it will publish the checkout order on a PUB socket
+    that other services can listen on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a cart consists of multiple items, the checkout service will need to make
+    multiple calls to the inventory service. In this example, you will learn how to
+    make multiple requests in parallel in order to speed up execution. We will also
+    use the `react/zmq` library, which offers an asynchronous interface for the ZeroMQ
+    library and the `react/promise` library that will help you to better handle an
+    asynchronous application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Start by creating a new `composer.json` file in a new `checkout/` directory
+    and initialize the project with `composer install`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: This file is similar to the inventory service's `composer.json`; the only difference
+    is the PSR-4 namespace and the additional requirements `react/zmq`, `react/promise`,
+    and `ext-ev`. If you are using Docker for your development setup, you can simply
+    copy your existing Dockerfile from the inventory service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Continue by creating a `server.json` file in your `checkout/` directory. As
+    with any React application (remember the Ratchet application from [Chapter 6](ch06.html
+    "Chapter 6.  Building a Chat Application"), *Building a Chat Application*), the
+    first thing you need to do is to create an event loop that you can then run:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that we're using the `React\ZMQ\Context` class instead of the `ZMQContext`
+    class now. The React context class offers the same interface, but extends its
+    base class by some functionalities to better support asynchronous programming.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can already start this program and it will run infinitely, but it will
+    not actually do anything just yet. As the checkout service should offer a REP
+    socket to which clients should send requests, you should continue by creating
+    and binding a new REP socket before running the event loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: '**ReactPHP** applications are asynchronous; instead of just calling `recv()`
+    on the socket to wait for the next incoming message, you can now register an event
+    handler on the socket that will be called by ReactPHP''s event loop as soon as
+    a message is received:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This callback solution works similar to other asynchronous libraries that you
+    will most commonly encounter when developing client-site JavaScript code. The
+    basic principle is the same: the `$socket->on(...)` method simply registers an
+    event listener that can be called at any later point in time whenever a new message
+    is received. The execution of the code will continue immediately (in contrast
+    to this, compare the regular `$socket->recv()` function that blocks until a new
+    message is received) and the `$loop->run()` method is called. This call starts
+    the actual event loop that is responsible for calling the registered event listener
+    when new messages are received. The event loop will block until it is interrupted
+    (for example, by a SIGINT signal that you can trigger with *Ctrl* + *C* on the
+    command line).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working with promises
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'When working with asynchronous code, it is often just a matter of time until
+    you find yourself in "callback hell". Imagine you want to send two consecutive
+    ZeroMQ requests (for example, first asking the inventory service if a given article
+    is available and then actually instructing the inventory service to reduce the
+    stock by the required amount). You can implement this using multiple sockets and
+    the ''message'' event that you have seen previously. However, this will quickly
+    become an unmaintainable mess:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code snippet is just an example of how complicated this might
+    get; in our case, you would even need to consider that each checkout order can
+    contain any number of articles, each of them requiring two new requests to the
+    identity service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make life better, you can implement this functionality using promises (see
+    the following box for a detailed explanation of the concept). A good implementation
+    of promises is provided by the `react/promise` library that should already be
+    declared in your `composer.json` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '**What are promises?** Promises (sometimes also called futures) are a concept
+    commonly found in asynchronous libraries. They present an alternative to the regular
+    callback-based approach.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Basically, a promise is an object that represents a value that is not yet available
+    (for example, because the ZeroMQ request that was supposed to retrieve the value
+    has not yet received a reply). In an asynchronous application, a promise may become
+    available (fulfilled) at any time. You can then register functions that should
+    be called whenever a promise was fulfilled, to further process the promised, and
+    now resolved value:`$promise = $someService->someFunction();` `$promise->then(function($promisedValue)
+    {` `    echo "Promise resolved: $promisedValue\n";` `});`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each call of the `then()` function returns a new promise, this time for the
+    value that will be returned by the callback passed to `then()`. This allows you
+    to easily chain multiple promises together:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$promise` `    ->then(function($value) use ($someService) {` `        $newPromise
+    = $someService->someOtherFunc($value);` `         return $newPromise;` `    })`
+    `    ->then(function ($newValue) {` `        echo "Promise resolved: $newValue\n";`
+    `    });`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can now put this principle to use by writing an asynchronous client class
+    for communicating with our inventory service. As that service communicates using
+    JSON-RPC, we will now implement the `Packt\Chp7\Checkout\JsonRpcClient` class.
+    This class is initialized with a ZeroMQ context, and for convenience, also the
+    remote service''s URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, the class already contains a `request` method that accepts
+    a method name and a set of parameters, and should return an implementation of
+    `React\Promise\PromiseInterface`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the `request()` method, you can now open a new REQ socket and send a JSON-RPC
+    request to it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since the `request()` method is supposed to work asynchronously, you cannot
+    simply call the `recv()` method and block until a result is received. Instead,
+    we will need to return a promise for the response value that can be resolved later,
+    whenever a response message is received on the REQ socket. For this, you can use
+    the `React\Promise\Deferred` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is a prime example of how promises work: you can use the `Deferred` class
+    to create and return a promise for a value that is not yet available. Remember:
+    the function passed into the `$sock->on(...)` method will not be called immediately,
+    but at any later point in time when a response was actually received. As soon
+    as this event occurs, the promise that was returned by the request function is
+    resolved with the actual response value.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As the response message contains a JSON-RPC response, you need to evaluate
+    this response before fulfilling the promise that you made to the caller of the
+    request function. As a JSON-RPC response can also contain an error, it is worth
+    noting that you can also reject a promise (for example, when an error occurred
+    while waiting for the response):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can now use this JSON-RPC client class in your `server.php` to actually
+    communicate with the inventory service on each incoming checkout request. Let''s
+    start with a simple example on how you can use the new class to chain two consecutive
+    JSON-RPC calls together:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As you can see, the `PromiseInterface`''s `then` function accepts two parameters
+    (each both a new function): the first function will be called as soon as the promise
+    was resolved with an actual value; the second function will be called in case
+    the promise was rejected.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a function passed to `then(...)` returns a new value, the then function will
+    return a new promise for this value. An exception to this rule is when the callback
+    function returns a new promise itself (in our case, in which `$client->request`
+    is called again within the `then()` callback). In this case, the returned promise
+    replaces the original promise. This means that chained calls to the `then()` function
+    actually listen on the second promise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s put this to use in the `server.php` file. In contrast to the preceding
+    example, you need to consider that each checkout order may contain multiple articles.
+    This means that you will need to execute multiple `checkArticle` requests to the
+    inventory service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In this example, we assume that incoming checkout orders are JSON encoded messages
+    that look like the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the current version of our `server.php`, we call the JSON-RPC client multiple
+    times and collect the returned promises in an array. However, we do not actually
+    do anything with them yet. You could now call the `then()` function on each of
+    these promises with a callback that will be called for each article with a boolean
+    parameter indicating whether this one article is available. However, for processing
+    the order correctly, we need to know if all articles from the checkout order are
+    available. So what you need to do is not to wait on each promise separately, but
+    to wait until all of them are completed. This is what the `React\Promise\all`
+    function is for: this function takes a list of promises as parameters and returns
+    a new promise that is fulfilled as soon as all supplied promises are fulfilled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: If not all required articles are available in the inventory service, you can
+    answer the request early with an error message, as there is no need to continue
+    any further. If all articles are available, you'll need a set of subsequent requests
+    to actually reduce the inventory by the specified amounts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The `array_sum($values) == count($values)` construct used in this example is
+    a quick hack to ensure that an array of boolean values contains only true values.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the next step, you can now extend your server to run the second set of requests
+    to the inventory service after all of the `checkArticle` method calls have successfully
+    returned. This can be done by following the same way as before using the `React\Promise\all`
+    method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In order to actually test this new server, let''s write a short test script
+    that tries to execute an example checkout order. For this, create a new `client.php`
+    file in your `checkout/` directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To run both the checkout service and the test script, you can extend your `docker-compose.yml`
+    file in your project''s root directory with the new checkout service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For the test script, add a second Compose configuration file, `docker-compose.testing.yml`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Afterwards, you can test your checkout service using the following command
+    line commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following screenshot shows an example output of both the test script and
+    both server scripts (in this example, some additional `echo` statements have been
+    added to make the server more verbose):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Working with promises](graphics/image_07_006.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: An example output of a checkout order being processed by the checkout and inventory
+    services
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building the mailing service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the next step, we will put a mailing service into our Microservice architecture.
+    After a checkout was processed, the user should be notified via e-mail about the
+    status of the checkout.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As mentioned before, the focus of this chapter is on building the communication
+    patterns between individual services. Because of this, we will not implement the
+    mailing service's actual mailing functionality in this section, but instead focus
+    on how this service will communicate with other services. Have a look at [Chapter
+    3](ch03.html "Chapter 3.  Building a Social Newsletter Service"), *Building a
+    Social Newsletter Service*, to see how you can use PHP to actually send e-mails
+    to other recipients.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In theory, you could implement the mailing service just as you did the inventory
+    service - build a standalone PHP program that listens on a ZeroMQ REP socket,
+    have the checkout service open an REQ socket, and send requests to the mailing
+    service. However, the same can also be achieved using the publish/subscribe pattern.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the publish/subscribe pattern, the checkout service does not even need
+    to know about the mailing service. Instead, the checkout service simply opens
+    a PUB socket that other services can connect to. Any and all messages that are
+    sent on the PUB socket are distributed to all connected (subscribing) services.
+    This allows you to implement a very loosely coupled architecture that is also
+    very extensible - you can add new functionality to your checkout process by having
+    more and different services subscribe to the same PUB socket, without having to
+    modify the checkout service itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is possible, because in the case of the mailing service, communication
+    does not need to be synchronous - the checkout service does not need to wait for
+    the mailing service to complete its action before continuing with the process,
+    nor does it need any kind of data that might be returned from the mailing service.
+    Instead, messages can flow strictly in one direction - from checkout service to
+    mailing service.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, you need to open the PUB socket in the checkout service. For this, modify
+    the checkout service''s `server.php`, create a new PUB socket, and bind it to
+    a TCP address:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After having successfully taken the required items from the inventory service,
+    you can then publish a message on this socket. In this case, we''ll simply resend
+    the original message on the PUB socket:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that you have a PUB socket on which accepted checkout orders are published,
+    you can write the actual mailing service that creates a SUB socket that subscribes
+    to this PUB socket.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For this, start by creating a new directory, `mailing/`, in your project directory.
+    Copy the Dockerfile from the previous examples and create a new `composer.json`
+    file with the following contents:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: In contrast to the previous examples, the only difference is the new package
+    name and the different PSR-4 autoloading namespace. Also, you will not need the
+    `react/promise` library for the mailing service. As usual, continue by running
+    `composer install` on a command line within the `mailing/` directory to download
+    the required dependencies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can now create a new `server.php` file in the `mailing/` directory in which
+    you create a new SUB socket that you can then connect to the checkout service:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: Pay attention to the `$socket->subscribe()` call. Each SUB socket can subscribe
+    to a given *topic* or *channel*. A channel is identified by a string prefix that
+    can be submitted as part of each published message. Clients will then only receive
+    messages that match the channel that they have subscribed to. If you do not care
+    about different channels on one PUB socket, you can simply subscribe to the empty
+    channel by calling `$socket->subscribe` with an empty string to receive all messages
+    that are published on the PUB socket. However, if you do not call the subscribe
+    method; you will not receive any messages at all.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After the socket is connected, you can provide a listener function for the
+    `''message''` event in which you decode the JSON-encoded message and process it
+    accordingly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Also note that PUB and SUB sockets are strictly unidirectional: you send messages
+    from the PUB sockets to any number of subscribing SUB sockets, but you cannot
+    send a reply back to the publisher-at least, not on the same socket. If you really
+    need some kind of feedback channel, you could have the publisher listening on
+    a separate REP or SUB socket and the subscriber connecting with a new REQ or PUB
+    socket. The following diagram illustrates two strategies to implement a feedback
+    channel like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Building the mailing service](graphics/image_07_007.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Different strategies for implementing feedback channels in a publish/subscribe
+    architecture
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To test the new mailing service, you can reuse the `client.php` script from
+    the previous section. As the mailing service requires the checkout order to contain
+    an e-mail address, you''ll need to add one to the message body:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Also, remember to add the new mailing service to the `docker-compose.yml` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After adding the new service to `docker-compose.yml`, start all services and
+    run the test script again:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After that, inspect the output of the separate containers to check if the checkout
+    order was correctly processed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building the shipping service
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In our small e-commerce example, we are still missing the shipping service.
+    In real-world scenarios, this would be a really complex task, and you would often
+    need to communicate with outside parties and maybe integrate with APIs of external
+    transport service providers. For this reason, we will now build our shipping service
+    as a worker pool using PUSH and PULL sockets and an arbitrary number of worker
+    processes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PUSH/PULL for beginners
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A PUB socket publishes each message to all connected subscribers. ZeroMQ also
+    offers the PUSH and PULL socket types - they work similar to PUB/SUB, but each
+    message published on a PUSH socket is sent to only one of potentially many connected
+    PULL sockets. You can use this to implement a worker pool into which you can push
+    long-running tasks that are then executed in parallel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For this, we will need one master process that uses a SUB socket to subscribe
+    to completed checkout orders. The same process needs to offer a PUSH socket that
+    the individual worker processes can connect to. The following diagram illustrates
+    this architecture:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![PUSH/PULL for beginners](graphics/image_07_008.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: PUB/SUB and PUSH/PULL in combination
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As usual, start by creating a new directory, `shipping/`, in your project folder.
+    Copy the Dockerfile from one of the previous services, create a new `composer.json`
+    file, and initialize the project with `composer install`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We''ll start by implementing the master process. This master process needs
+    to do three simple things:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Open a SUB socket and connect this socket to the checkout service's PUB socket.
+    This will allow the shipping service to receive all checkout orders that were
+    accepted by the checkout service.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Open a PUSH socket and bind this socket to a new TCP port. This will allow the
+    worker processes to connect and receive checkout orders.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Forward each message received on the SUB socket to the PUSH socket.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For this, create a new `master.php` file in your `shipping/` directory in which
+    you can create a new event loop and create the two required sockets:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For actually processing messages that are received on the SUB socket, register
+    a listener function on the `$subSocket` variable that sends each received message
+    on the PUSH socket:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, create a new file, `worker.php`, also in the `shipping/` directory. In
+    this file, you will create a PULL socket that receives messages from the PUSH
+    socket opened in the master process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Again, attach a listener function to the `$pullSocket` in order to process
+    incoming messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`sleep(5)`, in this example, just simulates the execution of a shipping order
+    which may take a longer amount of time. As usual in this chapter, we will not
+    implement the actual business logic any more than we need to, to demonstrate the
+    communication patterns between the individual services.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order to test the shipping service, now add both the master process and
+    the worker process to your `docker-compose.yml` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After this, you can start all containers and then follow their output using
+    the following commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By default, Docker compose will always start one instance of each service.
+    However, you can start additional instances of each service by using the `docker-compose
+    scale` command. This is a good idea for the `shippingworker` service, as the PUSH/PULL
+    architecture that we''ve chosen for this service actually allows any number of
+    instances of this service to be running in parallel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After having started some more instances of the `shippingworker` service, you
+    can attach to all container''s log output using the `docker-compose logs` command.
+    Then, use a second terminal to start the client test script that you''ve created
+    in the previous section:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE58]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When you run this command multiple times, you will see that the debug output
+    within the shipping worker process is printed by different instances of the container
+    for subsequent invocations. You can see an example output in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![PUSH/PULL for beginners](graphics/image_07_009.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: An example output, demonstrating a working push/pull architecture with multiple
+    workers
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fan-out/fan-in
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In addition to distributing time-consuming tasks to a number of worker processes,
+    you can also use PUSH and PULL sockets to have the workers push results back to
+    their master process. This pattern is called **fan-out/fan-in**. For this example,
+    have the master process in the `master.php` file listen on a separate PULL socket:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE59]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the `worker.php` file, you can now connect to this PULL socket with a new
+    PUSH socket and send a message as soon as a checkout order has successfully been
+    processed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE60]'
+  prefs: []
+  type: TYPE_PRE
+- en: This will push the message back to the master process as soon as it has been
+    processed. Note that PUSH/PULL is used the other way around than in the previous
+    section - before we had one PUSH socket and multiple PULL sockets; for the fan-in
+    we have one PULL socket on the master process and multiple PUSH sockets on the
+    worker processes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '**Using bind() and connect()**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this section, we have used both the `bind()` and `connect()` method for both
+    PUSH and PULL sockets. In general, `bind()` is used to have a socket listen on
+    a new TCP port (or UNIX socket), while `connect()` is used to have a socket connect
+    to another, already existing socket. In general, you can use both `bind()` and
+    `connect()` with any socket type. In some cases, like REQ/REP, you'll intuitively
+    `bind()` the REP socket and then `connect()` the REQ socket, but both PUSH/PULL
+    and PUB/SUB actually work both ways. You can have a PULL socket connect to a listening
+    PUSH socket, but you can also have a PUSH socket connect to a listening PULL socket.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot shows an example output of both the shipping service''s
+    master and worker processes handling multiple checkout orders in parallel. Note
+    that the actual processing is done by different worker processes (`shippingworker_1`
+    to `shippingworker_3` in this example), but are "fanned-in" back to the master
+    process after that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Fan-out/fan-in](graphics/image_07_010.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Fan-out/fan-in in action
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bridging ZeroMQ and HTTP
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As you have seen in this chapter, ZeroMQ offers a lot of different possibilities
+    for implementing communication between separate services. In particular, patterns
+    such as publish/subscribe and push/pull are not that easy to implement with PHP's
+    de-facto standard protocol, HTTP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, HTTP is more widely adopted and offers a richer set of protocol
+    semantics, handling concerns such as caching or authentication already at the
+    protocol-level. Because of this, especially when offering external APIs, you might
+    prefer offering an HTTP-based API instead of a ZeroMQ-based API. Luckily, it's
+    easy to bridge between the two protocols. In our example architecture, the checkout
+    service is the only service that will be used by outside services. In order to
+    offer a better interface for the checkout service, we will now implement an HTTP-based
+    wrapper for the checkout service that can be used in a RESTful way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For this, you can use the `react/http` package. This package offers a minimalist
+    HTTP server that - just like `react/zmq` - works asynchronously and uses an event
+    loop for handling requests. This means that a react-based HTTP server can even
+    run in the same process using the same event loop as the REP ZeroMQ socket that
+    is already offered by the checkout service. Start by installing the `react/http`
+    package by running the following command in the `checkout/` folder in your project
+    directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE61]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Before extending the checkout service with an HTTP server, the `server.php`
+    script needs a bit of refactoring. Currently, the `server.php` creates a REP ZeroMQ
+    socket with an event listener function in which the request is processed. As our
+    goal is now to add an HTTP API that triggers the same functionality, we''ll need
+    to extract this logic into a separate class. Start by creating the `Packt\Chp7\Checkout\CheckoutService`
+    class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE62]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `handleCheckoutOrder` method will be holding the logic that was previously
+    implemented directly in the `server.php` file. As this method will later be used
+    by both the ZeroMQ REP socket and the HTTP server, this method cannot directly
+    send a response message, but will simply return a promise that can then be used
+    in the `server.php`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE63]'
+  prefs: []
+  type: TYPE_PRE
+- en: The consistent use of promises and not caring about the return message actually
+    allows some simplifications; instead of directly sending back an error message,
+    you can simply throw an exception, which will cause the *promise* returned by
+    this function to be automatically rejected.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The existing `server.php` file can now be simplified by quite a few lines of
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE64]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, you can get to work on the HTTP server. For this, you''ll first need
+    a simple socket server that you can then pass into the actual HTTP server class.
+    This can be done at any point in the `server.php` before the event loop is run:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE65]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The HTTP server itself has a `''request''` event for which you can register
+    a listener function (similar to the `''message''` event of the ZeroMQ sockets).
+    The listener function gets a request and a response object passed as a parameter.
+    These are instances of the `React\Http\Request` respective `React\Http\Response`
+    classes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE66]'
+  prefs: []
+  type: TYPE_PRE
+- en: Unfortunately, React HTTP's `Request` and `Response` classes are not compatible
+    with the respective PSR-7 interfaces. However, if the need arises you can convert
+    them relatively easily, as already seen in the section *Bridging Ratchet and PSR-7
+    applications* in [Chapter 6](ch06.html "Chapter 6.  Building a Chat Application"),
+    *Building a Chat Application*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Within this listener function, you can first check for a correct request method
+    and path, and send an error code, otherwise:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE67]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is where it gets tricky. The ReactPHP HTTP server is so asynchronous,
+    that when the `request` event is triggered the request body has not yet been read
+    from the network socket. To get the actual request body, you need to listen on
+    the request''s `data` event. However, the request body is read in chunks of 4096
+    bytes, so for large request bodies, the data event may actually be called multiple
+    times. The easiest way to read the full request body is to check the `Content-Length`
+    header and check in the data event handler if exactly this amount of bytes has
+    already been read:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE68]'
+  prefs: []
+  type: TYPE_PRE
+- en: Of course, this won't work when the sender uses the so-called chunked transfer
+    encoding in their request. However, reading a request body using chunked transfer
+    would work a similar way; in this case, the exit condition is not dependent on
+    the `Content-Length` header, but instead when the first empty chunk has been read.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After the complete request body has been read, you can then pass this body
+    into the `$checkoutService` that you have already used before:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE69]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `CheckoutService` class is used exactly the same way as before. The only
+    difference now is how the response is sent back to the client; if the original
+    request was received by the ZeroMQ REP socket, a respective response was sent
+    to the REQ socket that sent the request. Now, if the request was received by the
+    HTTP server, an HTTP response with the same content is sent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can test your new HTTP API using a command-line tool such as curl or HTTPie:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE70]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following screenshot shows an example output when testing the new API endpoint
+    using the preceding HTTPie command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Bridging ZeroMQ and HTTP](graphics/image_07_011.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Testing the new HTTP API
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you have learned about ZeroMQ as a new communication protocol
+    and how you can use it in PHP. In contrast to HTTP, ZeroMQ supports other and
+    more complex communication patterns than the simple request/reply pattern. Especially
+    the publish/subscribe and the push/pull pattern, which allow you to build loosely
+    coupled architectures that are easily extensible by new functionalities and scale
+    very well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You have also learned how you can use the ReactPHP framework to build asynchronous
+    services using event loops and how you can make asynchronicity manageable using
+    promises. We have also discussed how you can integrate ZeroMQ-based applications
+    with *regular* HTTP APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While the previous chapters have all focused on different network communication
+    patterns (RESTful HTTP in [Chapter 5](ch05.html "Chapter 5.  Creating a RESTful
+    Web Service"), *Creating a RESTful Web Service*, WebSockets in [Chapter 6](ch06.html
+    "Chapter 6.  Building a Chat Application"), *Building a Chat Application*, and
+    now ZeroMQ), we will make a fresh start in the following chapter and learn how
+    PHP can be used to build parsers for custom expression languages.
+  prefs: []
+  type: TYPE_NORMAL

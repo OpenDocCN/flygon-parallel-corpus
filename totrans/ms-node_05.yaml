@@ -1,0 +1,983 @@
+- en: Managing Many Simultaneous Client Connections
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '"If everyone helps to hold up the sky, then one person does not become tired."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: – Tshi Proverb
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Maintaining a high level of throughput while managing thousands of simultaneous
+    client transactions in the unpredictable and *bursty* environment of networked
+    software is one expectation developers have for their Node implementations. Given
+    a history of failed and unpopular solutions, the problem of concurrency has even
+    been assigned its own numeronym: "*The C10K problem*". How should network software
+    confidently serving 10,000 simultaneous clients be designed?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The question of how to best build high concurrency systems has provoked much
+    theory over the last several decades, with the debate mostly between two alternatives,
+    threads and events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Threading allows programmers to write straight-line code and rely on the operating
+    system to overlap computation and I/O by transparently switching across threads.
+    The alternative, events, allows programmers to manage concurrency explicitly by
+    structuring code as a single-threaded handler that reacts to events (such as non-blocking
+    I/O completions, application-specific messages, or timer events)."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: – "A Design Framework for Highly Concurrent Systems"  (Welsh, Gribble, Brewer
+    & Culler, 2000), p. 2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Two important points are made in the preceding quote:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Developers prefer to write structured code (straight line; single threaded)
+    that hides the complexity of multiple simultaneous operations where possible
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I/O efficiency is a primary consideration of high-concurrency applications
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Until very recently, programming languages and related frameworks were not (necessarily)
+    optimized for software executing across nodes in a distributed network, or even
+    across processors. Algorithms are expected to be deterministic; data written to
+    a database is expected to be immediately available for reading. In this age of
+    eventually consistent databases and asynchronous control flow, developers can
+    no longer expect to know the precise state of an application at any given point
+    of time; a sometimes mind-bending challenge for the architects of highly concurrent
+    systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we learned in [Chapter 2](4cb6b06a-7800-4595-9908-f14d1ced3602.xhtml), *Understanding
+    Asynchronous Event-Driven Programming,* Node's design attempts to combine the
+    advantages of both threads and events, serving all clients on a single thread
+    (an event loop wrapping a JavaScript runtime) while delegating the blocking work
+    (I/O) to an optimized thread pool that informs the main thread of state changes
+    via an event notification system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Think clearly about how the following HTTP server implementation, running on
+    a single CPU, is responding to each client request by wrapping a callback function
+    in the context of the request and pushing that execution context onto a stack
+    that is constantly emptied and rebuilt within a single thread bound to an event
+    loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Schematically, it is this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/7dcb3dae-75b2-4ef1-ba34-433e6e556c37.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'On the other hand, a server like Apache spins up a thread for each client request:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9db30472-79fb-46ca-a25c-65579afd9641.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'These two approaches are very different. The claim implicit in Node''s design
+    is this: it is easier to reason about highly concurrent software when program
+    flow is organized along a single thread, and that decreasing I/O latency increases
+    the number of simultaneous clients that can be supported even in a single-threaded
+    execution model. The second claim will be tested later, but for now, let''s see
+    how easy it can be to build basic processes that naturally scale.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will demonstrate how to track and manage the relationships between concurrent
+    processes using Node, in particular, those servicing multiple clients simultaneously.
+    Our goal is to set up a basic understanding of how state should be modeled within
+    a Node server or other processes. How is it that a large online social network
+    serves you customized information tailored by your friendships or interests? How
+    is your shopping cart maintained over several shopping sessions, without disappearing,
+    even containing suggestions based on your history of purchases? How can a single
+    client interact with other clients?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding concurrency
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We would all agree that there are unexpected events in the world, and that many
+    of them occur at exactly the same time. It is also clear that the state of any
+    given system may be composed of any number of substates, where the full consequence
+    of even minor state changes are difficult to predict—the power of a butterfly's
+    wings being enough to tip a much larger system into an alternate state. Also,
+    we also know that the volume and shape of a system, over time, changes in ways
+    difficult to predict.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In his PHD thesis "*Foundations of Actor Semantics*", written in 1981, William
+    Clinger proposed that his work was:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"...motivated by the prospect of highly parallel computing machines consisting
+    of dozens, hundreds or even thousands of independent microprocessors, each with
+    its own local memory and communications processor, communicating via a high-performance
+    communications network."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As it turns out, Clinger was on to something. Concurrency is a property of systems
+    composed of many simultaneously executing operations, and the network software
+    we are now building resembles the one he envisioned, only much larger, where *hundreds
+    or even thousands* is the lower bound, not the higher.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node makes concurrency accessible, while simultaneously scaling across multiple
+    cores, multiple processes, and multiple machines. It is important to note that
+    Node places as much importance on the simplicity and consistency of programs as
+    it does on being the fastest solution, embracing and enforcing non-blocking I/O
+    in an effort to deliver high concurrency through well-designed and predictable
+    interfaces. This is what Dahl meant when he said, "Node's goal is to provide an
+    easy way to build scalable network programs".
+  prefs: []
+  type: TYPE_NORMAL
+- en: Happily, it also turns out that Node is very fast.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Concurrency is not parallelism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A problem can be solved by dividing it into smaller problems, spreading those
+    smaller problems across a pool of available people or workers to work on in parallel,
+    and delivering the parallel results concurrently.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Multiple processes each solving one part of a single mathematical problem simultaneously
+    is an example of parallelism.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Rob Pike, general wizard hacker and co-inventor of Google''s Go programming
+    language, defines concurrency in this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Concurrency is a way to structure a thing so that you can, maybe, use parallelism
+    to do a better job. But parallelism is not the goal of concurrency; concurrency''s
+    goal is a good structure."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Successful high-concurrency application development frameworks provide a simple
+    and expressive vocabulary for describing such systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node's design suggests that achieving its primary goal—to provide an easy way
+    to build scalable network programs—includes simplifying how the execution order
+    of coexisting processes is structured and composed. Node helps a developer struggling
+    with a program within which many things are happening at once (such as serving
+    many concurrent clients) to better organize his or her code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is not to say that Node is designed to concede efficiency in order to maintain
+    simple interfaces—far from it. Instead, the idea is to move responsibility for
+    implementing efficient parallel processing away from the developer and into the
+    core design of the system, leaving the developer free to structure concurrency
+    through a simple and predictable callback system, safe from deadlocks and other
+    traps.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node's bracing simplicity comes at a good time, as social and community networks
+    grow alongside the world's data. Systems are being scaled to sizes that few would
+    have predicted. It is a good time for new thinking, such as how to describe and
+    design these systems, and the way they make requests of, and respond to, each
+    other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Routing requests
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: HTTP is a data transfer protocol built upon a request/response model. Using
+    this protocol, many of us communicate our current status to friends, buy presents
+    for family, or discuss a project over email with colleagues. A staggering number
+    of people have come to depend on this foundational internet protocol.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Typically, a browser client will issue an HTTP GET request to a server. This
+    server then returns the requested resource, often represented as an HTML document.
+    HTTP is stateless, which simply means that each request or response maintains
+    no information on previous requests or responses—with each back and forward movement
+    through web pages, the entire browser state is destroyed and rebuilt from scratch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Servers route state change requests from clients, ultimately causing new state
+    representations to be returned, which clients (often browsers) redraw or report.
+    When the WWW was first conceived, this model made sense. For the most part, this
+    new network was understood as a distributed filesystem, accessible by anyone with
+    a web browser, where a specific resource (such as a newspaper article) could be
+    requested from a file-serving computer (a server) located somewhere on the network
+    (at an Internet Protocol or IP address) via an HTTP request (such as GET) by simply
+    typing in an URL (for example, [http://www.example.org/articles/april/showers.html](http://www.example.org/articles/april/showers.html)).
+    A user requests a page and that page appears, perhaps containing (hyper) links
+    to related pages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, since a stateless protocol does not maintain context information, it
+    was nearly impossible for the operator of a server to develop a more interesting
+    relationship with a visitor across a series of requests, or for a visitor to dynamically
+    aggregate multiple responses into a single view.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Additionally, the expressiveness of requests was limited both by the protocol
+    itself and by the lack of server content rich enough to usefully support a more
+    descriptive vocabulary. For the most part, requests were as blunt as pointing
+    a finger at an object of desire—*get that for me*. Consider the parts of a typical
+    URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/8e5bfd4c-8f16-4b85-8909-315c391656bd.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: We can see how much client work is involved in describing a simple resource
+    location, with query parameters and resource targets an awkward afterthought,
+    becoming nearly unusable once more than a few resource descriptors are used. While
+    this was workable in a time of simple documents in well-understood and invariant
+    hierarchies, the demands and complexities of modern networked software have rendered
+    the original concept unworkable and in need of improvement.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The clumsiness of passing around increasingly complex key/value pairs to maintain
+    user state began to frustrate the ambitions of this new medium. Very quickly,
+    it became obvious to developers that a growing reliance on the internet as the
+    utility communication layer of the world's information, software, and commerce
+    required a more refined approach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Over time, these limitations have been overcome through a combination of improvements
+    to the HTTP protocol, the introduction of JavaScript to the browser, technologies
+    such as browser cookies and the attendant innovation from developers building
+    products and services exploiting these advances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nevertheless, the HTTP protocol itself continues to be dominated by the same
+    motifs of individual file-like resources existing at a distinct and permanent
+    path and identified by an often non-descriptive name.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What actually exists on many servers now is a complex software specifying network
+    interfaces to data models. Communicating with these types of networked applications
+    involves getting and setting the state of that data model, both in general and
+    as it applies in particular to the client making a request.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clients deploying a real-time solution both set and get resource state representations
+    on a server. Application servers must report a client's state in relation to multiple
+    processes (databases, files, rules engines, calculation engines, and so on) on
+    each request, and often unilaterally on application state changes (for example,
+    a user losing access permission). Clients are often not browsers, but other servers.
+    How should they communicate?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding routes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Routes map URLs to actions. Rather than constructing an application interface
+    in terms of URL paths to specific files that contain some logic, designing with
+    routes involves assigning a specific function to a distinct combination of a URL
+    path and request method. For example, a web service that accepts requests for
+    lists of cities might be called in this manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When your server receives this request, it would pass the URL information to
+    a PHP process that will execute the application logic in `cities.php`, such as
+    reading the query, parsing out the country and state, calling a database, building
+    a response, and returning it. Node has the great benefit of being able to function
+    both as the server and the application environment. The server can field requests
+    directly. Then, it makes more sense to use URLs as simple statements of intent:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In a Node server, we might use something like the following code to handle
+    these requests for cities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'One good thing and one bad jump out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: URL handling is clearly organized in one place
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The code is impossibly repetitive
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Writing out every possible route won''t work. We''ll keep the organization,
+    but need to create variables in routes, preferring to define a general route expression
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The method `listCities` can accept `country` and `state` *variable* arguments,
+    identified with a colon (`:`) prefix. Within our server, we would need to convert
+    this symbolic expression into a regular expression. In this case, the `RegExp
+    /^\/listCities\/([^\/\.]+)\/([^\/\.]+)\/?$/` could be used to extract ordered
+    values from our example URL into a value map similar to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By treating requests as expressions, our server design has become a little
+    saner, nicely routing any country/state combination to a common handler function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: This form of request routing has *won the argument* in the Node community, being
+    the default behavior of various frameworks and tools. In fact, this way of thinking
+    about routing requests has gained acceptance in many other development environments,
+    such as Ruby on Rails. As a result, most web application frameworks for Node have
+    been developed around routing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The most popular web application framework for Node is T.J. Holowaychuk's Express
+    framework, and we'll be using this framework frequently in this book when designing
+    routing servers. You can install it via `npm` by running `npm install express`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Express to route requests
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Express simplifies the complexity of defining route-matching routines. Our
+    example might be written in the following way using Express:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Instantiating Express delivers a fully-formed web server wrapped in an easy-to-use
+    application development API. Our cities service is clearly defined and its variables
+    stated, expecting to be called via GET (one might also use `app.post(...)` or
+    `app.put(...)`, or any other standard `HTTP` method).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Express also introduces the idea of chaining request-handling routines, which
+    in Express are understood as middleware. In our example, we are calling a single
+    function in order to handle a cities request. What if, prior to calling our database,
+    we want to check that the user is authenticated? We might add an `authenticate()`
+    method prior to our main service method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Middleware can be chained, in other words, simplifying the creation of complex
+    execution chains, nicely following the Rule of Modularity. Many types of middleware
+    for handling favicons, logging, uploads, static file requests, and so on have
+    already been developed. To learn more, visit: [https://expressjs.com/](https://expressjs.com/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having established the proper way for Node servers to be configured for routing
+    requests, we can now begin a discussion on how to identify the client making the
+    request, assigning that client a unique session ID, and managing that session
+    through time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Redis for tracking client state
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For some of the applications and examples in this chapter, we will be using
+    **Redis**, an in-memory Key/Value (KV) database developed by *Salvatore Sanfilippo*.
+    More information on Redis can be found at: [http://redis.io](http://redis.io).
+    A well-known competitor to Redis is **Memcached** ([http://memcached.org](http://memcached.org)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general, any server that must maintain the session state of many clients
+    will need a high-speed data layer with near-instantaneous read/write performance,
+    as request validation and user state transformations can occur multiple times
+    on each request. Traditional file-backed relational databases tend to be slower
+    at this task than in-memory KV databases. We're going to use Redis for tracking
+    the client state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Redis is a single-threaded data store that runs in memory. It is very fast,
+    and focused on implementing several data structures, such as hashes and lists
+    and sets, and performing operations on those (such as set intersections and list
+    pushing and popping). Instructions for installing Redis can be found here: [https://redis.io/topics/quickstart](https://redis.io/topics/quickstart).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To interact with Redis:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notably, Amazon''s ElastiCache service enables Redis "in the cloud" as an in-memory
+    cache, with automatic scaling and redundancy at: [https://aws.amazon.com/elasticache/](https://aws.amazon.com/elasticache/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Redis supports a standard interface for expected actions, such as getting or
+    setting key/value pairs. To `get` the value stored at a key, first start the Redis
+    CLI:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Redis will return (`nil`) when a key does not exist. Let''s `set` a key:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To use Redis within a Node environment, we will need some sort of binding.
+    We will be using Matt Ranney''s `node_redis` module. Install it with npm using
+    the following command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To set a value in Redis and get it back again, we can now do this in Node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Storing user data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Managing many users means at least tracking their user information, some stored
+    long term (for example, address, purchase history, and contact list) and some
+    session data stored for a short time (time since login, last game score, and most
+    recent answer).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Normally, we would create a secure interface or similar, allowing administrators
+    to create user accounts. It will be clear to the reader how to create such an
+    interface by the end of this chapter. For the examples that follow, we''ll only
+    need to create one user, to act as a volunteer. Let''s create `Jack`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This will create a key in Redis—Jack—containing a hash resembling:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we wanted to create a hash and add several KV pairs all at once, we could
+    achieve the preceding with the `hmset` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, `Jack` exists:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can use the following command to fetch the value stored for a specific field
+    in Jack''s account:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Handling sessions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: How does a server know if the current client request is part of a chain of previous
+    requests? Web applications engage with clients through long transactional chains—the
+    shopping cart containing items to buy will still be there even if a shopper navigates
+    away to do some comparison-shopping. We will call this a session, which may contain
+    any number of KV pairs, such as a username, product list, or the user's login
+    history.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How are sessions started, ended, and tracked? There are many ways to attack
+    this problem, depending on many factors existing in different ways on different
+    architectures. In particular, if more than one server is being used to handle
+    clients, how is session data shared between them?
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will use cookies to store session IDs for clients, while building a simple
+    long-polling server. Keep in mind that as applications grow in complexity, this
+    simple system will need to be extended. As well, long-polling as a technology
+    is giving ground to the more powerful socket techniques we will explore in our
+    discussions around building real-time systems. However, the key issues faced when
+    holding many connected clients simultaneously on a server, and tracking their
+    sessions, should be demonstrated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cookies and client state
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Netscape provided the preliminary specification for cookies in 1997:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: According to [https://web.archive.org/web/20070805052634/http://wp.netscape.com/newsref/std/cookie_spec.html](https://web.archive.org/web/20070805052634/http://wp.netscape.com/newsref/std/cookie_spec.html), "Cookies
+    are a general mechanism which server side connections (such as CGI scripts) can
+    use to both store and retrieve information on the client side of the connection.
+    The addition of a simple, persistent, client-side state significantly extends
+    the capabilities of Web-based client/server applications. A server, when returning
+    an HTTP object to a client, may also send a piece of state information which the
+    client will store. Included in that state object is a description of the range
+    of URLs for which that state is valid. Any future HTTP requests made by the client
+    which fall in that range will include a transmittal of the current value of the
+    state object from the client back to the server. The state object is called a
+    cookie, for no compelling reason."
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, we have one of the first attempts to *fix* the stateless nature of HTTP,
+    specifically, the maintenance of session state. It was such a good attempt, which
+    still remains a fundamental part of the web.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We''ve already seen how to read and set the cookie header with Node. Express
+    makes the process a little easier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note the `use` method, which allows us to turn on the cookie handling middleware
+    for Express. Here, we see that whenever a client hits our server, this client
+    is assigned a random number as a cookie. By navigating to `/mycookie`, this client
+    can see the cookie.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A simple poll
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Next, let's create a concurrent environment, one with many simultaneously connected
+    clients. We'll use a long-polling server to do this, broadcasting to all connected
+    clients via `stdin`. Additionally, each client will be assigned a unique session
+    ID, used to identify the client's `http.serverResponse` object, which we will
+    push data to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Long polling is a technique whereby a server holds on to a client connection
+    until there is data available to send. When data is ultimately sent to the client,
+    the client reconnects to the server and the process continues. It was designed
+    as an improvement on short polling, which is the inefficient technique of blindly
+    checking with a server for new information every few seconds or so, hoping for
+    new data. Long polling only requires a reconnection following a tangible delivery
+    of data to the client.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll use two routes. The first route is described using a forward slash (`/`),
+    a root domain request. Calls to this path will return some HTML forming the client
+    UI. The second route is `/poll`, which the client will use to reconnect with the
+    server following the receipt of some data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The client UI is extremely simple: its sole purpose is to make an XML HTTP
+    request (XHR) to a server (which will hold that request until some data arrives),
+    repeating this step immediately following the receipt of some data. Our UI will
+    display a list of messages received within an unordered list. For the XHR bit
+    we will use the jQuery library. Any similar library can be used, and building
+    a pure JavaScript implementation is not difficult.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'HTML:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'JavaScript:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the client code above you should see how this will work. A client makes a
+    GET call to /poll, and will wait until data is received. Once data is received
+    it is added to the client display and another /poll call is made. In this way
+    the client holds a long connection to the server, and reconnects only after receiving
+    data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The server is also simple, mainly responsible for setting session IDs and holding
+    on to concurrent client connections until such time as data is available, which
+    is broadcast to all connected clients. Data is made available through a redis
+    pub/sub mechanism. These connections are indexed via session IDs, maintained using
+    cookies:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Run this server on the command line, and connect to the server via a browser
+    (http://localhost:2112). A page with the text "Results:" will be displayed. Return
+    to the command line and enter some text—this message should immediately appear
+    in your browser. As you keep typing on the command line, your message will be
+    routed to connected clients. You can try this as well with multiple clients --
+    note that you should use different browsers, incognito mode, or other ways to
+    distinguish each client.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While this is a toy server used for demonstration (you probably shouldn't use
+    long polling -- better options are presented in [Chapter 6](7c71fdd2-8060-4363-9ab3-1c5cdc24c8cf.xhtml),
+    *Creating Real-Time Applications*), ultimately it should be seen how one might
+    use some business logic to update state, and then have those state change events
+    caught and then broadcast to listening clients using a mechanism like Redis pub/sub.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Authenticating connections
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In conjunction with establishing client session objects, a Node server often
+    demands authentication credentials. The theory and practice of web security is
+    extensive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We want to simplify our understanding into two main authentication scenarios:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the wire protocol is HTTPS
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When it is HTTP
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The first is naturally secure, and the second is not. For the first, we will
+    learn how to implement Basic authentication in Node, and for the second, a challenge-response
+    system will be described.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Basic authentication
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As mentioned, Basic authentication sends plain text over the wire containing
+    a username/password combination, using standard HTTP headers. It is a simple and
+    well-known protocol. Any server sending the correct headers will cause any browser
+    to display a login dialog, like the following one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/8b8f4ff2-1e85-46b4-8ef2-59f273085118.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Nonetheless, this method remains insecure, sending non-encrypted data in plain
+    text over the wire. For the sake of simplicity, we will demonstrate this authentication
+    method on an HTTP server, but it must be stressed that in real-world usage the
+    server must be communicating via a secure protocol, such as HTTPS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s implement this authentication protocol with Node. Employing the user
+    database developed earlier in Redis, we validate submitted credentials by checking
+    user objects for matching passwords, handling failures and successes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By sending a `401` status and the `''authorization''` header on a new client
+    connection, a dialog like the one previous screenshot will be created via this
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this way, a straightforward login system can be designed. As browsers will
+    naturally prompt users requesting access to a protected domain, even the login
+    dialog is taken care of.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handshaking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Another authentication method to consider in situations where an HTTPS connection
+    cannot be established is a challenge-response system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/53a64cb6-d275-4202-8fd3-f0fb575ba817.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: In this scenario, a client asks a server for access for a specific user, username,
+    ID, or similar. Typically, this data would be sent via a login form. Let's mock
+    up a challenge/response scenario, using for our example the user we created earlier—Jack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The general design and purpose of a challenge/response system aims to avoid
+    sending any password data in plain text over the wire. So, we will need to decide
+    on an encryption strategy that both the client and the server share. For our example,
+    let''s use the SHA256 algorithm. Node''s crypto library contains all of the tools
+    necessary for creating this type of hash. The client likely does not, so we must
+    provide one. We''ll use the one developed by Chris Veness, which can be downloaded
+    from the following link: [https://github.com/chrisveness/crypto/blob/master/sha256.js.](https://github.com/chrisveness/crypto/blob/master/sha256.js)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To initiate this login, the client will need to send an authentication request
+    for the user Jack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In response, the client should receive a server-generated public key—the challenge.
+    The client must now form a string of Jack''s password prefixed by this key. Create
+    a SHA256 hash from it, and pass the resulting hash to `/login/`. The server will
+    have also created the same SHA256 hash—if the two match, the client is authenticated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The server itself is very simple, composed of the two mentioned authentication
+    routes. We can see in the following code how, upon receipt of a username (`jack`),
+    the server will first check for an existing user hash in Redis, breaking the handshake
+    if no such data is found. If a record exists we create a new, random public key,
+    compose the relevant SHA256 hash, and return this challenge value to the client.
+    Additionally, we set this hash as a key in Redis, with its value being the sent
+    username:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the `/login/` route handler, we can see how a check is made if the response
+    exists as a key in Redis and, if found, we immediately delete the key. This is
+    necessary for several reasons, not least of which is preventing others to send
+    the same response and gain access. We also generally don''t want these now useless
+    we want keys to pile up. This presents a problem: what if a client never responds
+    to the challenge? As the key cleanup only happens when a `/login/` attempt is
+    made, this key will never be removed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Unlike most KV data stores, Redis introduces the idea of **key expiry**, where
+    a set operation can specify a **Time To Live** (**TTL**) for a key. For example,
+    here, we use the `setex` command to set a key `userId` to value `183` and specify
+    that this key should expire in one second:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This feature offers an excellent solution to our problem. By replacing the
+    `client.set(challenge, username);` line with the following line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: We ensure that, no matter what, this key will disappear in `5` seconds. Doing
+    things this way also functions as a light security measure, leaving a very short
+    window for a response to remain valid, and being naturally suspicious of delayed
+    responses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using JSON Web Tokens for authentication
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A basic authentication system might require a client to send a username and
+    password on each request. To initiate a token-based authenticated session a client
+    sends credentials just once, receives a token in exchange, and then sends only
+    that token on subsequent requests, gaining any access that token provides. Incessantly
+    passing around sensitive credentials is no longer required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0b5ae151-9f87-4a30-8abd-b3f01561c0aa.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: One particular advantage of JWTs is that servers are no longer responsible for
+    maintaining access to a common database of credentials, as only the issuing authority
+    need validate an initial sign-in. There is no need to maintain a session store
+    when using JWTs. The issued token (think of it as an access card) can therefore
+    be used within any domain (or server) that recognizes and accepts it. In terms
+    of performance, the cost of a request is now the cost of decrypting a hash versus
+    the cost of making a database call to validate credentials. We also avoid the
+    problems one can face using cookies on mobile devices, cross-domain issues (cookies
+    are domain-bound), certain types of request forgery attacks, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `express-jwt` module can be useful if you want to integrate with Express: [https://github.com/auth0/express-jwt](https://github.com/auth0/express-jwt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's look at the structure of a JWT, then build a simple example demonstrating
+    how to issue, validate, and otherwise use JWTs to manage sessions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A JWT token has the following format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each segment is described in JSON format. A **header** simply describes the
+    token -- its type and encryption algorithm. Consider this example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, we declare that this is a JWT token, encrypted using HMAC SHA-256\. See [https://nodejs.org/api/crypto.html](https://nodejs.org/api/crypto.html)
+    for more information about encryption, and how to perform encryption with Node.
+    The JWT specification itself can be found at: [https://tools.ietf.org/html/rfc7519](https://tools.ietf.org/html/rfc7519).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **claims** segment outlines security and other constraints that are should
+    be checked by any service receiving the JWT. Check the specification for a full
+    accounting. Typically, a JWT claims manifest will want to indicate when the JWT
+    was issued, who issued it, when it expires, who the subject of the JWT is, and
+    who should accept the JWT:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `iat` (issued-at) and `exp` (expires) claims are both set to numeric values
+    indicating the number of seconds since the Unix epoch. The `iss` (issuer) should
+    be a URL describing the issuer of the JWT. Any service that receives a JWT must
+    inspect the `aud` (audience), and that service must reject the JWT if it does
+    not appear in the audience list. The `sub` (subject) of the JWT identifies the
+    subject of the JWT, such as the user of an application—a unique value that is
+    never reassigned, such as the name of the issuing service and a unique user ID.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, some sort of useful data is attached, using any key/value pairing you'd
+    like. Here let's call the token data sessionData. Note that we need to encrypt
+    this data—the signature segment of a JWT prevents tampering with session data,
+    but JWTs are not themselves encrypted (though you can always encrypt the entire
+    token itself).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last step is to create a signature, which, as mentioned, prevents tampering—a
+    JWT validator is specifically checking for mismatches between the signature and
+    the packet received.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What follows is a scaffold server and client example demonstrating how to implement
+    a JWT-driven authentication system. Rather than implementing the various signing
+    and validation steps "by hand", we'll use the `jwt-simple` package. Feel free
+    to browse the `/jwt` folder in your code bundle, which contains the full code
+    we'll be unpacking as we move ahead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To ask for a token, we will use the following client code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And when we have received a `username` and `password` in some way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: We'll implement the server code next. For now, note that we have a send method
+    that expects at some point to have a global token set for it to pass along when
+    making requests. The initial `/login` is where we ask for that token.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using Express, we create the following server and `/login` route:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Note that we store our `jwtsecret` on the app server. This is the key that
+    is used when signing tokens. When a login attempt is made the server will return
+    the result of `jwt.encode`, which encodes the JWT claims discussed earlier. That''s
+    it. From now on, any client that mentions this token to the correct audience will
+    be allowed to interact with any services those audience members provide for a
+    period expiring 7 days from the date of issue. These services will implement something
+    like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, we are simply fetching the **Authorization** header (stripping out **Bearer**)
+    and decoding via `jwt.decode`. A service must at least check for token expiry,
+    which we do here by comparing the current number of seconds since the Epoch to
+    the token's expiry time. Using this simple framework you can create an easily
+    scalable authentication/session system using a secure standard. No longer required
+    to maintain a connection to a common credentials database, individual services
+    (deployed perhaps as microservices) can use JWTs to validate requests, incurring
+    little CPU, latency, or memory cost.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Node provides a set of tools that help in the design and maintenance of large-scale
+    network applications facing the C10K problem. In this chapter, we've taken our
+    first steps into creating network applications with many simultaneous clients,
+    tracking their session information and their credentials. This exploration into
+    concurrency has demonstrated some techniques for routing, tracking, and responding
+    to clients. We've touched on some simple techniques to use when scaling, such
+    as the implementation of intra-process messaging via a publish/subscribe system
+    built using a Redis database. We also touched on various authentication mechanisms,
+    from basic authentication to token-based authentication with JSON Web Tokens.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We are now ready to go deeper into the design of real-time software—the logical
+    next step after achieving high concurrency and low latency using Node. We will
+    extend the ideas outlined during our discussion of long polling and place them
+    in the context of more robust problems and solutions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Concurrency and parallelism are rich concepts that have enjoyed rigorous study
+    and debate. When an application architecture is designed to favor threads, events,
+    or some hybrid, it is likely that the architects are opinionated about both concepts.
+    You are encouraged to dip a toe into the theory and read the following articles.
+    A clear understanding of precisely what the debate is about will provide an objective
+    framework that can be used to qualify a decision to choose (or not choose) Node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some numbers: [http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.154.7354&rep=rep1&type=pdf](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.154.7354&rep=rep1&type=pdf)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Threads are a bad idea: [https://web.stanford.edu/~ouster/cgi-bin/papers/threads.pdf](https://web.stanford.edu/~ouster/cgi-bin/papers/threads.pdf)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Events are a bad idea: [https://people.eecs.berkeley.edu/~brewer/papers/threads-hotos-2003.pdf](https://people.eecs.berkeley.edu/~brewer/papers/threads-hotos-2003.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'How about together? : [https://www.cis.upenn.edu/~stevez/papers/LZ06b.pdf](https://www.cis.upenn.edu/~stevez/papers/LZ06b.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The science: [http://courses.cs.vt.edu/cs5204/fall09-kafura/Presentations/Threads-VS-Events.pdf](http://courses.cs.vt.edu/cs5204/fall09-kafura/Presentations/Threads-VS-Events.pdf)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

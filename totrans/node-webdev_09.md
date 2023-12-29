@@ -1,0 +1,432 @@
+Data Storage and Retrieval
+
+In the previous two chapters, we built a small and somewhat useful application for storing notes, and then made it work on mobile devices. While our application works reasonably well, it doesn't store these notes anywhere on a long-term basis, meaning the notes are lost when you stop the server, and if you run multiple instances of `Notes`, each instance has its own set of notes. Our next step is to introduce a database tier to persist the notes to long-term storage. 
+
+In this chapter, we will look at database support in Node.js, with the goal being to gain exposure to several kinds of databases. For the `Notes` application, the user should see the same set of notes for any `Notes` instance accessed, and the user should be able to reliably access notes at any time.
+
+We'll start with the `Notes` application code used in the previous chapter. We started with a simple in-memory data model, using an array to store the notes, and then made it mobile-friendly. In this chapter, we will cover the following topics:
+
+*   The relationship between databases and asynchronous code
+*   Configuring the logging of operational and debugging information
+*   Catching important system errors
+*   Using `import()` to enable the runtime selection of the database to use
+*   Implementing data persistence for the `Notes` objects using several database engines
+*   Designing simple configuration files with YAML
+
+The first step is to duplicate the code from the previous chapter. For instance, if you were working in `chap06/notes`, duplicate it and change its name to `chap07/notes`.
+
+Let's start by reviewing a little theory on why database code in Node.js is asynchronous.
+
+Let's get started!
+
+# Remembering that data storage requires asynchronous code
+
+By definition, external data storage systems require asynchronous coding techniques, such as the ones we discussed in previous chapters. The core principle of the Node.js architecture is that any operation that requires a long time to perform must have an asynchronous API in order to keep the event loop running. The access time to retrieve data from a disk, another process, or a database always needs to take sufficient time to require deferred execution. 
+
+The existing `Notes` data model is an in-memory datastore. In theory, in-memory data access does not require asynchronous code and, therefore, the existing model module could use regular functions, rather than `async` functions.
+
+We know that `Notes` should use databases and it requires an asynchronous API to access the `Notes` data. For this reason, the existing `Notes` model API uses `async` functions, so in this chapter, we can persist the Notes data to databases.
+
+That was a useful refresher. Let's now talk about one of the administrative details required for a production application—using a logging system to store the usage data.
+
+# Logging and capturing uncaught errors
+
+Before we get into databases, we have to address one of the attributes of a high-quality web application—managing logged information, including normal system activity, system errors, and debugging information. Logs give us an insight into the behavior of the system. They answer the following questions for the developers:
+
+*   How much traffic is the application getting?
+*   If it's a website, which pages are people hitting the most?
+*   How many errors occur and of what kind? Do attacks occur? Are malformed requests being sent?
+
+Log management is also an issue. Unless managed well, log files can quickly fill the disk space. So, it becomes high priority to process old logs, hopefully extracting useful data before deleting the old logs. Commonly, this includes **log rotation**, which means regularly moving the existing log file to an archive directory and then starting with a fresh log file. Afterward, processing can occur to extract useful data, such as errors or usage trends. Just as your business analyst looks at profit/loss statements every few weeks, your DevOps team needs various reports to know whether there are enough servers to handle the traffic. Furthermore, log files can be screened for security vulnerabilities.
+
+When we used the Express generator to initially create the `Notes` application, it configured an activity-logging system using `morgan` with the following code:
+
+[PRE0]js\1
+
+This is the pattern we are following throughout this book; namely, to have a default value baked into the application and to use an environment variable to override the default. If we don't supply a configuration value through the environment variable, the program uses the `dev` format. Next, we need to run `Notes`, as follows:
+
+[PRE1]js\1
+
+However, this has a problem; it's impossible to perform log rotation without killing and restarting the server. The phrase *log rotation* refers to a DevOps practice of keeping log file snapshots, where each snapshot covers a few hours of activity. Typically, an application server will not keep a file handle continuously open to the log file, and the DevOps team can write a simple script that runs every few hours and uses the `mv` command to move log files around and the `rm` command to delete old files. Unfortunately, `morgan`, when configured as it is here, keeps a continuously open file handle to the log file.
+
+Instead, we'll use the `rotating-file-stream` package. This package even automates the log rotation task so that the DevOps team doesn't have to write a script for that purpose. 
+
+For the documentation on this, refer to the package page at [https://www.npmjs.com/package/rotating-file-stream](https://www.npmjs.com/package/rotating-file-stream).
+
+First, install the package:
+
+[PRE2]js\1
+
+In the `import` section at the top, we're loading `rotating-file-stream` as `rfs`. If the `REQUEST_LOG_FILE` environment variable is set, we'll take that as the filename to record to. The `stream` argument to `morgan` simply takes a writable stream. If `REQUEST_LOG_FILE` is not set, we use a `?:` operator to supply the value of `process.stdout` as the writable stream. If it is set, then we use `rfs.createStream` to create a writable stream that handles log rotation through the `rotating-file-stream` module.
+
+In `rfs.createStream`, the first argument is the filename of the log file and the second is an `options` object describing the behavior to use. Quite a comprehensive set of options are available for this. The configuration shown here rotates the log file when it reaches 10 megabytes in size (or after 1 day) and the rotated log file is compressed using the `gzip` algorithm.
+
+It's possible to set up multiple logs. For example, if we wanted to log to the console, in addition to logging to the file, we could add the following `logger` declaration:
+
+[PRE3]js\1
+
+With this configuration, an Apache format log will be created in `log.txt`. After making a few requests, we can inspect the log:
+
+[PRE4]js\1
+
+This is pretty useful if you want to debug Express. However, we can use this in our own code as well. This works similarly to inserting `console.log` statements, but without having to remember to comment out the debugging code.
+
+To use this in our code, add the following declaration to the top of any module where you want the debugging output:
+
+[PRE5]js\1
+
+When debugging is enabled for the current module, this causes a message to be printed. If debugging is not enabled for the current module, no messages are printed. Again, this is similar to using `console.log`, but you can dynamically turn it on and off without modifying your code, simply by setting the `DEBUG` variable appropriately.
+
+The `DEBUG` environment variable contains a specifier describing which code will have debugging enabled. The simplest specifier is `*`, which is a wildcard that turns on every debugger. Otherwise, debug specifiers use the `identifer:identifier` format. When we said to use `DEBUG=express:*`, the specifier used `express` as the first identifier and used the `*` wildcard for the second identifier.
+
+By convention, the first identifier should be the name of your application or library. So, we used `notes:debug` and `notes:error` earlier as specifiers. However, that's just a convention; you can use any specifier format you like.  
+
+To add debugging to `Notes`, let's add a little more code. Add the following to the bottom of `app.mjs`:
+
+[PRE6]js\1
+
+This will output an error trace on any errors captured by Express.
+
+Then, change `onListening` to the following:
+
+[PRE7]js\1
+
+Look at this carefully and you'll see that the output is both the logging output from `morgan` and the debugging output from the `debug` module. The debugging output, in this case, starts with `notes:debug`. The logging output is, because of the `REQUEST_LOG_FORMAT` variable, in Apache format.
+
+We now have a debug tracing system that's ready to be used. The next task to cover is seeing whether it's possible to capture this or other console output in a file.
+
+## Capturing stdout and stderr
+
+Important messages can be printed to `process.stdout` or `process.stderr`, which can be lost if you don't capture the output. It is best practice to capture this output for future analysis because there can be useful debugging information contained in it. An even better practice is to use a system facility to capture these output streams.
+
+A **system facility** can include a process manager application that launches applications while connecting the standard output and standard error streams to a file. 
+
+While it lacks this sort of facility, it turns out that JavaScript code running in Node.js can intercept the `process.stdout` and `process.stderr` streams. Among the available packages, let's look at `capture-console`. For a writable stream, this package will invoke a callback function that you provided for any output.
+
+Refer to the `capture-console` package page for the relevant documentation at [https://www.npmjs.com/package/capture-console](https://www.npmjs.com/package/capture-console).
+
+The last administrative item to cover is ensuring we capture otherwise uncaught errors.
+
+## Capturing uncaught exceptions and unhandled rejected Promises
+
+Uncaught exceptions and unhandled rejected Promises are other areas where important information can be lost. Since our code is supposed to capture all errors, anything that's uncaught is an error on our part. Important information might be missing from our failure analysis if we do not capture these errors.
+
+Node.js indicates these conditions with events sent by the process object, `uncaughtException` and `unhandledRejection`. In the documentation for these events, the Node.js team sternly says that in either condition, the application is in an unknown state because something failed and that it may not be safe to keep the application running.
+
+To implement these handlers, add the following to `appsupport.mjs`:
+
+[PRE8]js\1
+
+We'll use this to convert the `Note` objects into and from JSON-formatted text.
+
+The `JSON` method is a getter, which means it retrieves the value of the object. In this case, the `note.JSON` attribute/getter (with no parentheses) will simply give us the JSON representation of the note. We'll use this later to write to JSON files.
+
+`fromJSON` is a static function, or factory method, to aid in constructing the `Note` objects if we have a JSON string. Since we could be given anything, we need to test the input carefully. First, if the string is not in JSON format, `JSON.parse` will fail and throw an exception. Secondly, we have what the TypeScript community calls a **type guard**, or an `if` statement, to test whether the object matches what is required of a `Note` object. This checks whether it is an object with the `key`, `title`, and `body` fields, all of which must be strings. If the object passes these tests, we use the data to construct a `Note` instance.
+
+These two functions can be used as follows:
+
+[PRE9]js\1
+
+This imports the required modules; one addition is the use of the `fs-extra` module. This module is used because it implements the same API as the core `fs` module while adding a few useful additional functions. In our case, we are interested in `fs.ensureDir`, which verifies whether the named directory structure exists and if not, a directory path is created. If we did not need `fs.ensureDir`, we would simply use `fs.promises` since it, too, supplies filesystem functions that are useful in `async` functions.
+
+For the documentation on `fs-extra`, refer to [https://www.npmjs.com/package/fs-extra](https://www.npmjs.com/package/fs-extra).
+
+Now, add the following to `models/notes-fs.mjs`:
+
+[PRE10]js\1
+
+The `crupdate` function is used to support both the `update` and `create` methods. For this `Notes` store, both of these methods are the same and write the content to the disk as a JSON file.
+
+As the code is written, the notes are stored in a directory determined by the `notesDir` function. This directory is either specified in the `NOTES_FS_DIR` environment variable or in `notes-fs-data` within the `Notes` root directory (as learned from the `approotdir` variable). Either way, `fs.ensureDir` is used to make sure that the directory exists.  
+
+The pathname for `Notes` is calculated by the `filePath` function.
+
+Because the pathname is `${notesDir}/${key}.json`, the key cannot use characters that cannot be used in filenames. For that reason, `crupdate` throws an error if the key contains a `/` character.
+
+The `readJSON` function does what its name suggests—it reads a `Note` object as a JSON file from the disk.
+
+We're also adding another dependency:
+
+[PRE11]js\1
+
+However, our intent is to use ES6 modules, and so let's see how this works within that context. Because in the regular `import` statement the module name cannot be an expression like this, we need to load modules using `dynamic import`. The `dynamic import` feature—the `import()` function, in other words—does allow us to dynamically compute a module name to load. 
+
+To implement this idea, let's create a new file, `models/notes-store.mjs`, containing the following:
+
+[PRE12]js\1
+
+Any module implementing `AbstractNotesStore` will export the defined class as the default export.
+
+In `app.mjs`, we need to make another change to call this `useModel` function. In [Chapter 5](582d3898-0135-430c-8b6e-8326f287e18b.xhtml), *Your First Express Application*, we had `app.mjs` import `models/notes-memory.mjs` and then set up `NotesStore` to contain an instance of `InMemoryNotesStore`. Specifically, we had the following:
+
+[PRE13]js\1
+
+We are importing `useModel`, renaming it `useNotesModel`, and then calling it by passing in the `NOTES_MODEL` environment variable. In case the `NOTES_MODEL` variable is not set, we’ll default to the “memory” `NotesStore`. Since `useNotesModel` is an `async` function, we need to handle the resulting Promise. `.then` handles the success case, but there is nothing to do, so we supply an empty function. What's important is that any errors will shut down the application, so we have added `.catch`, which calls `onError` to do so.  
+
+To support this error indicator, we need to add the following to the `onError` function in `appsupport.mjs`:
+
+[PRE14]js\1
+
+We are importing the `NotesStore` export from `notes-store.mjs`, renaming it `notes`. Therefore, in both of the router modules, we will make calls such as `notes.keylist()` to access the dynamically selected `AbstractNotesStore` instance.
+
+This layer of abstraction gives the desired result—setting an environment variable that lets us decide at runtime which datastore to use.
+
+Now that we have all the pieces, let's run the `Notes` application and see how it behaves.
+
+## Running the Notes application with filesystem storage
+
+In `package.json`, add the following to the `scripts` section:
+
+[PRE15]js\1
+
+We can use the application at `http://localhost:3000` as before. Because we did not change any template or CSS files, the application will look exactly as you left it at the end of [Chapter 6](db8b0ab8-181f-4d8d-9088-a9962ec461b8.xhtml), *Implementing the Mobile-First Paradigm*.
+
+Because debugging is turned on for `notes:*`, we'll see a log of whatever the `Notes` application is doing. It's easy to turn this off by simply not setting the `DEBUG` variable.
+
+You can now kill and restart the `Notes` application and see the exact same notes. You can also edit the notes in the command line using regular text editors such as **vi**. You can now start multiple servers on different ports, using the `fs-server1` and `fs-server2` scripts, and see exactly the same notes.
+
+As we did at the end of [Chapter 5](582d3898-0135-430c-8b6e-8326f287e18b.xhtml), *Your First Express Application*, we can start the two servers' separate command windows. This runs two instances of the application, each on different ports. Then, visit the two servers in separate browser windows, and you will see that both browser windows show the same notes.
+
+Another thing to try is specifying `NOTES_FS_DIR` to define a different directory to store notes.
+
+The final check is to create a note where the key has a `/` character. Remember that the key is used to generate the filename where we store the note, and so the key cannot contain a `/` character. With the browser open, click on ADD Note and enter a note, ensuring that you use a `/` character in the `key` field. On clicking the Submit button, you'll see an error saying that this isn't allowed.
+
+We have now demonstrated adding persistent data storage to `Notes`. However, this storage mechanism isn't the best, and there are several other database types to explore. The next database service on our list is LevelDB.
+
+# Storing notes with the LevelDB datastore
+
+To get started with actual databases, let's look at an extremely lightweight, small-footprint database engine: `level`. This is a Node.js-friendly wrapper that wraps around the LevelDB engine and was developed by Google. It is normally used in web browsers for local data persistence and is a non-indexed, NoSQL datastore originally designed for use in browsers. The Level Node.js module uses the LevelDB API and supports multiple backends, including leveldown, which integrates the C++ LevelDB database into Node.js.
+
+Visit [https://www.npmjs.com/package/level](https://www.npmjs.com/package/level) for information on this module. 
+
+To install the database engine, run the following command:
+
+[PRE16]js\1
+
+We start the module with the `import` statements and a couple of declarations. The `connectDB` function is used for what the name suggests—to connect with a database. The `createIfMissing` option also does what it suggests, which is creating a database if there isn't one already one with the name that is used. The import from the module, `level`, is a constructor function that creates a `level` instance connected to the database specified by the first argument. This first argument is a location in the filesystem—a directory, in other words—where the database will be stored.
+
+The `level` constructor returns a `db` object through which to interact with the database. We're storing `db` as a global variable in the module for ease of use. In `connectDB`, if the `db` object is set, we just return it immediately; otherwise, we open the database using the constructor, as just described.
+
+The location of the database defaults to `notes.level` in the current directory. The `LEVELDB_LOCATION` environment variable can be set, as the name implies, to specify the database location.
+
+Now, let's add the rest of this module:
+
+[PRE17]js\1
+
+Finally, you can run the `Notes` application:
+
+[PRE18]js\1
+
+We import `NotesStore` so that we can call its methods, and `server` was already imported elsewhere.
+
+The first three `process.on` calls listen to operating system signals. If you're familiar with Unix process signals, these terms will be familiar. In each case, the event calls the `catchProcessDeath` function, which then calls the `close` function on `NotesStore` and, for good measure, on `server`.
+
+Then, to have a measure of confirmation, we attached an `exit` listener so that we can print a message when the process is exiting. The Node.js documentation says that the `exit` listeners are prohibited from doing anything that requires further event processing, so we cannot close database connections in this handler.
+
+Let's try it out by running the `Notes` application and then immediately pressing *Ctrl* + *C*:
+
+[PRE19]js\1
+
+This, of course, installs the `sqlite3` package.
+
+To manage a SQLite3 database, you'll also need to install the SQLite3 command-line tools. The project website has precompiled binaries for most operating systems. You'll also find the tools available in most package management systems.
+
+One management task that we can use is setting up the database tables, as we will see in the next section.
+
+## The SQLite3 database schema
+
+Next, we need to make sure that our database is configured with a database table suitable for the `Notes` application. This is an example database administrator task, as mentioned at the end of the previous section. To do this, we'll use the `sqlite3` command-line tool. The `sqlite3.org` website has precompiled binaries, or the tool can be installed through your operating system's package management system—for example, you can use `apt-get` on Ubuntu/Debian and MacPorts on macOS.
+
+For Windows, make sure you have installed the Chocolatey package manager tool from [https://chocolatey.org](https://chocolatey.org/). Then start a PowerShell with Administrator privileges, and run "`choco install sqlite`". That installs the SQLite3 DLL's and its command-line tools, letting you run the following instructions.
+
+We're going to use the following SQL table definition for the schema (save it as `models/schema-sqlite3.sql`):
+
+[PRE20]js\1
+
+While we can do this, however, the best practice is to automate all the administrative processes. To that end, we should instead write a little bit of script to initialize the database.
+
+Fortunately, the `sqlite3` command offers us a way to do this. Add the following to the `scripts` section of `package.json`:
+
+[PRE21]js\1
+
+This isn't fully automated since we have to press *Ctrl* + *D* at the `sqlite` prompt, but at least we don't have to use our precious brain cells to remember how to do this. We could have easily written a small Node.js script to do this; however, by using the tools provided by the package, we have less code to maintain in our own project.
+
+With the database table set up, let's move on to the code to interface with SQLite3.
+
+## The SQLite3 model code
+
+We are now ready to implement an `AbstractNotesStore` implementation for SQLite3.
+
+Create the `models/notes-sqlite3.mjs` file:
+
+[PRE22]js\1
+
+Since there are many member functions, let's talk about them individually:
+
+[PRE23]js\1
+
+We are now justified in defining to have separate `create` and `update` operations for the `Notes` model because the SQL statement for each function is different. The `create` function, of course, requires an `INSERT INTO` statement, while the `update` function, of course, requires an `UPDATE` statement.
+
+The `db.run` function, which is used several times here, executes a SQL query while giving us the opportunity to insert parameters in the query string.
+
+This follows a parameter substitution paradigm that's common in SQL programming interfaces. The programmer puts the SQL query in a string and then places a question mark anywhere that the aim is to insert a value in the query string. Each question mark in the query string has to match a value in the array provided by the programmer. The module takes care of encoding the values correctly so that the query string is properly formatted, while also preventing SQL injection attacks.
+
+The `db.run` function simply runs the SQL query it is given and does not retrieve any data:
+
+[PRE24]js\1
+
+In our `destroy` method, we simply use `db.run` to execute the `DELETE FROM` statement to delete the database entry for the associated note:
+
+[PRE25]js\1
+
+In `count`, the task is similar, but we simply need a count of the rows in the table. SQL provides a `count()` function for this purpose, which we've used, and then because this result only has one row, we can again use `db.get`.
+
+This enables us to run `Notes` with `NOTES_MODEL` set to `sqlite3`. With our code now set up, we can now proceed to run `Notes` with this database.
+
+## Running Notes with SQLite3
+
+We're now ready to run the `Notes` application with SQLite3\. Add the following code to the `scripts` section of `package.json`:
+
+[PRE26]js\1
+
+You can now browse the application at `http://localhost:3000` and run it through its paces, as before.
+
+Because we still haven't made any changes to the `View` templates or CSS files, the application will look the same as before.
+
+Of course, you can use the `sqlite` command, or other SQLite3 client applications, to inspect the database:
+
+[PRE27]js\1
+
+The first obviously installs the Sequelize package. The second, `js-yaml`, is installed so that we can implement a YAML-formatted file to store the Sequelize connection configuration. YAML is a human-readable **data serialization language**, which simply means it is an easy-to-use text file format to describe data objects.
+
+Perhaps the best place to learn about YAML is its Wikipedia page, which can be found at [https://en.wikipedia.org/wiki/YAML](https://en.wikipedia.org/wiki/YAML).
+
+Let's start this by learning how to configure Sequelize, then we will create an `AbstractNotesStore` instance for Sequelize, and finally, we will test `Notes` using Sequelize.
+
+## Configuring Sequelize and connecting to a database
+
+We'll be organizing the code for Sequelize support a little differently from before. We foresee that the `Notes` table is not the only data model that the `Notes` application will use. We could support additional features, such as the ability to upload images for a note or to allow users to comment on notes. This means having additional database tables and setting up relationships between database entries. For example, we might have a class named `AbstractCommentStore` to store comments, which will have its own database table and its own modules to manage the commented data. Both the `Notes` and `Comments` storage areas should be in the same database, and so they should share a database connection.
+
+With that in mind, let's create a file, `models/sequlz.mjs`, to hold the code to manage the Sequelize connection:
+
+[PRE28]js\1
+
+The `params.dialect` value determines what type of database to use; in this case, we're using SQLite3\. Depending on the dialect, the `params` object can take different forms, such as a connection URL to the database. In this case, we simply need a filename, which is given here.
+
+The `authenticate` call is there to test whether the database connected correctly.
+
+The `close` function does what you expect—it closes the database connection.
+
+With this design, we can easily change the database to use other database servers, just by adding a runtime configuration file. For example, it is easy to set up a MySQL connection; we just create a new file, such as `models/sequelize-mysql.yaml`, containing something similar to the following code:
+
+[PRE29]js\1
+
+Running Sequelize against the other databases it supports, such as PostgreSQL, is just as simple. Just create a configuration file, install the Node.js driver, and install/configure the database engine.
+
+The object returned from `connectDB` is a database connection, and as we'll see that it is used by Sequelize. So, let's get going with the real goal of this section—to define the `SequelizeNotesStore` class.
+
+## Creating a Sequelize model for the Notes application
+
+As with the other data storage engines we've used, we need to create a subclass of `AbstractNotesStore` for Sequelize. This class will manage a set of notes using a Sequelize `Model` class.
+
+Let's create a new file, `models/notes-sequelize.mjs`:
+
+[PRE30]js\1
+
+The first thing to note is that in each function, we call static methods defined in the `SQNote` class to perform database operations. Sequelize model classes work this way, and there is a comprehensive list of these static methods in its documentation.
+
+When creating a new instance of a Sequelize model class—in this case, `SQNote`—there are two patterns to follow. One is to call the `build` method and then to create the object and the `save` method to save it to the database. Alternatively, we can, as is done here, use the `create` method, which does both of these steps. This function returns an `SQNote` instance, called `sqnote` here, and if you consult the Sequelize documentation, you will see that these instances have a long list of methods available. The contract for our `create` method is to return a note, so we construct a `Note` object to return.
+
+In this, and some other methods, we do not want to return a Sequelize object to our caller. Therefore, we construct an instance of our own `Note` class in order to return a clean object.
+
+Our `update` method starts by calling `SQNote.findOne`. This is done to ensure that there is an entry in the database corresponding to the key that we're given. This function looks for the first database entry where `notekey` matches the supplied key. Following the happy path, where there is a database entry, we then use `SQNote.update` to update the `title` and `body` values, and by using the same `where` clause, it ensures the `update` operation targets the same database entry.
+
+The Sequelize `where` clause offers a comprehensive list of matching operators. If you ponder this, it's clear it roughly corresponds to SQL as follows:
+
+[PRE31]js\1
+
+This sets up commands to run a single server instance (or two).
+
+Then, run it as follows:
+
+[PRE32]js\1
+
+This creates a data directory and then runs the MongoDB daemon against the directory.
+
+In another command window, you can test it as follows:
+
+[PRE33]js\1
+
+This sets us up with the driver package and adds it to `package.json`.
+
+Now, create a new file, `models/notes-mongodb.mjs`:
+
+[PRE34]js\1
+
+MongoDB stores all documents in collections. A *collection* is a group of related documents and is analogous to a table in a relational database. This means creating a new document or updating an existing one starts by constructing it as a JavaScript object and then asking MongoDB to save the object to the database. MongoDB automatically encodes the object into its internal representation.
+
+The `db().collection` method gives us a `Collection` object with which we can manipulate the named collection. In this case, we access the `notes` collection with `db().collection('notes')`.
+
+For the documentation of the `Collection` class, see the MongoDB Node.js driver documentation referenced earlier.
+
+In the `create` method, we use `insertOne`; as the method name implies, it inserts one document into the collection. This document is used for the fields of the `Note` class. Likewise, in the `update` method, the `updateOne` method first finds a document (in this case, by looking up the document with the matching `notekey` field) and then changes fields in the document, as specified, before saving the modified document back to the database.
+
+The `read` method uses `db().findOne` to search for the note.  
+
+The `findOne` method takes what is called a *query selector*. In this case, we are requesting a match against the `notekey` field. MongoDB supports a comprehensive set of operators for query selectors.
+
+On the other hand, the `updateOne` method takes what is called a *query filter*. As an `update` operation, it searches the database for a record that matches the filter, updates its fields based on the update descriptor, and then saves it back to the database.
+
+For an overview of the MongoDB CRUD operations, including inserting documents, updating documents, querying for documents, and deleting documents, refer to [https://docs.mongodb.com/manual/crud/](https://docs.mongodb.com/manual/crud/).
+
+For the documentation on query selectors, refer to [https://docs.mongodb.com/manual/reference/operator/query/#query-selectors](https://docs.mongodb.com/manual/reference/operator/query/#query-selectors).
+
+For the documentation on query filters, refer to [https://docs.mongodb.com/manual/core/document/#query-filter-documents](https://docs.mongodb.com/manual/core/document/#query-filter-documents).
+
+For the documentation on update descriptors, refer to [https://docs.mongodb.com/manual/reference/operator/update/](https://docs.mongodb.com/manual/reference/operator/update/).
+
+MongoDB has many variations of base operations. For example, `findOne` is a variation on the basic `find` method.  
+
+In our `destroy` method, we see another `find` variant, `findOneAndDelete`. As the name implies, it finds a document that matches the query descriptor and then deletes the document.
+
+In the `keylist` method, we need to process every document in the collection, and so the `find` query selector is empty. The `find` operation returns a `Cursor`, which is an object used to navigate query results. The `Cursor.forEach` method takes two callbacks and is not a Promise-friendly operation, so we have to use a Promise wrapper. The first callback is called for every document in the query result, and in this case, we simply push the `notekey` field into an array. The second callback is called when the operation is finished, and we notify the Promise whether it succeeded or failed. This gives us our array of keys, which is returned to the caller.
+
+For the documentation on the `Cursor` class, refer to [http://mongodb.github.io/node-mongodb-native/3.1/api/Cursor.html](http://mongodb.github.io/node-mongodb-native/3.1/api/Cursor.html).
+
+In our `count` method, we simply call the MongoDB `count` method. The `count` method takes a query descriptor and, as the name implies, counts the number of documents that match the query. Since we've given an empty query selector, it ends up counting the entire collection.
+
+This allows us to run Notes with `NOTES_MODEL` set to `mongodb` to use a MongoDB database.
+
+Now that we have everything coded for MongoDB, we can proceed with testing `Notes`.
+
+## Running the Notes application with MongoDB
+
+We are ready to test `Notes` using a MongoDB database. By now, you know the drill; add the following to the `scripts` section of `package.json`:
+
+[PRE35]js\1
+
+The `MONGO_URL` environment variable should contain the URL for connecting with your MongoDB database. The URL shown here is correct for a MongoDB server started on the local machine, as would be the case if you started MongoDB at the command line as shown at the beginning of this section. Otherwise, if you have a MongoDB server provisioned somewhere else, you will have been told what the access URL is, and your `MONGO_URL` variable should have that URL.
+
+You can start two instances of the `Notes` application and see that both share the same set of notes.
+
+We can verify that the MongoDB database ends up with the correct value.  First, start the MongoDB client program as so:
+
+```js\1
+
+Again, this is assuming the MongoDB configuration presented so far, and if your configuration differs then add the URL on the command line. This starts the interactive MongoDB shell, connected to the database configured for use by Notes. To inspect the content of the database, simply enter the command:  `db.notes.find()`. That will print out every database entry.
+
+With that, we have completed support not only for MongoDB but also for several other databases in the `Notes` application, and so we are now ready to wrap up the chapter.
+
+# Summary
+
+In this chapter, we went through a real whirlwind of different database technologies. While we looked at the same seven functions over and over, it's useful to be exposed to the various data storage models and ways of getting things done. Even so, we only touched on the surface of options for accessing databases and data storage engines in Node.js.
+
+By abstracting the model implementations correctly, we were able to easily switch data storage engines without changing the rest of the application. This technique lets us explore how subclassing works in JavaScript and the concept of creating different implementations of the same API. Additionally, we got a practical introduction to the `import()` function and saw how it can be used to dynamically choose which module to load.
+
+In real-life applications, we frequently create abstractions for a similar purpose. They help us hide details or allow us to change implementations while insulating the rest of the application from the change. A dynamic import, which we used for our app, is useful for dynamically stitching together an application; for example, to load each module in a given directory.
+
+We avoided the complexity of setting up database servers. As promised, we'll get into that in [Chapter 10,](176ce11c-dd6f-4ebf-ba14-529be6db28da.xhtml) *Deploying Node.js Applications to Linux Servers*, when we explore the production deployment of Node.js applications.
+
+By focusing our model code for the purpose of storing data, both the model and the application should be easier to test. We'll look at this in more depth in [Chapter 13](1c1eb7f2-8b1a-4f70-9f0a-94d865c739ef.xhtml), *Unit Testing and Functional Testing*.
+
+In the next chapter, we'll focus on supporting multiple users, allowing them to log in and out, and authenticating users using OAuth 2.

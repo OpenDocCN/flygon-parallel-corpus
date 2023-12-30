@@ -1,0 +1,1424 @@
+- en: Chapter 5. Building Distributed Systems and Working with Flexible Data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we will explore transferrable skills that allow us to use schemaless
+    data and distributed technologies to solve big data problems. The system we will
+    build in this chapter will prepare us for a future where democratic elections
+    all happen online—on Twitter of course. Our solution will collect and count votes
+    by querying Twitter's streaming API for mentions of specific hashtags, and each
+    component will be capable of horizontally scaling to meet demand. Our use case
+    is a fun and interesting one, but the core concepts we'll learn and specific technology
+    choices we'll make are the real focus of this chapter. The ideas discussed here
+    are directly applicable to any system that needs true-scale capabilities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Horizontal scaling refers to adding nodes, such as physical machines, to a system
+    in order to improve its availability, performance, and/or capacity. Big data companies
+    such as Google can scale by adding affordable and easy-to-obtain hardware (commonly
+    referred to as commodity hardware) due to the way they write their software and
+    architect their solutions. Vertical scaling is synonymous with increasing the
+    resource available to a single node, such as adding additional RAM to a box, or
+    a processor with more cores.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, you will:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learn about distributed NoSQL datastores; specifically how to interact with
+    MongoDB
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learn about distributed messaging queues; specifically Bit.ly's NSQ and how
+    to use the `go-nsq` package to easily publish and subscribe to events
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Stream live tweet data through Twitter's streaming APIs and manage long running
+    net connections
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learn about how to properly stop programs with many internal goroutines
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learn how to use low memory channels for signaling
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: System design
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Having a basic design sketched out is often useful, especially in distributed
+    systems where many components will be communicating with each other in different
+    ways. We don't want to spend too long on this stage because our design is likely
+    to evolve as we get stuck into the details, but we will look at a high-level outline
+    so we can discuss the constituents and how they fit together.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![System design](img/Image00011.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The preceding image shows the basic overview of the system we are going to
+    build:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Twitter is the social media network we all know and love.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Twitter's streaming API allows long-running connections where tweet data is
+    streamed as quickly as possible.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`twittervotes` is a program we will write that reads tweets and pushes the
+    votes into the messaging queue. `twittervotes` pulls the relevant tweet data,
+    figures out what is being voted for (or rather, which options are mentioned),
+    and pushes the vote into NSQ.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: NSQ is an open source, real-time distributed messaging platform designed to
+    operate at scale, built and maintained by Bit.ly. NSQ carries the message across
+    its instances making it available to anyone who has expressed an interest in the
+    vote data.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`counter` is a program we will write that listens out for votes on the messaging
+    queue, and periodically saves the results in the MongoDB database. `counter` receives
+    the vote messages from NSQ and keeps an in-memory tally of the results, periodically
+    pushing an update to persist the data.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: MongoDB is an open source document database designed to operate at scale.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`web` is a web server program that will expose the live results that we will
+    write in the next chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It could be argued that a single Go program could be written that reads the
+    tweets, counts the votes, and pushes them to a user interface but such a solution,
+    while being a great proof of concept, would be very limited in scale. In our design,
+    any one of the components can be horizontally scaled as the demand for that particular
+    capability increases. If we have relatively few polls, but lots of people viewing
+    the data, we can keep the `twittervotes` and `counter` instances down and add
+    more `web` and MongoDB nodes, or vice versa if the situation is reversed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another key advantage to our design is redundancy; since we can have many instances
+    of our components working at the same time, if one of our boxes disappears (due
+    to a system crash or power cut, for example) the others can pick up the slack.
+    Modern architectures often distribute such a system over the geographical expanse
+    to protect from local natural disasters too. All of these options are available
+    to use if we build our solution in this way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We chose the specific technologies in this chapter because of their links to
+    Go (NSQ, for example, is written entirely in Go), and the availability of well-tested
+    drivers and packages. Conceptually, however, you can drop in a variety of alternatives
+    as you see fit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Database design
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We will call our MongoDB database `ballots` . It will contain a single collection
+    called `polls` which is where we will store the poll details, such as the title,
+    the options, and the results (in a single JSON document). The code for a poll
+    will look something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `_id` field is automatically generated by MongoDB and will be how we identify
+    each poll. The `options` field contains an array of string options; these are
+    the hashtags we will look for on Twitter. The `results` field is a map where the
+    key represents the option, and the value represents the total number of votes
+    for each item.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Installing the environment
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The code we write in this chapter has real external dependencies that we need
+    to get set up before we can start to build our system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Be sure to check out the chapter notes at [https://github.com/matryer/goblueprints](https://github.com/matryer/goblueprints)
+    if you get stuck on installing any of the dependencies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In most cases, services such as `mongod` and `nsqd` will have to be started
+    before we can run our programs. Since we are writing components of a distributed
+    system, we will have to run each program at the same time, which is as simple
+    as opening many terminal windows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: NSQ
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: NSQ is a messaging queue that allows one program to send messages or events
+    to another, or to many other programs running either locally on the same machine,
+    or on different nodes connected by a network. NSQ guarantees the delivery of messages,
+    which means it keeps undelivered messages cached until all interested parties
+    have received them. This means that, even if we stop our `counter` program, we
+    won't miss any votes. You can contrast this capability with fire-and-forget message
+    queues where information is deemed out-of-date, and therefore is forgotten if
+    it isn't delivered in time, and where the sender of the messages doesn't care
+    if the consumer received them or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A message queue abstraction allows you to have different components of a system
+    running in different places, provided they have network connectivity to the queue.
+    Your programs are decoupled from others; instead, your designs start to care about
+    the ins and outs of specialized micro-services, rather than the flow of data through
+    a monolithic program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: NSQ transfers raw bytes, which means it is up to us how we encode data into
+    those bytes. For example, we could encode the data as JSON or in a binary format
+    depending on our needs. In our case, we are going to send the vote option as a
+    string without any additional encoding, since we are only sharing a single data
+    field.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Open [http://nsq.io/deployment/installing.html](http://nsq.io/deployment/installing.html)
+    in a browser (or search `install nsq` ) and follow the instructions for your environment.
+    You can either download pre-compiled binaries or build your own from the source.
+    If you have homebrew installed, installing NSQ is as simple as typing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Once you have installed NSQ, you will need to add the `bin` folder to your `PATH`
+    environment variable so that the tools are available in a terminal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To validate that NSQ is properly installed, open a terminal and run `nsqlookupd`
+    ; if the program successfully starts, you should see some output similar to the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: We are going to use the default ports to interact with NSQ so take note of the
+    TCP and HTTP ports listed in the output, as we will be referring to them in our
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Press *Ctrl* + *C* to stop the process for now; we'll start them properly later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The key tools from the NSQ install that we are going to use are `nsqlookupd`
+    and `nsqd` . The `nsqlookupd` program is a daemon that manages topology information
+    about the distributed NSQ environment; it keeps track of all the `nsqd` producers
+    for specific topics and provides interfaces for clients to query such information.
+    The `nsqd` program is a daemon that does the heavy lifting for NSQ such as receiving,
+    queuing, and delivering messages from and to interested parties. For more information
+    and background on NSQ, visit [http://nsq.io/](http://nsq.io/) .
+  prefs: []
+  type: TYPE_NORMAL
+- en: NSQ driver for Go
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The NSQ tools themselves are written in Go, so it is logical that the Bit.ly
+    team already has a Go package that makes interacting with NSQ very easy. We will
+    need to use it, so in a terminal, get it using `go get` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: MongoDB
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'MongoDB is a document database, which basically allows you to store and query
+    JSON documents and the data within them. Each document goes into a collection
+    that can be used to group the documents together without enforcing any schema
+    on the data inside them. Unlike rows in a traditional RDBMS such as Oracle, Microsoft
+    SQL Server, or MySQL, it is perfectly acceptable for documents to have a different
+    shape. For example, a `people` collection can contain the following three JSON
+    documents at the same time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: This flexibility allows data with varying structure to coexist without impacting
+    performance or wasting space. It is also extremely useful if you expect your software
+    to evolve over time, as we really always should.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MongoDB was designed to scale while also remaining very easy to work with on
+    single-box install such as our development machine. When we host our application
+    for production, we would likely install a more complex multi-sharded, replicated
+    system, which is distributed across many nodes and locations, but for now, just
+    running `mongod` will do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Head over to [http://www.mongodb.org/downloads](http://www.mongodb.org/downloads)
+    to grab the latest version of MongoDB and install it, making sure to register
+    the `bin` folder with your `PATH` environment variable as usual.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To validate that MongoDB is successfully installed, run the `mongod` command,
+    then hit *Ctrl* + *C* to stop it for now.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MongoDB driver for Go
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Gustavo Niemeyer has done a great job in simplifying interactions with MongoDB
+    with his `mgo` (pronounced "mango") package hosted at [http://labix.org/mgo](http://labix.org/mgo)
+    , which is *go gettable* with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Starting the environment
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we have all the pieces we need installed, we need to start our environment.
+    In this section, we are going to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Start `nsqlookupd` so that our `nsqd` instances are discoverable
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Start `nsqd` and tell it which `nsqlookupd` to use
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Start `mongod` for data services
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each of these daemons should run in their own terminal window, which will make
+    it easy for us to stop them by just hitting *Ctrl* + *C* .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Remember the page number for this section as you will likely revisit it a few
+    times as you work through this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a terminal window, run:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Take note of the TCP port, which by default is `4160` , and in another terminal
+    window, run:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Make sure the port number in the `--lookupd-tcp-address` flag matches the TCP
+    port of the `nsqlookupd` instance. Once you start `nsqd` , you will notice some
+    output is printed to the terminal from both `nsqlookupd` and `nsqd` ; this indicates
+    that the two processes are talking to each other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In yet another window or tab, start MongoDB by running:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `dbpath` flag tells MongoDB where to store the data files for our database.
+    You can pick any location you like, but you'll have to make sure the folder exists
+    before `mongod` will run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: By deleting the `dbpath` folder at any time, you can effectively erase all data
+    and start afresh. This is especially useful during development.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that our environment is running, we are ready to start building our components.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Votes from Twitter
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In your `$GOPATH/src` folder, alongside other projects, create a new folder
+    called `socialpoll` for this chapter. This folder won''t be a Go package or program
+    by itself, but will contain our three component programs. Inside `socialpoll`
+    , create a new folder called `twittervotes` and add the obligatory `main.go` template
+    (this is important as `main` packages without a `main` function won''t compile):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Our `twittervotes` program is going to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Load all polls from the MongoDB database using `mgo` , and collect all options
+    from the `options` array in each document
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Open and maintain a connection to Twitter's streaming APIs looking for any mention
+    of the options
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For each tweet that matches the filter, figure out which option is mentioned
+    and push that option through to NSQ
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the connection to Twitter is dropped (which is common in long-running connections
+    as it is actually part of Twitter's streaming API specification) after a short
+    delay (so we do not bombard Twitter with connection requests), reconnect and continue
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Periodically re-query MongoDB for the latest polls and refresh the connection
+    to Twitter to make sure we are always looking out for the right options
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When the user terminates the program by hitting *Ctrl* + *C* , it will gracefully
+    stop itself
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Authorization with Twitter
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In order to use the streaming API, we will need authentication credentials from
+    Twitter's Application Management console, much in the same way we did for our
+    Gomniauth service providers in [Chapter 3](text00027.html#ch03 "Chapter 3. Three
+    Ways to Implement Profile Pictures") , *Three Ways to Implement Profile Pictures*
+    . Head over to [https://apps.twitter.com](https://apps.twitter.com) and create
+    a new app called something like `SocialPoll` (the names have to be unique, so
+    you can have some fun here; the choice of name doesn't affect the code either
+    way). When your app has been created, visit the **API Keys** tab and locate the
+    **Your access token** section where you need to create a new access token. After
+    a short delay, refresh the page and notice that you in fact have two sets of keys
+    and secrets; an API key and a secret, and an access token and the corresponding
+    secret. Following good coding practices, we are going to set these values as environment
+    variables so that our program can have access to them without us having to hardcode
+    them in our source files.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The keys we will use in this chapter are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SP_TWITTER_KEY`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SP_TWITTER_SECRET`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SP_TWITTER_ACCESSTOKEN`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SP_TWITTER_ACCESSSECRET`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can set the environment variables however you like, but since the app relies
+    on them in order to work, creating a new file called `setup.sh` (for bash shells)
+    or `setup.bat` (on Windows) is a good idea since you can check such files into
+    your source code repository. Insert the following code in `setup.sh` or `setup.bat`
+    by copying the appropriate values from the Twitter app page:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Run the file with the source or call commands to have the values appropriately
+    set, or add them to your `.bashrc` or `C:\cmdauto.cmd` files to save you running
+    them every time you open a new terminal window.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Extracting the connection
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The Twitter streaming API supports HTTP connections that stay open for a long
+    time, and given the design of our solution, we are going to need to access the
+    `net.Conn` object in order to close it from outside of the goroutine in which
+    requests occur. We can achieve this by providing our own `dial` method to an `http.Transport`
+    object that we will create.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `twitter.go` inside `twittervotes` (which is where
+    all things Twitter-related will live), and insert the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Our bespoke `dial` function first ensures `conn` is closed, and then opens a
+    new connection keeping the `conn` variable updated with the current connection.
+    If a connection dies (Twitter's API will do this from time to time) or is closed
+    by us, we can redial without worrying about zombie connections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will periodically close the connection ourselves and initiate a new one,
+    because we want to reload the options from the database at regular intervals.
+    To do this, we need a function that closes the connection, and also closes an
+    `io.ReadCloser` that we will use to read the body of the responses. Add the following
+    code to `twitter.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now we can call `closeConn` at any time to break the ongoing connection with
+    Twitter and tidy things up. In most cases, our code will load the options from
+    the database again and open a new connection right away, but if we're shutting
+    the program down (in response to a *Ctrl* + *C* hit) then we can call `closeConn`
+    just before we exit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading environment variables
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Next we are going to write a function that will read the environment variables
+    and set up the `OAuth` objects we''ll need in order to authenticate the requests.
+    Add the following code in the `twitter.go` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we define a `struct` type to store the environment variables that we need
+    to authenticate with Twitter. Since we don't need to use the type elsewhere, we
+    define it inline and creating a variable called `ts` of this anonymous type (that's
+    why we have the somewhat unusual `var ts struct…` code). We then use Joe Shaw's
+    elegant `envdecode` package to pull in those environment variables for us. You
+    will need to run `go get github.com/joeshaw/envdecode` and also import the `log`
+    package. Our program will try to load appropriate values for all the fields marked
+    `required` , and return an error if it fails to do so, which reminds people that
+    the program won't work without Twitter credentials.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The strings inside the back ticks alongside each field in `struct` are called
+    tags, and are available through a reflection interface, which is how `envdecode`
+    knows which variables to look for. Tyler Bunnell and I added the required argument
+    to this package, which indicates that it is an error for any of the environment
+    variables to be missing (or empty).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once we have the keys, we use them to create `oauth.Credentials` and an `oauth.Client`
+    object from Gary Burd's `go-oauth` package, which will allow us to authorize requests
+    with Twitter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now that we have the ability to control the underlying connection and authorize
+    requests, we are ready to write the code that will actually build the authorized
+    request, and return the response. In `twitter.go` , add the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: We use `sync.Once` to ensure our initialization code only gets run once despite
+    the number of times we call `makeRequest` . After calling the `setupTwitterAuth`
+    method, we create a new `http.Client` using an `http.Transport` that uses our
+    custom `dial` method. We then set the appropriate headers needed for authorization
+    with Twitter by encoding the specified `params` object that will contain the options
+    we are querying for.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading from MongoDB
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to load the polls, and therefore the options to search Twitter for,
+    we need to connect to and query MongoDB. In `main.go` , add the two functions
+    `dialdb` and `closedb` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: These two functions will connect to and disconnect from the locally running
+    MongoDB instance using the `mgo` package, and store `mgo.Session` (the database
+    connection object) in a global variable called `db` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As an additional assignment, see if you can find an elegant way to make the
+    location of the MongoDB instance configurable so that you don't need to run it
+    locally.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assuming MongoDB is running and our code is able to connect, we need to load
+    the poll objects and extract all the options from the documents, which we will
+    then use to search Twitter. Add the following `Options` function to `main.go`
+    :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Our poll document contains more than just `Options` , but our program doesn't
+    care about anything else, so there's no need for us to bloat our `poll` struct.
+    We use the `db` variable to access the `polls` collection from the `ballots` database,
+    and call the `mgo` package's fluent `Find` method, passing `nil` (meaning no filtering).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A fluent interface (first coined by Eric Evans and Martin Fowler) refers to
+    an API design that aims to make the code more readable by allowing you to chain
+    together method calls. This is achieved by each method returning the context object
+    itself, so that another method can be called directly afterwards. For example,
+    `mgo` allows you to write queries such as this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: We then get an iterator by calling the `Iter` method, which allows us to access
+    each poll one by one. This is a very memory-efficient way of reading the poll
+    data, because it only ever uses a single `poll` object. If we were to use the
+    `All` method instead, the amount of memory we'd use would depend on the number
+    of polls we had in our database, which would be out of our control.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When we have a poll, we use the `append` method to build up the options slice.
+    Of course, with millions of polls in the database, this slice too would grow large
+    and unwieldy. For that kind of scale, we would probably run multiple `twittervotes`
+    programs, each dedicated to a portion of the poll data. A simple way to do this
+    would be to break polls into groups based on the letters the titles begin with,
+    such as group A-N and O-Z. A somewhat more sophisticated approach would be to
+    add a field to the `poll` document grouping it up in a more controlled manner,
+    perhaps based on the stats for the other groups so that we are able to balance
+    the load across many `twittervotes` instances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The `append` built-in function is actually a `variadic` function, which means
+    you can pass multiple elements for it to append. If you have a slice of the correct
+    type, you can add `...` to the end, which simulates the passing of each item of
+    the slice as a different argument.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we close the iterator and clean up any used memory before returning
+    the options and any errors that occurred while iterating (by calling the `Err`
+    method on the `mgo.Iter` object).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading from Twitter
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now we are able to load the options and make authorized requests to the Twitter
+    API. We are thus ready to write the code that initiates the connection, and continuously
+    reads from the stream until either we call our `closeConn` method, or Twitter
+    closes the connection for one reason or another. The structure contained in the
+    stream is a complex one containing all kinds of information about the tweet—who
+    made it and when, and even what links or mentions of users occur in the body (see
+    Twitter''s API documentation for more details). However, we are only interested
+    in the tweet text itself so you need not worry about all the other noise; add
+    the following structure to `twitter.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This may feel incomplete, but think about how clear it makes our intentions
+    to other programmers who might see our code: a tweet has some text, and that is
+    all we care about.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using this new structure, in `twitter.go` , add the following `readFromTwitter`
+    function that takes a send-only channel called `votes` ; this is how this function
+    will inform the rest of our program that it has noticed a vote on twitter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, after loading the options from all the polls data (by
+    calling the `loadOptions` function), we use `url.Parse` to create a `url.URL`
+    object describing the appropriate endpoint on Twitter. We build a `url.Values`
+    object called `query` , and set the options as a comma-separated list. As per
+    the API, we make a new `POST` request using the encoded `url.Values` object as
+    the body, and pass it to `makeRequest` along with the query object itself. All
+    being well, we make a new `json.Decoder` from the body of the request, and keep
+    reading inside an infinite `for` loop by calling the `Decode` method. If there
+    is an error (probably due to the connection being closed), we simply break the
+    loop and exit the function. If there is a tweet to read, it will be decoded into
+    the `tweet` variable, which will give us access to the `Text` property (the 140
+    characters of the tweet itself). We then iterate over all possible options, and
+    if the tweet has mentioned it, we send it on the `votes` channel. This technique
+    also allows a tweet to contain many votes at the same time, something you may
+    or may not decide to change based on the rules of the election.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `votes` channel is **send-only** (which means we cannot receive on it),
+    since it is of the type `chan<- string` . Think of the little "arrow" telling
+    us which way messages will flow: either into the channel or out of it. This is
+    a great way to express intent—it''s clear that we never intend to read votes using
+    our `readFromTwitter` function; rather we will only send them on that channel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Terminating the program whenever `Decode` returns an error doesn't provide a
+    very robust solution. This is because the Twitter API documentation states that
+    the connection will drop from time to time, and clients should consider this when
+    consuming the services. And remember, we are going to terminate the connection
+    periodically too, so we need to think about a way to reconnect once the connection
+    is dropped.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Signal channels
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A great use of channels in Go is to signal events between code running in different
+    goroutines. We are going to see a real-world example of this when we write our
+    next function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The purpose of the function is to start a goroutine that continually calls the
+    `readFromTwitter` function (with the specified `votes` channel to receive the
+    votes on), until we signal that we want it to stop. And once it has stopped, we
+    want to be notified through another signal channel. The return of the function
+    will be a channel of `struct{}` ; a signal channel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Signal channels have some interesting properties that are worth taking a closer
+    look at. Firstly, the type sent down the channels is an empty `struct{}` , instances
+    of which actually take up zero bytes, since it has no fields. So `struct{}{}`
+    is a great memory-efficient option for signaling events. Some people use `bool`
+    types, which is also fine, although `true` and `false` both take up a byte of
+    memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Head over to [http://play.golang.org](http://play.golang.org) and try this out
+    for yourself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The size of a `bool` is 1:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Whereas the size of `struct{}{}` is `0` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: The signal channels also have a buffer size of 1, which means that execution
+    will not block until something reads the signal from the channel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We are going to employ two signal channels in our code, one that we pass into
+    our function that tells our goroutine that it should stop, and another (provided
+    by the function) that signals once stopping is complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In `twitter.go` , add the following function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, the first argument `stopchan` is a channel of type `<-chan
+    struct{}` , a **receive-only** signal channel. It is this channel that, outside
+    the code, will signal on, which will tell our goroutine to stop. Remember that
+    it's receive-only inside this function, the actual channel itself will be capable
+    of sending. The second argument is the `votes` channel on which votes will be
+    sent. The return type of our function is also a signal channel of type `<-chan
+    struct{}` ; a receive-only channel that we will use to indicate that we have stopped.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These channels are necessary because our function triggers its own goroutine,
+    and immediately returns, so without this, calling code would have no idea if the
+    spawned code were still running or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first thing we do in the `startTwitterStream` function is make our `stoppedchan`
+    , and defer the sending of a `struct{}{}` to indicate that we have finished when
+    our function exits. Notice that `stoppedchan` is a normal channel so even though
+    it is returned as a receive-only, we will be able to send on it from within this
+    function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then start an infinite `for` loop in which we select from one of two channels.
+    The first is the `stopchan` (the first argument), which would indicate that it
+    was time to stop, and return (thus triggering the deferred signaling on `stoppedchan`
+    ). If that hasn't happened, we will call `readFromTwitter` (passing in the `votes`
+    channel), which will go and load the options from the database and open the connection
+    to Twitter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the Twitter connection dies, our code will return here where we sleep for
+    ten seconds using the `time.Sleep` function. This is to give the Twitter API a
+    rest in case it closed the connection due to overuse. Once we've rested, we re-enter
+    the loop and check again on the `stopchan` channel to see if the calling code
+    wants us to stop or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make this flow clear, we are logging out key statements that will not only
+    help us debug our code, but also let us peek into the inner workings of this somewhat
+    complicated mechanism.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Publishing to NSQ
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Once our code is successfully noticing votes on Twitter and sending them down
+    the `votes` channel, we need a way to publish them into an NSQ topic; after all,
+    this is the point of the `twittervotes` program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will write a function called `publishVotes` that will take the `votes` channel,
+    this time of type `<-chan string` (a receive-only channel) and publish each string
+    that is received from it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In our previous functions, the `votes` channel was of type `chan<- string` ,
+    but this time it's of the type `<-chan string` . You might think this is a mistake,
+    or even that it means we cannot use the same channel for both but you would be
+    wrong. The channel we create later will be made with `make(chan string)` , neither
+    receive or only send, and can act in both cases. The reason for using the `<-`
+    operator on a channel in arguments is to make clear the intent of what the channel
+    will be used for; or in the case where it is the return type, to prevent users
+    from accidentally sending on channels intended for receiving or vice versa. The
+    compiler will actually produce an error if they use such a channel incorrectly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the `votes` channel is closed (this is how external code will tell our
+    function to stop working), we will stop publishing and send a signal down the
+    returned stop signal channel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the `publishVotes` function to `main.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again the first thing we do is to create the `stopchan` , which we later return,
+    this time not deferring the signaling but doing it inline by sending a `struct{}{}`
+    down `stopchan` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The difference is to show alternative options: within one codebase you should
+    pick a style you like and stick with it, until a standard emerges within the community;
+    in which case we should all go with that.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then create an NSQ producer by calling `NewProducer` and connecting to the
+    default NSQ port on `localhost` , using a default configuration. We start a goroutine,
+    which uses another great built-in feature of the Go language that lets us continually
+    pull values from a channel (in our case the `votes` channel) just by doing a normal
+    `for…range` operation on it. Whenever the channel has no values, execution will
+    be blocked until a value comes down the line. If the `votes` channel is closed,
+    the `for` loop will exit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: To learn more about the power of channels in Go, it is highly recommended that
+    you seek out blog posts and videos by John Graham-Cumming, in particular one entitled
+    *A Channel Compendium* that he presented at Gophercon 2014 and which contains
+    a brief history of channels, including their origin. (Interestingly, John was
+    also the guy who successfully petitioned the British Government to officially
+    apologize for its treatment of Alan Turing.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the loop exits (after the `votes` channel is closed) the publisher is stopped,
+    following which the `stopchan` signal is sent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Gracefully starting and stopping
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: When our program is terminated, we want to do a few things before actually exiting;
+    namely closing our connection to Twitter and stopping the NSQ publisher (which
+    actually deregisters its interest in the queue). To achieve this, we have to override
+    the default *Ctrl + C* behavior.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The upcoming code blocks all go inside the main function; they are broken up
+    so we can discuss each section before continuing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the following code inside the `main` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we create a stop `bool` with an associated `sync.Mutex` so that we can
+    access it from many goroutines at the same time. We then create two more signal
+    channels, `stopChan` and `signalChan` , and use `signal.Notify` to ask Go to send
+    the signal down the `signalChan` when someone tries to halt the program (either
+    with the `SIGINT` interrupt, or the `SIGTERM` termination POSIX signals). The
+    `stopChan` is how we indicate that we want our processes to terminate, and we
+    pass it as an argument to `startTwitterStream` later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then run a goroutine that blocks waiting for the signal by trying to read
+    from `signalChan` ; this is what the `<-` operator does in this case (it's trying
+    to read from the channel). Since we don't care about the type of signal, we don't
+    bother capturing the object returned on the channel. Once a signal is received,
+    we set `stop` to `true` , and close the connection. Only when one of the specified
+    signals is sent will the rest of the goroutine code run, which is how we are able
+    to perform teardown code before exiting the program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the following piece of code (inside the main function) to open and defer
+    the closing of the database connection:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since the `readFromTwitter` method reloads the options from the database each
+    time, and because we want to keep our program updated without having to restart
+    it, we are going to introduce one final goroutine. This goroutine will simply
+    call `closeConn` every minute, causing the connection to die, and cause `readFromTwitter`
+    to be called over again. Insert the following code at the bottom of the `main`
+    function to start all of these processes, and then wait for them to gracefully
+    stop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: First we make the `votes` channel that we have been talking about throughout
+    this section, which is a simple channel of string. Notice that it is neither a
+    send (`chan<-` ) or receive (`<-chan` ) channel; in fact, making such channels
+    makes little sense. We then call `publishVotes` , passing in the `votes` channel
+    for it to receive from, and capturing the returned stop signal channel as `publisherStoppedChan`
+    . Similarly, we call `startTwitterStream` passing in our `stopChan` from the beginning
+    of the `main` function, and the `votes` channel for it to send to, while capturing
+    the resulting stop signal channel as `twitterStoppedChan` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then start our refresher goroutine, which immediately enters an infinite
+    `for` loop before sleeping for a minute and closing the connection via the call
+    to `closeConn` . If the stop `bool` has been set to true (in that previous goroutine),
+    we will `break` the loop and exit, otherwise we will loop around and wait another
+    minute before closing the connection again. The use of the `stoplock` is important
+    because we have two goroutines that might try to access the stop variable at the
+    same time but we want to avoid collisions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the goroutine has started, we then block on the `twitterStoppedChan` by
+    attempting to read from it. When successful (which means the signal was sent on
+    the `stopChan` ), we close the `votes` channel which will cause the publisher's
+    `for…range` loop to exit, and the publisher itself to stop, after which the signal
+    will be sent on the `publisherStoppedChan` , which we wait for before exiting.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To make sure our program works, we need to do two things: first we need to
+    create a poll in the database, and second, we need to peer inside the messaging
+    queue to see if the messages are indeed being generated by `twittervotes` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a terminal, run the `mongo` command to open a database shell that allows
+    us to interact with MongoDB. Then enter the following commands to add a test poll:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding commands add a new item to the `polls` collection in the `ballots`
+    database. We are using some common words for options that are likely to be mentioned
+    by people on Twitter so that we can observe real tweets being translated into
+    messages. You might notice that our poll object is missing the `results` field;
+    this is fine since we are dealing with unstructured data where documents do not
+    have to adhere to a strict schema. The `counter` program we are going to write
+    in the next section will add and maintain the `results` data for us later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Press *Ctrl + C* to exit the MongoDB shell and type the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `nsq_tail` tool connects to the specified messaging queue topic and outputs
+    any messages that it notices. This is where we will validate that our `twittervotes`
+    program is sending messages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a separate terminal window, let''s build and run the `twittervotes` program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now switch back to the window running `nsq_tail` and notice that messages are
+    indeed being generated in response to live Twitter activity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you aren't seeing much activity, try looking up trending hashtags on Twitter
+    and adding another poll containing those options.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Counting votes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The second program we are going to implement is the `counter` tool, which will
+    be responsible for watching out for votes in NSQ, counting them, and keeping MongoDB
+    up to date with the latest numbers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new folder called `counter` alongside `twittervotes` , and add the
+    following code to a new `main.go` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Normally when we encounter an error in our code, we use a call like `log.Fatal`
+    or `os.Exit` , which immediately terminates the program. Exiting the program with
+    a non-zero exit code is important, because it is our way of telling the operating
+    system that something went wrong, and we didn't complete our task successfully.
+    The problem with the normal approach is that any deferred functions we have scheduled
+    (and therefore any tear down code we need to run), won't get a chance to execute.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The pattern employed in the preceding code snippet lets us call the `fatal`
+    function to record that an error occurred. Note that only when our main function
+    exits will the deferred function run, which in turn calls `os.Exit(1)` to exit
+    the program with an exit code of `1` . Because the deferred statements are run
+    in LIFO (last in, first out) order, the first function we defer will be the last
+    function to be executed, which is why the first thing we do in the `main` function
+    is to defer the exiting code. This allows us to be sure that other functions we
+    defer will be called *before* the program exits. We'll use this feature to ensure
+    our database connection gets closed regardless of any errors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Connecting to the database
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The best time to think about cleaning up resources, such as database connections,
+    is immediately after you have successfully obtained the resource; Go''s `defer`
+    keyword makes this easy. At the bottom of the main function, add the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: This code uses the familiar `mgo.Dial` method to open a session to the locally
+    running MongoDB instance and immediately defers a function that closes the session.
+    We can be sure that this code will run before our previously deferred statement
+    containing the exit code (because deferred functions are run in the reverse order
+    in which they were called). Therefore, whatever happens in our program, we know
+    that the database session will definitely and properly close.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The log statements are optional, but will help us see what's going on when we
+    run and exit our program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the end of the snippet, we use the `mgo` fluent API to keep a reference of
+    the `ballots.polls` data collection in the `pollData` variable, which we will
+    use later to make queries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Consuming messages in NSQ
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to count the votes, we need to consume the messages on the `votes`
+    topic in NSQ, and we''ll need a place to store them. Add the following variables
+    to the `main` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: A map and a lock (`sync.Mutex` ) is a common combination in Go, because we will
+    have multiple goroutines trying to access the same map and we need to avoid corrupting
+    it by trying to modify or read it at the same time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the following code to the `main` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `NewConsumer` function allows us to set up an object that will listen on
+    the `votes` NSQ topic, so when `twittervotes` publishes a vote on that topic,
+    we can handle it in this program. If `NewConsumer` returns an error, we'll use
+    our `fatal` function to record it and return.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next we are going to add the code that handles messages (votes) from NSQ:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: We call the `AddHandler` method on `nsq.Consumer` and pass it a function that
+    will be called for every message received on the `votes` topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a vote comes in, the first thing we do is lock the `countsLock` mutex.
+    Next we defer the unlocking of the mutex for when the function exits. This allows
+    us to be sure that while `NewConsumer` is running, we are the only ones allowed
+    to modify the map; others will have to wait until our function exits before they
+    can use it. Calls to the `Lock` method block execution while the lock is in place,
+    and it only continues when the lock is released by a call to `Unlock` . This is
+    why it's vital that every `Lock` call has an `Unlock` counterpart, otherwise we
+    will deadlock our program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every time we receive a vote, we check if `counts` is `nil` and make a new map
+    if it is, because once the database has been updated with the latest results,
+    we want to reset everything and start at zero. Finally we increase the `int` value
+    by one for the given key, and return `nil` indicating no errors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Although we have created our NSQ consumer, and added our handler function,
+    we still need to connect to the NSQ service, which we will do by adding the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: It is important to note that we are actually connecting to the HTTP port of
+    the `nsqlookupd` instance, rather than NSQ instances; this abstraction means that
+    our program doesn't need to know *where* the messages are coming from in order
+    to consume them. If we fail to connect to the server (for instance if we forget
+    to start it), we'll get an error, which we report to our fatal function before
+    immediately returning.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keeping the database updated
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our code will listen out for votes, and keep a map of the results in memory,
+    but that information is so far trapped inside our program. Next, we need to add
+    the code that will periodically push the results to the database:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `time.AfterFunc` function calls the function after the specified duration
+    in a goroutine of its own. At the end we call `Reset` , which starts the process
+    again; this allows us to schedule our update code to run at regular intervals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When our update function runs, the first thing we do is lock the `countsLock`
+    , and defer its unlocking. We then check to see if there are any values in the
+    counts map. If there aren't, we just log that we're skipping the update and wait
+    for next time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If there are some votes, we iterate over the `counts` map pulling out the option
+    and number of votes (since the last update), and use some MongoDB magic to update
+    the results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: MongoDB stores BSON (short for Binary JSON) documents internally, which are
+    easier to traverse than normal JSON documents, and is why the `mgo` package comes
+    with `mgo/bson` encoding package. When using `mgo` , we will often use `bson`
+    types, such as the `bson.M` map to describe concepts for MongoDB.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We first create the selector for our update operation using the `bson.M` shortcut
+    type, which is similar to creating `map[string]interface{}` types. The selector
+    we create will look something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: In MongoDB, the preceding BSON specifies that we want to select polls where
+    `"happy"` is one of the items in the `options` array.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we use the same technique to generate the update operation, which looks
+    something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: In MongoDB, the preceding BSON specifies that we want to increase the `results.happy`
+    field by 3\. If there is no `results` map in the poll, one will be created, and
+    if there is no `happy` key inside `results` , `0` will be assumed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then call the `UpdateAll` method on our `pollsData` query to issue the command
+    to the database, which will in turn update every poll that matches the selector
+    (contrast this to the `Update` method, which will update only one). If something
+    goes wrong, we report it and set the `ok` Boolean to false. If all goes well,
+    we set the `counts` map to nil, since we want to reset the counter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We are going to specify the `updateDuration` as a constant at the top of the
+    file, which will make it easy for us to change when we are testing our program.
+    Add the following code above the `main` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: Responding to Ctrl + C
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The last thing to do before our program is ready is to make sure our `main`
+    function waits for operations to complete before exiting, like we did in our `twittervotes`
+    program. Add the following code at the end of the `main` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we have employed a slightly different tactic than before. We trap the termination
+    event, which will cause a signal to go down `termChan` when we hit *Ctrl + C*
+    . Next we start an infinite loop, inside which we use Go's `select` structure
+    to allow us to run code if we receive something on either `termChan` , or the
+    `StopChan` of the consumer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In fact, we will only ever get a `termChan` signal first in response to a `Ctrl+C`
+    -press, at which point we stop the `updater` timer and ask the consumer to stop
+    listening for votes. Execution then re-enters the loop and will block until the
+    consumer reports that it has indeed stopped by signaling on its `StopChan` . When
+    that happens, we're done and we exit, at which point our deferred statement runs,
+    which, if you remember, tidies up the database session.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running our solution
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'It''s time to see our code in action. Be sure to have `nsqlookupd` , `nsqd`
+    , and `mongod` running in separate terminal windows with:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If you haven''t already done so, make sure the `twittervotes` program is running
+    too. Then in the `counter` folder, build and run our counting program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You should see periodic output describing what work `counter` is doing, such
+    as:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The output will of course vary since we are actually responding to real live
+    activity on Twitter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can see that our program is receiving vote data from NSQ, and reports to
+    be updating the database with the results. We can confirm this by opening the
+    MongoDB shell and querying the poll data to see if the `results` map is being
+    updated. In another terminal window, open the MongoDB shell:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Ask it to use the ballots database:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Use the find method with no arguments to get all polls (add the `pretty` method
+    to the end to get nicely formatted JSON):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `results` map is indeed being updated, and at any point in time contains
+    the total number of votes for each option.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter we covered a lot of ground. We learned different techniques
+    for gracefully shutting down programs using signaling channels, which is especially
+    important when our code has some work to do before it can exit. We saw that deferring
+    the reporting of fatal errors at the start of our program can give our other deferred
+    functions a chance to execute before the process ends.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We also discovered how easy it is to interact with MongoDB using the `mgo` package,
+    and how to use BSON types when describing concepts for the database. The `bson.M`
+    alternative to `map[string]interface{}` helps us keep our code more concise, while
+    still providing all the flexibility we need when working with unstructured or
+    schemaless data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We learned about message queues and how they allow us to break apart the components
+    of a system into isolated and specialized micro-services. We started an instance
+    of NSQ by first running the lookup daemon `nsqlookupd` , before running a single
+    `nsqd` instance and connecting them together via a TCP interface. We were then
+    able to publish votes to the queue in `twittervotes` , and connect to the lookup
+    daemon to run a handler function for every vote sent in our `counter` program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While our solution is actually performing a pretty simple task, the architecture
+    we have put together in this chapter is capable of doing some pretty great things.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We eliminated the need for our `twittervotes` and `counter` programs to run
+    on the same machine—as long as they can both connect to the appropriate NSQ, they
+    will function as expected regardless of where they are running.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We can distribute our MongoDB and NSQ nodes across many physical machines which
+    would mean our system is capable of gigantic scale—whenever resources start running
+    low, we can add new boxes to cope with the demand.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When we add other applications that need to query and read the results from
+    polls, we can be sure that our database services are highly available and capable
+    of delivering.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We can spread our database across geographical expanses replicating data for
+    backup so we don't lose anything when disaster strikes.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We can build a multi-node, fault tolerant NSQ environment, which means when
+    our `twittervotes` program learns of interesting tweets, there will always be
+    somewhere to send the data.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We could write many more programs that generate votes from different sources;
+    the only requirement is that they know how to put messages into NSQ.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the next chapter, we will build a RESTful data service of our own, through
+    which we will expose the functionality of our social polling application. We will
+    also build a web interface that lets users create their own polls, and visualize
+    the results.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

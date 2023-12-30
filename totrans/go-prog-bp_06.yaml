@@ -1,0 +1,1388 @@
+- en: Chapter 6. Exposing Data and Functionality through a RESTful Data Web Service
+    API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the previous chapter, we built a service that reads tweets from Twitter,
+    counts the hashtag votes, and stores the results in a MongoDB database. We also
+    used the MongoDB shell to add polls and see the poll results. This approach is
+    fine if we are the only ones using our solution, but it would be madness if we
+    released our project and expected users to connect directly to our MongoDB instance
+    in order to use the service we built.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Therefore, in this chapter, we are going to build a RESTful data service through
+    which the data and functionality will be exposed. We will also put together a
+    simple website that consumes the new API. Users may then either use our website
+    to create and monitor polls or build their own application on top of the web services
+    we release.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The code in this chapter depends on the code in [Chapter 5](text00036.html#page
+    "Chapter 5. Building Distributed Systems and Working with Flexible Data") , *Building
+    Distributed Systems and Working with Flexible Data* , so it is recommended that
+    you complete that chapter first, especially since it covers setting up the environment
+    that the code in this chapter runs on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Specifically, you will learn:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How wrapping `http.HandlerFunc` types can give us a simple but powerful pipeline
+    of execution for our HTTP requests
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to safely share data between HTTP handlers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Best practices for writing handlers responsible for exposing data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Where small abstractions can allow us to write the simplest possible implementations
+    now, but leave room to improve them later without changing the interface
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How adding simple helper functions and types to our project will prevent us
+    from (or at least defer) adding dependencies on external packages
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: RESTful API design
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: For an API to be considered RESTful, it must adhere to a few principles that
+    stay true to the original concepts behind the Web, and are already known to most
+    developers. Such an approach allows us to make sure we aren't building anything
+    strange or unusual into our API while also giving our users a head start towards
+    consuming it, since they are already familiar with its concepts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Some of the most important RESTful design concepts are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: HTTP methods describe the kind of action to take, for example, `GET` methods
+    will only ever *read* data, while `POST` requests will *create* something
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Data is expressed as a collection of resources
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Actions are expressed as changes to data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: URLs are used to refer to specific data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: HTTP headers are used to describe the kind of representation coming into and
+    going out of the server
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: For an in-depth overview of these and other details of RESTful designs, see
+    the Wikipedia article at [http://en.wikipedia.org/wiki/Representational_state_transfer](http://en.wikipedia.org/wiki/Representational_state_transfer)
+    .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following table shows the HTTP methods and URLs that represent the actions
+    that we will support in our API, along with a brief description and an example
+    use case of how we intend the call to be used:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Request | Description | Use case |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `GET /polls/` | Read all polls | Show a list of polls to the users |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `GET /polls/{id}` | Read the poll | Show details or results of a specific
+    poll |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `POST /polls/` | Create a poll | Create a new poll |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `DELETE /polls/{id}` | Delete a poll | Delete a specific poll |'
+  prefs: []
+  type: TYPE_TB
+- en: The `{id}` placeholder represents where in the path the unique ID for a poll
+    will go.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Sharing data between handlers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'If we want to keep our handlers as pure as the `http.Handler` interface from
+    the Go standard library, while still extracting common functionality into our
+    own methods, we need a way of sharing data between handlers. The `HandlerFunc`
+    signature that follows tells us that we are only allowed to pass in an `http.ResponseWriter`
+    object and an `http.Request` object, and nothing else:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: This means that we cannot create and manage database session objects in one
+    place and pass them into our handlers, which is ideally what we want to do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Instead, we are going to implement an in-memory map of per-request data, and
+    provide an easy way for handlers to access it. Alongside the `twittervotes` and
+    `counter` folders, create a new folder called `api` and create a new file called
+    `vars.go` inside it. Add the following code to the file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we declare a `vars` map that has a pointer to an `http.Request` type as
+    its key, and another map as the value. We will store the map of variables keyed
+    with the request instances that the variables belong to. The `varsLock` mutex
+    is important, as our handlers will all be trying to access and change the `vars`
+    map at the same time as handling many concurrent HTTP requests, and we need to
+    ensure that they do this safely.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next we are going to add the `OpenVars` function that allows us to prepare
+    the `vars` map to hold variables for a particular request:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function first locks the mutex so that we can safely modify the map, before
+    ensuring that `vars` contains a non-nil map, which would otherwise cause a panic
+    when we try to access its data. Finally, it assigns a new empty `map` value using
+    the specified `http.Request` pointer as the key, before unlocking the mutex and
+    therefore freeing other handlers to interact with it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once we have finished handling the request, we need a way to clean up the memory
+    that we are using here; otherwise the memory footprint of our code would continuously
+    increase (also known as a memory leak). We do this by adding a `CloseVars` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This function safely deletes the entry in the `vars` map for the request. As
+    long as we call `OpenVars` before we try to interact with the variables, and `CloseVars`
+    when we have finished, we will be free to safely store and retrieve data for each
+    request. However, we don''t want our handler code to have to worry about locking
+    and unlocking the map whenever it needs to get or set some data, so let''s add
+    two helper functions, `GetVar` and `SetVar` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `GetVar` function will make it easy for us to get a variable from the map
+    for the specified request, and `SetVar` allows us to set one. Notice that the
+    `GetVar` function calls `RLock` and `RUnlock` rather than `Lock` and `Unlock`
+    ; this is because we're using `sync.RWMutex` , which means it's safe for many
+    reads to occur at the same time, as long as a write isn't happening. This is good
+    for performance on items that are safe to concurrently read from. With a normal
+    mutex, `Lock` would block execution—waiting for the thing that has locked it to
+    unlock it—while `RLock` will not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrapping handler functions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One of the most valuable patterns to learn when building web services and websites
+    in Go is one we already utilized in [Chapter 2](text00020.html#page "Chapter 2. Adding
+    Authentication") , *Adding Authentication* , where we decorated `http.Handler`
+    types by wrapping them with other `http.Handler` types. For our RESTful API, we
+    are going to apply this same technique to `http.HandlerFunc` functions, to deliver
+    an extremely powerful way of modularizing our code without breaking the standard
+    `func(w http.ResponseWriter, r *http.Request)` interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: API key
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Most web APIs require clients to register an API key for their application,
+    which they are asked to send along with every request. Such keys have many purposes,
+    ranging from simply identifying which app the requests are coming from to addressing
+    authorization concerns in situations where some apps are only able to do limited
+    things based on what a user has allowed. While we don't actually need to implement
+    API keys for our application, we are going to ask clients to provide one, which
+    will allow us to add an implementation later while keeping the interface constant.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the essential `main.go` file inside your `api` folder:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next we are going to add our first `HandlerFunc` wrapper function called `withAPIKey`
+    to the bottom of `main.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, our `withAPIKey` function both takes an `http.HandlerFunc` type
+    as an argument and returns one; this is what we mean by wrapping in this context.
+    The `withAPIKey` function relies on a number of other functions that we are yet
+    to write, but you can clearly see what's going on. Our function immediately returns
+    a new `http.HandlerFunc` type that performs a check for the query parameter `key`
+    by calling `isValidAPIKey` . If the key is deemed invalid (by the return of `false`
+    ), we respond with an `invalid API key` error. To use this wrapper, we simply
+    pass an `http.HandlerFunc` type into this function to enable the `key` parameter
+    check. Since it returns an `http.HandlerFunc` type too, the result can then be
+    passed into other wrappers or given directly to the `http.HandleFunc` function
+    to actually register it as the handler for a particular path pattern.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s add our `isValidAPIKey` function next:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: For now, we are simply going to hardcode the API key as `abc123` ; anything
+    else will return `false` and therefore be considered invalid. Later we could modify
+    this function to consult a configuration file or database to check the authenticity
+    of a key without affecting how we use the `isValidAPIKey` method, or indeed the
+    `withAPIKey` wrapper.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Database session
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we can be sure a request has a valid API key, we must consider how
+    handlers will connect to the database. One option is to have each handler dial
+    its own connection, but this isn''t very **DRY** ( **Don''t Repeat Yourself**
+    ), and leaves room for potentially erroneous code, such as code that forgets to
+    close a database session once it is finished with it. Instead, we will create
+    another `HandlerFunc` wrapper that manages the database session for us. In `main.go`
+    , add the following function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `withData` function takes a MongoDB session representation using the `mgo`
+    package, and another handler as per the pattern. The returned `http.HandlerFunc`
+    type will copy the database session, defer the closing of that copy, and set a
+    reference to the `ballots` database as the `db` variable using our `SetVar` helper,
+    before finally calling the next `HandlerFunc` . This means that any handlers that
+    get executed after this one will have access to a managed database session via
+    the `GetVar` function. Once the handlers have finished executing, the deferred
+    closing of the session will occur, which will clean up any memory used by the
+    request without the individual handlers having to worry about it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Per request variables
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our pattern allows us to very easily perform common tasks on behalf of our actual
+    handlers. Notice that one of the handlers is calling `OpenVars` and `CloseVars`
+    so that `GetVar` and `SetVar` may be used without individual handlers having to
+    concern themselves with setting things up and tearing them down. The function
+    will return an `http.HandlerFunc` that first calls `OpenVars` for the request,
+    defers the calling of `CloseVars` , and calls the specified handler function.
+    Any handlers wrapped with `withVars` will be able to use `GetVar` and `SetVar`
+    .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the following code to `main.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: There are lots of other problems that can be addressed using this pattern; and
+    whenever you find yourself duplicating common tasks inside handlers, it's worth
+    considering whether a handler wrapper function could help simplify code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cross-browser resource sharing
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The same-origin security policy mandates that AJAX requests in web browsers
+    be only allowed for services hosted on the same domain, which would make our API
+    fairly limited since we won''t be necessarily hosting all of the websites that
+    use our web service. The CORS technique circumnavigates the same-origin policy,
+    allowing us to build a service capable of serving websites hosted on other domains.
+    To do this, we simply have to set the `Access-Control-Allow-Origin` header in
+    response to `*` . While we''re at it—since we''re using the `Location` header
+    in our create poll call—we''ll allow that header to be accessible by the client
+    too, which can be done by listing it in the `Access-Control-Expose-Headers` header.
+    Add the following code to `main.go` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: This is the simplest wrapper function yet; it just sets the appropriate header
+    on the `ResponseWriter` type and calls the specified `http.HandlerFunc` type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In this chapter, we are handling CORS explicitly so we can understand exactly
+    what is going on; for real production code, you should consider employing an open
+    source solution such as [https://github.com/fasterness/cors](https://github.com/fasterness/cors)
+    .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 读累了记得休息一会哦~
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**公众号：古德猫宁李**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 电子书搜索下载
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 书单分享
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 书友学习交流
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**网站：**[沉金书屋 https://www.chenjin5.com](https://www.chenjin5.com)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 电子书搜索下载
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 电子书打包资源分享
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 学习资源分享
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Responding
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A big part of any API is responding to requests with a combination of status
+    codes, data, errors, and sometimes headers—the `net/http` package makes all of
+    this very easy to do. One option we have, which remains the best option for tiny
+    projects or even the early stages of big projects, is to just build the response
+    code directly inside the handler. As the number of handlers grows, however, we
+    would end up duplicating a lot of code and sprinkling representation decisions
+    all over our project. A more scalable approach is to abstract the response code
+    into helper functions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the first version of our API, we are going to speak only JSON, but we want
+    the flexibility to add other representations later if we need to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `respond.go` , and add the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: These two functions abstract the decoding and encoding of data from and to the
+    `Request` and `ResponseWriter` objects respectively. The decoder also closes the
+    request body, which is recommended. Although we haven't added much functionality
+    here, it means that we do not need to mention JSON anywhere else in our code,
+    and if we decide to add support for other representations or switch to a binary
+    protocol instead, we need only touch these two functions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next we are going to add a few more helpers that will make responding even
+    easier. In `respond.go` , add the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function makes it easy to write the status code and some data to the `ResponseWriter`
+    object using our `encodeBody` helper.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Handling errors is another important aspect that is worth abstracting. Add
+    the following `respondErr` helper:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This method gives us an interface similar to the `respond` function, but the
+    data written will be enveloped in an `error` object, to make it clear that something
+    went wrong. Finally, we can add an HTTP error-specific helper that will generate
+    the correct message for us by using the `http.StatusText` function from the Go
+    standard library:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice that these functions are all dogfooding, which means they use each other
+    (as in, eating your own dog food), which is important since we want actual responding
+    to only happen in one place, for if (or more likely, when) we need to make changes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the request
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `http.Request` object gives us access to every piece of information we
+    might need about the underlying HTTP request, and therefore it is worth glancing
+    through the `net/http` documentation to really get a feel for its power. Examples
+    include, but are not limited to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: URL, path and query string
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: HTTP method
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cookies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Files
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Form values
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Referrer and user agent of requester
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Basic authentication details
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Request body
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Header information
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are a few things it doesn't address, which we need to either solve ourselves
+    or look to an external package to help us with. URL path parsing is one such example—while
+    we can access a path (such as `/people/1/books/2` ) as a string via the `http.Request`
+    type's `URL.Path` field, there is no easy way to pull out the data encoded in
+    the path such as the people ID of `1` , or the books ID of `2` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A few projects do a good job of addressing this problem, such as Goweb or Gorillz's
+    `mux` package. They let you map path patterns that contain placeholders for values
+    that they then pull out of the original string and make available to your code.
+    For example, you can map a pattern of `/users/{userID}/comments/{commentID}` ,
+    which will map paths such as `/users/1/comments/2` . In your handler code, you
+    can then get the values by the names placed inside the curly braces, rather than
+    having to parse the path yourself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since our needs are simple, we are going to knock together a simple path-parsing
+    utility; we can always use a different package later if we have to, but that would
+    mean adding a dependency to our project.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `path.go` , and insert the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: This simple parser provides a `NewPath` function that parses the specified path
+    string and returns a new instance of the `Path` type. Leading and trailing slashes
+    are trimmed (using `strings.Trim` ) and the remaining path is split (using `strings.Split`
+    ) by the `PathSeparator` constant that is just a forward slash. If there is more
+    than one segment (`len(s) > 1` ), the last one is considered to be the ID. We
+    re-slice the slice of strings to select the last item for the ID using `s[len(s)-1]`
+    , and the rest of the items for the remainder of the path using `s[:len(s)-1]`
+    . On the same lines, we also re-join the path segments with the `PathSeparator`
+    constant to form a single string containing the path without the ID.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This supports any `collection/id` pair, which is all we need for our API. The
+    following table shows the state of the `Path` type for the given original path
+    string:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Original path string | Path | ID | HasID |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `/` | `/` | `nil` | `false` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `/people/` | `people` | `nil` | `false` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `/people/1/` | `people` | `1` | `true` |'
+  prefs: []
+  type: TYPE_TB
+- en: A simple main function to serve our API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A web service is nothing more than a simple Go program that binds to a specific
+    HTTP address and port and serves requests, so we get to use all our command-line
+    tool-writing knowledge and techniques.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We also want to ensure that our `main` function is as simple and modest as possible,
+    which is always a goal of coding, especially in Go.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before we write our `main` function, let''s look at a few design goals of our
+    API program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We should be able to specify the HTTP address and port to which our API listens
+    and the address of the MongoDB instances without having to recompile the program
+    (through command-line flags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We want the program to gracefully shut down when we terminate it, allowing the
+    in-flight requests (requests that are still being processed when the termination
+    signal is sent to our program) to complete
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We want the program to log out status updates and report errors properly
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Atop the `main.go` file, replace the `main` function placeholder with the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function is the entirety of our API `main` function, and even as our API
+    grows, there is just a little bloat we would need to add to this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first thing we do is to specify two command-line flags, `addr` and `mongo`
+    , with some sensible defaults, and to ask the `flag` package to parse them. We
+    then attempt to dial the MongoDB database at the specified address. If we are
+    unsuccessful, we abort with a call to `log.Fatalln` . Assuming the database is
+    running and we are able to connect, we store the reference in the `db` variable
+    before deferring the closing of the connection. This ensures our program properly
+    disconnects and tidies up after itself when it ends.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then create a new `http.ServeMux` object, which is a request multiplexer
+    provided by the Go standard library, and register a single handler for all requests
+    that begin with the path `/polls/` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we make use of Tyler Bunnell's excellent `Graceful` package, which
+    can be found at [https://github.com/stretchr/graceful](https://github.com/stretchr/graceful)
+    to start the server. This package allows us to specify `time.Duration` when running
+    any `http.Handler` (such as our `ServeMux` handler), which will allow any in-flight
+    requests some time to complete before the function exits. The `Run` function will
+    block until the program is terminated (for example, when someone presses *Ctrl*
+    + *C* ).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using handler function wrappers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'It is when we call `HandleFunc` on the `ServeMux` handler that we are making
+    use of our handler function wrappers, with the line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since each function takes an `http.HandlerFunc` type as an argument and also
+    returns one, we are able to chain the execution just by nesting the function calls
+    as we have done previously. So when a request comes in with a path prefix of `/polls/`
+    , the program will take the following execution path:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`withCORS` is called, which sets the appropriate header.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`withVars` is called, which calls `OpenVars` and defers `CloseVars` for the
+    request.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`withData` is then called, which copies the database session provided as the
+    first argument and defers the closing of that session.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`withAPIKey` is called next, which checks the request for an API key and aborts
+    if it''s invalid, or else calls the next handler function.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`handlePolls` is then called, which has access to variables and a database
+    session, and which may use the helper functions in `respond.go` to write a response
+    to the client.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Execution goes back to `withAPIKey` that just exits.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Execution goes back to `withData` that exits, therefore calling the deferred
+    session `Close` function and clearing up the database session.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Execution goes back to `withVars` that exits, therefore calling `CloseVars`
+    and tidying that up too.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Execution finally goes back to `withCORS` that just exits.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The order that we nest the wrapper functions in is important, because `withData`
+    puts the database session for each request in that request's variables map using
+    `SetVar` . So `withVars` must be outside `withData` . If this isn't respected,
+    the code will likely panic and you may want to add a check so that the panic is
+    more meaningful to other developers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handling endpoints
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The final piece of the puzzle is the `handlePolls` function that will use the
+    helpers to understand the incoming request and access the database, and generate
+    a meaningful response that will be sent back to the client. We also need to model
+    the poll data that we were working with in the previous chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `polls.go` , and add the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we define a structure called `poll` that has three fields that in turn
+    describe the polls being created and maintained by the code we wrote in the previous
+    chapter. Each field also has a tag (two in the `ID` case), which allows us to
+    provide some extra metadata.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using tags to add metadata to structs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Tags are strings that follow a field definition within a `struct` type on the
+    same line of code. We use the back tick character to denote literal strings, which
+    means we are free to use double quotes within the tag string itself. The `reflect`
+    package allows us to pull out the value associated with any key; in our case,
+    both `bson` and `json` are examples of keys, and they are each key/value-pair-separated
+    by a space character. Both the `encoding/json` and `gopkg.in/mgo.v2/bson` packages
+    allow you to use tags to specify the field name that will be used with encoding
+    and decoding (along with some other properties), rather than having it infer the
+    values from the name of the fields themselves. We are using BSON to talk with
+    the MongoDB database and JSON to talk to the client, so we can actually specify
+    different views of the same `struct` type. For example, consider the ID field:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: The name of the field in Go is `ID` , the JSON field is `id` , and the BSON
+    field is `_id` , which is the special identifier field used in MongoDB.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Many operations with a single handler
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Because our simple path-parsing solution cares only about the path, we have
+    to do some extra work when looking at the kind of RESTful operation the client
+    is making. Specifically, we need to consider the HTTP method so we know how to
+    handle the request. For example, a `GET` call to our `/polls/` path should read
+    polls, where a `POST` call would create a new one. Some frameworks solve this
+    problem for you, by allowing you to map handlers based on more than the path,
+    such as the HTTP method or the presence of specific headers in the request. Since
+    our case is ultra simple, we are going to use a simple `switch` case. In `polls.go`
+    , add the `handlePolls` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We switch on the HTTP method and branch our code depending on whether it is
+    `GET` , `POST` , or `DELETE` . If the HTTP method is something else, we just respond
+    with a `404 http.StatusNotFound` error. To make this code compile, you can add
+    the following function stubs underneath the `handlePolls` handler:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In this section, we learned how to manually parse elements of the requests (the
+    HTTP method) and make decisions in code. This is great for simple cases, but it's
+    worth looking at packages such as Goweb or Gorilla's `mux` package for some more
+    powerful ways of solving these problems. Nevertheless, keeping external dependencies
+    to a minimum is a core philosophy of writing good and contained Go code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading polls
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Now it''s time to implement the functionality of our web service. Inside the
+    `GET` case, add the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: The very first thing we do in each of our subhandler functions is to use `GetVar`
+    to get the `mgo.Database` object that will allow us to interact with MongoDB.
+    Since this handler was nested inside both `withVars` and `withData` , we know
+    that the database will be available by the time execution reaches our handler.
+    We then use `mgo` to create an object referring to the `polls` collection in the
+    database—if you remember, this is where our polls live.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We then build up an `mgo.Query` object by parsing the path. If an ID is present,
+    we use the `FindId` method on the `polls` collection, otherwise we pass `nil`
+    to the `Find` method, which indicates that we want to select all the polls. We
+    are converting the ID from a string to a `bson.ObjectId` type with the `ObjectIdHex`
+    method so that we can refer to the polls with their numerical (hex) identifiers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since the `All` method expects to generate a collection of poll objects, we
+    define the result as `[]*poll` , or a slice of pointers to poll types. Calling
+    the `All` method on the query will cause `mgo` to use its connection to MongoDB
+    to read all the polls and populate the `result` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: For small scale projects, such as a small number of polls, this approach is
+    fine, but as the number of polls grow, we would need to consider paging the results
+    or even iterating over them using the `Iter` method on the query, so we do not
+    try to load too much data into memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have added some functionality, let's try out our API for the first
+    time. If you are using the same MongoDB instance that we set up in the previous
+    chapter, you should already have some data in the `polls` collection; to see our
+    API working properly, you should ensure there are at least two polls in the database.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'If you need to add other polls to the database, in a terminal, run the `mongo`
+    command to open a database shell that will allow you to interact with MongoDB.
+    Then enter the following commands to add some test polls:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In a terminal, navigate to your `api` folder, and build and run the project:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now make a `GET` request to the `/polls/` endpoint by navigating in your browser
+    to `http://localhost:8080/polls/?key=abc123` ; remember to include the trailing
+    slash. The result will be an array of polls in JSON format.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Copy and paste one of the IDs from the polls list, and insert it before the
+    `?` character in the browser to access the data for a specific poll; for example,
+    `http://localhost:8080/polls/5415b060a02cd4adb487c3ae?key=abc123` . Notice that
+    instead of returning all the polls, it only returns one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Test the API key functionality by removing or changing the key parameter to
+    see what the error looks like.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might have also noticed that although we are only returning a single poll,
+    this poll value is still nested inside an array. This is a deliberate design decision
+    made for two reasons: the first and most important reason is that nesting makes
+    it easier for users of the API to write code to consume the data. If users are
+    always expecting a JSON array, they can write strong types that describe that
+    expectation, rather than having one type for single polls and another for collections
+    of polls. As an API designer, this is your decision to make. The second reason
+    we left the object nested in an array is that it makes the API code simpler, allowing
+    us to just change the `mgo.Query` object and to leave the rest of the code the
+    same.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a poll
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Clients should be able to make a `POST` request to `/polls/` to create a poll.
+    Let''s add the following code inside the `POST` case:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we first attempt to decode the body of the request that, according to RESTful
+    principles, should contain a representation of the poll object the client wants
+    to create. If an error occurs, we use the `respondErr` helper to write the error
+    to the user, and immediately return the function. We then generate a new unique
+    ID for the poll, and use the `mgo` package's `Insert` method to send it into the
+    database. As per HTTP standards, we then set the `Location` header of the response
+    and respond with a `201 http.StatusCreated` message, pointing to the URL from
+    which the newly created poll maybe accessed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deleting a poll
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The final piece of functionality we are going to include in our API is the
+    capability to delete polls. By making a request with the `DELETE` HTTP method
+    to the URL of a poll (such as `/polls/5415b060a02cd4adb487c3ae` ), we want to
+    be able to remove the poll from the database and return a `200 Success` response:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: Similar to the `GET` case, we parse the path, but this time we respond with
+    an error if the path does not contain an ID. For now, we don't want people to
+    be able to delete all polls with one request, and so use the suitable `StatusMethodNotAllowed`
+    code. Then, using the same collection we used in the previous cases, we call `RemoveId`
+    , passing in the ID in the path after converting it into a `bson.ObjectId` type.
+    Assuming things go well, we respond with an `http.StatusOK` message, with no body.
+  prefs: []
+  type: TYPE_NORMAL
+- en: CORS support
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In order for our `DELETE` capability to work over CORS, we must do a little
+    extra work to support the way CORS browsers handle some HTTP methods such as `DELETE`
+    . A CORS browser will actually send a pre-flight request (with an HTTP method
+    of `OPTIONS` ) asking for permission to make a `DELETE` request (listed in the
+    `Access-Control-Request-Method` request header), and the API must respond appropriately
+    in order for the request to work. Add another case in the `switch` statement for
+    `OPTIONS` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: If the browser asks for permission to send a `DELETE` request, the API will
+    respond by setting the `Access-Control-Allow-Methods` header to `DELETE` , thus
+    overriding the default `*` value that we set in our `withCORS` wrapper handler.
+    In the real world, the value for the `Access-Control-Allow-Methods` header will
+    change in response to the request made, but since `DELETE` is the only case we
+    are supporting, we can hardcode it for now.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The details of CORS are out of the scope of this book, but it is recommended
+    that you research the particulars online if you intend to build truly accessible
+    web services and APIs. Head over to [http://enable-cors.org/](http://enable-cors.org/)
+    to get started.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing our API using curl
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`curl` is a command-line tool that allows us to make HTTP requests to our service
+    so that we can access it as though we were a real app or client consuming the
+    service.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Windows users do not have access to `curl` by default, and will need to seek
+    an alternative. Check out [http://curl.haxx.se/dlwiz/?type=bin](http://curl.haxx.se/dlwiz/?type=bin)
+    or search the Web for "Windows `curl` alternative".
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a terminal, let''s read all the polls in the database through our API. Navigate
+    to your `api` folder and build and run the project, and also ensure MongoDB is
+    running:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We then perform the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Enter the following `curl` command that uses the `-X` flag to denote we want
+    to make a `GET` request to the specified URL:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The output is printed after you hit *Enter* :'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'While it isn''t pretty, you can see that the API returns the polls from your
+    database. Issue the following command to create a new poll:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Get the list again to see the new poll included:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Copy and paste one of the IDs, and adjust the URL to refer specifically to
+    that poll:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we see only the selected poll, `Best Beatle` . Let''s make a `DELETE` request
+    to remove the poll:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now when we get all the polls again, we''ll see that the `Best Beatle` poll
+    has gone:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: So now that we know that our API is working as expected, it's time to build
+    something that consumes the API properly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A web client that consumes the API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We are going to put together an ultra-simple web client that consumes the capabilities
+    and data exposed through our API, allowing users to interact with the polling
+    system we built in the previous chapter and earlier in this chapter. Our client
+    will be made up of three web pages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An `index.html` page that shows all the polls
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A `view.html` page that shows the results of a specific poll
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A `new.html` page that allows users to create new polls
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Create a new folder called `web` alongside the `api` folder, and add the following
+    content to the `main.go` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: These few lines of Go code really highlight the beauty of the language and the
+    Go standard library. They represent a complete, highly scalable, static website
+    hosting program. The program takes an `addr` flag and uses the familiar `http.ServeMux`
+    type to serve static files from a folder called `public` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Building the next few pages—while we're building the UI—consists of writing
+    a lot of HTML and JavaScript code. Since this is not Go code, if you'd rather
+    not type it all out, feel free to head over to the GitHub repository for this
+    book and copy and paste it from [https://github.com/matryer/goblueprints](https://github.com/matryer/goblueprints)
+    .
+  prefs: []
+  type: TYPE_NORMAL
+- en: An index page showing a list of polls
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Create the `public` folder inside `web` and add the `index.html` file after
+    writing the following HTML code in it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We will use Bootstrap again to make our simple UI look nice, but we need to
+    add two additional sections to the `body` tag of the HTML page. First, add the
+    DOM elements that will display the list of polls:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we are using Bootstrap's grid system to center-align our content that is
+    made up of a list of polls and a link to `new.html` , where users can create new
+    polls.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, add the following `script` tags and JavaScript underneath the previous
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: We are using jQuery's `$.get` function to make an AJAX request to our web service.
+    We are also hardcoding the API URL. In practice, you might decide against this,
+    but you should at least use a domain name to abstract it. Once the polls have
+    loaded, we use jQuery to build up a list containing hyperlinks to the `view.html`
+    page, passing the ID of the poll as a query parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A page to create a new poll
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To allow users to create a new poll, create a file called `new.html` inside
+    the `public` folder, and add the following HTML code to the file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We are going to add the elements for an HTML form that will capture the information
+    we need when creating a new poll, namely the title of the poll and the options.
+    Add the following code inside the `body` tags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Since our API speaks JSON, we need to do a bit of work to turn the HTML form
+    into a JSON-encoded string, and also break the comma-separated options string
+    into an array of options. Add the following `script` tag:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we add a listener to the `submit` event of our form, and use jQuery's `val`
+    method to collect the input values. We split the options with a comma, and trim
+    the spaces away before using the `$.post` method to make the `POST` request to
+    the appropriate API endpoint. `JSON.stringify` allows us to turn the data object
+    into a JSON string, and we use that string as the body of the request, as expected
+    by the API. On success, we pull out the `Location` header and redirect the user
+    to the `view.html` page, passing a reference to the newly created poll as the
+    parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A page to show details of the poll
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The final page of our app we need to complete is the `view.html` page where
+    users can see the details and live results of the poll. Create a new file called
+    `view.html` inside the `public` folder, and add the following HTML code to it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This page is mostly similar to the other pages; it contains elements for presenting
+    the title of the poll, the options, and a pie chart. We will be mashing up Google''s
+    Visualization API with our API to present the results. Underneath the final `div`
+    tag in `view.html` (and above the closing `body` tag), add the following `script`
+    tags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: We include the dependencies we will need to power our page, jQuery and Bootstrap,
+    and also the Google JavaScript API. The code loads the appropriate visualization
+    libraries from Google, and waits for the DOM elements to load before extracting
+    the poll ID from the URL by splitting it on `poll=` . We then create a variable
+    called `update` that represents a function responsible for generating the view
+    of the page. This approach is taken to make it easy for us to use `window.setTimeout`
+    to issue regular calls to update the view. Inside the `update` function, we use
+    `$.get` to make a `GET` request to our `/polls/{id}` endpoint, replacing `{id}`
+    with the actual ID we extracted from the URL earlier. Once the poll has loaded,
+    we update the title on the page and iterate over the options to add them to the
+    list. If there are results (remember in the previous chapter, the `results` map
+    was only added to the data as votes start being counted), we create a new `google.visualization.PieChart`
+    object and build a `google.visualization.DataTable` object containing the results.
+    Calling `draw` on the chart causes it to render the data, and thus update the
+    chart with the latest numbers. We then use `setTimeout` to tell our code to call
+    `update` again in another second.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we bind to the `click` event of the `delete` button we added to our
+    page, and after asking the user if they are sure, make a `DELETE` request to the
+    polls URL and then redirect them back to the home page. It is this request that
+    will actually cause the `OPTIONS` request to be made first, asking for permission,
+    which is why we added explicit support for it in our `handlePolls` function earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running the solution
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We have built many components over the last two chapters, and it is now time
+    to see them all working together. This section contains everything you need to
+    get all the items running, assuming you have the environment set up properly as
+    described at the beginning of the previous chapter. This section assumes you have
+    a single folder that contains four subfolders: `api` , `counter` , `twittervotes`
+    , and `web` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assuming nothing is running, take the following steps (each step in its own
+    terminal window):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the top-level folder, start the `nsqlookupd` daemon:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the same directory, start the `nsqd` daemon:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Start the MongoDB daemon:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Navigate to the `counter` folder and build and run it:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Navigate to the `twittervotes` folder and build and run it. Be sure that you
+    have the appropriate environment variables set, otherwise you will see errors
+    when you run the program:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Navigate to the `api` folder and build and run it:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Navigate to the `web` folder and build and run it:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that everything is running, open a browser and head to `http://localhost:8081/`
+    . Using the user interface, create a poll called `Moods` and input the options
+    as `happy,sad,fail,and success` . These are common enough words that we are likely
+    to see some relevant activity on Twitter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you have created your poll, you will be taken to the view page where you
+    will start to see the results coming in. Wait for a few seconds, and enjoy the
+    fruits of your hard work as the UI updates in real time showing live, real-time
+    results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Running the solution](img/Image00012.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we exposed the data for our social polling solution through
+    a highly scalable RESTful API and built a simple website that consumes the API
+    to provide an intuitive way for users to interact with it. The website consists
+    of static content only, with no server-side processing (since the API does the
+    heavy lifting for us). This allows us to host the website very cheaply on static
+    hosting sites such as [bitballoon.com](http://bitballoon.com) , or to distribute
+    the files to content delivery networks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Within our API service, we learned how to share data between handlers without
+    breaking or obfuscating the handler pattern from the standard library. We also
+    saw how writing wrapped handler functions allows us to build a pipeline of functionality
+    in a very simple and intuitive way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We wrote some basic encoding and decoding functions that—while only simply wrapping
+    their counterparts from the `encoding/json` package for now—could be improved
+    later to support a range of different data representations without changing the
+    internal interface to our code. We wrote a few simple helper functions that make
+    responding to data requests easy, while providing the same kind of abstraction
+    that would allow us to evolve our API later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We saw how, for simple cases, switching on to HTTP methods is an elegant way
+    to support many functions for a single endpoint. We also saw how, with a few extra
+    lines of code, we are able to build in support for CORS to allow applications
+    running on different domains to interact with our services—without the need for
+    hacks like JSONP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code in this chapter, combined with the work we did in the previous chapter,
+    provides a real-world, production-ready solution that implements the following
+    flow:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The user clicks on the **Create Poll** button on the website, and enters the
+    title and options for a poll.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The JavaScript running in the browser encodes the data as a JSON string and
+    sends it in the body of a `POST` request to our API.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The API receives the request, and after validating the API key, setting up a
+    database session, and storing it in our variables map, calls the `handlePolls`
+    function that processes the request and stores the new poll in the MongoDB database.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The API redirects the user to the `view.html` page for the newly created poll.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Meanwhile, the `twittervotes` program loads all polls from the database, including
+    the new one, and opens a connection to Twitter filtering on the hashtags that
+    represent options from the polls.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: As votes come in, `twittervotes` pushes them to NSQ.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `counter` program is listening in on the appropriate channel and notices
+    the votes coming in, counting each one and periodically making updates to the
+    database.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The user sees the results displayed (and refreshed) on the `view.html` page
+    as the website continually makes `GET` requests to the API endpoint for the selected
+    poll.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the next chapter, we will evolve our API and web skills to build a brand
+    new start-up app called Meander. We'll see how we can write a full, static web
+    server in just a few lines of Go code, and explore an interesting way of representing
+    enumerators in a language that doesn't officially support them!
+  prefs: []
+  type: TYPE_NORMAL

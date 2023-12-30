@@ -1,0 +1,1195 @@
+- en: Chapter 12. TrendCalculus
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Long before the concept of what''s trending became a popular topic of study
+    by data scientists, there was an older one that is still not well served by data
+    science: it is that of Trends. Presently, the analysis of trends, if it can be
+    called that, is primarily carried out by people "eyeballing" time series charts
+    and offering interpretations. But what is it that people''s eyes are doing?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter describes an implementation in Apache Spark of a new algorithm
+    for studying trends numerically, called TrendCalculus, invented by Andrew Morgan.
+    The original reference implementation is written in the Lua language and was open-sourced
+    in 2015, the code can be viewed at [https://bitbucket.org/bytesumo/trendcalculus-public](https://bitbucket.org/bytesumo/trendcalculus-public).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter explains the core method, which delivers the fast extraction of
+    trend change points on a time series; these are the moments when trends change
+    direction. We will describe our TrendCalculus algorithm in detail while implementing
+    it in Apache Spark. The result is a set of scalable functions to quickly compare
+    trends across time series, to make inferences about trends and examine correlation
+    across timeframes. Using these disruptive new methods, we demonstrate how to construct
+    a causal ranking technique to extract potential causal models from across the
+    thousands of time series inputs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter we will learn:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to construct time windowed summary data efficiently
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to effectively summarize time series data to reduce noise, for further trend
+    studies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to extract trend reversal *change points* from the summary data using the
+    new TrendCalculus algorithm
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to create **User Defined Aggregate Functions** (**UDAFs**) that operate
+    on partitions created by complex *window* functionality as well as more common
+    *group by* methods
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to return multiple values from UDAFs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to use lag functions to compare current and previous records
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When presented with a problem, amongst the first hypotheses that data scientists
+    consider are those related to trends; trends are an excellent way to provide a
+    visualization of data and lend themselves particularly well to large datasets,
+    where the general direction of change of the data can often be seen. In Chapter
+    5, *Spark for Geographic Analysis*, we produced a simple algorithm to attempt
+    to predict the price of crude oil. In that study, we concentrated on the direction
+    of change in the price, that is, by definition the trend of the price. We see
+    that trends are a natural way to think, explain, and forecast.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To explain and demonstrate our new trend methods, this chapter is organized
+    into two sections. The first is technical, to deliver the code we need to execute
+    our new algorithm. The second section is about the application of that method
+    on real data. We hope it demonstrates that the apparent simplicity of trends as
+    a concept can often be more complicated to calculate than we may have first thought,
+    particularly in the presence of noise. Noise results in many local highs and lows
+    (referred to as jitter in this chapter), which can make finding trend turning
+    points and discovering the general direction of change over time difficult to
+    determine. Ignoring noise in time series, and extracting interpretable trend signals,
+    provides the central challenges we demonstrate how to overcome.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Studying trends
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The dictionary definition of trend is a general direction in which something
+    is developing or changing, but there are other more focused definitions that might
+    be more helpful for guiding data science. Two such definitions are from Salomé
+    Areias, who studies social trends, and Eurostat, the official statistical agency
+    in the European Union:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*"A trend is the slow variation over a longer period of time, usually several
+    years, generally associated with the structural causes affecting the phenomenon
+    being measured."* - EUROSTAT, official statistical agency in the European Union
+    ([http://ec.europa.eu/eurostat/statistics-explained/index.php/Glossary:Trend](http://ec.europa.eu/eurostat/statistics-explained/index.php/Glossary:Trend))'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*"A Trend is defined by a shift in behavior or mentality that influences a
+    significant amount of people."* - Salomé Areias, social trend commentator ([https://salomeareias.wordpress.com/what-is-a-trend/](https://salomeareias.wordpress.com/what-is-a-trend/))'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We generally think of trends as nothing more than a long rise or fall in stock
+    market prices. However, trends can also refer to many other use cases that relate
+    to economics, politics, popular culture, and society: for example, the study of
+    sentiments revealed by media outlets when they report on the news. In this chapter,
+    we will use the price of oil as a simple demonstration; however, the technique
+    could be applied to any data where trends occur in the following manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rising trends**: When successive peaks and troughs are higher (higher highs
+    and higher lows), referred to as an upward or rising trend. For example, the first
+    arrow in the following diagram is the result of a series of peaks and troughs
+    where the overall effect is an increase.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Falling trends**: When successive peaks and troughs are lower (lower highs
+    and lower lows), referred to as a downward or falling trend. For example, the
+    second arrow in the following diagram is the result of a series of peaks and troughs
+    where the overall effect is a decrease.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Horizontal trends**: This is not strictly a trend on its own, but a lack
+    of a well-defined trend in either direction. We are not specifically concerned
+    with this at this stage, but it is discussed later in the chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![Studying trends](img/image_12_001.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you search for "higher highs" "higher lows" "trend" "lower highs" "lower
+    lows" you will see over 16,000 hits including many high profile financial sites.
+    This is a standard practice, rule of thumb definition of a trend in the finance
+    industry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The TrendCalculus algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section we will explain the detail of the TrendCalculus implementation,
+    using the Brent oil price data set seen in Chapter 5, *Spark for Geographic Analysis*,
+    as an example use case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trend windows
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to measure any type of change, we must first quantify it in some way.
+    For trends, we are going to define this in the following manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Overall positive change (usually expressed as a value increase)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Higher highs and higher lows => +1
+  prefs: []
+  type: TYPE_NORMAL
+- en: Overall negative change (usually expressed as a value decrease)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lower highs and lower lows => -1
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We must therefore translate our data into a time series of trend direction,
+    being either +1 or -1\. By splitting our data into a series of windows, size *n*,
+    we can calculate the dated highs and lows for each of them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Trend windows](img/image_12_002.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Since this type of windowing is a common practice in data science, it is reasonable
+    to think there must be an implementation in Spark; if you have read [Chapter 5](ch05.xhtml
+    "Chapter 5. Spark for Geographic Analysis"), *Spark for Geographic Analysis* you
+    will have seen them, in the form of Spark SQL windows functions. Let''s read in
+    some Brent oil data, which in this case is simply a date and the closing price
+    of oil on that date (example data is located in our code repository):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we should ensure the date field schema is correct so that we can use
+    it in the `window` function. Our example dataset has a `String` date in the format
+    `dd/MM/yyyy` so we shall convert it to `yyyy-MM-dd` using `java.text.SimpleDateFormat`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This will allow us to create a **User Defined Function** (**UDF**) that we
+    can use to replace the date column we already have in the `oilPriceDF` DataFrame:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As a quick aside, if we want to concentrate on a particular range of the data,
+    we can filter it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And now we can implement the window using the window function introduced in
+    Spark 2.0:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The arguments in the preceding statement allow us to provide a size of window,
+    window offset and data offset, so this schema actually produces a tumbling window
+    with an offset at the beginning of the data. This allows us to ensure that each
+    window is constructed so that it always contains data for Monday to Friday (the
+    trading days for oil), and each subsequent window contains data for the following
+    week.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'View the DataFrame at this stage to ensure all is in order; we cannot use `show`
+    method in the usual way as `windowDF` is a `RelationalGroupedDataset`. So we can
+    run a simple inbuilt function to create a readable output. Counting each window
+    content, showing the first twenty lines and not truncating the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Which will appear similar to this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, count is the number of entries in the window, that is, the number of prices
+    in our case. Depending upon the data used, we may find that some windows contain
+    less than five entries, due to missing data. We will keep these in the dataset,
+    otherwise there will be gaps in our output.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Data quality should never be overlooked, and due diligence should always be
+    performed before working with a new dataset, see Chapter 4, *Exploratory Data
+    Analysis*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Changing the size of the window *n* (in this case, 1 week) will adjust our
+    scale of investigation. For example, an *n* sized 1 week will provide a weekly
+    change, and an *n* sized 1 year will provide a yearly change (each window will
+    be sized: [no. of weeks'' oil traded * 5] using our data). Of course, this is
+    entirely related to how the dataset is structured, that is, depending on whether
+    it be hourly or daily prices, and so on. Later in the chapter we will see how
+    we can easily examine trends on an iterative basis, taking the change points from
+    one pass over the data as the inputs to a second iteration.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Simple trend
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we have windowed data, we can calculate the +1 or -1 values for each
+    window (the simple trend), so we need to develop a trend calculation equation.
+    We can do this visually using an example from the previous graph diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Simple trend](img/image_12_003.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: For the set of calculated windows, we can compare the current window to the
+    previous window thereby showing the higher highs, higher lows and lower highs,
+    lower lows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We do this by selecting the following from each window:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The earliest high price
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The latest low price
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Using this information, we can derive our TrendCalculus equation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Simple trend](img/image_12_004.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'where:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**sign**: is the function (x > 0) ? 1 : ((x < 0) ? -1 : 0)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**H**: high'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**L**: low'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Pi**: current window'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Pi -1**: previous window'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For example, given the following scenario:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Simple trend](img/image_12_005.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Simple trend = sign(sign(HighDiff) + sign(LowDiff))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Simple trend = sign(sign(1000-970) + sign(800-780))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Simple trend = sign(sign(30) + sign(20))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Simple trend = sign(1 + 1)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Simple trend = sign(2)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Simple trend = +1
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is also possible to obtain an answer of 0\. This is explained in detail later
+    in the chapter., see *Edge Cases*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User Defined Aggregate Functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There are a number of ways to perform the above task programmatically, we are
+    going to look at UDFs for aggregated data (Spark `UserDefinedAggregateFunction`)
+    so that we can use the windowed data collected earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We would like to be able to use a function on our windows in a similar way to
+    our previous UDF example. However, a standard UDF would not be possible, since
+    our windows are represented as `RelationalGroupedDataset`. At runtime, the data
+    for such a set may be held on more than one Spark node, so that functions are
+    performed in parallel, as opposed to the data for a UDF, which must be co-located.
+    The UDAF is therefore great news for us, as it means that we can implement our
+    program logic safe in the knowledge that the concerns of parallelization efficiencies
+    are abstracted away and the code will automatically scale to massive datasets!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In summary, we are looking to output the earliest high price along with its
+    date and the latest low price with date (for each window) so that we can use this
+    data to calculate the simple trend as described previously. We will write a Scala
+    class that extends the `UserDefinedAggregateFunction`, which contains the following
+    functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`inputSchema`: The structure of the input data supplied to the function'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bufferSchema`: The structure of the internal information (aggregation buffer)
+    held for this instance'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dataType`: The type of the output data structure'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`deterministic`: Whether the function is `deterministic` (that is, the same
+    input always returns the same output)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`initialize`: The initial state of the aggregation buffer; merging two initial
+    buffers together must always return the same initial state'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`update`: Update the aggregation buffer with the input data'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`merge`: Merge two aggregation buffers'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`evaluate`: Calculate the final result based on the aggregation buffer'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The full code for our class is shown below, refer back to the preceding definitions
+    as you're raeding through to understand the purpose of each. The code has deliberately
+    been left quite verbose so that the functionality can be more easily understood.
+    In practice, we could certainly refactor the `update` and `merge` functions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You will notice that there is common use of the `signum` function. This is
+    very useful for comparison, as it produces the following outcomes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the first value is less than the second, output -1
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the first value is greater than the second, output +1
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the two values are equal, output 0
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This function will really show its worth later in the chapter when we write
+    the code to calculate the actual simple trend value. We have also used the `option`
+    class (in `parseDate`), which enables us to return an instance of `Some` or `None`.
+    This has a number of advantages: primarily it promotes a separation of concerns
+    by removing the need to check for null immediately, but also enables the use of
+    pattern matching, allowing us to chain together many Scala functions without the
+    need for verbose type-checking. For example, if we write a function that returns
+    either `Some(Int)` or `None`, then we can `flatMap` those values with no additional
+    checking:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code returns `Int = 6`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Simple trend calculation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we have our aggregation function, we can register it and use this
+    to output the values to our DataFrame:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Producing an output similar to this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We have already mentioned that we will need to compare the current window to
+    the previous one. We can create a new DataFrame with the inclusion of the previous
+    window details by implementing the Spark `lag` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We now have a DataFrame where each row contains all of the information required
+    to calculate the simple trend value. We can again implement a UDF, this time to
+    represent the simple trend equation using the `signum` function mentioned previously:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And finally, apply the UDF to our DataFrame:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Reversal rule
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Having run the code across all of the identified windows we now have our data
+    represented as a series of +1 and -1s, and we can analyze this further to progress
+    our understanding of the trends. You will notice that the data appears random,
+    but there is a pattern that we can identify: the trend values often flip, either
+    from +1 to -1 or -1 to +1\. On closer inspection of the graph at these points,
+    we can see that these flips actually represent a reversal of the trend:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Reversal rule](img/image_12_006.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'This can be summarized thus:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the trend moves from +1 to -1, then a previous high is a reversal
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the trend moves from -1 to +1, then a previous low is a reversal
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Using this simple rule, we can output a new time series that contains just
+    the reversal points found on our scale. In this time series, we will create tuples
+    of (date, price) that are equivalent to the higher high for a +1 reversal and
+    the lower low for a -1 reversal as discussed earlier. We can code this by using
+    the same method as before, that is, capture the previous sign using the `lag`
+    function and implement a UDF to work out the reversals, like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: In summary, we have successfully removed the jitter (non significant rise and
+    fall) from our price data, and we could benefit from displaying this data straight
+    away. It will certainly show a simplified representation of the original dataset
+    and, assuming we are primarily interested in the points at which the price significantly
+    changes, retains the key information, which is related to the important peaks
+    and troughs. However, there is more that we can do to represent the data in a
+    presentable and easily readable manner.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing the FHLS bar structure
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In the financial sector, **Open, High, Low, Close** (**OHLC**) charts are very
+    common as they display the key data that every analyst requires; the price the
+    item opened and closed at and the high and low price points for that period (usually
+    one day). We can use this same idea for our own purposes. The **First, High, Low,
+    Second** (**FHLS**) chart will enable us to visualize our data and build upon
+    it to produce new insights.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The FHLS data format is described as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The open date
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**First** of High/Low value - whichever high or low occurs first'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**High** value'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Low** value'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Second** of High/Low value - the other value to first of High/Low'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: High date
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Low date
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Close date
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We have almost all of the data we need in the `reversalsDF` described perviously,
+    the only items that we have not identified are the First and Second values, that
+    is, whether the highest or the lowest price was first seen in any given window.
+    We could calculate this using a UDF or select statement, however updating the
+    `UserDefinedAggregateFunction` from earlier will enable us to make a small change
+    whilst ensuring an efficient method. Only the evaluate function requires change:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we can write a statement to select the required fields and write our
+    data to file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You will notice that the reversals column does not implement a `Struct` like
+    the others, but a tuple. If you check `reversalsUDF`, you will see how this has
+    been done. For demonstration purposes, we will show how to rename the component
+    fields once they have been selected:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Writing the data to file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You could encrypt the data with the addition of the line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: This important codec, and other security related techniques, are described in
+    [Chapter 13](ch13.xhtml "Chapter 13. Secure Data"), *Secure Data*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualize the data
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that we have the data in a file, we can take the opportunity to display
+    it; there are many packages available for creating charts, as a data scientist
+    perhaps one of the key ones is D3.js. As we have mentioned D3 in other areas of
+    the book, it is not our intention to explore here any more detail than is necessary
+    to produce our end results. That said, it's worth outlining that D3 is a JavaScript
+    library for manipulating documents based on data, and that there are many contributors
+    to the ecosystem such that the number of data visualizations available is huge.
+    Understanding the basics will allow us to provide truly impressive results with
+    relatively little effort.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the FHLS format, we can convince chart software to accept our data as
+    if it were OHLC formatted. So we should search the Internet for a D3 OHLC library
+    that we can use. In this example, we have chosen [techanjs.org](http://techanjs.org/)
+    as it provides not just OHLC, but also some other visualizations that may be useful
+    later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Implementing D3 code is usually as simple as cutting and pasting into a text
+    file, having amended any paths to data directories in the source code. If you
+    have never worked in this area before, there are some useful tips below to help
+    you get started:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are working with web technologies with the Chrome browser, there is a
+    set of very useful tools located under ****Options** | **More Tools** | **Developer
+    Tools**** . If nothing else, this will provide an output of errors from the code
+    that you are trying to run, which otherwise will be lost, making a blank page
+    result much easier to debug.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you are using a single file for your code, as in the example below, always
+    use `index.html` for the filename.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If your code references local files, which is usually the case when implementing
+    D3, you will need to run a web server so that they can be served. By default,
+    a web browser cannot access local files due to the inherent security risks (malicious
+    code accessing local files). A simple way to run a web server is to execute: `nohup
+    python -m SimpleHTTPServer &` in the source directory for your code. You must
+    never give your browser access to local files, as it will be left wide open to
+    attack. For example, do not run: `chrome --allow-file-access-from-files`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When using D3 in your source, where possible always use `<script src="img/d3.v4.min.js"></script>`
+    to ensure you import the latest version of the library.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We can use the code as is, the only change we should make is the way in which
+    the columns are referenced:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This will produce a chart similar to this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Visualize the data](img/image_12_007.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: On this chart, green bars indicate an increase from the **First**, a low price,
+    to the **Second**, a high price, and red bars indicate a decrease from a **first
+    high** to **second low**. This subtle change from typical OHLC charts is critical.
+    At a glance we can now easily see the flow of the time series as it rises and
+    falls across the summarizing bars. This helps us to understand the flow of rises
+    and falls in price on our fixed scale of enquiry, or window size, without having
+    the disadvantage of having to interpret the effect of time scale as we would on
+    a line chart of raw price values. The resulting chart offers a way to reduce noise
+    on smaller timeframes, delivering a neat and repeatable way of summarizing our
+    time series visually. There is still more that we can do, however.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FHLS with reversals
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We have previously calculated the trend reversals, using our TrendCalculus
+    equation, and plotting these together with the FHLS summary data above will really
+    enhance our visualization, showing the high/low bars and the trend reversal points
+    together. We can do this by modifying our D3 code to also implement D3 Scatterplot
+    code. The code required can be found on the Internet in many places, as before;
+    we have some code below which can be integrated by adding the relevant parts to
+    `<script>`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Add the `reversalPrice` field:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And draw the dots:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once this is successfully integrated, we will see a chart similar to this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![FHLS with reversals](img/image_12_008.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Alternatively, the reversals can be very effective using just a simple line
+    chart. The following is an example of such a chart to demonstrate the visual impact
+    of trend reversal plotting:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![FHLS with reversals](img/image_12_009.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Edge cases
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'During our previous calculations, we briefly mentioned that the value 0 could
+    be produced when executing the simple trend algorithm. Given our algorithm, this
+    can occur in the following scenarios:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: sign ( -1 + (+1) )
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: sign ( +1 + (-1) )
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: sign ( 0 + (0) )
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'With an example graph we can identify the values using our algorithm thus:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Edge cases](img/image_12_010.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In the money markets we can identify each of the windows as being an inner bar
+    or outer bar. Inner is a bar that defines uncertainty in the market; there is
+    no higher high or lower low. Outer is where a higher high or lower low has been
+    reached; of course these terms can only be assigned once the data is available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: From what we have seen so far, these zeroes appear to break our algorithm. However,
+    this is not the case and indeed there is an efficient solution that enables us
+    to take account of them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Zero values
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: When reviewing the previous graph, we can imagine the path taken across the
+    FHLS bars by the price, a process made easy considering that green bars mean rising
+    prices in time, and red ones mean falling prices in time. How does understanding
+    the path through time help solve the zero trend problem? There is a simple answer,
+    but it is not necessarily intuitive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have previously kept a record of the dates of all highs and lows throughout
+    our data processing; although we have not used all of them. Our **First** and
+    **Second** values calculated using those dates actually indicate the flow or direction
+    of that local trend, as in the following diagram, and once you study the summary
+    charts for a while, your eye will naturally move with this flow to interpret the
+    time series:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Zero values](img/image_12_011.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'If we look at the next diagram, we can see that the dotted line showing how
+    our eyes interpret the flow of time is not just implied. Between our dated highs
+    and lows, there are data values that are not summarized in the chart by our specially
+    constructed bars, meaning there are time gaps in coverage between the bars. We
+    can leverage this property to solve the problem. Consider the following diagram,
+    with the price line added back in:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Zero values](img/image_12_012.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Completing the gaps
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Using a continuation of the same example, we will take one of the identified
+    gaps and demonstrate a method that we can use to fill them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Completing the gaps](img/image_12_013.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The steps are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Find a 0 trend (inner/outer bar)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Insert a new FHLS summary for the gap implied by borrowing the second value
+    from the previous window, and the first value from the current window (see previous
+    diagram)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Emit these special bars during normal FHLS construction, format them as per
+    regular windows of highs/lows and use them to find the trends in the normal way
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now that we have created a new bar, we can use it in the already defined manner;
+    one of the signs of our equation (the high diff or low diff) will have a value
+    of 0, the other will now be +1 or -1\. The reversals are then calculated as before.
+    In the previous example, the question mark becomes a -1 under our new system as
+    we find a lower low; therefore the last high was a reversal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can modify the code in the following way, starting with the `simpleTrendDF`
+    from our previous efforts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Filter all of the rows with a sign of 0.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`val zeroSignRowsDF = simpleTrendDF.filter("sign == 0")`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Drop the sign column as we are going to use the schema of this new DataFrame.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`val zeroRowsDF = zeroSignRowsDF.drop("sign")`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Iterate each row and output an updated row that has been amended in the following
+    way:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `window.start` date is the date of the **Second** value from the `highLowPrev`
+    column
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `window.end` date can remain the same, as it is not used in the FHLS calculation
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `highLow` entry is constructed thus:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`HighestHighDate`: The earlier of the **First** `highLow` date and      **Second** `highLowPrev`
+    date'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`HighestHighPrice`: The price related to above'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`LowestLowDate`: The later of the **First** `highLow` date and **Second** `highLowPrev`
+    date'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`LowestLowPrice`: The price related to above'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`firstPrice`: The price related to the earliest new `highLow` date'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`secondPrice`: The price related to the latest new `highLow` date'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `highLowPrev` column can remain, as it will be deleted in the next step
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Drop the `highLowPrev` column
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`val newHighLowDF = tempHighLowDF.drop("highLowPrev")`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Union the new DataFrame with `highLowDF`, which has the effect of inserting
+    new rows
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`val updatedHighLowDF = newHighLowDF.union(highLowDF)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Proceed with the simple trend process as before, using `updatedHighLowDF` instead
+    of `highLowDF` and starting with:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`val sortedWindow = Window.orderBy("window.start")`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Continuing with the preceding example, we see that there are (probably) no
+    longer any zeroes, and the reversals are still clear and quick to compute. If
+    the selected time window is very small, for example, seconds or minutes, then
+    there may still be zeroes in the output, indicating that the price has not changed
+    for that period. The gap process can be repeated, or the size of the window can
+    be changed to something that extends the period of static price:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Completing the gaps](img/image_12_014.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'We have already seen the time series using D3, but can now use charting software
+    to show where the new bars covering the implied gaps have been added, which are
+    the white bars shown in the following diagram. The overall results are so intuitive,
+    we can easily see the trends and their reversals just with our eyes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Completing the gaps](img/image_12_015.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Stackable processing
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Now we have this capability, we can treat the list of trend reversals as an
+    input to a second pass of the algorithm. To do this we can adjust our windowing
+    functions so that the inputs are windows of N-ordered observations, rather than
+    fixed blocks of time. If we do this, we can *stack* and create multi-scale *trees
+    of trends* TrendCalculus, meaning we can feed the output of the algorithm back
+    into it on a subsequent pass. This creates a multi-scale reversal finder. Processing
+    data in several passes, in this *stacked* way, is a highly efficient process due
+    to the inherent data reduction on later passes. With multiple runs partitions
+    build, bottom up, into a hierarchical structure. Working in this way, we can use
+    this method to *zoom* in and out of the longer and shorter ranges of trends depending
+    upon the level of detail we require; trend patterns become easier to see with
+    the naked eye as we *zoom* out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Selecting the relevant data from our `reversalsDF` DataFrame would enable us
+    to simply run the process again; the `highLow` column contains:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The date and price of the `HighestHigh`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The date and price of the `LowestLow`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Which can be selected and output as a file containing (date, price); exactly
+    the format we used to ingest our original file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s review what we have built:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have constructed code to process a time series and to summarize it effectively
+    into windows of dated highs and lows over fixed windows of time
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We have assigned a positive or negative trend to each time window
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We have a method to cope with edge cases, eliminating the zero valued trend
+    problem
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We have a calculation to find the actual moments in time, and values of the
+    prices when trend reversals occurred.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The effect of this is that we have constructed a very fast proxy method for
+    delivering something akin to a piecewise linear regression of our time series.
+    Seen in another way, the list of trend reversals represents a simplification of
+    our time series into a compressed form that ignores noise on small timeframes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Practical applications
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that we have our algorithm coded, let's look at practical applications for
+    this method on real data. We will start by understanding how the algorithm performs,
+    so that we can determine where we might use it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Algorithm characteristics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: So, what are the characteristics of this algorithm? Below is a list of strengths
+    and weaknesses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Advantages
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The advantages are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The algorithm is general, lending itself well to both stream based and Spark
+    implementations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The theory is simple, yet effective
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The implementation is fast and efficient
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The result is visual and interpretable
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The method is stackable and allows for multi scale studies; this is very simple
+    when using Spark windows
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Disadvantages
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The disadvantages are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A lagging indicator the algorithm finds trend reversals that occurred in the
+    past, and cannot be used directly to predict a trend change as it happens
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The lag accumulates for higher scales, meaning much more data (and thus time
+    lag) is required to find long-range trend changes versus finding trend reversals
+    on shorter timeframes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It's important to understand the limitations of this algorithm. We have created
+    a very useful analysis tool that can be used for researching trends. However,
+    it is not in itself a prediction tool, rather a tool to more easily identify trends
+    for follow-on processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Possible use cases
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: With our newly found ability to convert a time series into a list of change
+    points, many use cases that were once difficult become easy. Let's take a look
+    at some potential applications.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Chart annotation
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We can retrieve News Headlines from the GDELT feed at moments when trend changes
+    occur, at major highs or lows, thus annotating our charts with context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Co-trending
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We can use the reduction in noise to compare trends across different time series,
+    and devise calculations to measure which are co-trending.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Data reduction
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We can use the algorithm to simplify time series and reduce data volumes, while
+    retaining critical moments, stacking the algorithm allows for greater reductions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Indexing
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We can view the change points as a novel form of index to the time series, allowing,
+    for example, the retrieval of portions of the data where things were on a short
+    time frame running counter to a trend on a longer time frame.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fractal dimension
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We can find change points on different time scales, and use the information
+    to investigate the fractal dimensions of the time series.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Streaming proxy for piecewise linear regression
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The method can be used as a very fast way to compute proxy for piecewise linear
+    regression, where such methods are needed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we have introduced a method for analyzing trends with TrendCalculus.
+    We have outlined the fact that despite analysis of trends being a very common
+    use case, there are few tools to aid the data scientist in this cause apart from
+    very general-purpose visualization software. We have guided the reader through
+    the TrendCalculus algorithm, demonstrating how we implement an efficient and scalable
+    realization of the theory in Spark. We have described the process of identifying
+    the key output of the algorithm: trend reversals on a named scale. Having calculated
+    reversals, we used D3.js to visualize time series data that has been summarized
+    for one-week windows, and plotted trend reversals. The chapter continued with
+    an explanation of how to overcome the main edge case: the zero values found during
+    simple trend calculation. We have concluded with a brief outline of the algorithm
+    characteristics and potential use cases, demonstrating how the method is elegant
+    and can be easily described and realized in Spark.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will be demystifying the topic of data security. We'll
+    describe the most important areas of security from a data science perspective,
+    concentrating on the theory and implementation of sanctioned access for the handling
+    of highly confidential data.
+  prefs: []
+  type: TYPE_NORMAL

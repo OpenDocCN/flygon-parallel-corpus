@@ -1,0 +1,1197 @@
+- en: Chapter 7. Building Communities
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With more and more people interacting together and communicating, exchanging
+    information, or simply sharing a common interest in different topics, most data
+    science use cases can be addressed using graph representations. Although very
+    large graphs were, for a long time, only used by the Internet giants, government,
+    and national security agencies, it is becoming more common place to work with
+    large graphs containing millions of vertices. Hence, the main challenge of a data
+    scientist will not necessarily be to detect communities and find influencers on
+    graphs, but rather to do so in a fully distributed and efficient way in order
+    to overcome the constraint of scale. This chapter progresses through building
+    a graph example, at scale, using the persons we identified using NLP extraction
+    described in [Chapter 6](ch06.xhtml "Chapter 6. Scraping Link-Based External Data"),
+    *Scraping Link-Based External Data*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use Spark to extract content from Elasticsearch, build a Graph of person entities
+    and learn the benefits of using Accumulo as a secure graph database
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Write a community detection algorithm from A to Z using *GraphX* and triangle
+    optimization
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Leverage Accumulo specific features, including cell-level security to observe
+    the changes in communities, and iterators to provide server and client-side computation
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This chapter being quite technical, we expect the reader to be already familiar
+    with graph theory, message passing, and *Pregel* API. We also invite the reader
+    to go through every white paper mentioned in the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a graph of persons
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We previously used NLP entity recognition to identify persons from an HTML raw
+    text format. In this chapter, we move to a lower level by trying to infer relations
+    between these entities and detect the possible communities surrounding them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Contact chaining
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Within the context of news articles, we first need to ask ourselves a fundamental
+    question. What defines a relation between two entities? The most elegant answer
+    would probably be to study words using the Stanford NLP libraries described in
+    [Chapter 6](ch06.xhtml "Chapter 6. Scraping Link-Based External Data"), *Scraping
+    Link-Based External Data*. Given the following input sentence, which is taken
+    from [http://www.ibtimes.co.uk/david-bowie-yoko-ono-says-starmans-death-has-left-big-empty-space-1545160](http://www.ibtimes.co.uk/david-bowie-yoko-ono-says-starmans-death-has-left-big-empty-space-1545160):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*"Yoko Ono said she and late husband John Lennon shared a close relationship
+    with David Bowie"*'
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: 'We could easily extract the syntactic tree, a structure that linguists use
+    to model how sentences are grammatically built and where each element is reported
+    with its type such as a noun (`NN`), a verb (`VR`), or a determiner (`DT`) and
+    its relative position in the sentence:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A thorough study of each element, its type, its predecessors, and successors
+    would help build a directed graph with edges being the true definitions of the
+    relations that exist between all these three entities. An example of a graph built
+    out of that sentence is reported as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Contact chaining](img/image_07_001.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1: Syntactic graph for David Bowie, Yoko Ono, and John Lennon'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Although it makes perfect sense (grammatically speaking), building a graph
+    out of syntactic trees would require excessive amount of coding, would probably
+    deserve a whole chapter on its own, and does not bring much added value since
+    most of the relations we would build (in the context of news articles) would not
+    be based on true facts taken from history books, but rather need to be put in
+    their context. To illustrate this point we have two sentences which are taken
+    from [http://www.digitalspy.com/music/news/a779577/paul-mccartney-pays-tribute-to-great-star-david-bowie-his-star-will-shine-in-the-sky-forever/](http://www.digitalspy.com/music/news/a779577/paul-mccartney-pays-tribute-to-great-star-david-bowie-his-star-will-shine-in-the-sky-forever/):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*"Sir Paul McCartney described [David Bowie] as a great star"*'
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '*"[Sir Paul McCartney] treasure[s] the moments they had together"*'
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: It would create the same grammatical link between vertices [Paul McCartney]
+    and [David Bowie], while only the latter assumes a physical connection between
+    them (they actually spent time together).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead, we use a much faster approach by grouping names based on their positions
+    within a text. Our Naive assumption is that most of the authors usually start
+    mentioning the names of important people first, then write about secondary characters,
+    and lastly about less important persons. Our contact chaining is therefore a simple
+    nested loop across all the names in a given article, names being sorted from the
+    most to the least important ones using their actual position. Because of its relative
+    time complexity *O(n²)* this approach will only be valid for hundreds of records
+    per article and will certainly be a limiting factor with text mentioning hundreds
+    of thousands of different entities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In our code repository, you will see an alternative: `Combinations`, which
+    is a more generic solution that allows the specification of a variable `r`; this
+    allows us to specify the number of entities that need to appear in each output
+    combination, that is, 2 for this chapter but more in other contexts. Using `Combinations.buildTuples`
+    is functionally equal to the `buildTuples` code given earlier.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Extracting data from Elasticsearch
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Elasticsearch is a perfect tool for storing and indexing text content together
+    with its metadata attributes, and was therefore a logical choice for our online
+    data store using the text content we extracted in the previous chapter. As this
+    section is more batch-process oriented, we get the data from Elasticsearch into
+    our Spark cluster using the excellent Spark Elasticsearch API as shown in the
+    following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Given an index type and name, a convenient way for interacting with the Elasticsearch
+    API is using Spark DataFrame. Efficient enough in most use cases (a simple example
+    is shown next), this might become a challenge when working on more complex and
+    nested schemas:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In fact, the Elasticsearch API is not flexible enough to read nested structures
+    and complex arrays. Using latest versions of Spark, one will quickly run into
+    errors such as *"Field ''persons'' is backed by an array but the associated Spark
+    Schema does not reflect this"*. With some experimentation, we can see that accessing
+    nested and complex structures from Elasticsearch is usually much easier using
+    a set of standard JSON parsers (such as `json4s` in the following code):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We query Elasticsearch using the implicit `esJsonRdd` function from a spark
+    context:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the `query` parameter, we can access all the data from Elasticsearch,
+    a sample of it, or even all of the records matching a specific query. We can finally
+    build our list of tuples using the simple contact chaining method explained earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the Accumulo database
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have seen a method to read our `personRdd` object from Elasticsearch and
+    this forms a simple and neat solution for our storage requirements. However, when
+    writing commercial applications, we must always be mindful of security and, at
+    the time of writing, Elasticsearch security is still in development; so it would
+    be useful at this stage to introduce a storage mechanism with native security.
+    This is an important consideration we are using GDELT data that is, of course,
+    open source by definition. In a commercial environment, it is very common for
+    datasets to be confidential or commercially sensitive in some way, and clients
+    will often request details of how their data will be secured long before they
+    discuss the data science aspect itself. It is the authors experience that many
+    a commercial opportunity is lost due to the inability of solution providers to
+    demonstrate a robust and secure data architecture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Accumulo** ([http://accumulo.apache.org](http://accumulo.apache.org)) is
+    a NoSQL database based on Google''s Bigtable design ([http://research.google.com/archive/bigtable.html](http://research.google.com/archive/bigtable.html))
+    and was originally developed by the United States National Security Agency, which
+    was subsequently released to the Apache community in 2011\. Accumulo offers us
+    the usual big data advantages such as bulk loading and parallel reading but also
+    has some additional capabilities such as Iterators, for efficient server and client-side
+    precomputation, data aggregation and, most importantly, cell-level security.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For our work in community detection, we will use Accumulo to take advantage
+    specifically of its iterator and cell-level security features. First of all, we
+    should set up an Accumulo instance and then load some data from Elasticsearch
+    to Accumulo you can find the full code in our GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setup Accumulo
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The steps required to install Accumulo are out of the scope of this book; there
+    are several tutorials available on the Web. A vanilla installation with a root
+    user is all that is required to continue with this chapter, although we need to
+    pay particular attention to the initial security setup in the Accumulo configuration.
+    Once you run the Accumulo shell successfully, you are ready to proceed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use the following code as a guideline to creating users. The aim is to create
+    several users with different security labels so that when we load the data, the
+    users will have varying access to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Cell security
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Accumulo protects its cells using tokens. Tokens are made up of labels; in
+    our case, these are [`unclassified`], [`secret`], and [`topsecret`], but you can
+    use any comma-delimited values. Accumulo rows are written with a `visibility`
+    field (refer to the following code) that is simply a string representation of
+    the labels required to access a row value. The `visibility` field can contain
+    Boolean logic to combine different labels and also allows for basic precedence,
+    for instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: A user has to match at least the `visibility` field in order to be granted access,
+    and must supply labels that are a subset of his token stored in Accumulo (or the
+    query will be rejected). Any values that are not matched will simply not be returned
+    in the user query, this is an important point because if there is some indication
+    to the user that data is missing, it is often possible for the user to draw logical,
+    correct (or often worse, incorrect) conclusions about the nature of the data,
+    for example, in a contact chain of people, if some vertices are available to a
+    user and some not, but the unavailable vertices are marked as such, then the user
+    might be able to determine information about those missing entities based on the
+    surrounding graph. For example, a government agency investigating organized crime
+    may allow senior employees to view an entire graph, but junior employees to only
+    view parts of it. Let's say some well-known persons are shown in the graph, and
+    there is a blank entry for a vertex, then it might be straightforward to workout
+    who the missing entity is; if this placeholder is absent altogether, then there
+    is no obvious indication that the chain stretches any further, thus allowing the
+    agency to control dissemination of information. The graph is still of use to analysts,
+    however, who are oblivious to the link and can continue working on specific areas
+    of the graph.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iterators
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Iterators are a very important feature in Accumulo and provide a real-time processing
+    framework, which leverages the power and parallelization of Accumulo, to produce
+    modified versions of data at very low latency. We won't go into great detail here
+    as the Accumulo documentation has plenty of examples, but we will use an iterator
+    to keep a sum of the values for the same Accumulo row, that is, the number of
+    times we have seen the same person pair; and this will be stored in that row value.
+    This iterator will then appear to take effect whenever the table is scanned; we
+    will also demonstrate how to invoke the same Iterator from the client side (for
+    use when it has not been applied to the server).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Elasticsearch to Accumulo
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Let's take advantage of Spark's ability to use Hadoop input and output formats,
+    which leverage the native Elasticsearch and Accumulo libraries. It is worth noting
+    that there are different routes that we could take here, the first is to use the
+    Elasticsearch code given earlier to produce an array of string tuples and feed
+    that into `AccumuloLoader` (found in the code repository); the second is to explore
+    an alternative using additional Hadoop `InputFormat`; we can produce code that
+    reads from Elasticsearch using `EsInputFormat` and writes to Accumulo using `AccumuloOutputFormat`
+    class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A graph data model in Accumulo
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Before delving into the code, it is worth describing the schema we will be
+    using to store a graph of persons in Accumulo. Each source node (`person A`) will
+    be stored as a row key, the association name (such as "is also known as") as a
+    column family, the destination node (`person B`) as a column qualifier, and a
+    default value of `1` as a column value (that will be aggregated thanks to our
+    iterator). This is reported here in Figure 2:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![A graph data model in Accumulo](img/image_07_002.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: Graph data model on Accumulo'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The main advantage of such a model is that given an input vertex (a person's
+    name), one can quickly access all its known relationships through a simple GET
+    query. The reader will surely appreciate the cell level security where we hide
+    a particular edge triplet `[personA] <= [relationB] => [personD]` from most Accumulo
+    users with no [`SECRET`] authorization granted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The downside of such a model is that, compared to a graph database (such as
+    Neo4J or OrientDB), traversing queries such as a depth first search would be terribly
+    inefficient (we would need multiple recursive queries). We delegate any graph
+    processing logic to GraphX later in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hadoop input and output formats
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We use the following maven dependency in order to build both our input/output
+    formats and our Spark client. The version obviously depends on the distribution
+    of Hadoop and Accumulo installed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We configure for reading from Elasticsearch through the `ESInputFormat` class.
+    We extract a key-value pair RDD of `Text` and `MapWritable`, where the key contains
+    the document ID and the value of all the JSON documents wrapped inside of a serializable
+    HashMap:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'An Accumulo `mutation` is similar to a `put` object in HBase, and contains
+    the table''s coordinates such as row key, column family, column qualifier, column
+    value, and visibility. This object is built as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: We use the aforementioned `buildTuples` method to calculate our person pairs
+    and write them to Accumulo using the Hadoop `AccumuloOutputFormat`. Note that
+    we can optionally apply a security label to each of our output rows using `ColumnVisibility`;
+    refer to *Cell security*, which we saw earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We configure for writing to Accumulo. Our output RDD will be a key-value pair
+    RDD of `Text` and `Mutation`, where the key contains the Accumulo table and the
+    value the mutation to insert:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Reading from Accumulo
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we have our data in Accumulo, we can use the shell to inspect it (assuming
+    we select a user that has enough privileges to see the data). Using the `scan`
+    command in Accumulo shell, we can simulate a specific user and query, therefore
+    validating the results of `io.gzet.community.accumulo.AccumuloReader`. When using
+    the Scala version, we must ensure that the correct Authorization is used-it is
+    passed into the read function via a `String`, an example might be `"secret,topsecret"`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This method of applying Hadoop input/output format utilizes `static` methods
+    within the Java Accumulo library (`AbstractInputFormat` is subclassed by `InputFormatBase`,
+    which is subclassed by `AccumuloInputFormat`). Spark users must pay particular
+    attention to these utility methods that alter the Hadoop configuration via an
+    instance of a `Job` object. This can be set as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You will also notice the configuration of an Accumulo iterator:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can use client or server-side iterators and we have previously seen an example
+    of server-side when configuring Accumulo via the shell. The key difference is
+    that client-side Iterators are executed within the client JVM, as opposed to server-side,
+    which leverage the power of the Accumulo tablet servers. A full explanation can
+    be found in the Accumulo documentation. However, there are many reasons for selecting
+    a client or server-side Iterator including choices over whether tablet server
+    performance should be compromised, JVM memory usage, and so on. These decisions
+    should be made when creating your Accumulo architecture. At the end of our `AccumuloReader`
+    code, we can see the calling function that produces an RDD of `EdgeWritable`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: AccumuloGraphxInputFormat and EdgeWritable
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We have implemented our own Accumulo `InputFormat` to enable us to read Accumulo
+    rows and automatically output our own Hadoop `Writable`; `EdgeWritable`. This
+    provides for a convenience wrapper to hold our source vertex, our destination
+    vertex, and the count as edge weight, which can then be used when building the
+    graph. This is extremely useful as Accumulo uses the iterator discussed earlier
+    to calculate the total count for each unique row, thereby removing the need to
+    do this manually. As Accumulo is written in Java, our `InputFormat` uses Java
+    to extend `InputFormatBase`, thus inheriting all of the Accumulo `InputFormat`
+    default behavior, but outputting our choice of schema.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We are only interested in outputting `EdgeWritables`; therefore, we set all
+    of the keys to be null (`NullWritable`) and the values to `EdgeWritable`, an additional
+    advantage being that values in Hadoop only need to inherit from the `Writable`
+    Interface (although we have inherited `WritableComparable` for completeness, and
+    `EdgeWritable` can therefore be used as a key, if required).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building a graph
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Because GraphX uses long objects as an underlying type for storing vertices
+    and edges, we first need to translate all of the persons we fetched from Accumulo
+    into a unique set of IDs. We assume our list of unique persons does not fit in
+    memory, or wouldn''t be efficient to do so anyway, so we simply build a distributed
+    dictionary using the `zipWithIndex` function as shown in the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: We create an edge RDD using two successive join operations onto our person tuples
+    and finally build our weighted and directed graph of persons with vertices containing
+    the person name, and edge attributes the frequency count of each tuple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Community detection algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Community detection has become a popular field of research over the past few
+    decades. Sadly, it did not move as fast as the digital world that a true data
+    scientist lives in, with more and more data collected every second. As a result,
+    most of the proposed solutions are simply not suitable for a big data environment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although a lot of algorithms suggest a new scalable way for detecting communities,
+    none of them is actually meaning scalable in a sense of distributed algorithms
+    and parallel computing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Louvain algorithm
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Louvain algorithm is probably the most popular and widely used algorithm for
+    detecting communities on undirected weighted graphs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: For more information about Louvain algorithm, refer to the publication: *Fast
+    unfolding of communities in large networks. Vincent D. Blondel, Jean-Loup Guillaume,
+    Renaud Lambiotte, Etienne Lefebvre. 2008*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The idea is to start with each vertex being the center of its own community.
+    At each step, we look for community neighbors and check whether or not merging
+    both communities together would result in any gain in the modularity values. Going
+    through each vertex, we compress the graph so that all nodes being part of the
+    same community become a unique community vertex, with all community internal edges
+    becoming a self-edge with aggregated weights. We repeat this process until the
+    modularity can no longer be optimized. The process is reported as follows in *Figure
+    3*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Louvain algorithm](img/B05261_07_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 3: Fast unfolding of communities in large networks-Vincent D. Blondel,
+    Jean-Loup Guillaume, Renaud Lambiotte, Etienne Lefebvre, 2008'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Because modularity will be updated any time a vertex changes, and because the
+    change of each vertex will be driven by the global modularity update, vertices
+    need to be processed in a serial order; making the modularity optimization a cut-off
+    point to the nature of parallel computing. Recent studies have reported that the
+    quality of results may decrease as the size of graph increases excessively so
+    that modularity is unable to detect small and well-defined communities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To the very best of our knowledge, the only distributed version of Louvain that
+    is publicly available has been created by Sotera, a national security technology
+    supplier ([https://github.com/Sotera/distributed-graph-analytics/tree/master/dga-graphx](https://github.com/Sotera/distributed-graph-analytics/tree/master/dga-graphx)).
+    With different implementations on either MapReduce, Giraph, or GraphX, their idea
+    is to make vertices choices simultaneously and update the graph state after each
+    change. Because of the parallel nature, some of the vertex choices will be incorrect
+    as they may not maximize a global modularity, but eventually become more and more
+    consistent after repeated iterations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This (potentially) slightly less accurate, but definitely highly scalable, algorithm
+    was worth investigating, but because there is no right or wrong solution to the
+    community detection problem and because each data science use case is different,
+    we decided to build our own distributed version of a different algorithm rather
+    than describing an existing one. For convenience, we repackaged this distributed
+    version of Louvain and made it available in our GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Weighted Community Clustering (WCC)
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: By searching for some documentation material on graph algorithms, we came across
+    a fantastic and recent white paper mentioning both scalability and parallel computing.
+    We invite our readers to read this paper first before moving forward in the implementation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For more information about WCC algorithm, refer to the publication: *A. Prat-Perez,
+    D. Dominguez-Sal, and J.-L. Larriba-Pey, "High quality, scalable and parallel
+    community detection for large real graphs," in Proceedings of the 23rd International
+    Conference on World Wide Web, ser. WWW ''14\. New York, NY, USA: ACM, 2014, pp.
+    225-236*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although no implementation could be found, and the authors are discrete about
+    the technologies they were using, we were particularly interested by the heuristic
+    used as a measure of the graph partitioning since detection can be done in parallel
+    without having to re-compute a global metric such as the graph modularity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Description
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Also interesting is the assumption they use, inspired from real-life social
+    networks, as a quality measure for detecting communities. Because communities
+    are groups of vertices that are tightly connected together and loosely connected
+    with the rest of the graph, there should be a high concentration of triangles
+    closed within each community. In other words, vertices that form part of a community
+    should be closing many more triangles in their own community than they would be
+    closing outside:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Description](img/B05261_07_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'As per the preceding equation, the clustering coefficient (WCC) for a given
+    vertex **x** in a community **C** will be maximized when **x** will be closing
+    more triangles inside of its community than outside (communities will be well
+    defined) and/or when the number of its neighbors where it does not close any triangle
+    with will be minimal (all nodes are interconnected). As reported in the following
+    equation, the **WCC** of a community **S** will be the average **WCC** of each
+    of its vertices:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Description](img/B05261_07_05.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Similarly, the **WCC** of a graph partition **P** will be the weighted average
+    of each community''s WCC:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Description](img/B05261_07_06.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The algorithm consists of three different phases explained next. A preprocessing
+    step that creates an initial set of communities, a community-back propagation
+    to ensure initial communities are consistent, and finally an iterative algorithm
+    that optimizes the global clustering coefficient value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preprocessing stage
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The first step is to define a graph structure with vertices containing all
+    the variables we need to compute the WCC metrics locally, including the current
+    community a vertex belongs to, the number of triangles each vertex is closing
+    inside and outside of its communities, the number of nodes it shares triangles
+    with and the current WCC metric. All these variables will be wrapped into a `VState`
+    class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: In order to compute the initial WCC, we first need to count the number of triangles
+    any vertex is closing within its neighborhood. Counting the number of triangles
+    usually consists of aggregating the neighbors IDs for each vertex, sending this
+    list to each of its neighbors, and searching for common IDs in both vertex neighbors
+    and vertex neighbors' neighbors. Given two connected vertices A and B, the intersection
+    between A's and B's respective list of neighbors is the number of triangles vertex
+    A closes with B, and the aggregation in A returns the total number of triangles
+    vertex A is closing across the graph.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In large networks with highly connected vertices, sending a list of adjacent
+    vertices to each neighbor can be time consuming and network intensive. In GraphX,
+    the `triangleCount` function has been optimized so that for each edge, only the
+    least important vertex (in term of degrees) will be sending its list to its adjacent
+    nodes, hence minimizing the associated cost. This optimization requires the graph
+    to be canonical (a source ID is lower than a destination ID) and partitioned.
+    Using our graph of persons, this can be done as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A prerequisite of the WCC optimization is to remove edges that are not part
+    of any triangle since they will not be contributing to communities. We therefore
+    need to count the number of triangles, the degree of each vertex, the neighbor''s
+    IDs, and we finally remove edges where the intersection of neighbor''s IDs is
+    empty. Filtering out these edges can be done using the `subGraph` method that
+    takes both a `filter` function for edges'' triplets and a `filter` function for
+    vertices as input arguments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Because we removed all edges that were not closing any triangle, the number
+    of degrees for each vertex becomes the number of distinct vertices a given vertex
+    is closing triangles with. Finally, we create our initial `VState` graph as follows,
+    where each vertex becomes a center node of its own community:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Initial communities
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The second step of this phase is to initialize communities using these initial
+    WCC values. We define our initial set of communities as being consistent if and
+    only if the following three requirements are all met:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Any community must contain a single center node and border nodes, and all border
+    vertices must be connected to the community center
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Any community center must have the highest clustering coefficient in its community
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A border vertex that is connected to two different centers (therefore two different
+    communities according to rule 1) must be part of the community whose center has
+    the highest clustering coefficient
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Message passing
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: In order to define our initial communities, each vertex needs to send information
+    to its neighbors, including its ID, its clustering coefficient, its degrees, and
+    the current community it belongs to. For convenience, we will send the main vertex
+    attribute `VState` class as a message as it already contains all this information.
+    Vertices will receive these messages from their neighborhood, will select the
+    best one with the highest WCC score (within our `getBestCid` method), highest
+    degree, highest ID, and will update their community accordingly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This communication across vertices is a perfect use case for the `aggregateMessages`
+    function, the equivalent of the map-reduce paradigm in GraphX. This function requires
+    two functions to be implemented, one that sends a message from one vertex to its
+    adjacent node, and one that aggregates multiple messages at the vertex level.
+    This process is called *message passing* and is described as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: An example of this community initialization process is reported in *Figure 4*.
+    The left graph, with its nodes proportionally resized to reflect their true WCC
+    coefficients, has been initialized with four different communities, **1**, **11**,
+    **16**, and **21**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Message passing](img/image_07_007.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 4: WCC community initialization'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although one will surely appreciate that a single `aggregateMessages` function
+    was returning relatively consistent communities, this initial partitioning violates
+    the third of the rules we defined earlier. Some vertices (such as **2**, **3**,
+    **4**, and **5**) belongs to a community whose center is not a center node (vertex
+    **1** belongs to community **21**). This same issue is noticed for community **11**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Community back propagation
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: In order to address this inconsistency and respect our third requirement, any
+    vertex *x* must broadcast its updated community to all of its neighbors having
+    a lower coefficient, as, according to our second rule, only these lower ranked
+    vertices could potentially become a border node of *x*. Any further update will
+    result in a new message to be passed to lower rank vertices, and so on, until
+    no vertices will change community, at which point the third of our rules will
+    be satisfied.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since no global knowledge of the graph is required between iterations (such
+    as counting the global WCC value), community updates can be extensively parallelized
+    using the Pregel API of GraphX. Initially developed at Google, Pregel allows vertices
+    to receive messages from previous iterations, send new messages to their neighborhood
+    and modify their own state until no further messages could be sent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For more information about *Pregel* algorithm, refer to the publication: *G.
+    Malewicz, M. H. Austern, A. J. Bik, J. C. Dehnert, I. Horn, N. Leiser, and G.
+    Czajkowski, "Pregel: A system for large-scale graph processing," in Proceedings
+    of the 2010 ACM SIGMOD International Conference on Management of Data, ser. SIGMOD
+    ''10\. New York, NY, USA: ACM, 2010, pp. 135-146\. [Online]. Available: [http://doi.acm.org/10.1145/1807167.1807184](http://doi.acm.org/10.1145/1807167.1807184)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similar to the `aggregateMessages` function mentioned earlier, we will send
+    the vertex attribute `VState` as a message across vertices, with, as an initial
+    message for Pregel super step, a new object initialized with default values (WCC
+    of 0).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When more than one message is received at the vertex level, we only keep the
+    one with the highest clustering coefficient, and given the same coefficient, the
+    one with the highest degree (and then the highest ID). We create an implicit ordering
+    on `VState` for that purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following the same principle as per recursive algorithms, we need to properly
+    define a breaking clause at which point Pregel should stop sending and processing
+    messages. This will be done within the send function that takes an edge triplet
+    as an input and returns an iterator of messages. A vertex will send its `VState`
+    attribute if and only if its community has changed over the previous iteration.
+    In that case, the vertex will inform its lower ranked neighbors about its community
+    update but will also send a signal to itself to acknowledge this successful broadcast.
+    The latter is our breaking clause as it ensures no further message will be sent
+    from that given node (unless its community gets updated in the further steps):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: The last function to implement is the core function of the Pregel algorithm.
+    Here we define the logic to be applied at the vertex level given the unique message
+    we selected from the `mergeMsg` function. We identify four different possibilities
+    of messages, each of them defined with the logic to be applied on the vertex status.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the message is the initial message sent from Pregel (vertex ID is not set,
+    WCC is null), we do not update the vertex community ID.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If the message comes from the vertex itself, this is an acknowledgement from
+    the `sendMsg` function, we set the vertex status to silent.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If the message (with higher WCC) comes from a center node of a community, we
+    update the vertex attribute to be a border node of this new community.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If the message (with higher WCC) comes from a border node of a community, this
+    vertex becomes a center of its own community and will broadcast this update further
+    to its lower-ranked network.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we chain all these three functions together using the `apply` function
+    of the `Pregel` object. We set the maximum number of iterations to infinity as
+    we rely on the breaking clause we defined using an acknowledgment type message:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Although the concept of Pregel is fascinating, its implementation is certainly
+    not. As a reward to this tremendous effort, we display the resulting graph in
+    *Figure 5* next. Vertices **1** and **11** are still part of community **21**
+    which remains valid, but communities **1** and **11** have now been replaced with
+    communities **15** and **5** respectively, vertices having the highest clustering
+    coefficient, degree, or ID in their community, hence validating the third requirement:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Community back propagation](img/image_07_008.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 5: Community back propagation update'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We used the Pregel API to create our initial set of communities with respect
+    to the rules introduced earlier, but we are not set yet. The preceding figure
+    definitely suggests some improvements that will be addressed in the following
+    subsection. However, before moving forward, one can notice that no particular
+    partitioning was used here. If we were to send multiple messages across communities'
+    nodes, and if those vertices were located on different partitions (hence different
+    executors), we would certainly not optimize the network traffic related to message
+    passing. Different sorts of partitioning exist in GraphX, but none of them allow
+    us to use a vertex attribute such as the community ID as a measure of the partitioning.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following simple function, we extract all graph triplets, build a hashcode
+    out of a community tuple and repartition this edge RDD using the standard key
+    value `HashPartitioner` class. We finally build a new graph out of this repartitioned
+    set so that we guarantee all vertices connected from a community C1 to a community
+    C2 will all belong to the same partition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: WCC iteration
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The purpose of this stage is to iteratively let all vertices choose between
+    the following three options until the WCC value cannot be longer optimized, at
+    which point our community detection algorithm would converge to its optimal graph
+    structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**STAY**: To stay in its community'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**TRANSFER**: To move from its community and become part of its neighbor''s
+    community'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**REMOVE**: To leave its community and become part of its own community'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For each vertex, the best movement is the one that maximizes the total WCC value.
+    Similar to the Louvain approach, each movement depends on a global score to be
+    computed, but the reason we turned to this algorithm is that this score can be
+    approximated using a heuristic defined in *High quality, scalable and parallel
+    community detection for large real graphs* from Arnau Prat-Pérez et. al. Because
+    this heuristic does not require the computation of all internal triangles, vertices
+    can all move simultaneously and this process can therefore be designed in a fully
+    decentralized and highly scalable way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Gathering community statistics
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'In order to compute this heuristic, we first need to aggregate basic statistics
+    at the community level such as the number of elements and the number of inbound
+    and outbound links, both of them expressed as a simple word count function here.
+    We combine them in memory as the number of communities will be considerably smaller
+    than the number of vertices:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we collect both the number of vertices and the community statistics
+    (including the community edge density) and broadcast the results to all of our
+    Spark executors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: It is important to understand the use of the `broadcast` method here. If the
+    community statistics are used within a Spark transformation, this object will
+    be sent to the executors for each record the latter has to process. We compute
+    them once, broadcast the result to the executors' caches so that any closure can
+    locally make use them, hence saving lots of unnecessary network transfer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: WCC Computation
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'According to the set of equations defined earlier, each vertex must have access
+    to the community statistics it belongs to and the number of triangles it closes
+    with any vertex inside of its community. For that purpose, we collect neighbors
+    via a simple message passing, but only on the vertices within the same community,
+    thus limiting the network traffic:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Similarly, we count the number of shared triangles using the following function.
+    Note that we use the same optimization as per the default `triangleCount` method
+    using the smallest set only to send messages to the largest one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We compute and update the new WCC score of each vertex as a function of the
+    community neighborhood size and the number of community triangles. This equation
+    is the one described earlier while introducing the WCC algorithm. We compute a
+    score as a ratio of triangles closed inside versus outside of a community C given
+    a vertex *x*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The global WCC value is a simple aggregation of each vertex WCC normalized
+    with the number of elements in each community. This value must be broadcast to
+    Spark executors too as it will be used inside of a Spark transformation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: WCC iteration
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Given the cost of inserting a vertex *x* into a community **C**, the costs
+    of removing/transferring *x* from/to a community **C** can be expressed as a function
+    of the former, and can be derived from three parameters **Θ[1]**, **Θ[2]**, and
+    **Θ[3]**. This heuristic states that for each vertex *x*, a single computation
+    is needed for each of its surrounding communities **C**, and can be done in parallel
+    assuming we gathered all the community statistics in the first place:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![WCC iteration](img/image_07_009.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The computation of **Θ[1]**, **Θ[2]**, and **Θ[3]** will not be reported here
+    (it is available on our GitHub), but depends on the community density, the external
+    edges, and the number of elements, all of them available within our broadcasted
+    set of `CommunityStats` objects defined earlier. Finally, it is worth mentioning
+    that this computation has a linear time complexity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At each iteration, we will collect the different communities surrounding any
+    vertex, and will aggregate the number of edges using the `mappend` aggregation
+    from Scalaz that we introduced in [Chapter 6](ch06.xhtml "Chapter 6. Scraping
+    Link-Based External Data"), *Scraping Link-Based External Data*. This helps us
+    to limit the amount of code written and avoids using mutable objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the community statistics, the WCC value from the previous iteration, the
+    number of vertices and the above edges count, we can now estimate the cost of
+    inserting each vertex *x* into a surrounding community **C**. We find the local
+    best movement for each vertex and for each of its surrounding communities, and
+    finally apply the best one that maximizes the WCC value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we call back the set of methods and functions defined earlier in order
+    to update the new WCC value for each vertex, for each community, and then for
+    the graph partition itself to see whether or not all these changes resulted in
+    any WCC improvement. If the WCC value cannot be optimized any longer, the algorithm
+    has converged to its optimal structure and we finally return a vertex RDD containing
+    both the vertex ID and the final community ID this vertex belongs to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our test community graph has been optimized (not without its fair share of
+    effort) and reported as shown in *Figure 6*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![WCC iteration](img/image_07_010.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 6: WCC optimized communities'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We observe all the changes we were expecting from the previous figures. Vertices
+    **1** and **11** are now part of their expected communities, respectively **5**
+    and **11**. We also note that vertex 16 has now been included within its community
+    11.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GDELT dataset
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In order to validate our implementation, we use the GDELT dataset we analyzed
+    in the previous chapter. We extracted all of the communities and spent some time
+    looking at the person names to see whether or not our community clustering was
+    consistent. The full picture of the communities is reported in *Figure 7* and
+    has been realized using the Gephi software, where only the top few thousand connections
+    have been imported:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![GDELT dataset](img/B05261_07_11-1.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7: Community detection on January 12'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We first observe that most of the communities we detected are totally aligned
+    with the ones we could eyeball on a force-directed layout, giving a good confidence
+    level about the algorithm accuracy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Bowie effect
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Any well-defined community has been properly identified, and the less obvious
+    ones are the ones surrounding highly connected vertices such as David Bowie. The
+    name David Bowie being heavily mentioned in GDELT articles alongside so many different
+    persons that, on that day of January 12, 2016, it became too large to be part
+    of its logical community (music industry) and formed a broader community impacting
+    all its surrounding vertices. There is definitely an interesting pattern here
+    as this community structure gives us clear insights about a potential breaking
+    news article for a particular person on a particular day.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking at the David Bowie's closest communities in *Figure 8*, we observe the
+    nodes to be highly interconnected because of what we will be calling the *Bowie
+    effect*. In fact, there have been so many tributes paid from so many various communities
+    that the number of triangles formed across different communities has been abnormally
+    high. As a result, it brought different logical communities closer to each other,
+    communities that were theoretically not meant to be, such as the *70s* rock star
+    idols close enough to religious people.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The small world phenomenon, as defined in the 60s by Stanley Milgram, states
+    that everyone is connected through a short number of acquaintances. Kevin Bacon,
+    an American actor, even suggested he would be connected to every other actor by
+    a maximum depth of 6 connections, also known as its *Bacon Number* ([https://oracleofbacon.org/](https://oracleofbacon.org/)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: On that day, the *Kevin Bacon Number* of Pope Francis and Mick Jagger was only
+    1 thanks to the Cardinal Gianfranco Ravasi who tweeted about David Bowie.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The Bowie effect](img/B05261_07_12-1.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 8: Communities surrounding David Bowie, January 12'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although the Bowie's effect, by its nature of a breaking news article, is a
+    true pattern on that particular graph structure, its effect could have been minimized
+    using weighted edges based on names frequency count. Indeed, some random noise
+    from the GDELT dataset could be enough to close critical triangles from two different
+    communities and therefore bring them close to each other, no matter the weight
+    of this critical edge. This limitation is common for all un-weighted algorithms
+    and would require a preprocessing phase to reduce this unwanted noise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Smaller communities
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We can, however, observe some more defined communities here, such as the UK
+    politicians Tony Blair, David Cameron, and Boris Johnson or the movie directors
+    Christopher Nolan, Martin Scorsese, or Quentin Tarantino. Looking at a broader
+    level, we can detect well-defined communities, such as tennis players, footballers,
+    artists, or politicians of a specific country. As an undeniable proof of accuracy,
+    we even detected Matt Leblanc, Courtney Cox, Matthew Perry, and Jennifer Anniston
+    as being part of a same Friends community and Luke Skywalker, Anakin Skywalker,
+    Chewbacca, and Emperor Palpatine as part of the Star Wars community and its recently
+    lost actress, Carrie Fisher. An example of professional boxer''s communities is
+    reported in *Figure 9*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Smaller communities](img/B05261_07_13-1.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 9: Professional boxer communities'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Accumulo cell level security
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We have previously discussed the nature of cell-level security in Accumulo.
+    In the context of the graphs that we have produced here, the usefulness of security
+    can be well simulated. If we configure Accumulo such that rows containing David
+    Bowie are securely labeled differently to all other rows, then we can turn on
+    and off the Bowie''s effect. Any Accumulo user with full access will see the complete
+    graph provided earlier. If we then restrict that user to everything other than
+    David Bowie (a simple change to the Authorization in `AccumuloReader`), then we
+    see the following figure. This new graph is very interesting as it serves a number
+    of purposes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It removes the noise created by the social media effect of David Bowie's death,
+    thereby revealing the true communities involved
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It removes many of the false links between entities, thereby increasing their
+    Bacon number and showing their true relationship
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It demonstrates that it is possible to remove a key figure in a graph and still
+    retain a large amount of useful information, thereby demonstrating the point made
+    earlier regarding the removal of key entities for security reasons (as discussed
+    in *Cell security*)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It also has to be said, of course, that by removing an entity, we may also be
+    removing key relationships between entities; that is, the contact chaining effect
+    and this is a negative aspect when specifically trying to relate individual entities-overall,
+    the communities, however, remain intact.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Using Accumulo cell level security](img/B05261_07_14.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 10: David Bowie''s communities with restricted access'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have discussed and built a real-world implementation of graph communities
+    leveraging the power of a secure and robust architecture. We have outlined the
+    idea that there is no right or wrong solution in the community detection problem
+    space, as it strongly depends on the use case. In a social network context, for
+    example, where vertices are tightly connected together (an edge represents a true
+    connection between two users), the edge weight does not really matter while the
+    triangle approach probably does. In the telecommunication industry, one could
+    be interested in the communities based on the frequency call of a given user A
+    to a user B, hence turning to a weighted algorithm such as Louvain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We appreciate that building this community algorithm was far from an easy task,
+    and perhaps stretches the goals of this book, but it involves all of the techniques
+    of graph processing in Spark that makes GraphX a fascinating and extensible tool.
+    We introduced the concepts of message passing, Pregel, graph partitioning, and
+    variable broadcast, backed by a real-world implementation in Elasticsearch and
+    Accumulo.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will apply the concepts of graph theory we learned here
+    to the music industry, learning how to build a music recommendation engine using
+    audio signal, Fourier transforms, and *PageRank* algorithm.
+  prefs: []
+  type: TYPE_NORMAL

@@ -1,0 +1,1032 @@
+- en: Chapter 9. Deploying Storm on Hadoop for Advertising Analysis
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the previous two chapters, we saw how we might integrate Storm with a real-time
+    analytics system. We then extended that implementation, supporting the real-time
+    system with batch processing. In this chapter, we will explore the reverse.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will examine a batch processing system that computes the effectiveness of
+    an advertising campaign. We will take the system that was built on Hadoop and
+    convert it into a real-time processing system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To do this, we will leverage the Storm-YARN project out of Yahoo! The Storm-YARN
+    project allows users to leverage YARN to deploy and run Storm clusters. The running
+    of Storm on Hadoop allows enterprises to consolidate operations and utilize the
+    same infrastructure for both real time and batch processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This chapter covers the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An introduction to Pig
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: YARN (resource management with Hadoop v2)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Deploying Storm using Storm-YARN
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Examining the use case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In our use case, we will process the logs of an advertising campaign to determine
+    the most effective campaigns. The batch processing mechanism will process a single
+    large flat file using a Pig script. Pig is a high-level language that allows users
+    to perform data transformation and analysis. Pig is similar to SQL and compiles
+    down into map/reduce jobs that typically deploy and run on Hadoop infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we will convert the Pig script into a topology and deploy that
+    topology using Storm-YARN. This allows us to transition from a batch processing
+    approach to one that is capable of ingesting and reacting to real-time events
+    (for example, clicks on a banner advertisement).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In advertising, an impression is an advertising event that represents an advertisement
+    displayed in front of a user, regardless of whether or not it was clicked. For
+    our analysis, we will track each impression and use a field to indicate whether
+    the user clicked on the advertisement.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each row in the flat file contains four fields that are described as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Field | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| cookie | This is a unique identifier from the browser. We will use this to
+    represent users in the system. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| campaign | This is a unique identifier that represents a specific set of
+    advertising content. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| product | This is the name of the product being advertised. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| click-thru | This is the Boolean field that represents whether or not the
+    user clicked on the advertisement: true if the user clicked on the ad; otherwise,
+    false. |'
+  prefs: []
+  type: TYPE_TB
+- en: Typically, advertisers will run campaigns for products. A campaign may have
+    a specific set of content associated with it. We want to calculate the most effective
+    campaign per product.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this context, we will calculate the effectiveness of a campaign by counting
+    distinct click-thrus as a percentage of the overall impressions. We will deliver
+    a report in the following format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Product | Campaign | Distinct click-thrus | Impressions |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| X | Y | 107 | 252 |'
+  prefs: []
+  type: TYPE_TB
+- en: The number of impressions is simply the total count of impressions for the product
+    and campaign. We do not distinct the impressions because we may have shown the
+    same advertisement to the same user multiple times to attain a single click-thru.
+    Since we are most likely paying per impression, we want to use the total number
+    of impressions as a means of calculating the cost required to drive interest.
+    Interest is represented as a click-thru.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Establishing the architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We touched on Hadoop in the previous chapter, but we focused mainly on the map/reduce
+    mechanism within Hadoop. In this chapter, we will do the opposite and focus on
+    the **Hadoop File System** (**HDFS**) and **Yet Another Resource Negotiator**
+    (**YARN**). We will leverage HDFS to stage the data, and leverage YARN to deploy
+    the Storm framework that will host the topology.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The recent componentization within Hadoop allows any distributed system to
+    use it for resource management. In Hadoop 1.0, resource management was embedded
+    into the MapReduce framework as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Establishing the architecture](img/8294OS_09_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Hadoop 2.0 separates out resource management into YARN, allowing other distributed
+    processing frameworks to run on the resources managed under the Hadoop umbrella.
+    In our case, this allows us to run Storm on YARN as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Establishing the architecture](img/8294OS_09_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: As shown in the preceding diagram, Storm fulfills the same function as MapReduce.
+    It provides a framework for the distributed computation. In this specific use
+    case, we use Pig scripts to articulate the ETL/analysis that we want to perform
+    on the data. We will convert that script into a Storm topology that performs the
+    same function, and then we will examine some of the intricacies involved in doing
+    that transformation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To understand this better, it is worth examining the nodes in a Hadoop cluster
+    and the purpose of the processes running on those nodes. Assume that we have a
+    cluster as depicted in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Establishing the architecture](img/8294OS_09_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: There are two different components/subsystems shown in the diagram. The first
+    is YARN, which is the new resource management layer introduced in Hadoop 2.0\.
+    The second is HDFS. Let's first delve into HDFS since that has not changed much
+    since Hadoop 1.0.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining HDFS
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: HDFS is a distributed filesystem. It distributes blocks of data across a set
+    of slave nodes. The NameNode is the catalog. It maintains the directory structure
+    and the metadata indicating which nodes have what information. The NameNode does
+    not store any data itself, it only coordinates **create, read, update, and delete**
+    (**CRUD**) operations across the distributed filesystem. Storage takes place on
+    each of the slave nodes that run DataNode processes. The DataNode processes are
+    the workhorses in the system. They communicate with each other to rebalance, replicate,
+    move, and copy data. They react and respond to the CRUD operations of clients.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining YARN
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: YARN is the resource management system. It monitors the load on each of the
+    nodes and coordinates the distribution of new jobs to the slaves in the cluster.
+    The **ResourceManager** collects status information from the **NodeManagers**.
+    The ResourceManager also services job submissions from clients.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One additional abstraction within YARN is the concept of an **ApplicationMaster**.
+    An ApplicationMaster manages resource and container allocation for a specific
+    application. The ApplicationMaster negotiates with the ResourceManager for the
+    assignment of resources. Once the resources are assigned, the ApplicationMaster
+    coordinates with the NodeManagers to instantiate **containers**. The containers
+    are logical holders for the processes that actually perform the work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ApplicationMaster is a processing-framework-specific library. Storm-YARN
+    provides the ApplicationMaster for running Storm processes on YARN. HDFS distributes
+    the ApplicationMaster as well as the Storm framework itself. Presently, Storm-YARN
+    expects an external ZooKeeper. Nimbus starts up and connects to the ZooKeeper
+    when the application is deployed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram depicts the Hadoop infrastructure running Storm via Storm-YARN:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Examining YARN](img/8294OS_09_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: As shown in the preceding diagram, YARN is used to deploy the Storm application
+    framework. At launch, Storm Application Master is started within a YARN container.
+    That, in turn, creates an instance of Storm Nimbus and the Storm UI.
+  prefs: []
+  type: TYPE_NORMAL
+- en: After that, Storm-YARN launches supervisors in separate YARN containers. Each
+    of these supervisor processes can spawn workers within its container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both Application Master and the Storm framework are distributed via HDFS. Storm-YARN
+    provides command-line utilities to start the Storm cluster, launch supervisors,
+    and configure Storm for topology deployment. We will see these facilities later
+    in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To complete the architectural picture, we need to layer in the batch and real-time
+    processing mechanisms: Pig and Storm topologies, respectively. We also need to
+    depict the actual data.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Often a queuing mechanism such as Kafka is used to queue work for a Storm cluster.
+    To simplify things, we will use data stored in HDFS. The following depicts our
+    use of Pig, Storm, YARN, and HDFS for our use case, omitting elements of the infrastructure
+    for clarity. To fully realize the value of converting from Pig to Storm, we would
+    convert the topology to consume from Kafka instead of HDFS as shown in the following
+    diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Examining YARN](img/8294OS_09_05.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'As the preceding diagram depicts, our data will be stored in HDFS. The dashed
+    lines depict the batch process for analysis, while the solid lines depict the
+    real-time system. In each of the systems, the following steps take place:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Step | Purpose | Pig Equivalent | Storm-Yarn Equivalent |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 1 | The processing frameworks are deployed | The MapReduce Application Master
+    is deployed and started | Storm-YARN launches Application Master and distributes
+    Storm framework |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2 | The specific analytics are launched | The Pig script is compiled to MapReduce
+    jobs and submitted as a job | Topologies are deployed to the cluster |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 | The resources are reserved | Map and reduce tasks are created in YARN
+    containers | Supervisors are instantiated with workers |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 4 | The analyses reads the data from storage and performs the analyses |
+    Pig reads the data out of HDFS | Storm reads the work, typically from Kafka; but
+    in this case, the topology reads it from a flat file |'
+  prefs: []
+  type: TYPE_TB
+- en: Another analogy can be drawn between Pig and Trident. Pig scripts compile down
+    into MapReduce jobs, while Trident topologies compile down into Storm topologies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For more information on the Storm-YARN project, visit the following URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/yahoo/storm-yarn](https://github.com/yahoo/storm-yarn)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the infrastructure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: First, we need to configure the infrastructure. Since Storm will run on the
+    YARN infrastructure, we will first configure YARN and then show how to configure
+    Storm-YARN for deployment on that cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Hadoop infrastructure
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To configure a set of machines, you will need a copy of Hadoop residing on them
+    or a copy that is accessible to each of them. First, download the latest copy
+    of Hadoop and unpack the archive. For this example, we will use Version 2.1.0-beta.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assuming that you have uncompressed the archive into `/home/user/hadoop`, add
+    the following environment variables on each of the nodes in the cluster:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Add YARN to your execute path as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All the Hadoop configuration files are located in `$HADOOP_CONF_DIR`. The three
+    key configuration files for this example are: `core-site.xml`, `yarn-site.xml`,
+    and `hdfs-site.xml`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this example, we will assume that we have a Master node named `master` and
+    four slave-nodes named `slave01-04`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Test the YARN configuration by executing the following command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuring HDFS
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As per the architecture diagram, to configure HDFS you need to start the NameNode
+    and then connect one or more DataNode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the NameNode
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To start the NameNode, you need to specify a host and port. Configure the host
+    and port in the `core-site.xml` file by using the following elements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Additionally, configure where the NameNode stores its metadata. This configuration
+    is stored in the `hdfs-site.xml` file, in the `dfs.name.dir` variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To keep the example simple, we will also disable security on the distributed
+    filesystem. To do this, we set `dfs.permissions` to `False`. After these edits,
+    the HDFS configuration file looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The final step before starting the NameNode is the formatting of the distributed
+    filesystem. Do this with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we are ready to start the NameNode. Do so with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The last line of the startup will indicate where the logs are located:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Despite the message, the logs will actually be located in another file with
+    the same name but with the suffix `log` instead of `out`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, ensure that the name directory you declared in the configuration exists;
+    otherwise, you will receive the following error in the logfile:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Verify that the NameNode has started with the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Additionally, you should be able to navigate to the UI in a web browser. By
+    default, the server starts on port 50070\. Navigate to `http://master:50070` in
+    a browser. You should see the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Configuring the NameNode](img/8294OS_09_06.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Clicking on the **Live Nodes** link will show the nodes available and the space
+    allocation per node, as shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Configuring the NameNode](img/8294OS_09_07.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Finally, from the main page, you can also browse the filesystem by clicking
+    on **Browse the filesystem**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the DataNode
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In general, it is easiest to share the core configuration file between nodes
+    in the cluster. The data nodes will use the host and port defined in the `core-site.xml`
+    file to locate the NameNode and connect to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Additionally, each DataNode needs to configure the location for local storage.
+    This is defined in the following element within the `hdfs-site.xml` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If this location is consistent across slave machines, then this configuration
+    file can be shared as well. With this set, you can start the DataNode with the
+    following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Once again, verify that the DataNode is running using `jps` and monitor the
+    logs for any errors. In a few moments, the DataNode should appear in the **Live
+    Nodes** screen of the NameNode as previously shown.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring YARN
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: With HDFS up and running, it is now time to turn our attention to YARN. Similar
+    to what we did with HDFS, we will first get the ResourceManager running and then
+    we will attach slave nodes by running NodeManager.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the ResourceManager
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: The ResourceManager has various subcomponents, each of which acts as a server
+    that requires a host and port on which to run. All of the servers are configured
+    within the `yarn-site.xml` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For this example, we will use the following YARN configuration:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first four variables in the preceding configuration file assign host and
+    ports for the subcomponents. Setting the `yarn.acl.enable` variable to `False`
+    disables security on the YARN cluster. The `yarn.nodemanager.local-dirs` variable
+    specifies the place on the local filesystem where YARN will place the data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, the `yarn.nodemanager.aux-services` variable starts an auxiliary service
+    within the NodeManager's runtime to support MapReduce jobs. Since our Pig scripts
+    compile down into MapReduce jobs, they depend on this variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like the NameNode, start the ResourceManager with the following command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, check for the existence of the process with `jps`, monitor the logs for
+    exceptions, and then you should be able to navigate to the UI which by default
+    runs on port 8088.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The UI is shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Configuring the ResourceManager](img/8294OS_09_08.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Configuring the NodeManager
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The NodeManager uses the same configuration file (`yarn-site.xml`) to locate
+    the respective servers. Thus, it is safe to copy or share that file between the
+    nodes in the cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Start the NodeManager with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After all NodeManagers register with the ResourceManager, you will be able
+    to see them in the ResourceManager UI after clicking on **Nodes**, as shown in
+    the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Configuring the NodeManager](img/8294OS_09_09.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Deploying the analytics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With Hadoop in place, we can now focus on the distributed processing frameworks
+    that we will use for analysis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Performing a batch analysis with the Pig infrastructure
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The first of the distributed processing frameworks that we will examine is Pig.
+    Pig is a framework for data analysis. It allows the user to articulate analysis
+    in a simple high-level language. These scripts then compile down to MapReduce
+    jobs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although Pig can read data from a few different systems (for example, S3), we
+    will use HDFS as our data storage mechanism in this example. Thus, the first step
+    in our analysis is to copy the data into HDFS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To do this, we issue the following Hadoop commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding commands create a directory for the data file and copy the click-thru
+    data file into that directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To execute a Pig script against that data, we will need to install Pig. For
+    this, we simply download Pig and expand the archive on that machine configured
+    with Hadoop. For this example, we will use Version 0.11.1.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just like we did with Hadoop, we will add the following environment variables
+    to our environment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `PIG_CLASSPATH` variable tells Pig where to find Hadoop.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once you have those variables in your environment, you should be able to test
+    your Pig installation with the following commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: By default, Pig will read the Hadoop configuration and connect to the distributed
+    filesystem. You can see that in the previous output. It is connected to our distributed
+    filesystem at `hdfs://master:8020`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Via Pig, you can interact with HDFS in the same way as you would with a regular
+    filesystem. For example, `ls` and `cat` both work as shown in the following code
+    snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Performing a real-time analysis with the Storm-YARN infrastructure
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that we have infrastructure working for batch processing, let's leverage
+    the exact same infrastructure for real-time processing. Storm-YARN makes it easy
+    to reuse the Hadoop infrastructure for Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Since Storm-YARN is a new project, it is best to build from source and create
+    the distribution using the instructions in the `README` file found at the following
+    URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/yahoo/storm-yarn](https://github.com/yahoo/storm-yarn)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After building the distribution, you need to copy the Storm framework into HDFS.
+    This allows Storm-YARN to deploy the framework to each of the nodes in the cluster.
+    By default, Storm-YARN will look for the Storm library as a ZIP file in the launching
+    user's directory on HDFS. Storm-YARN provides a copy of a compatible Storm in
+    the `lib` directory of its distribution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assuming that you are in the Storm-YARN directory, you can copy the ZIP file
+    into the correct HDFS directory with the following commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can then verify that the Storm framework is HDFS by browsing the filesystem
+    through the Hadoop administration interface. You should see the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Performing a real-time analysis with the Storm-YARN infrastructure](img/8294OS_09_10.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: With the Storm framework staged on HDFS, the next step is to configure the local
+    YAML file for Storm-YARN. The YAML file used with Storm-YAML is the configuration
+    for both Storm-YAML and Storm. The Storm-specific parameters in the YAML file
+    get passed along to Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An example of the YAML file is shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: Many of the parameters are self-descriptive. However, take note of the last
+    variable in particular. This is the location of the ZooKeeper host. Although it
+    might not be the case always, for now Storm-YARN assumes you have a pre-existing
+    ZooKeeper.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To monitor whether Storm-YARN will continue to require a pre-existing ZooKeeper
+    instance, go through the information available at the following link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/yahoo/storm-yarn/issues/22](https://github.com/yahoo/storm-yarn/issues/22)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the the Storm framework in HDFS and the YAML file configured, the command
+    line to launch Storm on YARN is the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: You specify the location of the YAML file, the queue for YARN, a name for the
+    application, and the location of the ZIP file, which is relative to the user directory
+    unless a full path is specified.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Queues in YARN are beyond the scope of this discussion, but by default YARN
+    is configured with a default queue that is used in the preceding command line.
+    If you are running Storm on a pre-existing cluster, examine `capacity-scheduler.xml`
+    in the YARN configuration to locate potential queue names.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After executing the preceding command line, you should see the application
+    deployed in the YARN administration screen, as shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Performing a real-time analysis with the Storm-YARN infrastructure](img/8294OS_09_11.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Clicking on the application shows where the application master is deployed.
+    Examine the node value for the Application Master. This is where you will find
+    the Storm UI as shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Performing a real-time analysis with the Storm-YARN infrastructure](img/8294OS_09_12.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Drilling down one more level, you will be able to see the logfiles for Storm,
+    as shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Performing a real-time analysis with the Storm-YARN infrastructure](img/8294OS_09_13.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'With any luck, the logs will show a successful startup of Nimbus and the UI.
+    Examining the standard output stream, you will see Storm-YARN launching the supervisors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The key lines in the preceding output are highlighted. If you navigate to those
+    URLs, you will see the supervisor logs for the respective instances. Looking back
+    at the YAML file we used to launch Storm-YARN, notice that we specified the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Navigate to the UI using the node that hosts the ApplicationMaster, and then
+    navigate to the UI port specified in the YAML file used for launch (`ui.port:
+    7070`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a browser, open `http://node:7070/`, where node is the host for the Application
+    Master. You should see the familiar Storm UI as shown in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Performing a real-time analysis with the Storm-YARN infrastructure](img/8294OS_09_14.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The infrastructure is now ready for use. To kill the Storm deployment on YARN,
+    you can use the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding statement, the `appId` parameter corresponds to the `appId`
+    parameter assigned to Storm-YARN, and it is visible in the Hadoop administration
+    screen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Storm-YARN will use the local Hadoop configuration to locate the master Hadoop
+    node. If you are launching from a machine that is not a part of the Hadoop cluster,
+    you will need to configure that machine with the Hadoop environment variables
+    and configuration files. Specifically, it launches through the ResourceManager.
+    Thus, you will need the following variables configured in `yarn-site.xml`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`yarn.resourcemanager.address`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Performing the analytics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With both the batch and real-time infrastructure in place, we can focus on the
+    analytics. First, we will take a look at the processing in Pig, and then we will
+    translate the Pig script into a Storm topology.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Executing the batch analysis
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: For the batch analysis, we use Pig. The Pig script calculates the effectiveness
+    of a campaign by computing the ratio between the distinct numbers of customers
+    that have clicked-thru and the total number of impressions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Pig script is shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Let's take a closer look at the preceding code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first `LOAD` statement specifies the location of the data and a schema with
+    which to load the data. Typically, Pig loads denormalized data. The location for
+    the data is a URL. When operating in local mode, as previously shown, this is
+    a relative path. When running in MapReduce mode, the URL will most likely be a
+    location in HDFS. When running a Pig script against **Amazon Web Services** (**AWS**),
+    this will most likely be an S3 URL.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the subsequent lines after the `Load` statement, the script calculates all
+    the distinct click-thru. In the first line, it filters the dataset for only the
+    rows that have `True` in the column, which indicates that the impression resulted
+    in a click-thru. After filtering, the rows are filtered for only distinct entries.
+    The rows are then grouped by campaign and each distinct click-thru is counted
+    by campaign. The results of this analysis are stored in the alias `count_of_click_thrus_by_campaign`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The second dimension of the problem is then computed in the subsequent lines.
+    No filter is necessary since we simply want a count of the impressions by campaign.
+    The results of this are stored in the alias `count_of_impressions_by_campaign`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Executing the Pig script yields the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first element in the output is the campaign identifier. The number of all
+    the distinct click-thru and the total number of impressions follow that. The last
+    element is the effectiveness, which is the ratio of all the distinct click-thru
+    to total number of impressions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Executing real-time analysis
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, let''s translate the batch analysis into real-time analysis. A strict
+    interpretation of the Pig script might result in the following topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding topology, we fork the stream into two separate streams: `click_thru_stream`
+    and `impressions_stream`. The `click_thru_stream` contains the count of distinct
+    impressions. The `impressions_stream` contains the total count of impressions.
+    Those two streams are then joined using the `topology.join` method.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The issue with the preceding topology is the join. In Pig, since the sets are
+    static they can easily be joined. Joins within Storm are done on a per batch basis.
+    This would not necessarily be a problem. However, the join is also an inner join,
+    which means records are only emitted if there are corresponding tuples between
+    the streams. In this case, we are filtering records from the `click_thru_stream`
+    because we only want distinct records. Thus, the cardinality of that stream is
+    smaller than that of the `impressions_stream`, which means that tuples are lost
+    in the join process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Operations such as join are well defined for discrete sets, but it is unclear
+    how to translate their definitions into a real-time world of infinite event streams.
+    For more on this, visit the following URLs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://cwiki.apache.org/confluence/display/PIG/Pig+on+Storm+Proposal](https://cwiki.apache.org/confluence/display/PIG/Pig+on+Storm+Proposal)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[https://issues.apache.org/jira/browse/PIG-3453](https://issues.apache.org/jira/browse/PIG-3453)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Instead, we will use Trident's state construct to share the counts between the
+    streams.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is shown in the corrected topology in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Executing real-time analysis](img/8294OS_09_15.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The code for this topology is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s first take a look at the spout. It simply reads the file, parses the
+    rows, and emits the tuples, as shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: In a real system, the preceding spout would most likely read from a Kafka queue.
+    Alternatively, a spout could read directly from HDFS if we sought to recreate
+    exactly what the batch processing mechanism was doing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There is some preliminary work on a spout that can read from HDFS; check out
+    the following URL for more information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/jerrylam/storm-hdfs](https://github.com/jerrylam/storm-hdfs)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To compute the distinct count of all the click-thru, the topology first filters
+    the stream for only those impressions that resulted in a click-thru.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code for this filter is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Then, the stream filters for only distinct click-thrus. In this example, it
+    uses an in-memory cache to filter for distinct tuples. In reality, this should
+    use distributed state and/or a grouping operation to direct like tuples to the
+    same host. Without persistent storage, the example would eventually run out of
+    memory in the JVM.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There is active work on algorithms to approximate distinct sets against data
+    streams. For more information on **Streaming Quotient Filter** (**SQF**), check
+    out the following URL:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://www.vldb.org/pvldb/vol6/p589-dutta.pdf](http://www.vldb.org/pvldb/vol6/p589-dutta.pdf)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our example, the `Distinct` function is shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Once it has all the distinct click-thru, Storm persists that information into
+    Trident state using a call to `persistAggregate`. This collapses the stream by
+    using the `Count` operator. In the example, we use a MemoryMap. However, in a
+    real system we would most likely apply a distributed storage mechanism such as
+    Memcache or Cassandra.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The result of processing the initial stream is a `TridentState` object that
+    contains the count of all the distinct click-thru grouped by the campaign identifier.
+    The critical line that *joins* the two streams is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This incorporates the state developed in the initial stream into the analysis
+    developed by the second stream. Effectively, the second stream queries the state
+    mechanism for the distinct count of all the click-thru for that campaign and adds
+    it as a field to the tuples processed in this stream. That field can then be leveraged
+    in the effectiveness computation, which is encapsulated in the following class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: As shown in the preceding code, this class computes effectiveness by computing
+    the ratio between the field that contains the total count and the field introduced
+    by the state query.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying the topology
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To deploy the preceding topology, we must first retrieve the Storm-YAML configuration
+    using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding command interacts with the specified instance of the Storm-YARN
+    application to retrieve a `storm.yaml` file that can be used to deploy topologies
+    by using the standard mechanisms. Simply copy the `output.yaml` file into the
+    appropriate location (typically, `~/.storm/storm.yaml`) and deploy using the standard
+    `storm jar` command as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: Executing the topology
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Executing the preceding topology results in the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice that the values are the same as those emitted by Pig. If we let the
+    topology run, we eventually see decreasing effectiveness scores as shown in the
+    following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: This stands to reason because we now have a real-time system, which is continually
+    consuming the same impression events. Since we are only counting all the distinct
+    click-thru and the entire set of click-thru has already been accounted for in
+    the calculation, the effectiveness will continue to drop.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we saw a few different things. First, we saw the blueprint
+    for converting a batch processing mechanism that leverages Pig into a real-time
+    system that is implemented in Storm. We saw how a direct translation of that script
+    would not work due to the limitations of joins in a real-time system, because
+    traditional join operations require finite set of data. To overcome this problem,
+    we used a shared state pattern with the forked streams.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Secondly, and perhaps most importantly, we examined Storm-YARN; it allows a
+    user to reuse the Hadoop infrastructure to deploy Storm. Not only does this provide
+    a means for existing Hadoop users to quickly transition to Storm, it also allows
+    a user to capitalize on cloud mechanisms for Hadoop such as Amazon's **Elastic
+    Map Reduce** (**EMR**). Using EMR, Storm can be deployed quickly to cloud infrastructure
+    and scaled to meet demand.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, as future work, the community is exploring methods to run Pig scripts
+    directly on Storm. This would allow users to directly port their existing analytics
+    over to Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To monitor this work, visit [https://cwiki.apache.org/confluence/display/PIG/Pig+on+Storm+Proposal.](https://cwiki.apache.org/confluence/display/PIG/Pig+on+Storm+Proposal.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will explore automated Storm deployment to the cloud
+    using Apache Whirr. Although not specifically addressed, the techniques in the
+    next chapter can be used in cloud deployments.
+  prefs: []
+  type: TYPE_NORMAL

@@ -1,0 +1,765 @@
+- en: Chapter 9. Creating Asynchronous Tasks with Celery
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: While creating web apps, it is vital to keep the time that a request takes to
+    process below or around 50 ms. As the majority of response times are occupied
+    by waiting for users' connection, and extra processing time may hang the server.
+    Any extra processing on the server that can be avoided should be avoided. However,
+    it is quite common for several operations in a web app to take longer than a couple
+    of seconds, especially when complex database operations or image processing are
+    involved. To save our user experience, a task queue named Celery will be used
+    to move these operations out of the Flask process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is Celery?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Celery** is an asynchronous task queue written in Python. Celery runs tasks,
+    which are user-defined functions, *concurrently*—multiple tasks at once—through
+    the Python multiprocessing library. Celery receives messages that tell it to start
+    a task from a **broker**, which is usually called a message queue as shown in
+    the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![What is Celery?](img/B03929_09_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: A **message queue** is a system specifically designed to send data between producer
+    processes and consumer processes. **Producer processes** are any programs that
+    create messages to be sent in the queue, and **consumer processes** are any programs
+    that take the messages out of the queue. Messages sent from a producer are stored
+    in a **First In First Out** (**FIFO**) queue, where the oldest items are retrieved
+    first. Messages are stored until a consumer receives the message, after which
+    it is deleted. Message queues provide real-time messaging without relying on polling,
+    the process of continuously checking the status of a process. When messages are
+    sent from producers, consumers are *listening* on their connection to the message
+    queue for new messages; the consumer is not constantly contacting the queue. This
+    difference is like the difference between **AJAX** and **WebSockets**; AJAX requires
+    constant contact with the server while WebSockets are just a continuous stream.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is possible to replace the message queue with a traditional database. Celery
+    even comes with built-in support for SQLAlchemy to allow this. However, using
+    a database as a broker for Celery is highly discouraged. Using a database in place
+    of a message queue requires the consumer to constantly poll the database for updates.
+    Also, because Celery uses multiprocessing for concurrency, the number of connections
+    making lots of reads goes up quickly. Under medium loads, using a database requires
+    the producer to make lots of writes to the database at the same time as the consumer
+    is reading. Databases cannot have too many connections making reads, writes, and
+    updates at the same time on the same data. When this happens, tables are often
+    locked and all other connections are left waiting for each write to finish before
+    anything can read the data, and vice versa. Even worse, it can lead to race conditions,
+    which are situations where concurrent events change and read the same resource,
+    and each concurrent operation started using a stale version of the data. Specific
+    to Celery, this can lead to the same operation being run multiple times for the
+    same message.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is also possible to use a message queue as a broker and a database to store
+    the results of the tasks. In the preceding diagram, the message queue was used
+    for sending task requests and task results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, using a database to store the end result of the task allows the final
+    product to be stored indefinitely, whereas the message queue will throw out the
+    data as soon as the producer receives the data as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![What is Celery?](img/B03929_09_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: This database is often a key-value NoSQL store to help handle the load. This
+    is useful if you plan on doing analytics on previously run tasks; otherwise, it's
+    safer to just stick with the message queue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is even an option to drop the results of tasks entirely and not have the
+    results of tasks returned. This has the downside that the producer has no way
+    of knowing if a task was successful or not, but often this is enough in smaller
+    projects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For our stack, we will use **RabbitMQ** as the message broker. RabbitMQ runs
+    on all major OSes and is very simple to set up and run. Celery also supports RabbitMQ
+    without any extra libraries and is the recommended message queue in the Celery
+    documentation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: At the time of writing, there is no way to use RabbitMQ with Celery in Python
+    3\. You can use Redis instead of RabbitMQ. The only difference will be the connection
+    strings. For more information, see [http://docs.celeryproject.org/en/latest/getting-started/brokers/redis.html](http://docs.celeryproject.org/en/latest/getting-started/brokers/redis.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up Celery and RabbitMQ
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To install Celery with `pip`, run the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We will also need a Flask extension to help handle initializing Celery:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The Flask documentation states that Flask extensions for Celery are unnecessary.
+    However, getting the Celery server to work with Flask's application context when
+    your app is organized with an application factory is significant. So, we will
+    use **Flask-Celery-Helper** to do the heavy lifting.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, RabbitMQ needs to be installed. RabbitMQ is not written in Python; therefore,
+    installation instructions will be different for every OS. Thankfully, RabbitMQ
+    maintains a detailed list of instructions for each OS at [https://www.rabbitmq.com/download.html](https://www.rabbitmq.com/download.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After RabbitMQ is installed, go to a terminal window and run the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: This will start a RabbitMQ server with a user of guest and a password of guest.
+    By default, RabbitMQ only accepts connections on localhost, so this setup is okay
+    for the development.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating tasks in Celery
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As stated before, Celery tasks are just user-defined functions that perform
+    some operations. But before any tasks can be written, our Celery object needs
+    to be created. This is the object that the Celery server will import to handle
+    running and scheduling all of the tasks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At a bare minimum, Celery needs one configuration variable to run: the connection
+    to the message broker. The connection is defined like the SQLAlchemy connection,
+    as a URL. The backend, what stores our tasks'' results, is also defined as a URL
+    as shown in the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, in order for our Celery process to work with the database and any other
+    Flask extensions, it needs to work within our application context. In order to
+    do so, Celery will need to create a new instance of our application for each process.
+    Unlike most Celery apps, we need a Celery factory to create an application instance
+    and register our Celery instance on it. In a new file in the top-level directory,
+    the same location where `manage.py` resides, named `celery_runner.py`, add the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: What the `make_celery` function does is wraps every call to each Celery task
+    in a Python `with` block. This makes sure that every call to any Flask extension
+    will work as it is working with our app. Also, make sure not to name the Flask
+    app instance `app`, as Celery tries to import any object named `app` or `celery`
+    as the Celery application instance. So, naming your Flask object `app` will cause
+    Celery to try to use it as a Celery object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we can write our first task. It will be a simple task to start with, one
+    that just returns any string passed to it. In a new file in the application directory
+    named `tasks.py`, add the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, the final piece of the puzzle is to run the Celery process, which is called
+    a **worker**, in a new terminal window. Again, this is the process that will be
+    listening to our message broker for commands to start new tasks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `loglevel` flag is there, so you can see the confirmation that a task was
+    received and its output was available in the terminal window.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we can send commands to our Celery worker. Open the `manage.py` shell
+    and import the `log` task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The function can be called as if it were any other function; doing so will execute
+    the function in the current process. However, calling the `delay` method on the
+    task will send a message to the worker process to execute the function with the
+    given arguments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the terminal window that is running the Celery worker, you should see something
+    like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: With any asynchronous task, the `ready` method can be used to tell if the task
+    has successfully completed. If true, the `get` method can be used to retrieve
+    the result of the tasks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `get` method causes the current process to wait until the `ready` function
+    returns `True` to retrieve the result. So, calling `get` immediately after calling
+    the task essentially makes the task synchronous. Because of this, it's rather
+    rare for tasks to actually return a value to the producer. The vast majority of
+    tasks perform some operation and then exit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When a task is run on the Celery worker, the state of the task can be accessed
+    via the `state` attribute. This allows for a more fine-grained understanding of
+    what the task is currently doing in the worker process. The available states are
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`FAILURE`: The task failed and all of the retries failed as well'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PENDING`: The task has not yet been received by the worker'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`RECEIVED`: The task has been received by the worker and is not yet processing'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`RETRY`: The task failed and is waiting to be retried'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`REVOKED`: The task was stopped'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`STARTED`: The worker has started processing the task'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SUCCESS`: The task completed successfully'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In Celery, if a task fails, then the task can recall itself with the `retry`
+    method as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `bind` parameter in the decorator function tells Celery to pass a reference
+    to the task object as the first parameter in the function. Using the `self` parameter,
+    the `retry` method can be called, which will rerun the task with the same parameters.
+    There are several other parameters that can be passed to the function decorator
+    to change the behavior of the task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`max_retries`: This is the maximum number of times the task can be retried
+    before it is declared as failed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`default_retry_delay`: This is the time in seconds to wait before running the
+    task again. It''s a good idea to keep this at somewhere around a minute or so
+    if you expect that the conditions that led to the task failing are transitory—for
+    example, network errors.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`rate_limit`: This specifies the total number of unique calls to this task
+    that are allowed to run in a given interval. If the value is an integer, it is
+    the total number of this task that is allowed to run per second. The value can
+    also be a string in the form of *x/m* for *x* number of tasks per minute or *x/h*
+    for *x* number of tasks per hour. For example, passing in *5/m* will only allow
+    this task to be called five times a minute.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`time_limit`: If specified, the task will be killed if it runs longer than
+    this number of seconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ignore_result`: If the task''s return value isn''t used, then don''t send
+    it back.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It's a good idea to specify all of these for each task to avoid any chance that
+    a task will not be run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running Celery tasks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `delay` method is a shorthand version of the `apply_async` method, which
+    is called in this format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'However, the `args` keyword can be implicit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Calling `apply_async` allows you to define some extra functionality in the
+    task call that you cannot specify in the `delay` method. First, the `countdown`
+    option specifies the amount of time in seconds the worker should wait to run the
+    task after receiving it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`countdown` is not a guarantee that the task will be run after `600` seconds.
+    `countdown` only says that the task is up for processing after *x* number of seconds.
+    If all of the worker processes are busy with the other tasks, then it will not
+    be run immediately.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another keyword argument that `apply_async` gives is the `eta` argument. `eta`
+    is passed through a Python `datetime` object that specifies exactly when the task
+    should be run. Again, `eta` is not reliable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Celery workflows
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Celery provides many ways to group multiple, dependent tasks together or to
+    execute many tasks in parallel. These methods take a large amount of influence
+    from language features found in functional programming languages. However, to
+    understand how this works, we first need to understand signatures. Consider the
+    following task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s see a **signature** in action to understand it. Open up the `manage.py`
+    shell:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Calling a signature, or sometimes called a **subtask**, of a task creates a
+    function that can be passed to the other functions to be executed. Executing the
+    signature, like the third-to-last line in the example, executes the function in
+    the current process and not in the worker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Partials
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The first application of task signatures is functional programming style partials.
+    **Partials** are functions that originally take many arguments; however an operation
+    is applied to the original function to return a new function, so the first *n*
+    arguments are always the same. An example would be a `multiply` function that
+    is not a task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is a fictional API, but this is very close to the Celery version:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: The output in the worker window should show **16**. Basically, we created a
+    new function that was saved to partial and that will always multiply its input
+    by four.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Callbacks
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Once a task is completed, it is very common to have another task run based
+    on the output of the previous tasks. To achieve this, the `apply_async` function
+    has a `link` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: The worker output should show that both the `multiply` task and the `log` task
+    returned **16**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you have a function that does not take input, or your callback does not
+    need the result of the original method, the task signature must be marked as immutable
+    with the `si` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: '**Callbacks** can be used to solve real-world problems. If we wanted to send
+    a welcome e-mail every time a task created a new user, then we could produce that
+    effect with the following call:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Partials and callbacks can be combined to produce some powerful effects:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: It's important to note that if this call was saved and the `get` method was
+    called on it, the result would be **16** rather than **64**. This is because the
+    `get` method does not return the results for callback methods. This will be solved
+    with later methods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Group
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `group` function takes a list of signatures and creates a callable function
+    to execute all of the signatures in parallel and then return a list of all of
+    the results:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Chain
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `chain` function takes task signatures and passes the value of each result
+    to the next value in the chain, returning one result as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Chains and partials can be taken a bit further. Chains can be used to create
+    new functions when using partials, and chains can be nested as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: Chord
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `chord` function creates a signature that will execute a `group` of signatures
+    and pass the final result to a callback:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: Just like the link argument, the callback is not returned with the `get` method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using the `chain` syntax with a group and a callback automatically creates
+    a chord signature:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Running tasks periodically
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Celery also has the ability to call tasks periodically. For those familiar with
+    ***nix** OSes, this system is a lot like the command-line utility `cron`, but
+    it has the added benefit of being defined in our source code rather than on some
+    system file. As such, it will be much easier to update when our code is ready
+    for publishing to production in [Chapter 13](ch13.html "Chapter 13. Deploying
+    Flask Apps"), *Deploying Flask Apps*,. In addition, all of the tasks are run within
+    the application context, whereas a Python script called by `cron` would not be.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To add periodic tasks, add the following to the `DevConfig` configuration object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: This `configuration` variable defines that the `log` task should be run every
+    30 seconds with the `args` tuple passed as the parameters. Any `timedelta` object
+    can be used to define the interval to run the task on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To run periodic tasks, another specialized worker named a `beat` worker is
+    needed. In another terminal window, run the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you now watch the terminal output in the main `Celery` worker, you should
+    now see a log event every 30 seconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What if your task needs to run at much more specific intervals, for example,
+    every Tuesday in June at 3 am and 5 pm? For very specific intervals, there is
+    the Celery `crontab` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To illustrate how the `crontab` object represents intervals, here are some
+    examples:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The object has the following arguments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`minute`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`hour`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: day_of_week
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`day_of_month`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`month_of_year`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each of these arguments can take various inputs. With plain integers, they operate
+    much like the `timedelta` object, but they can also take strings and lists. When
+    passed a list, the task will execute on every moment that is in the list. When
+    passed a string in the form of **/x*, the task will execute every moment that
+    the modulo operation returns zero. Also, the two forms can be combined to form
+    a comma-separated string of integers and divisions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Monitoring Celery
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'When our code is pushed to the server, our `Celery` worker will not be run
+    in the terminal window, it will be run as a background task. Because of this,
+    Celery provides many command-line arguments to monitor the status of your `Celery`
+    worker and tasks. These commands take the following form:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The main tasks to view the status of your workers are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`status`: This prints the running workers and if they are up'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`result`: When passed a task id, this shows the return value and final status
+    of the task'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`purge`: Using this, all messages in the broker will be deleted'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`inspect active`: This lists all active tasks'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`inspect scheduled`: This lists all tasks that have been scheduled with the
+    `eta` argument'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`inspect registered`: This lists all of the tasks waiting to be processed'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`inspect stats`: This returns a dictionary full of statistics on the currently
+    running workers and the broker'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Web-based monitoring with Flower
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '**Flower** is a web-based, real-time management tool for Celery. In Flower,
+    all active, queued, and completed tasks can be monitored. Flower also provides
+    graphs and stats on how long each graph has been sitting in the queue versus how
+    long its execution took and the arguments to each of those tasks.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To install Flower, use `pip` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To run it, just treat `flower` as a Celery command as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, open your browser to `http://localhost:5555`. It''s best to familiarize
+    yourself with the interface while tasks are running, so go to the command line
+    and type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: Your worker process will now start processing 10,000 tasks. Browse around the
+    different pages while the tasks are running to see how Flower interacts with your
+    worker while it is really churning.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a reminder app
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's get into some real-world examples in Celery. Suppose another page on our
+    site now requires a reminder feature. Users can create reminders that will send
+    an e-mail to a specified location at the time specified. We will need a model,
+    a task, and a way to call our task automatically every time a model is created.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s start with the following basic SQLAlchemy model:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we need a task that will send an e-mail to the location in the model. In
+    our `tasks.py` file, add the following task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that our task takes a primary key rather than a model. This is a hedge
+    against a race condition, as a passed model could be stale by the time the worker
+    finally gets around to processing it. You will also have to replace the placeholder
+    e-mails and login with your own login info.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How do we have our task called when the user creates a reminder model? We will
+    use a SQLAlchemy feature named `events`. SQLAlchemy allows us to register callbacks
+    on our models that will be called when specific changes are made to our models.
+    Our task will use the `after_insert` event, which is called after new data is
+    entered into the database, whether the model is brand new or being updated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We need a callback in `tasks.py`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, in `__init__.py`, we will register our callback on our model:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, every time a model is saved, a task is registered that will send an e-mail
+    to our user.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a weekly digest
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Say our blog has a lot of people who don't use RSS and prefer mailing lists,
+    which is a large number of users. We need some way to create a list of new posts
+    at the end of every week to increase our site's traffic. To solve this problem,
+    we will create a digest task that will be called by a beat worker at 10 am every
+    Saturday.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, in `tasks.py`, let''s create our task as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We will also need to add a periodic schedule to our configuration object in
+    `config.py` to manage our task:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we need our e-mail template. Unfortunately, HTML in e-mail clients
+    is terribly outdated. Every single e-mail client has different rendering bugs
+    and quirks, and the only way to find them is to open your e-mail in all the clients.
+    Many e-mail clients don''t even support CSS, and those that do support a very
+    small amount of selectors and attributes. In order to compensate, we have to use
+    the web development methods of 10 years ago, that is, designing with tables with
+    inline styles. Here is our `digest.html`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, at the end of every week, our digest task will be called and it will send
+    an e-mail to all the users present in our mailing list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Celery is a very powerful task queue that allows programmers to defer the processing
+    of slower tasks to another process. Now that you understand how to move complex
+    tasks out of the Flask process, we will take a look at a collection of Flask extensions
+    that simplify some common tasks seen in Flask apps.
+  prefs: []
+  type: TYPE_NORMAL

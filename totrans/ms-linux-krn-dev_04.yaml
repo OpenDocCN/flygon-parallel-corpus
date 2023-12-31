@@ -1,0 +1,1533 @@
+- en: Memory Management and Allocators
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The efficiency of memory management broadly sets the efficiency of the whole
+    kernel. Casually managed memory systems can seriously impact the performance of
+    other subsystems, making memory a critical component of the kernel. This subsystem
+    sets all processes and kernel services in motion by virtualizing physical memory
+    and managing all dynamic allocation requests initiated by them. The memory subsystem
+    also handles a wide spectrum of operations in sustaining operational efficiency
+    and optimizing resources. The operations are both architecture specific and independent,
+    which mandates the overall design and implementation to be just and tweakable.
+    We will closely look at the following aspects in this chapter in our effort to
+    comprehend this colossal subsystem:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Physical memory representation
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Concepts of nodes and zones
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Page allocator
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Buddy system
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kmalloc allocations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Slab caches
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Vmalloc allocations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Contiguous memory allocations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Initialization operations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In most architectures, on *reset,* processor is initialized in normal or physical
+    address mode (also called **real mode** in x86) and begins executing the platform's
+    firmware instructions found at the **reset vector**. These firmware instructions
+    (which can be single binary or multi-stage binary) are programmed to carry out
+    various operations, which include initialization of the memory controller, calibration
+    of physical RAM, and loading the binary kernel image into a specific region of
+    physical memory, among others.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When in real mode, processors do not support virtual addressing, and Linux,
+    which is designed and implemented for systems with **protected mode**, requires
+    **virtual addressing** to enable process protection and isolation, a crucial abstraction
+    provided by the kernel (recall from [Chapter 1](part0020.html#J2B80-7300e3ede2f245b0b80e1b18d02a323f),
+    *Comprehending Processes, Address Space, and Threads*). This mandates the processor
+    to be switched into protected mode and turn on virtual address support before
+    the kernel kicks in and begins its boot operations and initialization of subsystems.
+    Switching to protected mode requires the MMU chipset to be initialized, by setting
+    up appropriate core data structures, in the process enabling *paging*. These operations
+    are architecture specific and are implemented in *arch* branch of the kernel source
+    tree. During kernel build these sources are compiled and linked as a header to
+    protected mode kernel image; this header is referred as the **kernel bootstrap**
+    or **real mode kernel**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00019.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Following is the `main()` routine of x86 architecture''s boot strap; this function
+    is executed in real mode and is responsible for allocating appropriate resources
+    before stepping into protected mode by invoking `go_to_protected_mode()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Real mode kernel routines that are invoked for setting up MMU and handle transition
+    into protected mode are architecture specific (we will not be touching on those
+    routines here). Irrespective of the architecture-specific code engaged, the primary
+    objective is to enable support for **virtual addressing** by turning on **paging**.
+    With paging enabled, system begins to perceive physical memory (RAM) as an array
+    of blocks of fixed size, called page frames. Size of a page frame is configured
+    by programming the paging unit of MMU appropriately; most MMUs support 4k, 8k,
+    16k, 64k up to 4MB options for frame size configuration. However, Linux kernel's
+    default build configuration for most architectures chooses 4k as its standard
+    page frame size.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page descriptor
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Page frames** are the smallest possible allocation units of memory and kernel
+    needs to utilize them for all its memory needs. Some page frames would be required
+    for mapping physical memory to virtual address spaces of user mode processes,
+    some for kernel code and its data structures, and some for processing dynamic
+    allocation requests raised by process or a kernel service. For efficient management
+    of such operations, kernel needs to distinguish between page frames currently
+    in *use* from those which are free and available. This purpose is achieved through
+    an architecture-independent data structure called `struct page`, which is defined
+    to hold all meta data pertaining to a page frame, including its current state.
+    An instance of `struct page` is allocated for each physical page frame found,
+    and kernel has to maintain a list of page instances in main memory all the time.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Page structure** is one of the heavily used data structures of the kernel,
+    and is referred from various kernel code paths. This structure is populated with
+    diverse elements, whose relevance is entirely based on the state of the physical
+    frame. For instance, specific members of page structure specify if corresponding
+    physical page is mapped to virtual address space of a process, or a group of process.
+    Such fields are not considered valid when the physical page has been reserved
+    for dynamic allocations. To ensure that page instance in memory is allocated only
+    with relevant fields, unions are heavily used to populate member fields. This
+    is a prudent choice, since it enables cramming more information into the page
+    structure without increasing its size in memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Following is a brief description of important members of page structure. Note
+    that a lot of the details here assume your familiarity with other aspects of memory
+    subsystem which we discuss in further sections of this chapter, such as memory
+    allocators, page tables, and so forth. I recommend new readers to skip and revisit
+    this section after you get acquainted with the necessary prerequisites.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Flags
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'This is an `unsigned long` bit-field that holds flags which describe state
+    of the physical page. Flag constants are defined through an `enum` in kernel header
+    `include/linux/page-flags.h`. The following table lists out important flag constants:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Flag** | **Description** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_locked` | Used to indicate if page is locked; this bit is set while initiating
+    I/O operations on page and cleared on completion. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_error` | Used to indicate an error page. Set on occurrence of an I/O
+    error on the page. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_referenced` | Set to indicate page reclaim for page cache. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_uptodate` | Set to indicate if page is valid after read operation from
+    disk. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_dirty` | Set when file backed page is modified and is out-of-sync with
+    disk image of the same. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_lru` | Used to indicate that the least recently used bit is set which
+    helps handle page reclaim. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_active` | Used to indicate if page is in active list. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_slab` | Used to indicate that the page is managed by slab allocator.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_reserved` | Used to indicate reserved pages which are not swappable.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_private` | Used to indicate that the page is used by a filesystem to
+    hold its private data. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_writeback` | Set while commencing write-back operation on a file-backed
+    page |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_head` | Used to indicate head page of a compound page. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_swapcache` | Used to indicate if page is in swapcache. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_mappedtodisk` | Used to indicate that page is mapped to *blocks* on storage.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_swapbacked` | Page is backed by swap. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_unevictable` | Used to indicate that page is in unevictable list; generally,
+    this bit is set for pages owned by ramfs and `SHM_LOCKed` shared memory pages.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PG_mlocked` | Used to indicate that VMA lock is enabled on the page. |'
+  prefs: []
+  type: TYPE_TB
+- en: 'A number of macros exist to `check`, `set`, and `clear` individual page bits;
+    these operations are guaranteed to be `atomic` and are declared in kernel header
+    `/include/linux/page-flags.h`. They are invoked to manipulate page flags from
+    various kernel code paths:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Mapping
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Another important element of the page descriptor is a pointer `*mapping` of
+    type `struct address_space`. However*,* this is one of the tricky pointers which
+    might either refer to an instance of `struct address_space`, or to an instance
+    of `struct anon_vma`. Before we get into details of how this is achieved, let's
+    first understand the importance of those structures and the resources they represent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Filesystems engage free pages( from page cache) to cache data of recently accessed
+    disk files. This mechanism helps minimize disk I/O operations: when file data
+    in the cache is modified, the appropriate page is marked dirty by setting the
+    `PG_dirty` bit; all dirty pages are written to the corresponding disk block by
+    scheduling disk I/O at strategic intervals. `struct address_space` is an abstraction
+    that represents a set of pages engaged for a file cache. Free pages of the page
+    cache can also be **mapped** to a process or process group for dynamic allocations,
+    pages mapped for such allocations are referred to as **anonymous** page mappings.
+    An instance of `struct anon_vma` represents a memory block created with anonymous
+    pages, that are mapped to the virtual address space (through VMA instance) of
+    a process or processes.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The tricky dynamic initialization of the pointer with address to either of the
+    data structures is achieved by bit manipulations. If low bit of pointer `*mapping`
+    is clear, then it is an indication that the page is mapped to an `inode` and the
+    pointer refers to `struct address_space`. If low bit is set, it is an indication
+    for anonymous mapping, which means the pointer refers to an instance of `struct
+    anon_vma`. This is made possible by ensuring allocation of `address_space` instances
+    aligned to `sizeof(long)`, which makes the least significant bit of a pointer
+    to `address_space` be unset (that is, set to 0).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Zones and nodes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Principal data structures that are elementary for entire memory management framework
+    are **zones** and ***nodes***. Let's familiarize ourselves with core concepts
+    behind these data structures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory zones
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For efficient management of memory allocations, physical pages are organized
+    into groups called **zones.** Pages in each *zone* are utilized for specific needs
+    like DMA, high memory, and other regular allocation needs. An `enum` in kernel
+    header `mmzone.h` declares *zone* constants:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`ZONE_DMA`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Pages in this *zone* are reserved for devices which cannot initiate DMA on
+    all addressable memory. Size of this *zone* is architecture specific:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Architecture | Limit |'
+  prefs: []
+  type: TYPE_TB
+- en: '| parsic, ia64, sparc | <4G |'
+  prefs: []
+  type: TYPE_TB
+- en: '| s390 | <2G |'
+  prefs: []
+  type: TYPE_TB
+- en: '| ARM | variable |'
+  prefs: []
+  type: TYPE_TB
+- en: '| alpha | unlimited or <16MB |'
+  prefs: []
+  type: TYPE_TB
+- en: '| alpha, i386, x86-64 | <16MB |'
+  prefs: []
+  type: TYPE_TB
+- en: '`ZONE_DMA32`: This *zone* is used for supporting 32-bit devices which can perform
+    DMA on <4G of memory. This *zone* is only present on x86-64 platforms.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ZONE_NORMAL`: All addressable memory is considered to be normal *zone*. DMA
+    operations can be initiated on these pages, provided DMA devices support all addressable
+    memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ZONE_HIGHMEM`: This *zone* contains pages that are only accessible by kernel
+    through explicit mapping into its address space; in other words, all physical
+    memory pages beyond kernel segment fall into this *zone*. This *zone* exists only
+    for 32-bit platforms with 3:1 virtual address split (3G for user mode and 1G address
+    space for kernel); for instance on i386, allowing the kernel to address memory
+    beyond 900 MB will require setting up special mappings (page table entries) for
+    each page that the kernel needs to access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ZONE_MOVABLE`: Memory fragmentation is one of the challenges for modern operating
+    systems to handle, and Linux is no exception to this. Right from the moment kernel
+    boots, throughout its runtime, pages are allocated and deallocated for an array
+    of tasks, resulting in small regions of memory with physically contiguous pages.
+    Considering Linux support for virtual addressing, fragmentation might not be an
+    obstacle for smooth execution of various processes, since physically scattered
+    memory can always be mapped to virtually contiguous address space through page
+    tables. Yet, there are a few scenarios like DMA allocations and setting up caches
+    for kernel data structures that have a stringent need for physically contiguous
+    regions.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Over the years, kernel developers have been evolving numerous anti-fragmentation
+    techniques to alleviate **fragmentation**. Introduction of `ZONE_MOVABLE` is one
+    of those attempts. The core idea here is to track *movable* pages in each *zone*
+    and represent them under this pseudo *zone*, which helps prevent fragmentation
+    (we discuss more on this in the next section on the buddy system).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The size of this *zone* is to be configured at boot time through one of the
+    kernel parameters `kernelcore`; note that the value assigned specifies the amount
+    of memory considered *non-movable,* and the rest, *movable*. As a general rule,
+    the memory manager is configured to consider migration of pages from the highest
+    populated *zone* to `ZONE_MOVABLE`, which is probably going to be `ZONE_HIGHMEM`
+    for x86 32-bit machines and `ZONE_DMA32` on x86_64.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ZONE_DEVICE`: This *zone* has been carved out to support hotplug memories,
+    like large capacity *persistent-memory arrays*. **Persistent memories** are very
+    similar to DRAM in many ways; specifically, CPUs can directly address them at
+    byte level. However, characteristics such as persistence, performance (slower
+    writes), and size (usually measured in terabytes) separate them from normal memory.
+    For the kernel to support such memories with 4 KB page size, it would need to
+    enumerate billions of page structures, which would consume significant percent
+    of main memory or not be fit at all. As a result, it was chosen by kernel developers
+    to consider persistent memory a **device**, rather than like **memory**; which
+    means that the kernel can fall back on appropriate **drivers** to manage such
+    memories.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `devm_memremap_pages()` routine of the persistent memory driver maps a region
+    of persistent memory into kernel's address space with relevant page structures
+    set up in persistent device memory. All pages under these mappings are grouped
+    under `ZONE_DEVICE`. Having a distinct *zone* to tag such pages allows the memory
+    manager to distinguish them from regular uniform memory pages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory nodes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Linux kernel is implemented to support multi-processor machine architectures
+    for a long time now. Kernel implements various resources such as per-CPU data
+    caches, mutual exclusion locks, and atomic operation macros, which are used across
+    various SMP-aware subsystems, such as process scheduler and device management,
+    among others. In particular, the role of memory management subsystem is crucial
+    for kernel to tick on such architectures, since it needs to virtualize memory
+    as viewed by each processor. Multi-processor machine architectures are broadly
+    categorized into two types based on each processor's perception, and access latency
+    to memory on the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Uniform Memory Access Architecture (UMA):** These are multi-processor architecture
+    machines, where processors are joined through an interconnect and share physical
+    memory and I/O ports. They are named as UMA systems due to memory access latency,
+    which is uniform and fixed irrespective of the processor from which they were
+    initiated. Most symmetric multi-processor systems are UMA.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Non-Uniform Memory Access Architecture (NUMA):** These are multi-processor
+    machines with a contrasting design to that of UMA**.** These systems are designed
+    with dedicated memory for each processor with fixed time access latencies. However,
+    processors can initiate access operations on local memory of other processors
+    through appropriate interconnects, and such operations render variable time access
+    latencies.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Machines of this model are appropriately named **NUMA** due to non-uniform
+    (non-contiguous) view of systems memory for each processor:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**![](img/00020.jpeg)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To extend support for NUMA machines, kernel views each non uniform memory partition
+    (local memory) as a `node`. Each node is identified by a descriptor of `type pg_data_t`
+    , which refers to pages under that node as per zoning policy, discussed earlier.
+    Each *zone* is represented through an instance of `struct zone`. UMA machines
+    would contain one node descriptor under which the entire memory is represented,
+    and on NUMA machines, a list of node descriptors are enumerated, each representing
+    a contiguous memory node. The following diagram illustrates the relationship between
+    these data structures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00021.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: We shall follow on with *node* and *zone* descriptor data structure definitions.
+    Note that we do not intend to describe every element of these structures as they
+    are related to various aspects of memory management which are out of scope of
+    this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Node descriptor structure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Node descriptor structure `pg_data_t` is declared in kernel header `mmzone.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Depending on the type of machine and kernel configuration chosen, various elements
+    are compiled into this structure. We''ll look at few important elements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Field | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_zones` | An array that holds *zone* instances for pages in this node.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_zonelists` | An array that specifies preferred allocation order for
+    zones in the node. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `nr_zones` | Count of zones in the current node. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_mem_map` | Pointer to list of page descriptors in the current node.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `bdata` | Pointer to boot memory descriptor (discussed in later section)
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_start_pfn` | Holds frame number of the first physical page in this
+    node; this value would be *zero* for UMA systems. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_present_pages` | Total count of pages in the node |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_spanned_pages` | Total size of physical page range, including holes
+    if any. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `node_id` | Holds unique node identifier (nodes are numbered from zero) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `kswapd_wait` | Wait queue of `kswapd` kernel thread |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `kswapd` | Pointer to task structure of `kswapd` kernel thread |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `totalreserve_pages` | Count of reserve pages not used for user space allocations
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: Zone descriptor structure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `mmzone.h` header also declares `struct zone`, which serves as *zone* descriptor.
+    Following is a code snippet of structure definition and is well commented. We
+    shall follow on with descriptions of a few important fields:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following is the summarized table of important fields, with short descriptions
+    for each of them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Field | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `watermark` | An array of unsigned long with `WRMARK_MIN, WRMARK_LOW`, and
+    `WRMARK_HIGH` offsets. Values in these offsets impact swap operations carried
+    out by `kswapd` kernel thread. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `nr_reserved_highatomic` | Holds count of reserved high order atomic pages
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `lowmem_reserve` | Array that specifies count of pages for each *zone* that
+    are reserved for critical allocations |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `zone_pgdat` | Pointer to node descriptor for this *zone*. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `pageset` | Pointer to per-CPU hot-and-cold page lists. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `free_area` | An array of instances of type `struct free_area`, each abstracting
+    contiguous free pages made available for buddy allocator. More on buddy allocator
+    in a later section. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `flags` | Unsigned long variable used to store current status of the *zone*.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `zone_start_pfn` | Index of first page frame in the *zone* |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `vm_stat` | Statistical information of the *zone* |'
+  prefs: []
+  type: TYPE_TB
+- en: Memory allocators
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Having looked at how physical memory is organized, and represented through core
+    data structures, we will now shift our attention to management of physical memory
+    for processing allocation and deallocation requests. Memory allocation requests
+    can be raised by various entities in the system, such as usermode process, drivers,
+    and filesystems. Depending on the type of entity and context from which allocation
+    is being requested, allocations returned might need to meet certain characteristics,
+    such as page-aligned physically contiguous large blocks or physically contiguous
+    small blocks, hardware cache aligned memory, or physically fragmented blocks that
+    are mapped to virtually contiguous address space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To efficiently manage physical memory, and cater to memory as per chosen priority
+    and pattern, the kernel engages with a group of memory allocators. Each allocator
+    has a distinct set of interface routines, which are backed by precisely designed
+    algorithms optimized for a specific allocation pattern.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page frame allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Also called the zoned page frame allocator, this serves as an interface for
+    physically contiguous allocations in multiples of page size. Allocation operations
+    are carried out by looking into appropriate zones for free pages. Physical pages
+    in each *zone* are managed by **Buddy System**, which serves as the backend algorithm
+    for the page frame allocator:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00022.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Kernel code can initiate memory allocation/deallocation operations on this
+    algorithm through interface inline functions and macros provided in the kernel
+    header `linux/include/gfp.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The first parameter `gfp_mask` serves as a means to specify attributes as per
+    which allocations are to be fulfilled; we will look into details of the attribute
+    flags in coming sections. The second parameter `order` is used to specify size
+    of the allocation; the value assigned is considered 2^(order). On success, it
+    returns the address of the first page structure, and NULL on failure. For single
+    page allocations an alternate macro is made available, which again falls back
+    on `alloc_pages()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Allocated page(s) are mapped on to contiguous kernel address space, through
+    appropriate page table entries (for paged address translation during access operations).
+    Addresses generated after page table mapping, for use in kernel code, are referred
+    to as **linear addresses**. Through another function interface `page_address()`,
+    the caller code can retrieve the start linear address of the allocated block.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Allocations can also be initiated through a set of **wrapper** routines and
+    macros to `alloc_pages()`, which marginally extend functionality and return the
+    start linear address for the allocated chunk, instead of pointer to page structure.
+    The following code snippet shows a list of wrapper functions and macros:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following are the interfaces for releasing memory back to the system. We need
+    to invoke an appropriate one that matches the allocation routine; passing an incorrect
+    address will cause corruption:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Buddy system
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: While the page allocator serves as an interface for memory allocations (in multiples
+    of page size), the buddy system operates at the back-end to administer physical
+    page management. This algorithm manages all physical pages for each *zone*. It
+    is optimized to accomplish allocations of large physically contiguous blocks (pages),
+    by minimizing external fragmentation*.* Let's explore its operational details*.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The *zone* descriptor structure contains an array of *`struct free_area`,*
+    and the size of the array is defined through a kernel macro `MAX_ORDER` whose
+    default value is `11`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each offset contains an instance of `free_area` structure. All free pages are
+    split into 11 (`MAX_ORDER`) lists, each containing a list of blocks of 2^(order)
+    pages, with order values in the range of 0 to 11 (that is, a list of of 2² would
+    contain 16 KB sized blocks, and 2³ to be 32 KB sized blocks, and so on). This
+    strategy ensures each block to be naturally aligned. Blocks in each list are exactly
+    double in size to that of blocks in lower lists, resulting in faster allocation
+    and deallocation operations. It also provides the allocator with the capability
+    to handle contiguous allocations, of upto 8 MB block size (2^(11) list):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00023.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: When an allocation request is made for a particular size, the *buddy system*
+    looks into the appropriate list for a free block, and returns its address, if
+    available. However, if it cannot find a free block, it moves to check in the next
+    high-order list for a larger block, which if available it splits the higher-order
+    block into equal parts called *buddies*, returns one for the allocator, and queues
+    the second into a lower-order list. When both buddy blocks become free at some
+    future time, they are coalesced to create a larger block. Algorithm can identify
+    buddy blocks through their aligned address, which makes it possible to coalesce
+    them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's consider an example to comprehend this better, assuming there were a request
+    to allocate an 8k block (through page allocator routines). Buddy system looks
+    for free blocks in an 8k list of the `free_pages` array(first offset containing
+    2¹ sized blocks), and returns the start linear address of the block if available;
+    however, if there are no free blocks in the 8k list, it moves on to the next higher-order
+    list, which is of 16k blocks (second offset of the `free_pages` array) to find
+    a free block. Let's further assume that there were no free block in this list
+    as well. It then moves ahead into the next high-order list of size 32k(third offset
+    in the *free_pages* array) to find a free block; if available, it splits the 32k
+    block into two equal halves of 16k each (*buddies*). The first 16k chunk is further
+    split into two halves of 8k (*buddies*) of which one is allocated for the caller
+    and other is put into the 8k list. The second chunk of 16k is put into the 16k
+    free list, when lower order (8k) buddies become free at some future time, they
+    are coalesced to form a higher-order 16k block. When both 16k buddies become free,
+    they are again coalesced to arrive at a 32k block which is put back into the free
+    list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When a request for allocation from a desired *zone* cannot be processed, the
+    buddy system uses a fallback mechanism to look for other zones and nodes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00024.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: '*The* buddy system has a long history with extensive implementations across
+    various *nix operating systems with appropriate optimizations. As discussed earlier,
+    it helps faster memory allocation and deallocations, and it also minimizes external
+    fragmentation to some degree. With the advent of *huge pages,* which provide much-needed
+    performance benefits, it has become all the more important to further efforts
+    toward anti-fragmentation. To accomplish this, the Linux kernel''s implementation
+    of the buddy system is equipped with anti-fragmentation capability through page
+    migration.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Page migration** is a process of *moving* data of a virtual page from one
+    physical memory region to another. This mechanism helps create larger blocks with
+    contiguous pages. To realize this, pages are categorized into the following types:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**1\. Unmovable pages**: Physical pages which are pinned and reserved for a
+    specific allocation are considered unmovable. Pages pinned for the core kernel
+    fall into this category. These pages are non reclaimable.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**2\. Reclaimable pages**: Physical pages mapped to a dynamic allocation that
+    can be evicted to a backstore, and those which can be regenerated are considered
+    *reclaimable*. Pages held for file caching, anonymous page mappings, and those
+    held by the kernel''s slab caches fall into this category. Reclaim operations
+    are carried out in two modes: periodic and direct reclaim, the former is achieved
+    through a kthread called *`kswapd`.* When system runs exceedingly short of memory,
+    kernel enters into *direct reclaim.*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**3\. Movable pages:** Physical pages that can be *moved to* different regions
+    through page migration mechanism. Pages mapped to virtual address space of user-mode
+    *process* are considered movable, since all the VM subsystem needs to do is copy
+    data and change relevant page table entries. This works, considering all access
+    operations from the user mode *process* are put through page table translations.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The buddy system groups pages on the basis of *movability* into independent
+    lists, and uses them for appropriate allocations. This is achieved by organizing
+    each 2^n list in `struct free_area` as a group of autonomous lists based on mobility
+    of pages. Each `free_area` instance holds an array of lists of size `MIGRATE_TYPES`.
+    Each offset holds `list_head` of a respective group of pages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`nr_free` is a counter that holds the total number of free pages for this `free_area`
+    (all migration lists put together). The following diagram depicts free lists for
+    each migration type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00025.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The following enum defines page migration types:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We have discussed key migration types `MIGRATE_MOVABLE`, `MIGRATE_UNMOVABLE`,
+    and `MIGRATE_RECLAIMABLE` types. `MIGRATE_PCPTYPES` is a special type introduced
+    to improve systems performance; each *zone* maintains a list of cache-hot pages
+    in a per-CPU page cache. These pages are used to serve allocation requests raised
+    by the local CPU. The *zone* descriptor structures `pageset` element points to
+    pages in the per-CPU cache:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`struct per_cpu_pageset` is an abstraction that represents *unmovable*, *reclaimable*,
+    and *movable* page lists. `MIGRATE_PCPTYPES` is a count of per-CPU page lists
+    sorted as per page *mobility.* `MIGRATE_CMA` is list of pages for the contiguous
+    memory allocator, which we shall discuss in further sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**![](img/00026.jpeg)**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The buddy system is implemented to *fall back* on the alternate list, to process
+    an allocation request when pages of desired mobility are not available. The following
+    array defines the fallback order for various migration types; we will not go into
+    further elaboration as it is self explanatory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: GFP mask
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Page allocator and other allocator routines (which we''ll discuss in the following
+    sections) need the `gfp_mask` flag as an argument, which is of type `gfp_t`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Gfp flags are used to supply two vital attributes for the allocator functions:
+    the first is the **mode** of the allocation, which controls the behavior of the
+    allocator function*,* and the second is the *source* of the allocation, which
+    indicates the *zone* or list of *zones* from which memory can be sourced*.* The
+    kernel header `gfp.h` defines various flag constants that are categorized into
+    distinct groups, called **zone modifiers, mobility and** **placement flags, watermark
+    modifiers, reclaim modifiers,** and **action modifiers.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Zone modifiers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Following is a summarized list of modifiers used to specify the *zone* from
+    which memory is to be sourced. Recall our discussions on *zones* in an earlier
+    section; for each of them, a `gfp` flag is defined:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Page mobility and placement
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following code snippet defines page mobility and placement flags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following is a list of page mobility and placement flags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`__GFP_RECLAIMABLE`**: Most kernel subsystems are designed to engage *memory
+    caches* for caching frequently needed resources such as data structures, memory
+    blocks, persistent file data, and so on. The memory manager maintains such caches
+    and allows them to dynamically expand on demand. However, such caches cannot be
+    allowed to expand boundlessly, or they will eventually consume all memory. The
+    memory manager handles this issue through the **shrinker** interface, a mechanism
+    by which the memory manager can shrink a cache, and reclaim pages when needed.
+    Enabling this flag while allocating pages (for the cache) is an indication to
+    the shrinker that the page is *reclaimable.* This flag is used by the slab allocator,
+    which is discussed in a later section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_WRITE`**: When this flag is used, it indicates to the kernel that
+    the caller intends to dirty the page. The memory manager allocates the appropriate
+    page as per the fair-zone allocation policy, which round-robins the allocation
+    of such pages across local *zones* of the node to avoid all the dirty pages being
+    in one *zone*.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`__GFP_HARDWALL`: This flag ensures that allocation is carried out on same
+    node or nodes to which the caller is bound; in other words, it enforces the CPUSET
+    memory allocation policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_THISNODE`**: This flag forces the allocation to be satisfied from
+    the requested node with no fallbacks or placement policy enforcements.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`__GFP_ACCOUNT`: This flag causes allocations to be accounted for the kmem
+    control group.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Watermark modifiers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following code snippet defines the watermark modifiers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following is list of watermark modifiers, which provide control over emergency
+    reserve pools of memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`__GFP_ATOMIC`**: This flag indicates that allocation is high priority and
+    the caller context cannot be put into wait.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_HIGH`**: This flag indicates that the caller is high priority and
+    granting allocation request is necessary for the system to make progress. Setting
+    this flag will cause the allocator to access the emergency pool.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_MEMALLOC`**: This flag allows access to all memory. This should only
+    be used when the caller guarantees the allocation will allow more memory to be
+    freed very shortly, for example, process exiting or swapping.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_NOMEMALLOC`**: This flag is used to forbid access to all reserved
+    emergency pools.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Page reclaim modifiers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As systems load increases, the amount of free memory in *zones* might fall
+    below the *low watermark,* resulting in memory crunch that will acutely impact
+    overall performance of the system*.* To handle such eventuality, the memory manager
+    is equipped with **page reclaim algorithms,** which are implemented to identify
+    and reclaim pages. Kernel memory allocator routines, engage reclaim algorithms
+    when invoked with appropriate GFP constants called **page reclaim modifiers**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following is a list of reclaim modifiers that can be passed as arguments to
+    allocation routines; each flag enables reclaim operations on a specific region
+    of memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`__GFP_IO`**: This flag indicates that the allocator can start physical I/O
+    (swap) to reclaim memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`__GFP_FS`: This flag indicates that the allocator may call down to the low-level
+    FS for reclaim.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_DIRECT_RECLAIM`**: This flag indicates that the caller is willing
+    to enter direct reclaim. This might cause the caller to block.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_KSWAPD_RECLAIM`**: This flag indicates that the allocator can wake
+    the `kswapd` kernel thread to initiate reclaim, when the low watermark is reached.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_RECLAIM`**: This flag is used to enable direct and `kswapd` reclaim.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_REPEAT`**: This flag indicates to try hard to allocate the memory,
+    but the allocation attempt might fail.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_NOFAIL`**: This flag forces the virtual memory manager to *retry*
+    until the allocation request. succeeds. This might cause the VM to trigger the
+    OOM killer to reclaim memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`__GFP_NORETRY`: This flag will cause the allocator to return appropriate failure
+    status when the request cannot be served.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Action modifiers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following code snippet defines action modifiers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following is a list of action modifier flags; these flags specify additional
+    attributes to be considered by the allocator routines while processing a request:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`__GFP_COLD`**: To enable quick access, a few pages in each *zone* are cached
+    into per-CPU caches; pages held in cache are referred to as **hot**, and uncached
+    pages are referred to as **cold.** This flag indicates that the allocator should
+    serve memory requests through cache cold page(s).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_NOWARN`**: This flag causes the allocator to run in silent mode, which
+    results in warning and error conditions to go unreported.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_COMP`**: This flag is used to allocate a compound page with appropriate
+    metadata. A compound page is a group of two or more physically contiguous pages,
+    which are treated as a single large page. Metadata makes a compound page distinct
+    from other physically contiguous pages. The first physical page of a compound
+    page is called the **head page** with the `PG_head` flag set in its page descriptor,
+    and the rest of the pages are referred to as **tail pages**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_ZERO`**: This flag causes the allocator to return zero filled page(s).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_NOTRACK`**: kmemcheck is one of the in-kernel debuggers which is used
+    detect and warn about uninitialized memory access. Nonetheless, such checks cause
+    memory access operations to be delayed. When performance is a criteria, the caller
+    might want to allocate memory which is not tracked by kmemcheck. This flag causes
+    the allocator to return such memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`__GFP_NOTRACK_FALSE_POSITIVE`**: This flag is an alias of **`__GFP_NOTRACK`**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`__GFP_OTHER_NODE`: This flag is used for allocation of transparent huge pages
+    (THP).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Type flags
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With so many categories of modifier flags (each addressing different attributes),
+    programmers exercise extreme care when choosing flags for corresponding allocations.
+    To make the process easier and quicker, type flags were introduced, which enable
+    programmers to make quick allocation choices. **Type flags** are derived from
+    combinations of various modifier constants (listed previously) for specific allocation
+    use cases. Programmers however can further customize type flags if required:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is the list of type flags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`GFP_ATOMIC`**: This flag is specified for non blocking allocations that
+    cannot fail. This flag will cause allocations from emergency reserves. This is
+    generally used while invoking the allocator from an atomic context.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_KERNEL`**: This flag is used while allocating memory for kernel use.
+    These requests are processed from normal *zone*. This flag might cause the allocator
+    to enter direct reclaim.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_KERNEL_ACCOUNT`**: Same as `GFP_KERNEL` with an addition that allocation
+    is tracked by the kmem control group**.**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_NOWAIT`: This flag is used for kernel allocations that are non-blocking.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_NOIO`: This flag allows the allocator to begin direct reclaim on clean
+    pages that do not require physical I/O(swap).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_NOFS`: This flag allows the allocator to begin direct reclaim but prevents
+    invocation of filesystem interfaces.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_TEMPORARY`**: This flag is used while allocating pages for kernel caches,
+    which are reclaimable through the appropriate shrinker interface. This flag sets
+    the `__GFP_RECLAIMABLE` flag we discussed earlier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_USER`**: This flag is used for user-space allocations. Memory allocated
+    is mapped to a user process and can also be accessed by kernel services or hardware
+    for DMA transfers from device into buffer or vice versa.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_DMA`**: This flag causes allocation from the lowest *zone*, called `ZONE_DMA`.
+    This flag is still supported for backward compatibility.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_DMA32`: This flag causes allocation to be processed from `ZONE_DMA32`
+    which contains pages in < 4G memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_HIGHUSER`: This flag is used for user space allocations from **`ZONE_HIGHMEM`**
+    (relevant only on 32-bit platforms).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_HIGHUSER_MOVABLE`: This flag is similar to `GFP_HIGHUSER`, with an addition
+    that allocations are carried out from movable pages, which enables page migration
+    and reclaim.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**`GFP_TRANSHUGE_LIGHT`**: This causes the allocation of transparent huge allocations
+    (THP), which are compound allocations. This type flag sets `__GFP_COMP`, which
+    we discussed earlier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Slab allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As discussed in earlier sections, the page allocator (in coordination with buddy
+    system) does an efficient job of handling memory allocation requests in multiples
+    of page size. However, most allocation requests initiated by kernel code for its
+    internal use are for smaller blocks (usually less than a page); engaging the page
+    allocator for such allocations results in *internal fragmentation,* causing wastage
+    of memory. The slab allocator is implemented precisely to address this; it is
+    built on top of the buddy system and is used to allocate small memory blocks,
+    to hold structure objects or data used by kernel services.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Design of the slab allocator is based on an idea of *object* *cache****.***
+    The concept of an **object cache** is quite simple: it involves reserving a set
+    of free page frames, dividing and organize them into independent free lists (with
+    each list containing a few free pages) called **slab caches**, and using each
+    list for allocation of a pool of objects or memory blocks of a fixed size, called
+    a **unit**. This way, each list is assigned a unique *unit* size, and would contain
+    a pool of objects or memory blocks of that size. When an allocation request arrives
+    for a block of memory of a given size, the allocator algorithm selects an appropriate
+    *slab cache* whose *unit* size is the best fit for the requested size, and returns
+    the address of a free block.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, at a low level, there is fair bit of complexity involved in terms of
+    initialization and management of slab caches. The algorithm needs to consider
+    various issues such as object tracking, dynamic expansion, and safe reclaim through
+    the shrinker interface. Addressing all these issues and achieving a proper balance
+    between enhanced performance and optimum memory footprint is quite a challenge.
+    We shall explore more on these challenges in subsequent sections, but for now
+    we will continue our discussion with allocator function interfaces.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kmalloc caches
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Slab allocator maintains a set of generic slab caches to cache memory blocks
+    of *unit* sizes in multiples of 8\. It maintains two sets of slab caches for each
+    *unit* size, one to maintain a pool of memory blocks allocated from `ZONE_NORMAL`
+    pages and another from `ZONE_DMA` pages. These caches are global and shared by
+    all kernel code. Users can track the status of these caches through a special
+    file `/proc/slabinfo`*.* Kernel services can allocate and release memory blocks
+    from these caches through the `kmalloc` family of routines*.* They are referred
+    to as `kmalloc` caches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`kmalloc-96` and `kmalloc-192` are caches used to maintain memory blocks aligned
+    with the level 1 hardware cache. For allocations above 8k (large blocks), the
+    slab allocator falls back on buddy system.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Following are the kmalloc family of allocator routines; all of these need appropriate
+    GFP flags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following routines return the allocated block to the free pool. Callers need
+    to ensure that address passed as argument is of a valid allocated block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Object caches
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The slab allocator provides function interfaces for setting up slab caches,
+    which can be owned by a kernel service or a subsystem. Such caches are considered
+    private since they are local to kernel services (or a kernel subsystem) like device
+    drivers, file systems, process scheduler, and so on. This facility is used by
+    most kernel subsystems to set up object caches and pool intermittently needed
+    data structures. Most data structures we''ve encountered so far (since [Chapter
+    1](part0020.html#J2B80-7300e3ede2f245b0b80e1b18d02a323f), *Comprehending Processes,
+    Address Space, and Threads*) including process descriptor, signal descriptor,
+    page descriptor, and so on are maintained in such object pools. The pseudo file
+    `/proc/slabinfo` shows the status of object caches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `*kmem_cache_create()*` routine sets up a new *cache* as per the parameter
+    passed. On success, it returns the address to the cache descriptor structure of
+    type `*kmem_cache*`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: '*The cache* is created by allocating free page frames (from buddy system),
+    and data objects of *size* specified (second argument) are populated. Though each
+    cache starts by hosting a fixed number of data objects during creation*,* they
+    can grow dynamically when required to accommodate more number of data objects.
+    Data structures can be complicated (we have encountered a few), and can contain
+    varied elements such as list headers, sub-objects, arrays, atomic counters, bit-fields,
+    and so on. Setting up each object might require all its fields to be initialized
+    to the default state; this can be achieved through an initializer routine assigned
+    to a `*ctor` function pointer (last argument). The initializer is called for each
+    new object allocated, both during cache creation and when it grows to add more
+    free objects. However, for simple objects, a *cache* can be created without an
+    initializer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Flags are used to enable debug checks, and enhance the performance of access
+    operations on cache by aligning objects with the hardware cache. The following
+    flag constants are supported:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Subsequently, *objects* can be allocated and released through relevant functions.
+    Upon release, *objects* are put back into the free list of the *cache*, making
+    them available for reuse; this results in a possible performance boost, particularly
+    when *objects* are cache hot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: kmem caches can be destroyed when all hosted data objects are *free* (not in
+    use)*,* by calling `kmem_cache_destroy().`
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cache management
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: All slab caches are managed internally by **slab core**, which is a low-level
+    algorithm. It defines various control structures that describe the physical layout
+    for each **cache list**, and implements core cache-management operations which
+    are invoked by interface routines. The slab allocator was originally implemented
+    in Solaris 2.4 kernels, and used by most other *nix kernels, based on a paper
+    by Bonwick.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traditionally, Linux was used on uniprocessor desktop and server systems with
+    moderate memories, and the kernel adopted the classic model of Bonwick with appropriate
+    performance improvements. Over the years, due to diversity of the platforms with
+    distinct priorities for which the Linux kernel is ported and used, it turns out
+    that the classic implementation of the slab core algorithm is inefficient to cater
+    to all the needs. While memory-constrained embedded platforms cannot afford the
+    higher footprint of the allocator (space used to manage metadata and density of
+    allocator operations), SMP systems with huge memories need consistent performance,
+    scalability, and better mechanisms to generate trace and debug information on
+    allocations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To cater to these dissimilar requirements, current versions of the kernel provide
+    three distinct implementations of the slab algorithm: **slob**, a classic K&R
+    type list allocator, designed for low-memory systems with scarce allocation needs,
+    and was default object allocator for Linux during its initial years(1991-1999);
+    **slab**, a classic Solaris-style slab allocator that has been around in Linux
+    since 1999; and **slub**, improved for current generation SMP hardware with huge
+    memories, and delivers consistent performance with better control and debug mechanisms.
+    The default kernel configuration for most architectures enables **slub** as default
+    slab allocator; this can be changed during kernel build through kernel configuration
+    options.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLAB`: The regular slab allocator that is established and known to
+    work well in all environments. It organizes cache hot objects in per-CPU and per
+    node queues.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLUB`: **SLUB** is a slab allocator that minimizes cache line usage
+    instead of managing queues of cached objects (SLAB approach). per-CPU caching
+    is realized using slabs of objects instead of queues of objects. SLUB can use
+    memory efficiently and has enhanced diagnostics. SLUB is the default choice for
+    a slab allocator.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLOB`: **SLOB** replaces the stock allocator with a drastically simpler
+    allocator. SLOB is generally more space efficient but does not perform as well
+    on large systems.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Irrespective of the type of allocator chosen, the programming interface remains
+    unchanged. In fact, at low level, all three allocators share some common code
+    base:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00027.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: We shall now look into physical layout of a *cache* and its control structures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cache layout - generic
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Each cache is represented by a cache descriptor structure `kmem_cache`; this
+    structure contains all crucial metadata of the cache. It includes a list of slab
+    descriptors, each hosting a page or a group of page frames*.* Pages under slabs
+    contain objects or memory blocks, which are the allocation *units* of the cache.
+    The **slab descriptor** points to a list of objects contained in the pages and
+    tracks their state. A slab may be in one of three possible states--full, partial
+    or empty--based on the state of the objects it is hosting. A s*lab* is considered
+    *full* when all its objects are *in use* with no *free* objects left for allocation.
+    *A slab* with at least one free object is considered to be in *partial* state,
+    and those with all objects in *free* state are considered *empty*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00028.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: This arrangement enables quick object allocations, since allocator routines
+    can look up to the *partial* slab for a free object, and possibly move on to an
+    *empty* slab if required. It also helps easier expansion of the cache with new
+    page frames to accommodate more objects (when required), and facilitates safe
+    and quick reclaims (slabs in *empty* state can be reclaimed).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Slub data structures
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Having looked at the layout of a cache and descriptors involved at a generic
+    level, let''s push further to view specific data structures used by the **slub**
+    allocator and explore the management of free lists. A s**lub** defines its version
+    of cache descriptor, `struct kmem_cache`, in kernel header `/include/linux/slub-def.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `list` element refers to a list of slab caches. When a new slab is allocated,
+    it is stored on a list in the cache descriptor, and is considered *empty,* since
+    all its objects are *free* and available. Upon allocation of an object, the slab
+    turns into *partial* state. Partial slabs are the only type of slabs that the
+    allocator needs to keep track of and are connected in a list inside the `kmem_cache`
+    structure. The **SLUB** allocator has no interest in tracking *full* slabs whose
+    objects have all been allocated, or *empty* slabs whose objects are *free*. **SLUB**
+    tracks partial slabs for each node through an array of pointers of type `struct
+    kmem_cache_node[MAX_NUMNODES]`, which encapsulates a list of *partial* slabs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: All *free* objects in a slab form a linked list; when allocation requests arrive,
+    the first free object is removed from the list and its address is returned to
+    the caller. Tracking free objects through a linked list requires significant metadata;
+    while the traditional **SLAB** allocator maintained metadata for all pages of
+    a slab within the slab header (causing data alignment issues), **SLUB** maintains
+    per-page metadata for pages in a slab by cramming more fields into the page descriptor
+    structure, thereby eliminating metadata from the slab head. **SLUB** metadata
+    elements in the page descriptor are only valid when the corresponding page is
+    part of a slab. Pages engaged for slab allocations have the `PG_slab` flag set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are fields of the page descriptor relevant to SLUB:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `freelist` pointer refers to the first free object in the list. Each free
+    object is composed of a metadata area that contain a pointer to the next free
+    object in the list. `index` holds the offset to the metadata area of the first
+    free object (contains a pointer to next free object). The metadata area of last
+    free object would contain the next free object pointer set to NULL. `inuse` contains
+    the total count of allocated objects, and `objects` contains the total number
+    of objects. `frozen` is a flag that is used as a page lock: if a page has been
+    frozen by a CPU core, only that core can retrieve free objects from the page.
+    `slab_cache` is a pointer to the kmem cache currently using this page:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00029.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: When an allocation request arrives, the first free object is located through
+    the `freelist` pointer, and is removed from the list by returning its address
+    to the caller. The `inuse` counter is also incremented to indicate an increase
+    in the number of allocated objects. The `freelist` pointer is then updated with
+    the address of the next free object in the list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For achieving enhanced allocation efficiency, each CPU is assigned a private
+    active-slab list, which comprises a partial/free slab list for each object type.
+    These slabs are referred to as CPU local slabs, and are tracked by struct `kmem_cache_cpu`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: When an allocation request arrives, the allocator takes the fast path and looks
+    into the `freelist` of the per-CPU cache, and it then returns free objects. This
+    is referred as the fast path since allocations are carried out through interrupt-safe
+    atomic instructions that does not require lock contention. When the fast path
+    fails, the allocator takes the slow path and looks through `*page*` and `*partial*`
+    lists of the cpu cache sequentially. If no free objects are found, the allocator
+    moves into the *partial* lists of nodes; this operation requires the allocator
+    to contend for appropriate exclusion lock. On failure, the allocator gets a new
+    slab from the buddy system. Fetching from either node lists or acquiring a new
+    slab from buddy system are considered very slow paths, since both of these operations
+    are not deterministic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram depicts the relationship between slub data structures
+    and free lists:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00030.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Vmalloc
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Page and slab allocators both allocate physically contiguous blocks of memory,
+    mapped to contiguous kernel address space. Most of the time, kernel services and
+    subsystems prefer to allocate physically contiguous blocks for exploiting caching,
+    address translation, and other performance-related benefits. Nonetheless, allocation
+    requests for very large blocks might fail due to fragmentation of physical memory,
+    and there are few situations that necessitate allocation of large blocks, such
+    as support for dynamically loadable modules, swap management operations, large
+    file caches and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a solution, the kernel provides **vmalloc**, a fragmented memory allocator
+    that attempts to allocate memory, by joining physically scattered memory regions
+    through virtually contiguous address space. A range of virtual addresses within
+    the kernel segment are reserved for vmalloc mappings, called vmalloc address space.
+    Total memory that can be mapped through the vmalloc interface depends on the size
+    of the vmalloc address space, which is defined by architecture-specific kernel
+    macros `VMALLOC_START` and `VMALLOC_END`; for x86-64 systems, the total range
+    of vmalloc address space is a staggering 32 TB**.** However, on the flip side,
+    this range is too little for most 32-bit architectures (a mere 12o MB). Recent
+    kernel versions use the vmalloc range for setting up a virtually mapped kernel
+    stack (x86-64 only), which we discussed in the first chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Following are interface routines for vmalloc allocations and deallocations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: Most kernel developers avoid vmalloc allocations due to allocation overheads
+    (since those are not identity mapped and require specific page table tweaks, resulting
+    in TLB flushes) and performance penalties involved during access operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Contiguous Memory Allocator (CMA)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Albeit with significant overheads, virtually mapped allocations solve the problem
+    of large memory allocations to a greater extent. However, there are a few scenarios
+    that mandate the allocation of physically contiguous buffers. DMA transfers are
+    one such case. Device drivers often find a stringent need for physically contiguous
+    buffer allocations (for setting up DMA transfers), which are carried out through
+    any of the physically contiguous allocators discussed earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, drivers dealing with specific classes of devices such as multimedia
+    often find themselves searching for huge blocks of contiguous memory. To meet
+    this end, over the years, such drivers have been *reserving* memory during system
+    boot through the kernel parameter `mem`, which allows setting aside enough contiguous
+    memory at boot, which can be *remapped* into linear address space during driver
+    runtime. Though valuable, this strategy has its limitations: first, such reserved
+    memories lie momentarily unused when the corresponding device is not initiating
+    access operations, and second, depending on the number of devices to be supported,
+    the size of reserved memories might increase substantially, which might severely
+    impact system performance due to cramped physical memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **contiguous Memory Allocator** (**CMA**) is a kernel mechanism introduced
+    to effectively manage *reserved* memories. The crux of *CMA* is to bring in *reserved*
+    memories under the allocator algorithm, and such memory is referred to as *CMA
+    area. CMA* allows allocations from the *CMA area* for both devices' and system's
+    use. This is achieved by building a page descriptor list for pages in reserve
+    memory, and enumerating it into the buddy system, which enables allocation of
+    *CMA pages* through the page allocator for regular needs (kernel subsystems) and
+    through DMA allocation routines for device drivers*.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: However*,* it must be ensured that DMA allocations do not fail due to the usage
+    of *CMA pages* for other purposes, and this is taken care through the `migratetype`
+    attribute, which we discussed earlier*.* Pages enumerated by CMA into buddy system
+    are assigned the `MIGRATE_CMA` property, which indicates that pages are movable*.*
+    While allocating memory for non-DMA purposes *,* the page allocator can use CMA
+    pages only for movable allocations (recall that such allocations can be made through
+    the `__GFP_MOVABLE` flag). When a DMA allocation request arrives, CMA pages held
+    by kernel allocations are *moved* out of the reserved region (through a page-migration
+    mechanism), resulting in the availability of memory for the device driver's use.
+    Further, when pages are allocated for DMA, their *migratetype* is changed from
+    `MIGRATE_CMA` to `MIGRATE_ISOLATE`, making them invisible to the buddy system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The size of the *CMA area* can be chosen during kernel build through its configuration
+    interface; optionally, it can also be passed through the kernel parameter `cma=`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have traversed through one of the most crucial aspects of the Linux kernel,
+    comprehending various nuances of memory representations and allocations. By understanding
+    this subsystem, we have also succinctly captured the design acumen and implementation
+    efficiency of the kernel, and more importantly understood the kernel's dynamism
+    in accommodating finer and newer heuristics and mechanisms for continuous enhancements.
+    Apart from the specifics of memory management, we also gauged the efficiency of
+    the kernel in maximizing resource usage at minimal costs, ushering all classical
+    mechanisms of code reuse and modular code structures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Though the specifics of memory management may vary in correspondence to the
+    underlying architecture, the generalities of design and implementation styles
+    would mostly remain the same to achieve code stability and sensitivity to change.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the next chapter, we will go further and look at another fundamental abstraction
+    of the kernel: *files.* We will look through file I/O and explore its architecture
+    and implementation details.'
+  prefs: []
+  type: TYPE_NORMAL

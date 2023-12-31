@@ -1,0 +1,1033 @@
+- en: CPU Scheduling on Linux
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: An often-posed question that people have about Linux is, how does scheduling
+    work? We will address this question for user space application developers in this
+    chapter in some detail. In order for the reader to clearly grasp important concepts
+    regarding CPU scheduling on Linux and how you can powerfully use this in applications, we
+    will cover essential background information (the process state machine, real time,
+    and so on) as well. This chapter will end with a brief note on how the Linux OS
+    can even be used as a hard, real-time OS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, the reader will learn about the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux process (or thread) state machine and, importantly, the POSIX scheduling
+    policies that Linux implements under the hood
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Related concepts, such as real-time and CPU affinity
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to exploit the fact that, on a per-thread basis, you can program threads
+    with a given scheduling policy and real time priority (a sample app will be shown)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A brief note on the fact that Linux can also be used as an RTOS
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Linux OS and the POSIX scheduling model
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In order to understand scheduling at the level of the application developer
+    (and how you can leverage this knowledge in actual code), we must first cover
+    some required background information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first and very important concept for the developer to understand is that
+    OSes maintain a construct called the **Kernel Schedulable Entity** (**KSE**)*. *The
+    KSE is the granularity at which the OS scheduling code operates. In effect, what
+    object exactly does the OS schedule?Is it the application, the process, the thread?
+    Well, the short answer is that the KSE on the Linux OS is a thread. In other words,
+    all runnable threads compete for the CPU resource; the kernel scheduler is ultimately
+    the arbiter that decides which thread gets which CPU core and when.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, we present an overview of the process, or thread's, state machine.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux process state machine
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On the Linux OS, every process or thread runs through a variety of definite
+    states, and by encoding these, we can form the state machine of a process (or
+    thread)  on the Linux OS (do refer to *Figure 1* in the following section while
+    reading this).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since we now understand that the KSE on the Linux OS is a thread and not a process,
+    we shall ignore convention—which uses the word *process*—and instead use the word *thread* when
+    describing the entity that cycles through various states of the state machine.
+    (If more comfortable, you could always, in your mind, substitute the word process
+    for thread in the following matter.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The states that a Linux thread can cycle through are as follows (the `ps(1)`
+    utility encodes the state via the letter shown here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**R**: Ready-to-run or Running'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Sleeping:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**S**: Interruptible Sleep'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**D**: Uninterruptible Sleep'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**T**: Stopped (or suspended/frozen)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Z**: Zombie (or defunct)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**X**: Dead'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When a thread is newly created (either via the `fork(2)`, `pthread_create(3)`or `clone(2)`APIs),
+    and once the OS determines that the thread is fully born, it informs the scheduler
+    of its existence by putting the thread into a runnable state. A thread in the
+    **R** state is either actually running on a CPU core or is in the ready-to-run
+    state. What we need to understand is that in both cases, the thread is enqueued
+    on a data structure within the OS called a **run queue** (**RQ**). The threads
+    in the run queue are the valid candidates to run; no thread can possibly run unless
+    it is enqueued on an OS run queue. (For your information, Linux from version 2.6
+    onward best exploits all possible CPU cores by setting up one RQ per CPU core, thus
+    obtaining perfect SMP scalability.) Linux does not explicitly distinguish between
+    the ready-to-run and running states; it merely marks the thread in either state
+    as **R**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The sleep states
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Once a thread is running its code, it obviously keeps doing so, until, typically,
+    one of a few things (mentioned as follows) happen:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It blocks on I/O, thus sleeping—entering state of **S** or **D**, depending
+    (see the following paragraph).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is preempted; there's no state change, and it remains in a ready-to-run state
+    **R** on a run queue.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is sent a signal that causes it to stop, thus entering state **T**.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is sent a signal (typically SIGSTOP or SIGTSTP)  that causes it to terminate, thus
+    first entering state **Z** (zombie is a transient state on the way to death),
+    and then actually dying (state X).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Often, a thread will encounter in its code path a blocking API—one that will
+    cause it to enter a sleep state, waiting on an event. While blocked, it is removed
+    (or dequeued) from the run queue it was on, and instead added (enqueued) onto
+    what's called a **wait queue** (**WQ**). When the event it was waiting upon arises,
+    the OS will issue it a wakeup, causing it to become runnable (dequeued from its
+    wait queue and enqueued onto a run queue) again. Note that the thread won't run
+    instantaneously; it will become runnable (**Rr** in *Figure 1*, Linux state machine),
+    and a candidate for the scheduler; soon enough, it will get a chance and actually
+    run on the CPU (**Rcpu**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A common misconception is to think that the OS maintains one run queue and one
+    wait queue. No—the Linux kernel maintains one run queue per CPU. Wait queues are
+    often created and used by device drivers (as well as the kernel); thus, there
+    can be any number of them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The depth of the sleep determines precisely which state the thread is put into.
+    If a thread issues a blocking call and the underlying kernel code (or device driver
+    code) puts it into an interruptible sleep, the state is marked as **S**. An interruptible
+    sleep state implies that the thread will be awoken when any signal destined for
+    it is delivered; then, it will run the signal handler code, and if not terminated
+    (or stopped), will resume the sleep (recall the `SA_RESTART` flag to `sigaction(2)`from [Chapter
+    11](99fafa09-8972-4d9f-b241-46caf9de98f3.xhtml)*, Signaling - Part I*). This interruptible
+    sleepstate **S** is indeed very commonly seen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, the OS (or driver) could put the blocking thread into a deeper uninterruptible
+    sleep, in which case the state is marked as **D**. An uninterruptible sleep state
+    implies that the thread will not respond to signals (none; not even a SIGKILL
+    from root!). This is done when the kernel determines that the sleep is critical
+    and the thread must await the pending event, blocking upon at any cost. (A common
+    example is a `read(2)` from a file—while data is being actually read, the thread
+    is placed into an uninterruptible sleep state; another is the mounting and unmounting
+    of a filesystem.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Performance issues are often caused by very high I/O bottlenecks; high CPU
+    usage is not always a major problem, but continually high I/O will make the system
+    feel very slow. A quick way to determine which application(s) (processes and threads,
+    really) are causing the heavy I/O is to filter the `ps(1)`output looking for processes
+    (or threads) in the **D**, uninterruptible sleep state. As an example, refer to
+    the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`$ ps -LA -o state,pid,cmd | grep`** `"^D"`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`**D** 10243 /usr/bin/gnome-shell`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`**D** 13337 [kworker/0:2+eve]`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`**D** 22545 /home/<user>/.dropbox-dist/dropbox-lnx.x86_64-58.4.92/dropbox`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that we use `ps -LA`; the `-L` switch shows all threads alive as well.
+    (FYI, the thread shown in the preceding square brackets,`[kworker/...]`, is a kernel
+    thread.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram represents the Linux state machine for any process or
+    thread:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/b25cef64-61ac-4c07-99f0-8cf2773c27cb.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1: Linux state machine'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding diagram shows transitionsbetween states via red arrows. Do note
+    that for clarity, some transitions (for example, a thread, can be killed while
+    asleep or stopped) are not explicitly shown in the preceding diagram.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is real time?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Many misconceptions exist regarding the meaning of real time (in application
+    programming and OS contexts). Real time essentially means that not only do the
+    real-time thread (or threads) perform their work correctly, but they must perform
+    within a given worst-case deadline. Actually, the key factor in a real time system
+    is called determinism. Deterministic systems have a guaranteed worst-case response
+    time to real-world (or artificially generated) events; they will process them
+    within a bounded time constraint. Determinism leads to predictable response, under
+    any conditions—even extreme load. One way in which computer scientists classify
+    algorithms is via their time complexity: the big-O notation. O(1) algorithms are deterministic; they
+    guarantee that they will complete within a certain worst-case time, no matter
+    the input load. True real-time systems require O(1) algorithms for implementing
+    their performance-sensitive code paths.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interestingly, real time does not necessarily mean real fast. A VDC survey (refer
+    to the *Further reading* section on the GitHub repository for more details) shows
+    that the majority of real-time systems have a deadline (real-time response time)
+    requirement of 1 to 9 milliseconds. As long as the system can consistently and
+    without fail service the event within its given deadline (which could be fairly
+    large), it's real time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Types of real time
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Real time is often classified into three types, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Hard real-time systems** are defined as those that must always meet all deadlines. Failure
+    to meet a deadline even once results in the catastrophic failure of the system,
+    including possible loss to human life, financial loss, and so on. A hard real
+    time system requires a **Real-Time Operating System** (**RTOS**) to drive it.
+    (Also, it''s really important that the applications are written to be hard real
+    time as well!). Possible hard real-time domains include human transportation vehicles
+    of many types (aircraft, marine vessels, spacecraft, trains, and elevators) and
+    some kinds of military grade or defense equipment, nuclear reactors, medical electronics,
+    and stock exchanges. (Yes, stock exchanges are very much a hard real time system;
+    do read the book *Automate This: How Algorithms Came to Rule Our World*—refer
+    to the *Further reading* section on the GitHub repository for more information.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Soft real-timesystems** are all about best effort; deadlines do exist, but
+    there is absolutely no guarantee that they will be met. The system will do its
+    best to meet them; failure to do so is considered okay (often, it''s just more
+    of an annoyance to the end user rather than anything dangerous). Consumer electronics
+    products (such as  our smartphones, MP3 players, cameras, tablets, and smart speakers)
+    are typical examples. While using them, it quite often happens that you will hear
+    a glitch while listening to music, or a streaming video stutters, buffers, and
+    jitters. While annoying, it''s unlikely the user will perish.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Firm real-timesystems** fall in-between the hard and soft real-time ones—deadlines
+    are important and will be met as far as is possible, but again, no ironclad guarantees
+    can be made. Performance degradation due to missing too many deadlines is an issue
+    here.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Scheduling policies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A key job of the **operating system** (**OS**) is to schedule runnable tasks.
+    The POSIX standard states that a POSIX-complaint OS must provide (at least) three scheduling
+    policies. A scheduling policy is really the scheduling algorithm used by the OS
+    to schedule tasks. In this book, we will not delve into such details, but we do
+    need the application developer to be aware of the scheduling policies available.
+    These are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SCHED_FIFO`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCHED_RR`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCHED_OTHER` (also known as `SCHED_NORMAL`)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Our discussions on this, naturally, will be solely with regard to the Linux
+    OS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first important thing to understand is that the vanilla Linux OS is not
+    an RTOS; it does not support hard real-time and is classified as a **General Purpose
+    Operating System** (**GPOS**), like the others—Unix, Windows, and macOS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do read on, though; we shall see that while hard real-time is not possible with
+    vanilla Linux, it is indeed possible to run an appropriately patched Linux as
+    an RTOS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Linux, though a GPOS, easily performs as a soft real-timesystem. Indeed, its
+    high performance characteristics bring it close to being a firm real-time system.
+    Thus, the predominant use of the Linux OS in consumer electronics (and enterprise)
+    products is not at all surprising.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, the first two scheduling policies that we mentioned—`SCHED_FIFO` and `SCHED_RR`
+    —are Linux's soft real-time scheduling policies. The `SCHED_OTHER` (also known
+    as `SCHED_NORMAL`) policy is the non-real-time scheduling policy and is always
+    the default one*.* The `SCHED_OTHER` policy is implemented on modern Linux kernels
+    as the **Completely Fair Scheduler** (**CFS**); it's an implementation whose primary
+    design goals are to provide overall high system throughput and fairness to every
+    runnable task (thread), ensuring that a thread does not starve. This is quite
+    the anti-thesis of a real-time policy algorithm, whose overriding motivation is priority of
+    the thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For both the `SCHED_FIFO` and `SCHED_RR` soft real-time policies, the Linux
+    OS specifies a priority range. This range is from 1 to 99, where 1 is the lowest
+    real-time priority and 99 is the highest. The soft real-time scheduling policy
+    design on Linux follows what is known as *f**ixed priority preemptive scheduling*,
+    and this is important to understand. Fixed priority implies that the applicationdecides
+    and fixes the thread priority (and can change it); the OS does not. Preemption is
+    the act of the OS snatching away the CPU from the running thread, relegating it
+    back to its run queue, and context switching to another thread. The precise preemptive
+    semantics with regard to the scheduling policies will be covered next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We shall now briefly describe, in real-world terms, what it means to be running
+    under these differing scheduling policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A running `SCHED_FIFO` thread can only be preempted under the following three
+    conditions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It (in)voluntarily yields the processor (technically, it moves out from the
+    **R** state). This happens when a task issues a blocking call or invokes a system
+    call like `sched_yield(2)`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It stops or dies.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A higher priority real-time task becomes runnable.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This is the key point to understand: a `SCHED_FIFO` task is aggressive; it
+    runs with infinite timeslice, and unless it blocks (or is stopped or killed),
+    will continue to run on the processor indefinitely. However, the moment a higher
+    priority thread becomes runnable (state **R**, entering the run queue), it will
+    be preempted in favor of this thread.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SCHED_RR` behavior is nearly identical to that of `SCHED_FIFO`, except that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It has a finite timeslice, and thus has an additional scenario under which
+    it can be preempted: when its timeslice expires.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When preempted, the task is moved to the tail of the run queue for its priority
+    level, ensuring that all `SCHED_RR` tasks at the same priority level are executed
+    in turn (hence its name round robin).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Notice that on an RTOS the scheduling algorithm is simple, as all it really
+    has to do is implement this semantic: the highest priority runnable thread must
+    be the thread that is running.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All threads run under the `SCHED_OTHER` (or `SCHED_NORMAL`) scheduling policy
+    by default. It is a decidedly non-real-time policy, the emphasis being on fairness
+    and overall throughput. Its implementation from Linux kernel version 2.6.0 up
+    until 2.6.22 (inclusive) was via the so-called O(1) scheduler; from 2.6.23 onward,
+    a further improved algorithm called the **Completely Fair Scheduler** (**CFS**) implements
+    this scheduling policy (actually a scheduling class). Refer to the following table
+    for more information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Scheduling policy** | **Type** | **Priority range** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_FIFO` | Soft real-time: Aggressive, unfair | 1 to 99 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_RR` | Soft real-time: Less aggressive | 1 to 99 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_OTHER` | Non real-time: Fair, time sharing; the default | Nice value
+    (-20 to +19) |'
+  prefs: []
+  type: TYPE_TB
+- en: Though not very commonly used, we point out that Linux also supports a batched
+    mode process execution policy with the SCHED_BATCH policy. Also, the SCHED_IDLE
+    policy is used for very low priority background tasks. (In fact, the CPU idle
+    thread—(mis)named `swapper` with PID `0`, exists for each CPU and runs only when
+    absolutely no other task wants the processor).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Peeking at the scheduling policy and priority
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Linux provides the `chrt(1)`utility to view and change a thread''s (or process)
+    real-time scheduling policy and priority. A quick demonstration of using it to
+    display the scheduling policy and priority of a given process (by PID) can be
+    seen in the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding, we have queried the scheduling policy and priority of the `chrt(1)` process
+    itself (with the shell's `$$` variable). Try this for other threads; you will
+    notice the policy is (almost) always `SCHED_OTHER` and that the real-time priority
+    is zero. A real-time priority of zero implies that the process is not real time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can always query a thread's scheduling policy and (real-time) priority by
+    passing the thread PID (via the output of `ps -LA` or similar) to `chrt(1)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The nice value
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'So, now you may be wondering, if all non-real-time threads (the `SCHED_OTHER`
+    chaps) have a priority of zero, then how can I support prioritization between
+    them? Well, that''s exactly what the nice value of a `SCHED_OTHER` thread is for:
+    it''s the (older) Unix-style priority model and now, on Linux, specifies a relative
+    priority between the non-real-time threads.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The nice value is a priority range between **-20** to **+19** (on modern Linux),
+    with the base priority being zero. On Linux, it''s a per-thread attribute; when
+    a thread is created, it inherits the nice value of its creator thread—zero being
+    the default. Refer to the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/7552b647-8192-4284-ab25-ef4e8ba443a2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: Linux thread priority ranges'
+  prefs: []
+  type: TYPE_NORMAL
+- en: From 2.6.23 (with the CFS kernel scheduler), the nice value of a thread has
+    a large impact (a factor of 1.25 for each degree of nice value) on scheduling;
+    thus, **-20** nice value threads get much more CPU bandwidth (this is good for
+    CPU-sensitive applications like multimedia) and **+19** nice value threads get
+    very little CPU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An application programmer can query and set the nice value via the `nice(1)` command-line
+    utility, and the `nice(2)`, `setpriority(2)`, and `sched_setattr(2)` system calls
+    (the last being the most recent and correct one to use). We refer you to the respective
+    man pages for these APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keep in mind that a real-time (`SCHED_FIFO` or `SCHED_RR`) thread is always
+    superior to a `SCHED_OTHER` thread in terms of priority (thus pretty much guaranteeing
+    that it will get a chance to run earlier).
+  prefs: []
+  type: TYPE_NORMAL
+- en: CPU affinity
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's visualize a Linux system with four CPU cores and, for simplicity, one
+    ready-to-run thread. On which CPU core will this thread run? The kernel will decide
+    this; the key thing to realize is that it could run upon any of the four available
+    CPUs!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Can the CPU(s) it could possibly be run upon be specified by the programmer?
+    Yes, indeed; just this feature alone is called CPU affinity. On Linux, it is a
+    per-thread attribute (within the OS). The CPU affinity can be changed on a per-thread
+    basis by changing the thread''s CPU affinity mask; this is achieved, of course,
+    via a system call. Let''s take a look at the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The kernel scheduler will honor the CPU mask—the set of CPUs the thread is allowed
+    to execute upon—set by the programmer. We are expected to specify the CPU affinity
+    mask as a `cpu_set_t` object. (We refer the reader to the man page on `sched_setaffinity(2)`, which
+    helpfully provides an example program).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the pthreads framework provides the wrapper APIs `pthread_setaffinity_np(3)` and `pthread_getaffinity_np(3)` to
+    perform the same on a given thread (they internally invoke the `sched_setaffinity(2)` system
+    call).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An interesting design is that of CPU reservation. On a sufficiently multi-core
+    system (say we have a system with four CPU cores: 0, 1, 2, and 3), you can use
+    the preceding CPU affinity mask model to effectively set aside one CPU core (say
+    core 3) for a given thread (or threads) that are crucial to performance. This
+    implies that you must set the CPU mask for that thread to the particular CPU (say
+    core 3) and, importantly, set the CPU mask for all other threads to exclude core
+    3.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though it may sound simple, it''s really not a trivial exercise; some of the
+    reasons why this is the case are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You must realize that the CPU set aside is not really exclusively reserved for
+    the thread(s) specified; for true CPU reservation, except for the given thread(s)
+    running on that CPU, all other threads on the entire system must somehow be excluded
+    from running on that CPU.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As a general guideline, the OS scheduler best understands how to allocate CPU
+    bandwidth among available CPU cores (it has a load balancer component and understands
+    the CPU hierarchy); thus, CPU allocation is best left to the OS.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Modern Linux kernels have support for a very powerful feature: **control groups** (**cgroups**).
+    (see [Appendix B](https://www.packtpub.com/sites/default/files/downloads/Daemon_Processes.pdf), *Daemon
+    Processes*, for a note). With regard to CPU reservation, it can be achieved via
+    the cgroup model. Please refer to the following Q&A on Stack Overflow for more
+    details: *How to use cgroups to limit all processes except whitelist to a single
+    CPU*:[https://unix.stackexchange.com/questions/247209/how-to-use-cgroups-to-limit-all-processes-except-whitelist-to-a-single-cpu](https://unix.stackexchange.com/questions/247209/how-to-use-cgroups-to-limit-all-processes-except-whitelist-to-a-single-cpu).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For convenience, Linux provides the `taskset(1)` utility as a simple way to
+    query and specify the CPU affinity mask of any given process (or thread). Here,
+    we shall query the CPU affinity mask of two processes. (we assume that the system
+    we are running on has four CPU cores; we can use `lscpu(1)` to query this):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: PID 1's (systemd) CPU affinity mask is `0xf`, which, of course, is binary `1111`.
+    If a bit is set `1`, it implies the thread can run on the CPU represented by that
+    bit. If the bit is cleared `0`, it implies the thread cannot run on the CPU represented
+    by that bit. Exactly as expected, on a four-CPU box, the CPU affinity bitmask
+    is 0xf (1111) by default, implying that, the process (or thread) can run on any
+    available CPU. Interestingly, in the preceding output the bash process appears
+    to have a CPU affinity mask of `7`, which translates to binary `0111`, implying
+    that it will never be scheduled to run on CPU 3.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following code, a simple shell script invokes the `chrt(1)` as well
+    as the `taskset(1)` utility in a loop, displaying the scheduling policy, (real-time)
+    priority, and CPU affinity mask of every process that''s alive on the system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We encourage the reader to try this out on their own system. In the following
+    code, we `grep(1)` for any `SCHED_FIFO` tasks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Yes! We find some threads. Wow, they are all of `SCHED_FIFO` real-time priority
+    99! Let''s check out who these threads are (with a cool one-liner script, too):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: For clarity, the `ps aux` heading—which would not normally be displayed—is shown
+    in the preceding code. Also, we use the `ps aux` style as, conveniently, kernel
+    threads are displayed in brackets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It turns out (here, in this particular example, at least) that they are all
+    kernel threads (see the following information box). The important thing to understand
+    is that they are deliberately `SCHED_FIFO` (real-time) priority 99, so that, when
+    they want to run on the CPU, they will run pretty much immediately. In fact, let''s
+    take a glance at their CPU affinity mask: it''s deliberately allocated (with values
+    like 1,2,4,8) so that they are affined to a particular CPU core. It''s important
+    to understand that these kernel threads are not CPU hoggers; in reality, they
+    will spend most of the time asleep (state **S**) and only spring into action when
+    required.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Kernel threads are not very different from their user space counterparts; they
+    too compete for the CPU resource. The key difference is that kernel threads have
+    no view of user space—they only execute in kernel virtual address space (whereas
+    user space threads, of course, see both: userland in normal user mode and, upon
+    issuing a system call, they switch to kernel space).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploiting Linux's soft real-time capabilities
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Recall that, earlier in this chapter, we stated: The soft real-time scheduling
+    policy design on Linux follows what is known as fixed priority preemptive scheduling;
+    fixed priority implies that the application decides and fixes the thread priority
+    (and can change it); the OS does not.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Not only can the application switch between thread priorities, but even the
+    scheduling policy (in effect, the scheduling algorithm used under the hood by
+    the OS) can be changed by the application developer; this can be done on a per-thread
+    basis. That's indeed very powerful; it implies that an application having, say,
+    five threads, can decide what scheduling policy and priority to assign to each
+    of these threads!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Scheduling policy and priority APIs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Obviously, in order to achieve this, the OS must expose some APIs; indeed, there
+    are a few system calls that deal with exactly this—changing a given process or
+    thread's scheduling policy and priority.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s a list—a sampling, really—of some of the more important of these APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`sched_setscheduler(2)`: Sets the scheduling policy and parameters of a specified
+    thread.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_getscheduler(2)`: Returns the scheduling policy of a specified thread.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_setparam(2)`: Sets the scheduling parameters of a specified thread.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_getparam(2)`: Fetches the scheduling parameters of a specified thread.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_get_priority_max(2)`: Returns the maximum priority available in a specified
+    scheduling policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_get_priority_min(2)`: Returns the minimum priority available in a specified
+    scheduling policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_rr_get_interval(2)`: Fetches the quantum used for threads that are scheduled
+    under the round-robin scheduling policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_setattr(2)`: Sets the scheduling policy and parameters of a specified
+    thread. This (Linux-specific) system call provides a superset of the functionality
+    of `sched_setscheduler(2)` and `sched_setparam(2)`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_getattr(2)`: Fetches the scheduling policy and parameters of a specified
+    thread. This (Linux-specific) system call provides a superset of the functionality
+    of `sched_getscheduler(2)` and `sched_getparam(2)`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sched_setattr(2)` and `sched_getattr(2)` are currently considered to be the
+    latest and more powerful of these APIs. Also, on Ubuntu, one can issue the convenient
+    `man -k sched` command to see all utils and APIs related to scheduling (-k: keyword).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The astute reader will quickly notice that all of the APIs we mentioned previously are
+    system calls (section 2 of the manual), but what about pthreads APIs? Indeed,
+    they do exist and, as you may have guessed, are mostly just wrappers that invoke
+    the underlying system calls; in the following code, we show two of them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It''s important to note that, in order to set the scheduling policy and priority
+    of a thread (or process), you need to be running with root access. Recall that
+    the modern way to bestow privileges to threads is via the Linux Capabilities model
+    (we covered this in detail in [Chapter 8](b4538277-87f0-46f1-83fa-632fa470bfd7.xhtml),
+    *Process Capabilities*). A thread with the capability `CAP_SYS_NICE` can arbitrarily
+    set its scheduling policy and priority to any value it desires. Think about it:
+    if this were not the case, then pretty much all apps could insist that they run
+    as `SCHED_FIFO` priority 99, effectively rendering the whole concept meaningless!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_setschedparam(3)` internally invokes the the `sched_setscheduler(2)` system
+    call, and `pthread_getschedparam(3)` invokes the `sched_getscheduler(2)` system
+    call under the hood. Their API signatures are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Other pthreads APIs exist as well. Notice that the ones shown here help set
+    up the thread attribute structure: `pthread_attr_setinheritsched(3)`, `pthread_attr_setschedparam(3)`, `pthread_attr_setschedpolicy(3)`, and
+    `pthread_setschedprio(3)`, to name a few.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The man page on `sched(7)` (look it up by typing `man 7 sched` in a terminal
+    window) details the available APIs for controlling scheduling policy, priority,
+    and behavior for threads. It provides details on current Linux scheduling policies,
+    privileges required to change them, relevant resource limit values, and kernel
+    tunables for scheduling, as well as other miscellaneous details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code example – setting a thread scheduling policy and priority
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help solidify the concepts that we learned about in the previous sections
+    of this chapter, we will design and implement a small demo program, illustrating
+    how a modern Linux pthreads application can set an individual thread's scheduling
+    policy and priority to make threads (soft) real-time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our demo app will have a total of three threads. The first is `main()`, of
+    course. The following bullet points show what the application is designed to do:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thread 0 (`main()`, really):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This runs as a `SCHED_OTHER` scheduling policy with real-time priority 0, which
+    is the default. It does the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Queries the priority range of `SCHED_FIFO`, printing out the values
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creates two worker threads (with joinability state set to detached); they will
+    automatically inherit the scheduling policy and priority of main
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Prints the character `m` to the terminal in a loop (using our `DELAY_LOOP` macro;
+    for a little longer than usual)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Terminates
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Worker thread 1:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changes its scheduling policy to `SCHED_RR`, setting its real-time priority
+    to the value passed on the command line
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sleeps for 2 seconds (thus blocking on I/O, allowing main to get some work done)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Upon waking up, it prints the character `1` to the terminal in a loop (via the `DELAY_LOOP` macro)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Terminates
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Worker thread 2:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changes its scheduling policy to `SCHED_FIFO`, setting its real-time priority
+    to the value passed on the command line plus 10
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sleeps for 4 seconds (thus blocking on I/O, allowing Thread 1 to do some work)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Upon waking up, it prints the character `2` to the terminal in a loop
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Terminates
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s take a quick look at the code (`ch17/sched_rt_eg.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here; to view
+    the complete source code, and build and run it, the entire tree is available for
+    cloning from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following code is the code for `main()`. (We have omitted showing the error
+    checking code):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following code is for worker thread 1. We have omitted showing the error
+    checking code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The code of worker thread 2 is almost identical to that of the preceding worker
+    thread; the difference, however, is that we set the policy to `SCHED_FIFO` and
+    the real-time priority is bumped up by 10 points, thus making it more aggressive.
+    We only show this snippet here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s build it (we definitely recommend building the debug version, as then
+    the `DELAY_LOOP` macro''s effect is clearly seen) and give it a spin:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We must run our app as root; we use `sudo(8)` to do so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding output, we can see the following characters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`m`: This implies that the main thread is currently running on CPU'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`1`: This implies that the (soft) real-time worker thread 1 is currently running
+    on CPU'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`2`: This implies that the (soft) real-time worker thread 2 is currently running
+    on CPU'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'But, oops, the preceding output really isn''t what we expect: the `m`, `1`,
+    and `2` characters are intermingled, leading us to conclude that they have been
+    time-sliced.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But this isn''t the case. Think about it—the output is as it appears in the
+    preceding code for the simple reason that we have run the app on a multi-core system
+    (in the preceding code, on a laptop with four CPU cores); thus, the kernel scheduler
+    has cleverly exploited the hardware and run all three threads in parallel on different
+    CPU cores! So, in order to have our demo application run the way we expect, we
+    need to ensure that it runs on exactly one CPU core and no more. How? Recall CPU
+    affinity: we can use the `sched_setaffinity(2)` system call to do this. There
+    is an easier way: we can use `taskset(1)` to guarantee that the process (and thus
+    all threads within it) run on only one CPU core (for example, CPU 0) by specifying
+    the CPU mask value as `01`. So, let''s perform the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Yes, using the `taskset(1)` to ensure that the whole app—all three threads—runs
+    on the first CPU core has the desired effect. Now, study the preceding output
+    carefully; we can see that the `main()` thread – non-real-time—runs first for
+    about 2 seconds; once 2 seconds have elapsed, the worker thread 1 wakes up, becoming
+    runnable. As its policy and priority far outweighs that of main(), it preempts
+    main() and runs, printing 1s to the terminal. Remember that worker thread 2 is
+    also running in parallel, but, of course, it sleeps for 4 seconds. So, 2 seconds
+    later—once a total of 4 seconds have elapsed – worker thread 2 wakes up, becoming
+    runnable. As its policy is `SCHED_FIFO` and, more importantly, its priority  is
+    10 points higher than thread 1, it preempts thread 1 and runs, printing `2s` to
+    the terminal. Until it terminates, the other threads cannot run; once it does,
+    worker thread 1 runs. Again, until it terminates, main() cannot run; once it does
+    die, main() finally gets the CPU and finishes, and so the application terminates.
+    Interesting; do try it out for yourself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For your information, the man page on `pthread_setschedparam(3)` has a fairly
+    detailed example program: [http://man7.org/linux/man-pages/man3/pthread_setschedparam.3.html](http://man7.org/linux/man-pages/man3/pthread_setschedparam.3.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Soft real-time – additional considerations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A few additional points to think about: we have the power to associate threads
+    with a (soft) real-time policy and priority (with the caveat that we have root
+    access; or the CAP_SYS_NICE capability). For most human interactive application
+    domains this is not only unnecessary, but it will cause disconcerting feedback
+    and side effects to the typical desktop or server system end user. As a general
+    rule, you should avoid using these real-time policies on interactive applications.
+    Only when it is essential to highly prioritize a thread—typically for a real-time application
+    (perhaps running on an embedded Linux box), or some kinds of benchmarking or profiling
+    software (`perf(1)` being a good example; one can specify the `--realtime=n` parameter
+    to `perf` to have it run as `SCHED_FIFO` priority `n`)—should you consider using
+    these powerful technologies.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, the precise real-time priorities to be used are left to the application
+    architects; using the same priority values for `SCHED_FIFO` and `SCHED_RR` threads
+    (recall that both policies are peers, with `SCHED_FIFO` being more aggressive)
+    can lead to unpredictable scheduling. Carefully think about the design and accordingly
+    set the policy and priority of each real-time thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, though not covered in depth in this book, Linux's cgroups model allows
+    you to powerfully control the bandwidth allocation of a resource (CPUs, network,
+    and block I/O) for a given process or group of processes. If this is what is required,
+    consider using the cgroups framework to achieve your goals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: RTL – Linux as an RTOS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The fact is, incredible as it may seem, the Linux OS can be used as an RTOS;
+    that is, a hard real-time-capable RTOS. The project started out as the brainchild
+    of Thomas Gleixner (of Linutronix), who wanted to port Linux to become an RTOS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, this is really the beauty of the open source model and Linux; being open
+    source, interested, and motivated people take Linux (or other projects) as a starting
+    point and build upon it, often coming up with significantly new and useful products.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few points to note regarding this project are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Modifying the Linux kernel to become an RTOS is a necessarily invasive procedure;
+    Linus Torvalds, the de facto Linux boss, does not want this code in the upstream
+    (vanilla) Linux kernel. Thus, the real-time Linux kernel project lives as a patch
+    series (on kernel.org itself; see the links in the *Further reading* section on
+    the GitHub repository for more information) that can be applied upon a mainline
+    kernel.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This effort has been successfully undertaken right from the 2.6.18 Linux kernel
+    (from perhaps around 2006 or 2007).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For many years, the project was called Preempt-RT (with the patches themselves
+    called PREEMPT_RT).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Later (from October 2015 onward), stewardship of the project was taken over
+    by the **Linux Foundation** (**LF**)—a positive step. The name was changed from Preempt
+    RT to **real-time Linux** (**RTL**).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Indeed, the RTL roadmap very much has the goal of pushing relevant PREEMPT_RT
+    work upstream (into the mainline Linux kernel; see the *Further reading* on the
+    GitHub repository section for a link on this).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In effect, you can apply the appropriate RTL patches and then use Linux as a hard
+    real-time RTOS. Industry has already begun to use the project (in industrial control
+    apps, drones,  and TV cameras); we can only imagine that this will grow tremendously.
+    It's also important to note that having a hard real-time OS is not sufficient
+    for true real-time usage; even the applications have to be written to conform
+    to real-time expectations. Do check out the *HOWTO* documentation provided on
+    this by the RTL project wiki site (see the *Further reading* section on the GitHub
+    repository).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we covered important concepts related to CPU scheduling on
+    Linux and real-time. The reader has been taken through progressive topics on the
+    Linux thread state-machine, real-time, CPU affinity, and the available POSIX scheduling
+    policies. Furthermore, we have shown APIs—both at the pthreads and system call
+    layers—to exploit these powerful mechanisms. A demo application reinforced the
+    concepts that we learned. Finally, a quick note on the fact that Linux can also
+    be used as a hard real-time (RTOS) was covered.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, the reader will be shown how to achieve the best I/O performance
+    using modern techniques.
+  prefs: []
+  type: TYPE_NORMAL

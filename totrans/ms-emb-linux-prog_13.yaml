@@ -1,0 +1,1278 @@
+- en: Chapter 13. Profiling and Tracing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Interactive debugging using a source level debugger, as described in the previous
+    chapter, can give you an insight into the way a program works, but it constrains
+    your view to a small body of code. In this chapter, I will look at the larger
+    picture to see if the system is performing as intended.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Programmers and system designers are notoriously bad at guessing where bottlenecks
+    are. So, if your system has performance issues, it is wise to start by looking
+    at the full system and then work down, using more sophisticated tools. In this
+    chapter I begin with the well-known command, `top`, as a means of getting an overview.
+    Often the problem can be localized to a single program, which you can analyze
+    using the Linux profiler, `perf`. If the problem is not so localized and you want
+    to get a broader picture, `perf` can do that as well. To diagnose problems associated
+    with the kernel, I will describe the trace tools, `Ftrace` and `LTTng`, as a means
+    of gathering detailed information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I will also cover Valgrind which, because of its sandboxed execution environment,
+    can monitor a program and report on code as it runs. I will complete the chapter
+    with a description of a simple trace tool, `strace`, which reveals the execution
+    of a program by tracing the system calls it makes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The observer effect
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before diving into the tools, let''s talk about what the tools will show you.
+    As is the case in many fields, measuring a certain property affects the observation
+    itself. Measuring the electric current in a line requires measuring the voltage
+    drop over a small resistor. However, the resistor itself affects the current.
+    The same is true for profiling: every system observation has a cost in CPU cycles
+    and that resource is no longer spent on the application. Measurement tools also
+    mess up caching behavior, eat memory space, and write to disk, which all make
+    it worse. There is no measurement without overhead.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: I've often heard engineers say that the results of a profiling job were totally
+    misleading. That is usually because they were performing the measurements on something
+    approaching a real situation. Always try to measure on the target, using release
+    builds of the software, with a valid data set, using as few extra services as
+    possible.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Symbol tables and compile flags
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We will hit a problem immediately. While it is important to observe the system
+    in its natural state, the tools often need additional information to make sense
+    of the events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some tools require special kernel options, specifically from those listed in
+    the introduction, `perf`, `Ftrace`, and `LTTng`. Therefore, you will probably
+    have to build and deploy a new kernel for these tests.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Debug symbols are very helpful in translating raw program addresses into function
+    names and lines of code. Deploying executables with debug symbols does not change
+    the execution of the code but it does require that you have copies of the binaries
+    and the kernel compiled with `debug`, at least for the components you want to
+    profile. Some tools work best if you have these installed on the target system,
+    `perf`, for example. The techniques are the same as for general debugging, as
+    I discussed in [Chapter 12](ch12.html "Chapter 12. Debugging with GDB"), *Debugging
+    with GDB*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you want a tool to generate call graphs, you may have to compile with stack
+    frames enabled. If you want the tool to attribute addresses with lines of code
+    accurately, you may need to compile with lower levels of optimization.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, some tools require instrumentation to be inserted into the program
+    to capture samples, so you will have to recompile those components. This applies
+    to `gprof` for applications, and `Ftrace` and `LTTng` for the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Be aware that, the more you change the system you are observing, the harder
+    it is to relate the measurements you make to the production system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: It is best to adopt a wait-and-see approach, making changes only when the need
+    is clear, and being mindful that each time you do so, you will change what you
+    are measuring.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Beginning to profile
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When looking at the entire system, a good place to start is with a simple tool
+    like `top`, which gives you an overview very quickly. It shows you how much memory
+    is being used, which processes are eating CPU cycles, and how this is spread across
+    different cores and time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If `top` shows that a single application is using up all the CPU cycles in user
+    space then you can profile that application using `perf`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If two or more processes have a high CPU usage, there is probably something
+    that is coupling them together, perhaps data communication. If a lot of cycles
+    are spent in system calls or handling interrupts, then there may be an issue with
+    the kernel configuration or with a device driver. In either case you need to start
+    by taking a profile of the whole system, again using `perf`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you want to find out more about the kernel and the sequencing of events there,
+    you would use `Ftrace` or `LTTng`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There could be other problems that `top` will not help you with. If you have
+    multi-threaded code and there are problems with lockups, or if you have random
+    data corruption then Valgrind plus the Helgrind plug-in might be helpful. Memory
+    leaks also fit into this category: I covered memory-related diagnosis in [Chapter
+    11](ch11.html "Chapter 11. Managing Memory"), *Managing Memory*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Profiling with top
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`top` is a simple tool that doesn''t require any special kernel options or
+    symbol tables. There is a basic version in BusyBox, and a more functional version
+    in the `procps` package which is available in the Yocto Project and Buildroot.
+    You may also want to consider using `htop` which is functionally similar to `top`
+    but has a nicer user interface (some people think).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To begin with, focus on the summary line of `top`, which is the second line
+    if you are using BusyBox and the third line if using `procps` `top`. Here is an
+    example, using BusyBox `top`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The summary line shows the percentage of time spent running in various states,
+    as shown in this table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| procps | Busybox |   |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `us` | `usr` | User space programs with default nice value |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `sy` | `sys` | Kernel code |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ni` | `nic` | User space programs with non-default nice value |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `id` | `idle` | Idle |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `wa` | `io` | I/O wait |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `hi` | `irq` | Hardware interrupts |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `si` | `sirq` | Software interrupts |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `st` | `--` | Steal time: only relevant in virtualized environments |'
+  prefs: []
+  type: TYPE_TB
+- en: 'In the preceding example, almost all of the time (58%) is spent in user mode,
+    with a small amount (4%) in system mode, so this is a system that is CPU-bound
+    in user space. The first line after the summary shows that just one application
+    is responsible: `ffmpeg`. Any efforts towards reducing CPU usage should be directed
+    there.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is another example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: This system is spending almost all of the time in kernel space, as a result
+    of `cat` reading from `/dev/urandom`. In this artificial, case, profiling `cat`
+    by itself would not help, but profiling the kernel functions that `cat` calls
+    might be.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default view of `top` shows only processes, so the CPU usage is the total
+    of all the threads in the process. Press *H* to see information for each thread.
+    Likewise, it aggregates the time across all CPUs. If you are using `procps top`,
+    you can see a summary per CPU by pressing the *1* key.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Imagine that there is a single user space process taking up most of the time
+    and look at how to profile that.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Poor man's profiler
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You can profile an application just by using GDB to stop it at arbitrary intervals
+    and see what it is doing. This is the *poor man's profiler*. It is easy to set
+    up and it is one way of gathering profile data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The procedure is simple and explained here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Attach to the process using `gdbserver` (for a remote debug) or gbd (for a native
+    debug). The process stops.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Observe the function it stopped in. You can use the `backtrace GDB` command
+    to see the call stack.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Type `continue` so that the program resumes.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After a while, type *Ctrl* + *C* to stop it again and go back to step 2.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If you repeat steps 2 to 4 several times, you will quickly get an idea of whether
+    it is looping or making progress and, if you repeat them often enough, you will
+    get an idea of where the hotspots in the code are.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a whole web page dedicated to the idea at [http://poormansprofiler.org](http://poormansprofiler.org),
+    together with scripts which make it a little easier. I have used this technique
+    many times over the years with various operating systems and debuggers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is an example of statistical profiling, in which you sample the program
+    state at intervals. After a number of samples, you begin to learn the statistical
+    likelihood of the functions being executed. It is surprising how few you really
+    need. Other statistical profilers are `perf record`, `OProfile`, and `gprof`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Sampling using a debugger is intrusive because the program is stopped for a
+    significant period while you collect the sample. Other tools can do that with
+    much lower overhead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I will now consider how to use `perf` to do statistical profiling.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing perf
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`perf` is an abbreviation of the **Linux performance event counter subsystem**,
+    `perf_events`, and also the name of the command-line tool for interacting with
+    `perf_events`. Both have been part of the kernel since Linux 2.6.31\. There is
+    plenty of useful information in the Linux source tree in `tools/perf/Documentation`,
+    and also at [https://perf.wiki.kernel.org](https://perf.wiki.kernel.org).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The initial impetus for developing `perf` was to provide a unified way to access
+    the registers of the **performance measurement unit** (**PMU**), which is part
+    of most modern processor cores. Once the API was defined and integrated into Linux,
+    it became logical to extend it to cover other types of performance counters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At its heart, `perf` is a collection of event counters with rules about when
+    they actively collect data. By setting the rules, you can capture data from the
+    whole system, or just the kernel, or just one process and its children, and do
+    it across all CPUs or just one CPU. It is very flexible. With this one tool you
+    can start by looking at the whole system, then zero in on a device driver that
+    seems to be causing problems, or an application that is running slowly, or a library
+    function that seems to being taking longer to execute than you thought.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The code for the `perf` command-line tool is part of the kernel, in the `tools/perf`
+    directory. The tool and the kernel subsystem are developed hand-in-hand, meaning
+    that they must be from the same version of the kernel. `perf` can do a lot. In
+    this chapter, I will examine it only as a profiler. For a description of its other
+    capabilities, read the `perf` man pages and refer to the documentation mentioned
+    in the previous paragraph.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the kernel for perf
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You need a kernel that is configured for `perf_events` and you need the `perf`
+    command cross compiled to run on the target. The relevant kernel configuration
+    is `CONFIG_PERF_EVENTS` present in the menu **General setup** | **Kernel Performance
+    Events And Counters**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you want to profile using tracepoints—more on this subject later—also enable
+    the options described in the section about `Ftrace`. While you are there, it is
+    worthwhile enabling `CONFIG_DEBUG_INFO` as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `perf` command has many dependencies which makes cross compiling it quite
+    messy. However, both the Yocto Project and Buildroot have target packages for
+    it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will also need debug symbols on the target for the binaries that you are
+    interested in profiling, otherwise `perf` will not be able to resolve addresses
+    to meaningful symbols. Ideally, you want debug symbols for the whole system including
+    the kernel. For the latter, remember that the debug symbols for the kernel are
+    in the `vmlinux` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building perf with the Yocto Project
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: If you are using the standard linux-yocto kernel, `perf_events` is enabled already,
+    so there is nothing more to do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To build the `perf` tool, you can add it explicitly to the target image dependencies,
+    or you can add the tools-profile feature which also brings in `gprof`. As I mentioned
+    previously, you will probably want debug symbols on the target image, and also
+    the kernel `vmlinux` image. In total, this is what you will need in `conf/local.conf`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building perf with Buildroot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Many Buildroot kernel configurations do not include `perf_events`, so you should
+    begin by checking that your kernel includes the options mentioned in the preceding
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To cross compile perf, run the Buildroot `menuconfig` and select the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`BR2_LINUX_KERNEL_TOOL_PERF` in **Kernel** | **Linux Kernel Tools**. To build
+    packages with debug symbols and install them unstripped on the target, select
+    these two settings.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`BR2_ENABLE_DEBUG` in the menu **Build options** | **build packages with debugging
+    symbols** menu.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`BR2_STRIP = none` in the menu **Build options** | **strip command for binaries
+    on target**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Then, run `make clean`, followed by `make`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you have built everything, you will have to copy `vmlinux` into the target
+    image manually.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Profiling with perf
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You can use `perf` to sample the state of a program using one of the event counters
+    and accumulate samples over a period of time to create a profile. This is another
+    example of statistical profiling. The default event counter is called cycles,
+    which is a generic hardware counter that is mapped to a PMU register representing
+    a count of cycles at the core clock frequency.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Creating a profile using `perf` is a two stage process: the `perf record` command
+    captures samples and writes them to a file named `perf.data` (by default) and
+    then `perf report` analyzes the results. Both commands are run on the target.
+    The samples being collected are filtered for the process and its children, for
+    a command you specify. Here is an example profiling a shell script that searches
+    for the string `linux`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now you can show the results from `perf.data` using the command `perf report`.
+    There are three user interfaces which you can select on the command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`--stdio`: This is a pure text interface with no user interaction. You will
+    have to launch `perf report` and annotate for each view of the trace.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--tui`: This is a simple text-based menu interface with traversal between
+    screens.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--gtk`: This is a graphical interface that otherwise acts in the same way
+    as `--tui`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The default is TUI, as shown in this example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Profiling with perf](img/B03982_13_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: '`perf` is able to record the kernel functions executed on behalf of the processes
+    because it collects samples in kernel space.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The list is ordered with the most active functions first. In this example, all
+    but one are captured while `grep` is running. Some are in a library, `libc-2.20`,
+    some in a program, `busybox.nosuid`, and some are in the kernel. We have symbol
+    names for program and library functions because all the binaries have been installed
+    on the target with debug information, and kernel symbols are being read from `/boot/vmlinux`.
+    If you have `vmlinux` in a different location, add `-k <path>` to the `perf report`
+    command. Rather than storing samples in `perf.data`, you can save them to a different
+    file using `perf record -o <file name>` and analyze them using `perf report -i
+    <file name>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By default, `perf record` samples at a frequency of 1000Hz using the cycles
+    counter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A sampling frequency of 1000Hz may be higher than you really need, and may
+    be the cause of an observer effect. Try with lower rates: 100Hz is enough for
+    most cases, in my experience. You can set the sample frequency using the `-F`
+    option.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Call graphs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: This is still not really making life easy; the functions at the top of the list
+    are mostly low level memory operations and you can be fairly sure that they have
+    already been optimized. It would be nice to step back and see where these functions
+    are being called from. You can do that by capturing the backtrace from each sample,
+    which you can do with the `-g` option to `perf record`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now `perf report` shows a plus sign (**+**) where the function is part of a
+    call chain. You can expand the trace to see the functions lower down in the chain:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Call graphs](img/B03982_13_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Generating call graphs relies on the ability to extract call frames from the
+    stack, just as is necessary for backtraces in GDB. The information needed to unwind
+    stacks is encoded in the debug information of the executables but not all combinations
+    of architecture and toolchains are capable of doing so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: perf annotate
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that you know which functions to look at, it would be nice to step inside
+    and see the code and to have hit counts for each instruction. That is what `perf
+    annotate` does, by calling down to a copy of `objdump` installed on the target.
+    You just need to use `perf annotate` in place of `perf report`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`perf annotate` requires symbol tables for the executables and vmlinux. Here
+    is an example of an annotated function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![perf annotate](img/B03982_13_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'If you want to see the source code interleaved with the assembler, you can
+    copy the relevant parts to the target device. If you are using the Yocto Project
+    and build with the extra image feature `dbg-pkgs`, or have installed the individual
+    `-dbg` package, then the source will have been installed for you in `/usr/src/debug`.
+    Otherwise, you can examine the debug information to see the location of the source
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The path on the target should be exactly the same as the path you can see in
+    `DW_AT_comp_dir`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is an example of annotation with source and assembler code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![perf annotate](img/B03982_13_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Other profilers: OProfile and gprof'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: These two statistical profilers predate `perf`. They are both subsets of the
+    functionality of `perf`, but they are still quite popular. I will mention them
+    only briefly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: OProfile is a kernel profiler that started out in 2002\. Originally, it had
+    its own kernel sampling code, but recent versions use the `perf_events` infrastructure
+    for that purpose. There is more information about it at [http://oprofile.sourceforge.net](http://oprofile.sourceforge.net).
+    OProfile consists of a kernel-space component and a user space daemon and analysis
+    commands.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'OProfile needs these two kernel options to be enabled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_PROFILING` in **General setup** | **Profiling support**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_OPROFILE` in **General setup** | **OProfile system profiling**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you are using the Yocto Project, the user-space components are installed
+    as part of the `tools-profile` image feature. If you are using Buildroot, the
+    package is enabled by `BR2_PACKAGE_OPROFILE`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can collect samples by using this command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Wait for your application to finish, or press *Ctrl* + *C*, to stop profiling.
+    The profile data is stored in `<cur-dir>/oprofile_data/samples/current`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use `opreport` to generate a profile summary. There are various options which
+    are documented in the OProfile manual.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`gprof` is part of the GNU toolchain and was one of the earliest open source
+    code profiling tools. It combines compile-time instrumentation and sampling techniques,
+    using a 100 Hz sample rate. It has the advantage that it does not require kernel
+    support.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To prepare a program for profiling with `gprof`, you add `-pg` to the compile
+    and link flags, which injects code that collects information about the call tree
+    into the function preamble. When you run the program, samples are collected and
+    stored in a buffer, which is written to a file named `gmon.out`, when the program
+    terminates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You use the `gprof` command to read the samples from `gmon.out` and the debug
+    information from a copy of the program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As an example, if you wanted to profile the BusyBox `grep` applet. you would
+    rebuild BusyBox with the `-pg` option, run the command, and view the results:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, you would analyze the captured samples on either the target or the host,
+    using the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that the execution times are all shown as zero, because most of the time
+    was spent in system calls, which are not traced by `gprof`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '`gprof` does not capture samples from threads other than the main thread of
+    a multi-threaded process, and it does not sample kernel space, all of which limits
+    its usefulness.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tracing events
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The tools we have seen so far all use statistical sampling. You often want
+    to know more about the ordering of events so that you can see them and relate
+    them to each other. Function tracing involves instrumenting the code with trace
+    points which capture information about the event, and may include some or all
+    of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Timestamp
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Context, such as the current PID
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Function parameters and return value
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Callstack
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is more intrusive than statistical profiling and it can generate a large
+    amount of data. The latter can be mitigated by applying filters when the sample
+    is captured, and later on when viewing the trace.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I will cover two trace tools here: the kernel function tracers, `Ftrace` and
+    `LTTng`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Ftrace
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The kernel function tracer, `Ftrace`, evolved from work done by Steven Rostedt,
+    and many others, as they were tracking down the causes of high latency. `Ftrace`
+    appeared in Linux 2.6.27 and has been actively developed since then. There are
+    a number of documents describing kernel tracing in the kernel source in `Documentation/trace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Ftrace` consists of a number of tracers that can log various types of activity
+    in the kernel. Here, I am going to talk about the `function` and `function_graph`
+    tracers, and about the event tracepoints. In [Chapter 14](ch14.html "Chapter 14. Real-time
+    Programming"), *Real-time Programming*, I will revisit Ftrace and use it to show
+    real-time latencies.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `function` tracer instruments each kernel function so that calls can be
+    recorded and timestamped. As a matter of interest, it compiles the kernel with
+    the `-pg` switch to inject the instrumentation, but there the resemblance to gprof
+    ends. The `function_graph` tracer goes further and records both the entry and
+    exit of functions so that it can create a call graph. The event tracepoints feature
+    also records parameters associated with the call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Ftrace` has a very embedded-friendly user interface that is entirely implemented
+    through virtual files in the `debugfs` filesystem, meaning that you do not have
+    to install any tools on the target to make it work. Nevertheless, there are other
+    user interfaces if you prefer: `trace-cmd` is a command-line tool which records
+    and views traces and is available in Buildroot (`BR2_PACKAGE_TRACE_CMD`) and the
+    Yocto Project (`trace-cmd`). There is a graphical trace viewer named KernelShark
+    which is available as a package for the Yocto Project.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preparing to use Ftrace
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`Ftrace` and its various options are configured in the kernel configuration
+    menu. You will need the following as a minimum:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_FUNCTION_TRACER` in the menu **Kernel hacking** | **Tracers** | **Kernel
+    Function Tracer**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For reasons that will become clear later, you would be well advised to turn
+    on these options as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_FUNCTION_GRAPH_TRACER` in the menu **Kernel hacking** | **Tracers**
+    | **Kernel Function Graph Tracer**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_DYNAMIC_FTRACE` in the menu **Kernel hacking** | **Tracers** | **enable/disable
+    function tracing dynamically**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Since the whole thing is hosted in the kernel, there is no user space configuration
+    to be done.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using Ftrace     Before you can use `Ftrace,` you have to mount the `debugfs` filesystem which,
+    by convention, goes in the `/sys/kernel/debug` directory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: All the controls for `Ftrace` are in the `/sys/kernel/debug/tracing` directory;
+    there is even a mini `HOWTO` in the `README` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is the list of tracers available in the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The active tracer is shown by `current_tracer`, which, initially, will be the
+    null tracer, `nop`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To capture a trace, select the tracer by writing the name of one of the `available_tracers`
+    to `current_tracer`, then enable tracing for a short while, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In that one second, the trace buffer will have been filled with the details
+    of every function called by the kernel. The format of the trace buffer is plain
+    text, as described in `Documentation/trace/ftrace.txt`. You can read the trace
+    buffer from the `trace` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can capture a large number of data points in just one second.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As with profilers, it is difficult to make sense of a flat function list like
+    this. If you select the `function_graph` tracer, Ftrace captures call graphs like
+    this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now you can see the nesting of the function calls, delimited by parentheses,
+    `{` and `}`. At the terminating brace, there is a measurement of the time taken
+    in the function, annotated with a plus sign, `+`, if it takes more than `10 µs`,
+    and an exclamation mark, `!`, if it takes more than `100 µs`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You are often only interested in the kernel activity caused by a single process
+    or thread, in which case you can restrict the trace to the one thread by writing
+    the thread ID to `set_ftrace_pid`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dynamic Ftrace and trace filters
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Enabling `CONFIG_DYNAMIC_FTRACE` allows Ftrace to modify the function `trace`
+    sites at runtime, which has a couple of benefits. Firstly, it triggers additional
+    build-time processing of the trace function probes which allows the Ftrace subsystem
+    to locate them at boot time and overwrite them with NOP instructions, thus reducing
+    the overhead of the function trace code to almost nothing. You can then enable
+    Ftrace in production or near production kernels with no impact on performance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The second advantage is that you can selectively enable function `trace sites`
+    rather than trace everything. The list of functions is put into `available_filter_functions`;
+    there are several tens of thousands of them. You can selectively enable function
+    traces as you need them by copying the name from `available_filter_functions`
+    to `set_ftrace_filter`, and then stop tracing that function by writing the name
+    to `set_ftrace_notrace`. You can also use wildcards and append names to the list.
+    For example, suppose you are interested in `tcp` handling:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Run some tests and then look at the trace:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`set_ ftrace_filter` can also contain commands, for example, to start and stop
+    tracing when certain functions are executed. There isn''t space to go into these
+    details here but, if you want to find out more, please read the **Filter commands**
+    section in `Documentation/trace/ftrace.txt`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trace events
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The function and `function_graph` tracers described in the preceding section
+    record only the time at which the function was executed. The trace events feature
+    also records parameters associated with the call, making the trace more readable
+    and informative. For example, instead of just recording that the function `kmalloc`
+    had been called, a trace event will record the number of bytes requested and the
+    returned pointer. Trace events are used in perf and LTTng as well as Ftrace, but
+    the development of the trace events subsystem was prompted by the LTTng project.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It takes effort from kernel developers to create trace events since each one
+    is different. They are defined in the source code using the `TRACE_EVENT` macro:
+    there are over a thousand of them now. You can see the list of events available
+    at runtime in `/sys/kernel/debug/tracing/available_events`. They are named `subsystem:function`,
+    for example, `kmem:kmalloc`. Each event is also represented by a subdirectory
+    in `tracing/events/[subsystem]/[function]`, as demonstrated here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The files are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`enable`: You write a `1` to this file to enable the event.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`filter`: This is an expression which must evaluate to true for the event to
+    be traced.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`format`: This is the format of the event and parameters.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`id`: This is a numeric identifier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`trigger`: This is a command that is executed when the event occurs using the
+    syntax defined in the **Filter commands** section of `Documentation/trace/ftrace.txt`.
+    I will show you a simple example involving `kmalloc` and `kfree`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Event tracing does not depend on the function tracers, so begin by selecting
+    the `nop` tracer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, select the events to trace by enabling each one individually:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can also write the event names to `set_event`, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, when you read the trace, you can see the functions and their parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Exactly the same trace events are visible in perf as *tracepoint events*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using LTTng
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The Linux Trace Toolkit project was started by Karim Yaghmour as a means of
+    tracing kernel activity and was one of the first trace tools generally available
+    for the Linux kernel. Later, Mathieu Desnoyers took up the idea and re-implemented
+    it as the next generation trace tool, LTTng. It was then expanded to cover user
+    space traces as well as the kernel. The project website is at [http://lttng.org/](http://lttng.org/)
+    and contains a comprehensive user manual.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'LTTng consists of three components:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A core session manager
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A kernel tracer implemented as a group of kernel modules
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A user space tracer implemented as a library
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In addition to those, you will need a trace viewer such as Babeltrace ([http://www.efficios.com/babeltrace](http://www.efficios.com/babeltrace))
+    or the Eclipse Trace Compaas plug-in to display and filter the raw trace data
+    on the host or target.
+  prefs: []
+  type: TYPE_NORMAL
+- en: LTTng requires a kernel configured with `CONFIG_TRACEPOINTS`, which is enabled
+    when you select **Kernel hacking** | **Tracers** | **Kernel Function Tracer**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The description that follows refers to LTTng version 2.5; other versions may
+    be different.
+  prefs: []
+  type: TYPE_NORMAL
+- en: LTTng and the Yocto Project
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'You need to add these packages to the target dependencies, for example, in
+    `conf/local.conf`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you want to run Babeltrace on the target, also append the package `babeltrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: LTTng and Buildroot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'You need to enable the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`BR2_PACKAGE_LTTNG_MODULES` in the menu **Target packages** | **Debugging,
+    profiling and benchmark** | **lttng-modules**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`BR2_PACKAGE_LTTNG_TOOLS` in the menu **Target packages** | **Debugging, profiling
+    and benchmark** | **lttng-tools**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For user space trace tracing, enable this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`BR2_PACKAGE_LTTNG_LIBUST` in the menu **Target packages** | **Libraries**
+    | **Other**, enable **lttng-libust**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There is a package called `lttng-babletrace` for the target. Buildroot builds
+    the host `babeltrace` automatically and places in `output/host/usr/bin/babeltrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using LTTng for kernel tracing
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: LTTng can use the set of `ftrace` events described above as potential trace
+    points. Initially, they are disabled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The control interface for LTTng is the `lttng` command. You can list the kernel
+    probes using the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Traces are captured in the context of a session which, in this example, is
+    called `test`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now enable a few events in the current session. You can enable all kernel tracepoints
+    using the `--all` option but remember the warning about generating too much trace
+    data. Let''s start with a couple of scheduler-related trace events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Check that everything is set up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now start tracing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Run the test load and then stop tracing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: Traces for the session are written to the session directory, `lttng-traces/<session>/kernel`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can use the Babeltrace viewer to dump the raw trace data in text format,
+    in this case, I ran it on the host computer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: The output is too verbose to fit on this page, so I will leave it as an exercise
+    for you, the reader, to capture and display a trace in this way. The text output
+    from eBabeltrace does have the advantage that it is easy to search for strings
+    using grep and similar commands.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A good choice for a graphical trace viewer is the Trace Compass plug-in for
+    Eclipse, which is now part of the Eclipse IDE for C/C++ Developers bundle. Importing
+    the trace data into Eclipse is characteristically fiddly. Briefly, you need to
+    follow these steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Open the tracing perspective.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Create a new project by selecting **File** | **New** | **Tracing project**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Enter a project name and click **Finish**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Right-click on the **New Project** option in the **Project Explorer** menu and
+    select **Import**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Expand **Tracing** and then select **Trace Import**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Browse to the directory containing the traces (for example, `test-20150824-140942`),
+    tick the box to indicate which sub-directories you want (it might be the kernel)
+    and click **Finish**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Now, expand the project and, within that, expand **Traces[1]** and, within that,
+    double-click on **kernel**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: You should see the trace data shown in the following screenshot:![Using LTTng
+    for kernel tracing](img/B03982_13_05.jpg)
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, I have zoomed in on the control flow view to show
+    state transitions between `dropbear` and a shell, and also some activity of the
+    `lttng` daemon.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Valgrind for application profiling
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I introduced Valgrind in [Chapter 11](ch11.html "Chapter 11. Managing Memory"),
+    *Managing Memory*, as a tool for identifying memory problems using the memcheck
+    tool. Valgrind has other useful tools for application profiling. The two I am
+    going to look at here are **Callgrind** and **Helgrind**. Since Valgrind works
+    by running the code in a sandbox, it is able to check the code as it runs and
+    report certain behaviors, which native tracers and profilers cannot do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Callgrind
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Callgrind is a call-graph generating profiler that also collects information
+    about processor cache hit rate and branch prediction. Callgrind is only useful
+    if your bottleneck is CPU-bound. It's not useful if heavy I/O or multiple processes
+    are involved.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Valgrind does not require kernel configuration but it does need debug symbols.
+    It is available as a target package in both the Yocto Project and Buildroot (`BR2_PACKAGE_VALGRIND`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You run Callgrind in Valgrind on the target, like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: This produces a file called `callgrind.out.<PID>` which you can copy to the
+    host and analyze with `callgrind_annotate`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default is to capture data for all the threads together in a single file.
+    If you add option `--separate-threads=yes` when capturing, there will be profiles
+    for each of the threads in files named `callgrind.out.<PID>-<thread id>`, for
+    example, `callgrind.out.122-01`, `callgrind.out.122-02`, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Callgrind can simulate the processor L1/L2 cache and report on cache misses.
+    Capture the trace with the `--simulate-cache=yes` option. L2 misses are much more
+    expensive than L1 misses, so pay attention to code with high D2mr or D2mw counts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Helgrind
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This is a thread error detector for detecting synchronization errors in C, C++,
+    and Fortran programs that include POSIX threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Helgrind can detect three classes of error. Firstly, it can detect the incorrect
+    use of the API. For example, it can unlock a mutex that is already unlocked, unlock
+    a mutex that was locked by a different thread, not checking the return value of
+    certain Pthread functions. Secondly, it monitors the order in which threads acquire
+    locks and thus detects potential deadlocks which could arise from the formation
+    of cycles of locks. Finally, it detects data races which can happen when two threads
+    access a shared memory location without using suitable locks or other synchronization
+    to ensure single-threaded access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using Helgrind is simple, you just need this command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: It prints problems and potential problems as it finds them. You can direct these
+    messages to a file by adding `--log-file=<filename>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using strace to show system calls
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'I started the chapter with the simple and ubiquitous tool, `top`, and I will
+    finish with another: `strace`. It is a very simple tracer that captures system
+    calls made by a program and, optionally, its children. You can use it to do the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learn which system calls a program makes.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Find those system calls that fail together with the error code. I find this
+    useful if a program fails to start but doesn't print an error message or if the
+    message is too general. `strace` shows the failing syscall.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Find which files a program opens.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Find out what syscalls a running program is making, for example to see if it
+    is stuck in a loop.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are many more examples online, just search for `strace` tips and tricks.
+    Everybody has their own favorite story, for example, [http://chadfowler.com/blog/2014/01/26/the-magic-of-strace](http://chadfowler.com/blog/2014/01/26/the-magic-of-strace)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`strace` uses the `ptrace(2)` function to hook calls from user space to the
+    kernel. If you want to know more about how `ptrace` works, the man page is detailed
+    and surprisingly legible.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The simplest way to get a trace is to run the command with `strace` as shown
+    here (the listing has been edited to make it clearer):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Most of the trace shows how the runtime environment is created. In particular
+    you can see how the library loader hunts for `libc.so.6`, eventually finding it
+    in `/lib`. Finally, it gets to running the `main()` function of the program, which
+    prints its message and exits.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you want `strace` to follow any child processes or threads created by the
+    original process, add the `-f` option.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you are using `strace` to trace a program that creates threads, you almost
+    certainly want the `-f` option. Better still, use `-ff` and `-o <file name>` so
+    that the output for each child process or thread is written to a separate file
+    named `<filename>.<PID | TID>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A common use of `strace` is to discover which files a program tries to open
+    at start up. You can restrict the system calls that are traced through the `-e`
+    option, and you can write the trace to a file instead of `stdout` by using the
+    `-o` option:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: This shows the libraries and configuration files `ssh` opens when it is setting
+    up a connection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can even use `strace` as a basic profile tool: if you use the `-c` option,
+    it accumulates the time spent in system calls and prints out a summary like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Nobody can complain that Linux lacks options to profile and trace. This chapter
+    has given you an overview of some of the most common ones.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When faced with a system that is not performing as well as you would like, start
+    with `top` and try to identify the problem. If it proves to be a single application,
+    then you can use `perf record/report` to profile it, bearing in mind that you
+    will have to configure the kernel to enable `perf` and you will need debug symbols
+    for the binaries and kernel. OProfile is an alternative to `perf record` and can
+    tell you similar things. `gprof` is, frankly, outdated but it does have the advantage
+    of not requiring kernel support. If the problem is not so well localized, use
+    `perf` (or OProfile) to get a system-wide view.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Ftrace` comes into its own when you have specific questions about the behavior
+    of the kernel. The `function` and `function_graph` tracers give a detailed view
+    of the relationship and sequence of function calls. The event tracers allow you
+    to extract more information about functions including the parameters and return
+    values. LTTng performs a similar role, making use the event trace mechanism, and
+    adds high speed ring buffers to extract large quantities of data from the kernel.
+    Valgrind has the particular advantage that it runs code in a sandbox and can report
+    on errors that are hard to track down in other ways.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the Callgrind tool, it can generate call graphs and report on processor
+    cache usage and, with Helgrind, it can report on thread-related problems. Finally,
+    don't forget `strace`. It is a good standby for finding out what system calls
+    a program is making, from tracking file open calls to find file path names to
+    checking for system wake ups and incoming signals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All the while, be aware of, and try to avoid, the observer effect: make sure
+    that the measurements you are making are valid for a production system. In the
+    next chapter, I will continue the theme as I delve into the latency tracers that
+    help us quantify the real-time performance of a target system.'
+  prefs: []
+  type: TYPE_NORMAL

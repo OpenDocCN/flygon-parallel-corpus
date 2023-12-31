@@ -1,0 +1,926 @@
+- en: Chapter 11. Managing Memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter covers issues relating to memory management, which is an important
+    topic for any Linux system, but especially for embedded Linux where system memory
+    is usually in limited supply. After a brief refresher on virtual memory, I will
+    show you how to measure memory use, how to detect problems with memory allocation,
+    including memory leaks, and what happens when you run out of memory. You will
+    have to understand the tools that are available, from simple tools such as `free`
+    and `top`, to complex tools such as mtrace and Valgrind.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Virtual memory basics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To recap, Linux configures the memory management unit of the CPU to present
+    a virtual address space to a running program that begins at zero and ends at the
+    highest address, `0xffffffff` on a 32-bit processor. That address space is divided
+    into pages of 4 KiB (there are rare examples of systems using other page sizes).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Linux divides this virtual address space into an area for applications, called
+    user space, and an area for the kernel, called kernel space. The split between
+    the two is set by a kernel configuration parameter named `PAGE_OFFSET`. In a typical
+    32-bit embedded system, `PAGE_OFFSET` is `0xc0000000`, giving the lower three
+    GiB to user space and the top one GiB to kernel space. The user address space
+    is allocated per process, so that each process runs in a sandbox, separated from
+    the others. The kernel address space is the same for all processes: there is only
+    one kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pages in this virtual address space are mapped to physical addresses by the
+    **memory management unit** (**MMU**), which uses page tables to perform the mapping.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each page of virtual memory may be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: unmapped, in which access will result in a `SIGSEGV`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: mapped to a page of physical memory that is private to the process
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: mapped to a page of physical memory that is shared with other processes
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'mapped and shared with a `copy on write` flag set: a write is trapped in the
+    kernel which makes a copy of the page and maps it to the process in place of the
+    original page before allowing the write to take place'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: mapped to a page of physical memory that is used by the kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The kernel may additionally map pages to reserved memory regions, for example,
+    to access registers and buffer memory in device drivers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An obvious question is, why do we do it this way instead of simply referencing
+    physical memory directly, as typical RTOS would?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are numerous advantages to virtual memory, some of which are described
+    here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Invalid memory accesses are trapped and applications alerted by `SIGSEGV`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Processes run in their own memory space, isolated from others
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Efficient use of memory through the sharing of common code and data, for example,
+    in libraries
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The possibility of increasing the apparent amount of physical memory by adding
+    swap files, although swapping on embedded targets is rare
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These are powerful arguments, but we have to admit that there are some disadvantages
+    as well. It is difficult to determine the actual memory budget of an application,
+    which is one of the main concerns of this chapter. The default allocation strategy
+    is to over-commit, which leads to tricky out-of-memory situations, which I will
+    also discuss later on. Finally, the delays introduced by the memory management
+    code in handling exceptions – page faults – make the system less deterministic,
+    which is important for real-time programs. I will cover this in [Chapter 14](ch14.html
+    "Chapter 14. Real-time Programming"), *Real-time Programming*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory management is different for kernel space and user space. The following
+    sections describe the essential differences and the things you need to know.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel space memory layout
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kernel memory is managed in a fairly straightforward way. It is not demand-paged,
+    meaning that, for every allocation using `kmalloc()` or similar function, there
+    is real physical memory. Kernel memory is never discarded or paged out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Some architectures show a summary of the memory mapping at boot time in the
+    kernel log messages. This trace is taken from a 32-bit ARM device (a BeagleBone
+    Black):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The figure of 505980 KiB available is the amount of free memory the kernel sees
+    when it begins execution but before it begins making dynamic allocations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Consumers of kernel-space memory include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel itself, in other words, the code and data loaded from the kernel
+    image file at boot time. This is shown in the preceding code in the segments `.text`,
+    `.init`, `.data`, and `.bss`. The `.init` segment is freed once the kernel has
+    completed initialization.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory allocated through the slab allocator, which is used for kernel data structures
+    of various kinds. This includes allocations made using `kmalloc()`. They come
+    from the region marked `lowmem`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory allocated via `vmalloc()`, usually for larger chunks of memory than is
+    available through `kmalloc()`. These are in the vmalloc area.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mapping for device drivers to access registers and memory belonging to various
+    bits of hardware, which you can see by reading `/proc/iomem`. These come from
+    the vmalloc area but since they are mapped to physical memory that is outside
+    of main system memory, they do not take any real memory.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kernel modules, which are loaded into the area marked modules.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Other low level allocations that are not tracked anywhere else.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How much memory does the kernel use?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Unfortunately, there isn't a complete answer to that question, but what follows
+    is as close as we can get.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Firstly, you can see the memory taken up by the kernel code and data in the
+    kernel log shown previously, or you can use the `size` command, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Usually, the size is small when compared to the total amount of memory. If
+    that is not the case, you need to look through the kernel configuration and remove
+    those components that you don''t need. There is an ongoing effort to allow small
+    kernels to be built: search for Linux-tiny or Linux Kernel Tinification. There
+    is a project page for the latter at [https://tiny.wiki.kernel.org/](https://tiny.wiki.kernel.org/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can get more information about memory usage by reading `/proc/meminfo`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There is a description of each of these fields in the man page for `proc(5)`.
+    The kernel memory usage is the sum of:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Slab**: The total memory allocated by the slab allocator'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**KernelStack**: The stack space used when executing kernel code'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**PageTables**: The memory used for storing page tables'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**VmallocUsed**: The memory allocated by `vmalloc()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the case of slab allocations, you can get more information by reading`/proc/slabinfo`.
+    Similarly, there is a breakdown of allocations in `/proc/vmallocinfo` for the
+    vmalloc area. In both cases, you need detailed knowledge of the kernel and its
+    subsystems to see exactly which subsystem is making the allocations and why, which
+    is beyond the scope of this discussion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With modules, you can use `lsmod` to find out the memory space taken up by
+    the code and data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: That leaves the low level allocations of which there is no record, and which
+    prevent us from generating an accurate account of kernel space memory usage. This
+    will appear as missing memory when we add up all the kernel and user space allocations
+    that we know about.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User space memory layout
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Linux employs a lazy allocation strategy for user space, only mapping physical
+    pages of memory when the program accesses it. For example, allocating a buffer
+    of 1 MiB using `malloc(3)` returns a pointer to a block of memory addresses but
+    no actual physical memory. A flag is set in the page table entries such that any
+    read or write access is trapped by the kernel. This is known as a page fault.
+    Only at this point does the kernel attempt to find a page of physical memory and
+    add it to the page table mapping for the process. It is worthwhile demonstrating
+    this with a simple program like this one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When you run it, you will see something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There were 172 minor page faults encountered initializing the program''s environment,
+    and a further 14 when calling `getrusage(2)` (these numbers will vary depending
+    on the architecture and the version of the C library you are using). The important
+    part is the increase when filling the memory with data: 442 – 186 = 256\. The
+    buffer is 1 MiB, which is 256 pages. The second call to `memset(3)` makes no difference
+    because all the pages are now mapped.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you can see, a page fault is generated when the kernel traps an access to
+    a page that has not been mapped. In fact, there are two kinds of page fault: minor
+    and major. With a minor fault, the kernel just has to find a page of physical
+    memory and map it into the process address space, as shown in the preceding code.
+    A major page fault occurs when the virtual memory is mapped to a file, for example
+    using `mmap(2)`, which I will describe shortly. Reading from this memory means
+    that the kernel not only has to find a page of memory and map it in, but it also
+    has to be filled with data from the file. Consequently, major faults are much
+    more expensive in time and system resources.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process memory map
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You can see the memory map for a process through the `proc` filesystem. As
+    an example, here is the map for the `init` process, PID 1:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The first three columns show the start and end virtual addresses and the permissions
+    for each mapping. The permissions are shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`r` = read'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`w` = write'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`x` = execute'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s` = shared'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`p` = private (copy on write)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If the mapping is associated with a file, the filename appears in the final
+    column, and columns four, five, and six contain the offset from the start of the
+    file, the block device number and the inode of the file. Most of the mappings
+    are to the program itself and the libraries it is linked with. There are two areas
+    where the program can allocate memory, marked `[heap]` and `[stack]`. Memory allocated
+    using `malloc(3)` comes from the former (except for very large allocations, which
+    we will come to later) ; allocations on the stack come from the latter. The maximum
+    size of both areas is controlled by the process''s `ulimit`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**heap**: `ulimit -d`, default unlimited'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**stack**: `ulimit -s`, default 8 MiB'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Allocations that exceed the limit are rejected by `SIGSEGV`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When running out of memory, the kernel may decide to discard pages that are
+    mapped to a file and are read-only. If that page is accessed again, it will cause
+    a major page fault and be read back in from the file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Swap
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The idea of swapping is to reserve some storage where the kernel can place
+    pages of memory that are not mapped to a file, so that it can free up the memory
+    for other uses. It increases the effective size of physical memory by the size
+    of the swap file. It is not a panacea: there is a cost to copying pages to and
+    from a swap file which becomes apparent on a system that has too little real memory
+    for the workload it is carrying and begins *disk thrashing*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Swap is seldom used on embedded devices because it does not work well with flash
+    storage where constant writing would wear it out quickly. However, you may want
+    to consider swapping to compressed RAM (zram).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Swap to compressed memory (zram)
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The zram driver creates RAM-based block devices named `/dev/zram0`, `/dev/zram1`,
+    and so on. Pages written to these devices are compressed before being stored.
+    With compression ratios in the range of 30% to 50%, you can expect an overall
+    increase in free memory of about 10%, at the expense of more processing and a
+    corresponding increase in power usage. It is used in some low memory Android devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To enable zram, configure the kernel with these options:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, mount zram at boot time by adding this to `/etc/fstab`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can turn swap on and off by using these commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Mapping memory with mmap
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A process begins life with a certain amount of memory mapped to the text (the
+    code) and data segments of the program file, together with the shared libraries
+    that it is linked with. It can allocate memory on its heap at runtime using `malloc(3)`
+    and on the stack through locally scoped variables and memory allocated through
+    `alloca(3)`. It may also load libraries dynamically at runtime using `dlopen(3)`.
+    All of these mappings are taken care of by the kernel. However, a process can
+    also manipulate its memory map in an explicit way using `mmap(2)`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: It maps `length` bytes of memory from the file with the descriptor `fd`, starting
+    at `offset` in the file, and returns a pointer to the mapping, assuming it is
+    successful. Since the underlying hardware works in pages, the `length` is rounded
+    up to the nearest whole number of pages. The protection parameter, `prot`, is
+    a combination of read, write, and execute permissions and the `flags` parameter
+    contains at least `MAP_SHARED` or `MAP_PRIVATE`. There are many other flags, which
+    are described in the man page.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are many things you can do with mmap. Here are a few of them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using mmap to allocate private memory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You can use mmap to allocate an area of private memory by setting the `MAP_ANONYMOUS`
+    flag and the `fd` file descriptor to `-1`. This is similar to allocating memory
+    from the heap using `malloc(3)` except that the memory is page-aligned and in
+    multiples of pages. The memory is allocated in the same area as that used for
+    libraries. In fact, that area is referred to by some as the mmap area for this
+    reason.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Anonymous mappings are better for large allocations because they do not pin
+    down the heap with chunks of memory, which would make fragmentation more likely.
+    Interestingly, you will find that `malloc(3)` (in glibc at least) stops allocating
+    memory from the heap for requests over 128 KiB and uses mmap in this way, so in
+    most cases, just using malloc is the right thing to do. The system will choose
+    the best way of satisfying the request.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using mmap to share memory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As we saw in [Chapter 10](ch10.html "Chapter 10. Learning About Processes and
+    Threads"), *Learning About Processes and Threads*, POSIX shared memory requires
+    mmap to access the memory segment. In this case, you set the `MAP_SHARED` flag
+    and use the file descriptor from `shm_open()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using mmap to access device memory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As I mentioned in Chapter 8, *Introducing Device Drivers*, it is possible for
+    a driver to allow its device node to be mmaped and so share some of the device
+    memory with an application. The exact implementation is dependent on the driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One example is the Linux frame buffer, `/dev/fb0`. The interface is defined
+    in `/usr/include/linux/fb.h`, including an `ioctl` function to get the size of
+    the display and the bits per pixel. You can then use mmap to ask the video driver
+    to share the frame buffer with the application and read and write pixels:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: A second example is the streaming video interface, Video 4 Linux, version 2,
+    or V4L2, which is defined in `/usr/include/linux/videodev2.h`. Each video device
+    has a node named `/dev/videoN`, starting with `/dev/video0`. There is an `ioctl`
+    function to ask the driver to allocate a number of video buffers which you can
+    mmap into user space. Then, it is just a question of cycling the buffers and filling
+    or emptying them with video data, depending on whether you are playing back or
+    capturing a video stream.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How much memory does my application use?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As with kernel space, the different ways of allocating, mapping and sharing
+    user space memory make it quite difficult to answer this seemingly simple question.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To begin with, you can ask the kernel how much memory it thinks is available,
+    which you can do by using the `free` command. Here is a typical example of the
+    output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'At first sight, this looks like a system that is almost out of memory with
+    only 4704 KiB free out of 509,016 KiB: less than 1%. However, note that 26,456
+    KiB is in buffers and a whopping 363,860 KiB is in cache. Linux believes that
+    free memory is wasted memory and so the kernel uses free memory for buffers and
+    caches, in the knowledge that they can be shrunk when the need arises. Removing
+    buffers and cache from the measurement gives the true free memory, which is 395,020
+    KiB; 77% of the total. When using free, the numbers on the second line marked
+    `-/+ buffers/cache` are the important ones.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can force the kernel to free up caches by writing a number between 1 and
+    3 to `/proc/sys/vm/drop_caches`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The number is actually a bit mask which determines which of the two broad types
+    of cache you want to free: 1 for the page cache and 2 for the dentry and inode
+    caches combined. The exact roles of those caches is not particularly important
+    here, only that there is memory that the kernel is using but which can be reclaimed
+    at short notice.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Per-process memory usage
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are several metrics to measure the amount of memory a process is using.
+    I will begin with the two that are easiest to obtain— the **virtual set size**
+    (**vss**) and the **resident memory size** (**rss**), both of which are available
+    in most implementations of the `ps` and `top` commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Vss**: called VSZ in the `ps` command and VIRT in `top`, is the total amount
+    of memory mapped by a process. It is the sum of all the regions shown in `/proc/<PID>/map`.
+    This number is of limited interest, since only part of the virtual memory is committed
+    to physical memory at any one time.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Rss**: called RSS in `ps` and RES in `top`, is the sum of memory that is
+    mapped to physical pages of memory. This gets closer to the actual memory budget
+    of the process, but there is a problem, if you add up the Rss of all the processes,
+    you will get an overestimate the memory in use because some pages will be shared.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using top and ps
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The versions of `top` and `ps` from BusyBox give very limited information. The
+    examples that follow use the full version from the `procps` pacakge.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `ps` command shows Vss (VSZ) and Rss (RSS) with the options, `-Aly`, and
+    a custom format which includes `vsz` and `rss`, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Likewise, `top` shows a summary of the free memory and memory usage per process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: These simple commands give you a feel of the memory usage and give the first
+    indication that you have a memory leak when you see that the Rss of a process
+    keeps on increasing. However, they are not very accurate in the absolute measurements
+    of memory usage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using smem
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In 2009, Matt Mackall began looking at the problem of accounting for shared
+    pages in process memory measurement and added two new metrics called the **unique
+    set size** or **Uss**, and the **proportional set size** or **Pss**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Uss**: This is the amount of memory that is committed to physical memory
+    and is unique to a process; it is not shared with any other. It is the amount
+    of memory that would be freed if the process were to terminate.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Pss**: This splits the accounting of shared pages that are committed to physical
+    memory between all the processes that have them mapped. For example, if an area
+    of library code is 12 pages long and is shared by six processes, each will accumulate
+    two pages in Pss. Thus, if you add the Pss numbers for all processes, you will
+    get the actual amount of memory being used by those processes. In other words,
+    Pss is the number we have been looking for.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The information is available in `/proc/<PID>/smaps`, which contains additional
+    information for each of the mappings shown in `/proc/<PID>/maps`. Here is one
+    section from such a file which provides information about the mapping for the
+    `libc` code segment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Note that the Rss is 264 KiB but because it is shared between many other processes,
+    the Pss is only 6 KiB.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a tool named smem that collates the information from the `smaps` files
+    and presents it in various ways, including as pie or bar charts. The project page
+    for smem is [https://www.selenic.com/smem](https://www.selenic.com/smem). It is
+    available as a package in most desktop distributions. However, since it is written
+    in Python, installing it on an embedded target requires a Python environment,
+    which may be too much trouble for just one tool. To help with this, there is a
+    small program named `smemcap` that captures the state from `/proc` on the target
+    and saves it to a TAR file which can be analyzed later on the host computer. It
+    is part of BusyBox, but it can also be compiled from the `smem` source.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Running `smem` natively, as `root`, you will see these results:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can see from the last line of the output that, in this case, the total Pss
+    is about a half of the Rss.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you don''t have or don''t want to install Python on your target, you can
+    capture the state using `smemcap`, again as `root`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, copy the TAR file to the host and read it using `smem -S`, though this
+    time there is no need to run as `root`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: The output is identical to that when running it natively.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other tools to consider
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Another way to display Pss is via `ps_mem` ([https://github.com/pixelb/ps_mem](https://github.com/pixelb/ps_mem)),
+    which prints much the same information but in a simpler format. It is also written
+    in Python.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Android also has a tool named `procrank`, which can be cross compiled for embedded
+    Linux with a few small changes. You can get the code from [https://github.com/csimmonds/procrank_linux](https://github.com/csimmonds/procrank_linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Identifying memory leaks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A memory leak occurs when memory is allocated but not freed when it is no longer
+    needed. Memory leakage is by no means unique to embedded systems, but it becomes
+    an issue partly because targets don't have much memory in the first place, and
+    partly because they often run for long periods of time without rebooting, allowing
+    the leaks to become a large puddle.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will realize that there is a leak when you run `free` or `top` and see that
+    free memory is continually going down, even if you drop caches, as shown in the
+    preceding section. You will be able to identify the culprit (or culprits) by looking
+    at the Uss and Rss per process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are several tools for identifying memory leaks in a program. I will look
+    at two: `mtrace` and `Valgrind`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: mtrace
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`mtrace` is a component of glibc that traces calls to `malloc(3)`, `free(3)`,
+    and related functions, and identifies areas of memory not freed when the program
+    exits. You need to call the `mtrace()` function from within the program to begin
+    tracing and then at runtime, write a path name to the `MALLOC_TRACE` environment
+    variable in which the trace information is written. If `MALLOC_TRACE` does not
+    exist or of the file cannot be opened, `mtrace` hooks are not not installed. While
+    the trace information is written in ASCII, it is usual to use the `mtrace` command
+    to view it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here is what you might see when running the program and looking at the trace:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Unfortunately, `mtrace` does not tell you about leaked memory while the program
+    runs. It has to terminate first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Valgrind
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Valgrind is a very powerful tool for discovering memory problems including leaks,
+    and other things besides. One advantage is that you don't have to recompile the
+    programs and libraries that you want to check, although it does work better if
+    they have been compiled with the `-g` option so that they include debug symbol
+    tables. It works by running the program in an emulated environment and trapping
+    execution at various points. This leads to the big downside of Valgrind, which
+    is that the program runs at a fraction of normal speed which makes it less useful
+    for testing anything with real-time constraints.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Incidentally, the name is often mispronounced: it says in the Valgrind FAQ
+    that the *grind* is pronounced with a short *i* -- as in *grinned* (rhymes with
+    *tinned*) rather than *grined* (rhymes with *find*). The FAQ, documentation and
+    downloads are available at [http://valgrind.org](http://valgrind.org).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Valgrind contains several diagnostic tools:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**memcheck**: This is the default tool, and detects memory leaks and general
+    misuse of memory'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**cachegrind**: This calculates the processor cache hit rate'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**callgrind**: This calculates the cost of each function call'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**helgrind**: This highlights misuse of the Pthread API, potential deadlocks,
+    and race conditions'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**DRD**: This is another Pthread analysis tool'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**massif**: This profiles usage of the heap and stack'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can select the tool you want with the `-tool` option. Valgrind runs on
+    the major embedded platforms: ARM (Cortex A), PPC, MIPS, and x86 in 32- and 64-bit
+    variants. It is available as a package in both the Yocto Project and Buildroot.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To find our memory leak, we need to use the default `memcheck` tool, with the
+    option `--leakcheck=full` to print out the lines where the leak was found:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Running out of memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The standard memory allocation policy is to **over-commit**, meaning that the
+    kernel will allow more memory to be allocated by applications than there is physical
+    memory. Most of the time, this works fine because it is common for applications
+    to request more memory than they really need. It also helps in the implementation
+    of `fork(2)`: it is safe to make a copy of a large program because the pages of
+    memory are shared with the `copy-on-write` flag set. In the majority of cases,
+    `fork` is followed by an `exec` function call, which unshares the memory and then
+    loads a new program.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, there is always the possibility that a particular workload will cause
+    a group of processes to try to cash in on the allocations they have been promised
+    simultaneously and so demand more than there really is. This is an **out of memory**
+    situation, or **OOM**. At this point, there is no other alternative but to kill
+    off processes until the problem goes away. This is the job of the out of memory
+    killer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before we get to that, there is a tuning parameter for kernel allocations in
+    `/proc/sys/vm/overcommit_memory`, which you can set to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0`: heuristic over-commit (this is the default)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`1`: always over-commit, never check'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`2`: always check, never over-commit'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Option 1 is only really useful if you run programs that work with large sparse
+    arrays and so allocate large areas of memory but write to a small proportion of
+    them. Such programs are rare in the context of embedded systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Option 2, never over-commit, seems to be a good choice if you are worried about
+    running out of memory, perhaps in a mission or safety-critical application. It
+    will fail allocations that are greater than the commit limit, which is the size
+    of swap space plus total memory multiplied by the over-commit ratio. The over-commit
+    ratio is controlled by `/proc/sys/vm/overcommit_ratio` and has a default value
+    of 50%.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As an example, suppose you have a device with 512 MB of system RAM and you
+    set a really conservative ratio of 25%:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is no swap so the commit limit is 25% of `MemTotal`, as expected.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is another important variable in `/proc/meminfo: Committed_AS`. This
+    is the total amount of memory that is needed to fulfill all the allocations made
+    so far. I found the following on one system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: In other words, the kernel has already promised more memory than the available
+    memory. Consequently, setting `overcommit_memory` to `2` means that all allocations
+    fail, regardless of `overcommit_ratio`. To get to a working system, I would have
+    to either install double the amount of RAM or severely reduce the number of running
+    processes, of which there are about 40.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In all cases, the final defense is the OOM killer. It uses a heuristic method
+    to calculate a badness score between 0 and 1,000 for each process and then terminates
+    those with the highest score until there is enough free memory. You should see
+    something like this in the kernel log:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can force an OOM event using `echo f > /proc/sysrq-trigger`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can influence the badness score for a process by writing an adjustment value
+    to `/proc/<PID>/oom_score_adj`. A value of `-1000` means that the badness score
+    can never be greater than zero and so it will never be killed; a value of `+1000`
+    means that it will always be greater than 1000 and so will always be killed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following resources have further information about the topics introduced
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Linux Kernel Development, 3rd Edition*, by *Robert Love*, *Addison Wesley*,
+    *O''Reilly Media*; (Jun. 2010) ISBN-10: 0672329468'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux System Programming, 2nd Edition*, by *Robert Love*, *O''Reilly Media*;
+    (8 Jun. 2013) ISBN-10: 1449339530'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Understanding the Linux VM Manager* by *Mel Gorman*: [https://www.kernel.org/doc/gorman/pdf/understand.pdf](https://www.kernel.org/doc/gorman/pdf/understand.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Valgrind 3.3 - Advanced Debugging and Profiling for Gnu/Linux Applications*
+    by *J Seward*, *N. Nethercote*, and *J. Weidendorfer*, *Network Theory Ltd*; (1
+    Mar. 2008) ISBN 978-0954612054'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Accounting for every byte of memory used in a virtual memory system is just
+    not possible. However, you can find a fairly accurate figure for the total amount
+    of free memory, excluding that taken by buffers and cache, by using the `free`
+    command. By monitoring it over a period of time and with different workloads,
+    you should become confident that it will remain within a given limit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When you want to tune memory usage or identify sources of unexpected allocations,
+    there are resources that give more detailed information. For kernel space, the
+    most useful information is in `/proc: meminfo`, `slabinfo`, and `vmallocinfo`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When it comes to getting accurate measurements for user space, the best metric
+    is Pss, as shown by `smem` and other tools. For memory debugging, you can get
+    help from simple tracers such as `mtrace`, or you have the heavyweight option
+    of the Valgrind memcheck tool.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you have concerns about the consequence of an out of memory situation, you
+    can fine-tune the allocation mechanism via `/proc/sys/vm/overcommit_memory` and
+    you can control the likelihood of particular processes being killed though the
+    `oom_score_adj` parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter is all about debugging user space and kernel code using the
+    GNU debugger, and the insights you can gain from watching code as it runs, including
+    the memory management functions I have described here.
+  prefs: []
+  type: TYPE_NORMAL

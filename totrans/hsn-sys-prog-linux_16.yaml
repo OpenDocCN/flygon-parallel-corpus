@@ -1,0 +1,1588 @@
+- en: Multithreading with Pthreads Part III
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Having covered, in [Chapters 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml), *Multithreading
+    with Pthreads Part I - Essentials**,* and [Chapter 15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml),
+    *Multithreading with Pthreads Part II - Synchronization*, a lot of the whys and
+    hows of writing powerful **multithreaded** (**MT**) applications, this chapter
+    focuses on teaching the reader several key safety aspects of MT programming.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It sheds some light on many key safety aspects of developing safe and robust
+    MT applications; here, the reader will learn about thread safety, why it is required,
+    and how to make a function thread-safe. While running, it's possible to have one
+    thread kill another thread; this is achieved via the thread-cancelation mechanism—going hand
+    in hand with cancelation, how does one ensure that prior to terminating a thread,
+    one ensures that it first releases any resources it is still holding (such as
+    locks and dynamic memory)? Thread cleanup handlers are covered to show this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, this chapter delves into how to safely mix multithreading and signaling,
+    some pros and cons of multiprocess versus multithreaded, as well as some tips
+    and FAQs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread safety
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A key, and unfortunately often not a clearly apparent, issue when developing
+    multithreaded applications is that of thread safety.A *thread-safe*, or, as the
+    man pages like to specify it, MT-Safe, function or API is one that can be safely
+    executed in parallel by multiple threads with no adverse issue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To understand what this thread-safety issue actually is, let''s go back to
+    one of the programs we saw in [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials;* you can find the source code within the book''s GitHub
+    repository: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux/blob/master/A_fileio/iobuf.c](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux/blob/master/A_fileio/iobuf.c).
+    In this program, we used `fopen(3)`to open a file in append mode and then performed
+    some I/O (reads/writes) upon it; we duplicate a small paragraph of that chapter
+    here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We `fopen(3)` a stream (in append mode: `a`) to our destination, just a regular
+    file in the `/tmp` directory (it will be created if it does not exist)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Then, in a loop, for a number of iterations provided by the user as a parameter,
+    we will do the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Read several (512) bytes from the source stream (they will be random values)
+    via the `fread(3)` stdio library API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Write those values to our destination stream via the `fwrite(3)` stdio library
+    API (checking for EOF and/or error conditions)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Here''s a snippet of the code, mainly the `testit` function performs the actual
+    I/O; refer to: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux/blob/master/A_fileio/iobuf.c](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux/blob/master/A_fileio/iobuf.c):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice the first line of code, it's really important to our discussion; the
+    memory buffer used to hold the source and destination data is a global (static)
+    variable, `gbuf`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s where it''s allocated in the `main()` function of the app:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So what? In [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*, we worked with the implicit assumption that the process
+    is single-threaded; so long as this assumption remains true, the program will
+    work well. But think carefully about this; the moment we want to port this program
+    to become multithreaded-capable, the code is not good enough. Why? It should be
+    quite clear: if multiple threads simultaneously execute the code of the `testit`function
+    (which is exactly the expectation), the presence of the global shared writable
+    memory variable, `gbuf`, tells us that we will have critical sections in the code
+    path.As we learned in detail in [Chapter 15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml),
+    *Multithreading with Pthreads Part II - Synchronization*, every critical section
+    must be either eliminated or protected to prevent data races.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding code fragment, we happily invoke both `fread(3)`and `fwrite(3)`on
+    this global buffer without any protection whatsoever*. *Just visualize multiple
+    threads that run through this code path simultaneously; the result is havoc.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, now we can see it and conclude that the `testit` function is not thread-safe(at
+    the very least, the programmer must documentthis fact, preventing others from
+    using the code in a multithreaded application!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Worse imagine that the preceding thread-unsafe function we developed is merged
+    into a shared library (often referred to as a shared object file on Unix/Linux);
+    any (multithreaded) application that links into this library will have access
+    to this function. If multiple threads of such an application ever invoke it, we
+    have a potential race—a bug, a defect! Not just that, such defects are the really
+    hard-to-spot and hard-to-understand ones, causing issues and perhaps all kinds
+    of temporary bandage fixes (which only make the situation worse and the customer
+    even less confident in the software). Disasters are caused in seemingly innocent
+    ways indeed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our conclusion on this is either render the function thread-safe, or clearly
+    document it as being thread-unsafe (and only use it, if at all, in a single-threaded
+    context).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Making code thread-safe
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Obviously, we would prefer to make the `testit` functionthread-safe. Now the
+    question becomes, how exactly can we do that? Well, again, it''s quite straightforward:
+    there are two approaches (more than two, actually, but we''ll get to that later).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If we can eliminate any and all global shared writable data in the code path,
+    we will have no critical sections and no problem; in other words, it will become
+    thread-safe. So, one way to achieve this is to ensure that the function uses only
+    local (automatic) variables. The function is now reentrant safe. Before proceeding
+    further, it's important to understand some key points regarding reentrant and
+    thread safety.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reentrant-safe versus thread-safe
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'How exactly is reentrant-safe different from thread-safe? Confusion does prevail.
+    Here''s a concise take: reentrant safety is an older issue prior to the advent
+    of multitasking and multithreading OSes, the implication being that only one thread
+    of concern is executing. For a function to be reentrant-safe, it should be able
+    to be correctly re-invoked from another context while the previous context has
+    not yet completed execution (think of a signal handler re-invoking a given function
+    while it is already executing). The key requirement: it should use only local
+    variables or have the ability to save and restore the global it uses such that
+    it''s safe. (These ideas have been dealt with in [Chapter 11](99fafa09-8972-4d9f-b241-46caf9de98f3.xhtml),
+    *Signaling - Part I*, in the *Reentrant safety and signaling* section. As we mentioned
+    in that chapter, a signal handler should only call functions that are guaranteed
+    to be reentrant safe; in the signal-handling context, these functions are referred
+    to as being async-signal-safe.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, thread safety is a much more recent issue—we are referring
+    to modern OSes that are multithreaded-capable. A function that is thread-safe
+    can be invoked in parallel from multiple threads (running on multiple CPU cores
+    perhaps) simultaneously, without breaking it. The shared writable data is the
+    thing that matters as code is in any case only readable can executable and thus
+    completely safe to execute in parallel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Making a function thread-safe via the use of a mutex lock (these discussions
+    follow in some detail with examples) is indeed possible but introduces performance
+    issues. There are better ways to make a function thread-safe: refactoring it,
+    or using TLS or TSD—we''ll cover these in the *Thread safety via TLS* and *Thread
+    safety via TSD* section.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In short, reentrant safety is concerned with one thread re-invoking a function
+    while an active invocation still exists; thread safety is concerned with multiple
+    threads—concurrent code—executing the same function in parallel. (An excellent
+    Stack Overflow post describes this in more detail; please refer to the *Further
+    reading* section on the GitHub repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, back to our earlier discussions. In theory, using only local variables
+    sounds good (and, for small utility functions, we should design it that way),
+    but the reality is that there are complex projects that evolve in such a manner
+    that using global shared writable data objects within functions becomes something
+    that cannot always be avoided. In such circumstances, from what we learned in
+    the previous [Chapter 15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml), *Multithreading
+    with Pthreads Part II - Synchronization*, on synchronization, we know the answer:
+    identify and protect the critical sections using a mutex lock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Yes, that would work, but at a significant cost to performance. Remember, locks
+    defeat parallelism and serialize the code flow, creating bottlenecks. Achieving
+    thread safety without using a mutex lock is what actually constitutes a truly reentrant-safe
+    function*.* Such code would indeed be a useful thing, and it can be done; there
+    are two powerful techniques to achieve this, called TLSand TSD.A little patience
+    please, we shall cover how to use these in the section: *Thread safety via TLS* and *Thread
+    safety via TSD*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A point to emphasize: the designer and programmer must guarantee that all code
+    that can be executed by multiple threads at any point in time is designed, implemented,
+    tested, and documented to be thread-safe.This is one of the key challenges to
+    meet when designing and implementing multithreaded applications.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, if one can guarantee that a function will always only be
+    executed by a single thread (an example is an early initialization routine called
+    from main()before threads are created), then obviously there is no need to guarantee
+    that it's thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary table – approaches to making functions thread-safe
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s summarize the preceding points in the form of a table that tells us
+    how to achieve the all-important goal of thread-safety for all our functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Approach to make a function thread-safe** | **Comments** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Use only local variables | Naive; hard to achieve in practice. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Use global and/or static variables and protect critical sections with mutex
+    locks | Viable but can significantly impact performance [1] |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Refactor the function, making it reentrant-safe-eliminate the use of static
+    variables in a function by using more parameters as required | Useful approach—several
+    old `foo` glibc functions refactored to `foo_r`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Thread local storage** (**TLS**) | Ensures thread safety by having one
+    copy of the variable per thread; toolchain and OS-version-dependent. Very powerful
+    and easy to use. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Thread-specific data** (**TSD**) | Same goal: make data thread-safe –older
+    implementation, more work to use. |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Table 1: Approaches to making functions thread-safe'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[1] Though we say that using the mutex can significantly impact performance,
+    the mutex performance is, in the normal case, really very high (largely due to
+    its internal implementation on Linux via the futex–fast user mutex).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's check out these approaches in more detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first one, using only local variables, being a fairly naive approach, will
+    probably only work well with small programs; we shall leave it at that.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread safety via mutex locks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Given that a function does use global and/or static variables, and the decision
+    is to continue to use them (the second approach we mention in *Table 1*), obviously
+    the places in the code where they are used constitute critical sections*. *As [Chapter
+    15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml), *Multithreading with Pthreads
+    Part II - Synchronization*, has shown in detail, we must *protect* these critical
+    sections; here, we use the pthreads mutex lockto do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here; to view
+    the complete source code, build and run it, the entire tree is available for cloning
+    from GitHub: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We apply this approach the addition of a pthread mutex lock to our sample function
+    (we rename it appropriately; find the full source code here: `ch16/mt_iobuf_mtx.c`)
+    in the following snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, we use the same macros to perform the mutex lock and unlock as we did
+    in (To avoid repetition, we do not show the code to initialize the mutex lock,
+    please refer to [Chapter 15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml), *Multithreading
+    with Pthreads Part II - Synchronization**,* for these details. Also we added an
+    additional `thrdnum`parameter to the function, so as to be able to print out the
+    thread number that's currently running through it.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The key point: at the critical sections—the places in the code where we access
+    (read or write) the shared writable global variable, `gbuf`*—*we take the mutex
+    lock, perform the access (in our case, at the `fread(3)`and `fwrite(3)`), and
+    unlock the mutex.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, even when multiple threads run through the preceding function, there will
+    be no data-integrity issue. Yes, it will work, but at a significant performance
+    cost; as stated earlier, each critical section (the code between a lock and the
+    corresponding unlock) will be serialized. Hence, locking can form bottlenecks
+    in the code path, especially if, as in our example, the `numio` parameter is a
+    large number, then the for loop will execute for a while. Similarly, bottlenecks
+    will result if the function is a busy one and is invoked often. (a quick check
+    with `perf(1)` revealed that the single-threaded version took 379 ms to perform
+    a 100,000 I/Os and the multithreaded version with locking took 790 ms for the
+    same number of I/Os.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have covered this, but let''s quickly test ourselves: why did we not protect
+    the places in the code that use the variables such as `fnr` and `syscalls`? The
+    answer is because it''s a local variable; more to the point, every thread will
+    get its own copy of a local variable when it executes the preceding function,
+    because every thread has its own private stack—and local variables are instantiated
+    on the stack.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make the program work, we have had to refactor how the preceding function
+    is actually set up as the thread-worker routine; we find we need to pass various
+    parameters to each thread using a custom data structure, and then have a small
+    `wrapper` function—`wrapper_testit_mt_mtx()`—invoke the actual I/O function; we
+    leave it to the reader to check out the source in detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s run it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: This reveals the full picture; clearly, the I/O buffer being used, gbuf, is
+    the same for both threads (look at the addresses printed out), hence the need
+    to lock it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an aside, within the standard-file streaming APIs, there exists (non-standard) *_unlocked APIs,
+    such as `fread_unlocked(3)` and `fwrite_unlocked(3)`. These are the same as their
+    regular counterparts, except that they are explicitly marked to be MT-unsafe in
+    the documentation. It's not advisable to use them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By the way, open files are a shared resource between the threads of a process;
+    the developer must take this into account as well. Performing IO simultaneously
+    with multiple threads on the same underlying file object can cause corruption,
+    unless file-locking techniques are used. Here, in this specific case, we are explicitly
+    using a mutex lock to protect critical sections – which happen to be at the precise
+    points where we perform file I/O, so explicit file-locking becomes unnecessary.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread safety via function refactoring
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we saw in the preceding example, we need the mutex lock because the `gbuf` global
+    buffer was being used by all application threads as their I/O buffer. So, think
+    on this: what if we can allocate an I/O buffer that''s local to each thread? That
+    would indeed solve the issue! How exactly, will be shown with the following code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But first, now that you are familiar with the previous example (where we used
+    the mutex lock), study the output of the refactored program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The keyrealization: the I/O buffer used here, `iobuf`,is unique for each thread (just
+    look at the addresses printed out)! Thus, this eliminates the critical sections
+    in the I/O function and the need to use a mutex. In effect, the function is using
+    only local variables and is thus both reentrant and thread-safe.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here. To view
+    the complete source code, build and run it; the entire tree is available for cloning
+    from GitHub: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following code snippets clearly reveal how this is set up (the full source
+    code:  `ch16/mt_iobuf_rfct.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As can be seen, we refactor by adding an additional buffer pointer member to
+    our custom `stToThread`structure. The important part: in the thread-wrapper function,
+    we then allocate it memory and pass the pointer it to our thread routine. We add
+    an additional parameter to our thread I/O routine for this very purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, in the preceding I/O loop, we operate upon the per-thread `iobuf`buffer, thus
+    there is no critical section, no need for locking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The standard C library and thread safety
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A significant amount of the standard C library (glibc), code is not thread-safe.
+    What? one asks. But, hey, a lot of this code was written back in the 1970s and
+    1980s, when multithreading did not exist (for Unix, at least); thus, one can hardly
+    blame them for not designing it to be thread-safe!
+  prefs: []
+  type: TYPE_NORMAL
+- en: List of APIs not required to be thread-safe
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The standard C library, glibc, has many older functions that, in the words
+    of the Open Group manual, need not be thread-safe (or are not required to be thread-safe).
+    All functions defined by this volume of POSIX.1-2017 shall be thread-safe, except that
+    the following functions need not be thread-safe. What does that actually mean?
+    Simple: these APIs are not thread-safe. So, be careful—do not use them in MT applications. The
+    complete list can be found at: [http://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_09_01](http://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_09_01).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, the preceding list is only valid as of POSIX.1-2017 and is bound
+    to get outdated. The reader must be aware of this recurring issue, and the need
+    to constantly update information like this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, they are mostly library-layer (glibc) APIs*. *Of all the preceding APIs, only
+    one of them—`readdir(2)`-is a system call; that too is considered deprecated (we
+    are to use its glibc wrapper, `readdir(3)`). As a rule of thumb, all system calls
+    are written to be thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An interesting aside: PHP, a popular web-scripting language, is not considered
+    thread-safe; hence, web servers that serve PHP pages do so using the traditional
+    multiprocess model and not a faster multithreaded framework (for example, Apache uses
+    its internal `mpm_prefork` module—which is single-threaded – to deal with PHP
+    pages).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, seeing what we have just discussed, does one conclude that glibc is no longer
+    viable to develop thread-safe MT apps? No sir, work has been done to convert (refactor,
+    really) many of the preceding APIs to render them thread-safe. Read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Refactoring glibc APIs from foo to foo_r
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Of course, today, with MT applications being the de facto reality, what do we
+    do? The glibc maintainers understand these issues, and have used precisely the
+    refactoringtechniques – passing additional parameters to avoid the usage of global
+    and/or static variables (like we did previous with our `ch16/mt_iobuf_rfct.c`
+    code), including using parameters as return values—to refactor standard `glibc`functions
+    to become thread-safe. The glibc naming convention is if the older function is
+    named `foo`, the refactored, usually reentrant- and thread-safe, version is named `foo_r`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To help lend clarity to this discussion, let's take an example of a glibc API
+    that has both the older `foo` and the newer `foo_r` functionality. The `ctime(3)` API is
+    often used by application developers; given a Unix-time timestamp, it converts
+    it into a human-readable date-timestamp (ASCII text). (Recall that we have used
+    the `ctime `API in [Chapter 13](1f621f72-e067-42db-b2eb-b82e20161dec.xhtml),* Timers.*)
+    Let's recall, directly from [Chaptr 13](1f621f72-e067-42db-b2eb-b82e20161dec.xhtml),* Timers,
+    that* Unix systems store time as the number of seconds elapsed since January 1,
+    1970, midnight (00:00) – think of it as Unix's birth! This time value is called
+    time since the Epoch or Unix time. OK, but it's going to be a rather large number
+    of seconds today, right? So how does one express it in a human-readable format?
+    Glad you asked; that's precisely the job of the `ctime(3)` and the `ctime_r(3)`
+    APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signature of the `ctime(3)` API is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Do you spot the issue here for multithreaded applications? The return value
+    is the time represented in plain ASCII text; it is stored by `ctime(3)` in a static
+    (thus, shared) data variable. If multiple threads execute the `ctime(3)` more
+    or less simultaneously (and that, my friend, is exactly what can, and indeed does,
+    happen on modern multicore systems!), there is always the risk that we perform
+    dirty reads or writes on the shared data. Simply because it is not protected;
+    simply because when the `ctime(3)` was first designed and implemented, only a
+    single thread would ever run it at a given point in time. Which is not the case
+    today, of course. In other words, `ctime(3)` is marked in the man page as being
+    MT-Unsafe, that is, it is not thread-safe. Thus, calling `ctime(3)` from an MT
+    application is wrong—you run the risk of having a race, a bug, or a defect at
+    some point.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The good glibc folks have literally re-implemented (refactored) `ctime(3)` to
+    become reentrant and thread-safe; the newer API is christened `ctime_r(3)`. Here
+    is a quote from its man page: the reentrant version `ctime_r()` does the same, but
+    stores the string in a user-supplied buffer which should have room for at least
+    26 bytes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Excellent! Did you notice that the key point here is that the `ctime(3)` API
+    has been refactored (and renamed to  `ctime_r(3)`) to become re-entrant- and thread-safe
+    by having the user supply the buffer in which the result is returned? How will
+    the user do this? Simple; here''s some code showing one way to achieve this (we
+    just require the concept here, no error-checking is shown):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Think about it: each thread that executes the preceding code will allocate a separate
+    unique buffer and pass that buffer pointer to the `ctime_r(3)` routine. This way,
+    we ensure that we do not step on each other's toes; the API is now reentrant-
+    and thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Notice in the preceding code how we achieved this refactoring trick in C: by
+    passing the unique buffer to be written into as a value-result-style parameter! This
+    is indeed a common technique, often employed by the glibc `foo_r` routines: we
+    keep the routine thread-safe by passing one or more values to  it (and even back
+    to the caller, as a kind of return value) without using static or global variables
+    (instead using value-result (or in-out) style parameters)!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The man page on `ctime(3)`, and indeed on most other APIs, documents whether
+    the API it describes are thread-safe: this is extremely important to note! We
+    cannot over-stress this: the multithreaded application programmer must check and
+    ensure that all functions being called in a function that is supposed to be thread-safe,
+    are themselves (documented to be) thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s a screenshot of a part of the man page on `ctime(3)` that shows, under
+    the **ATTRIBUTES** section, this information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/624d94f5-2e34-4d0a-bfea-a95243a043eb.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1 : Screenshot of ATTRIBUTES section of the man page on ctime(3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Quite obviously, MT-Safe implies the routine is thread-safe; MT-Unsafe implies
+    it isn't. The man page on attributes(7) delves further into these details; it
+    clearly notes that being thread-safe does not guarantee that the API is also atomic;
+    do read through it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We also note that the man page states that POSIX.1-2008 marks the `ctime_r`
+    API itself as obsolete, and to use `strftime(3)` in its place. Please do so. Here,
+    we have used the `ctime(3)` and `ctime_r(3)` APIs merely to illustrate an example
+    regarding the thread-unsafe and -safe versions of a glibc routine.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some glibc foo and foo_r APIs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `ctime(3)`, this being thread-unsafe, is now replaced by its thread-safe
+    counterpart `ctime_r(3)`; this is just one example of a generic trend in modern
+    glibc:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The older, thread (MT-unsafe) unsafe function is called  `foo`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Has a counterpart, the newer, thread (MT-Safe) safe `foo_r` API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'To give the reader an appreciation of this, we enumerate some (not all!) of
+    the glibc `foo_r` style of APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| `asctime_r(3)` `crypt_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ctime_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`drand48_r(3)` | `getpwnam_r(3)` `getpwuid_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getrpcbyname_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getrpcbynumber_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getrpcent_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getservbyname_r(3)` | `seed48_r(3)` `setkey_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`srand48_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`srandom_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`strerror_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`strtok_r(3)` |'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| `getdate_r(3)` `getgrent_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getgrgid_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getgrnam_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`gethostbyaddr_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`gethostbyname2_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`gethostbyname_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`gethostent_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`getlogin_r(3)` | `nrand48_r(3)` `ptsname_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`qecvt_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`qfcvt_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`qsort_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`radtofix_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`rand_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`random_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`readdir_r(3)` | `ustrtok_r(3)` `val_gethostbyaddr_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`val_gethostbyname2_r(3)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`val_gethostbyname_r(3)` |'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Table 3: Some of the glibc foo_r APIs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This list is not intended to be exhaustive; note that the `ctime_r(3)` API is
+    in this list. At the risk of repetition, ensure you only use the `foo_r` APIs
+    in an MT application as they are the thread-safe versions of the `foo` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread safety via TLS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The preceding discussion was with regard to the already existing standard C
+    library, glibc, and its API set. What about MT applications that are newly designed
+    and developed? Obviously, the code we write for them must be thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's not forget how we rendered our `testit_mt_refactored` function to become
+    thread-safe by refactoring it – adding an `iobuf` parameter that passed along
+    the address of the buffer to use for I/O—guaranteeing the buffer will be unique for
+    each thread and thus thread-safe (without any need for locking).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Could we get such functionality automatically? Well, yes: the compiler (GCC
+    and clang) does provide an almost magical feature to do something similar: TLS.
+    With TLS, a variable marked with the `__thread` special storage class keyword will
+    be instantiated once per thread that comes alive. In effect, if we use only local
+    and TLS variables, our function will by definition be thread-safe, without any
+    (expensive) locking required.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There do exist some ground rules and caveats; let''s check them out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `__thread` keyword can be used alone, or with (in fact, only with) the `static` or `extern`
+    keywords; if used with them, it must appear after them:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: More broadly, the `__thread` keyword can be specified against any global and
+    file-or- function scope `static` or `extern` variable. It cannot be applied to
+    any local variables.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: TLS can only be used on (fairly) recent versions of the toolchain and kernel.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Something important to understand: though it may seem akin to having a locked
+    variable, this is certainly not the case! Consider this: given a TLS variable
+    called `mytls`, different threads using it in parallel is fine. However, if a
+    thread uses the address-of operator on the TLS variable, `&mytls`, it will have
+    the address of its instance of the variable. Any other thread, if access to this
+    address, can use this address to gain access to the variable; thus, it''s not
+    really locked in any real sense. Of course, if the programmer uses normal conventions
+    (not letting other threads access a different thread''s TLS variables), then all
+    will work well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to realize that TLS support is only available from the Linux
+    2.6 kernel onward, gcc ver 3.3 or later, and NPTL. Well, practically speaking,
+    this implies that pretty much any fairly recent Linux distribution will support
+    TLS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, as usual, let''s port our thread-unsafe function to become thread-safe
+    via TLS. This is really simple; all we have to do is make the previously global
+    buffer, `gbuf`, into a thread-safe TLS buffer (`iobuf`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The only important change to note is the declaration of the `iobuf` variable
+    now as a TLS variable; everything else pretty much remains the same. A quick test
+    run confirms that each thread receives a separate copy of the TLS variable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Each `iobuf` is a per-thread TLS instance; each has a unique address. No locking,
+    no fuss, job done. Real-world usage of TLS is high; the uninitialized global `errno` is
+    a perfect example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'TLS seems such a powerful and easy-to-use technique to make a function thread-safe;
+    is there a downside? Well, think about it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For every variable marked as the TLS storage class, memory will have to be runtime-allocated for
+    every thread that comes alive; if we have large TLS buffers, this can cause significant
+    amounts of memory to be allocated.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Platform support: your Linux platform, if too old, will not support it (usually
+    shouldn''t be the case).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Thread safety via TSD
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Prior to the TLS technique that we just saw (that is, before Linux 2.6 and gcc
+    3.3), how did one guarantee writing a new API to be thread safe? A much older
+    technology exists, called TSD.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a nutshell, TSD is a more complex solution from the application developer's
+    viewpoint—more work must be done to achieve the very same end result that TLS
+    so easily gives us; that of making a function thread-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With TSD, the thread-safe routine must invoke an initializer function (usually
+    done with `pthread_once(3)`), which creates a unique thread-specific data key
+    (using the `pthread_key_create(3)` API). This initializer routine associates a
+    thread-specific data variable (such as the `iobuf` buffer pointer in our example)
+    with that key, using the `pthread_getspecific(3)` and `pthread_setspecific(3)`
+    APIs. The end result is that the data item is now thread-specific and therefore
+    thread-safe. Here, we do not delve further into using TSD as it's an older solution
+    that TLS easily and elegantly replaces on modern Linux platforms. Nevertheless,
+    for the interested reader, please refer to the *Further reading* section on the
+    GitHub repository—we provide a link to using TSD.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread cancelation and cleanup
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The pthreads design provides a sophisticated framework for achieving two other
+    key activities for a robust multithreaded application: the ability to have a thread
+    in the app cancel (effectively, kill) another thread, and the ability to have
+    a thread that is either terminated normally (via the `pthread_exit(3)`) or abnormally
+    (via cancelation) be able to perform the required resource cleanup.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The following sections deal with these topics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Canceling a thread
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Visualize a GUI application running; it pops up a dialog box informing the user
+    that it is now performing some work (perhaps displaying a progress bar as well).
+    We imagine that this work is being carried out by a thread of the overall application
+    process. For the user's convenience, a Cancel button is provided as well; clicking
+    on it should cause the ongoimg work to be canceled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How can we implement this? In  other words, how does one kill off a thread?
+    The first thing to note is that pthreads provides a framework for exactly this
+    type of operation: thread cancelation. Canceling a thread is not sending it a
+    signal; it is a way for one thread to request another a thread to die. Making
+    this happen requires us to understand and follow the provided framework.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The thread cancelation framework
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To help bring clarity, let''s take an example: let''s say that the main thread
+    of an application creates two worker threads, A and B. Now, the main thread wants
+    to cancel thread A.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The API to request cancelation upon a target thread (A, here) is the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_cancel(pthread_t thread);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `thread` parameter is the target thread—the one we are (politely) requesting
+    to please go and die, thank you very much.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But, you guessed it, it''s not as simple as that: the target thread has two
+    attributes (that it can set) that determine whether and when it gets canceled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cancelability state
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cancelability type
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The cancelability state
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The target thread is required to be in an appropriate cancelability state.
+    The state is Boolean-cancelability (on the target thread, A) is either *enabled* or *disabled*;
+    here is the API to set this up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_setcancelstate(int state, int *oldstate);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The two possible cancelability states, the value provided as the first parameter, for
+    a thread are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`PTHREAD_CANCEL_ENABLE`   (default on creation)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PTHREAD_CANCEL_DISABLE`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clearly, the previous cancelability state will be returned in the second parameter, `oldstate`.)
+    The target thread can only be canceled if its cancelability state is enabled.
+    A thread's cancelability state is enabled by default upon creation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is a powerful feature of the framework: if the target thread, A, is performing
+    a critical activity and does not want to be even considered for cancelation, it
+    merely sets its cancelability state to disabled, and, upon finishing the said
+    critical activity, resets it to enabled.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The cancelability type
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Assuming the target thread has the cancelability state enabled is the first
+    step; the thread's cancelability type determines what happens next. There are
+    two types: deferred (the default) and asynchronous. When a thread's cancelability
+    type is asynchronous, it can be canceled at any point in time (in fact, it should
+    happen immediately, but is not always guaranteed to); if the cancelability type is deferred (the
+    default), it can only be canceled (terminated) when it hits the next cancelation
+    point.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A cancelation point is a list of (usually blocking) functions (more on this
+    shortly). When the target thread—that, remember, is of the enabled cancelability
+    state and the deferred type—encounters the next cancelation point in its code
+    path, it will terminate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is the API to set the cancelability type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_setcanceltype(int type, int *oldtype);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The two possible cancelability types, the value provided as the first parameter
+    type, are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`PTHREAD_CANCEL_DEFERRED`   (default on creation)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PTHREAD_CANCEL_ASYNCHRONOUS`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clearly, the previous cancelability type will be returned in the second parameter, `oldtype`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Whew! Let''s try to represent this cancelation framework as a flowchart:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/39252ce8-4494-4e42-a3b2-73a52e05d354.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: Pthreads cancelation'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_cancel(3)` is a non-blocking API. What we mean is that, even if the
+    target thread has its cancelability state disabled, or its cancelability state
+    is enabled but the cancelability type is deferred and it has not reached a cancelation
+    point, though the target thread might take some time to actually die, the main thread''s `pthread_cancel(3)` call
+    will return with success (return value `0`), implying that the cancelation request
+    has been successfully queued.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Disabling the cancelation state for a short time while a critical activity is
+    carried out is fine, but doing the same for long periods could cause the application
+    to seem unresponsive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the asynchronous value for the cancelability type is usually not the right
+    thing to do. Why? Well, it becomes a race as to when exactly the thread was canceled;
+    was it before it allocated some resource (such as memory via `malloc(3)`) or after?
+    In such situations, even cleanup handlers are not really useful. Also, only APIs
+    documented as being async-cancel-safe can be safely canceled in an async fashion;
+    realistically there are very few—only the cancelation APIs themselves. For these
+    reasons, it's considered best to avoid asynchronous cancelation. On the other
+    hand, if a thread is predominantly highly CPU-bound (performing some mathematical
+    calculation, say prime number generation), then using async cancelation can help
+    guarantee the thread dies immediately on request.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another key point: how does (in our example) the main thread know that the
+    target thread has actually terminated? Remember that the main thread is expected
+    to join upon all threads; hence, the target thread upon termination will get joined,
+    and—here''s the thing – the return value (status) from `pthread_join(3)` will
+    be `PTHREAD_CANCELED`. `pthread_join(3)` is the only way to check that cancelation
+    has actually occurred.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have learned that, with the (default) cancelation type as deferred, the actual
+    thread-cancelation will not occur until the target thread encounters a cancelation
+    point function. A cancelation point is merely an API at which thread-cancelation
+    is actually detected and made to take effect by the underlying implementation.
+    The cancelation points are not limited to the pthreads APIs; many glibc functions
+    serve as cancelation points. The reader can find a list of cancelation point APIs
+    by following a link (Open Group POSIX.1c threads) provided in the *Further reading* section
+    on the GitHub repository. As a rule of thumb, the cancelation points are typically blocking
+    library APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But, what if a thread is executing code that just does not have a cancelation
+    point within it (say, a CPU-bound calculation loop)? In such cases, either one
+    can use the asynchronous cancelation type or, even better, explicitly introduce
+    a guaranteed cancelation point into the loop by invoking the `void pthread_test_cancel(void);`
+    API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the to-be-cancelled target thread hits this function, and a cancelation request
+    is pending, it will terminate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Canceling a thread – a code example
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A simple code example demonstrating thread-cancelation follows; we have the main thread
+    create two worker threads (think of them as thread A and thread B) and then have
+    the main thread cancel thread A. In parallel, we deliberately have thread A disable
+    cancelation (by setting the cancelation state to disabled), do some bogus work
+    (we call our trusty `DELAY_LOOP` macro to simulate work), then re-enable cancelation.
+    The cancelation request takes effect at the next cancelation point (as, of course,
+    the type defaults to deferred), which, here, is simply the `sleep(3)` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The code demonstrating thread cancelation (`ch16/cancelit.c`)follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here. To view
+    the complete source code, build and run it. The entire tree is available for cloning
+    from GitHub: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We pick up the code in `main`, after the thread creation loop is done:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here is the thread `worker` routine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A quick test run reveals that it indeed works; one can see that thread A has
+    been cancelled. We suggest you run the debug version of the program, as shown
+    here, as then the `DELAY_LOOP` macro''s effect can be seen (otherwise it completes
+    its job almost instantaneously as it''s pretty much optimized away by the compiler):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Cleaning up at thread exit
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Consider this hypothetical situation: a thread takes a mutex lock and allocates
+    some heap memory. Obviously, once the critical section it is in is done, we expect
+    it to free up the heap memory and unlock the mutex. Failure to do this cleanup
+    will cause serious, if not fatal, application bugs (defects) such as memory leakage
+    or deadlock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: But, one wonders, what if the poor thread is canceled prior to the free and
+    unlock? It could happen, right? No! Not if the developer understands and uses
+    the thread cleanup handler mechanism that the pthreads framework provides.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What happens when a thread terminates? The following steps are part of the
+    pthreads cleanup framework:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: All cleanup handlers are popped (reverse order of the cleanup handler push)
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: TSD destructors, if they exist, are invoked
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The thread dies
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'This opens our eyes to an interesting fact: the pthreads framework provides
+    a guaranteed way for a thread to ensure that it cleans up after itself—frees up
+    memory resources, closes open files, and so on—before terminating.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The programmer can take care of all these cases by setting up a thread-cleanup
+    handler – in effect, a kind of destructor function. A cleanup handler is a function
+    that is automatically executed when a thread is canceled or terminates with `pthread_exit(3)`;
+    it''s set up by invoking the `pthread_cleanup_push(3)` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Clearly, the first parameter to the preceding routine is the cleanup handler
+    function pointer, in other words, the name of the cleanup handler function. The
+    second parameter is any argument one cares to pass to the handler function (often
+    a pointer to a dynamically allocated buffer or data structure).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The reverse semantic is achieved via the corresponding cleanup pop routine;
+    when invoked, it pops off the cleanup handler stack and thus in reverse order
+    executes the cleanup handler(s) that were earlier pushed onto the cleanup handler
+    stack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`void pthread_cleanup_pop(int execute);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One can also explicitly invoke the topmost cleanup handler on the cleanup stack
+    by calling the `thread_cleanup_pop(3)` API with a non-zero argument.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The POSIX standard maintains that the preceding pair of APIs—the push and pop
+    cleanup handlers—can be implemented as macros that expand into functions; indeed,
+    it seems to be implemented this way on the Linux platform. As a side effect of
+    this, it becomes imperative that the programmer call both routines (the pair)
+    within the same function. Failure to comply causes weird compiler failures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As noted, TSD destructor handlers too, if they exist, get invoked; here, we
+    ignore this aspect.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You might think, fine, if we use these cleanup handler techniques, we can safely
+    restore state as both thread-cancelation and -termination will guarantee that
+    they invoke any registered cleanup handlers (destructors). But, what if another
+    process (perhaps a root process) sends my MT app a fatal signal (such as `kill
+    -9 <mypid>`)? Well, there's nothing to be done. Please realize that with a fatal
+    signal, all threads in the process, and indeed the entire process itself, will
+    die (in this example). It's an academic question—a moot point. On the other hand,
+    a thread cannot just randomly get killed; there has to be an explicit `pthread_exit(3)`
+    or cancelation carried out upon it. Thus, there is no excuse for the lazy programmer—set
+    up cleanup handler(s) to perform the appropriate cleanup and all will be well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread cleanup – code example
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As a simple code example, let's modify our earlier refactored program—`ch16/mt_iobif_rfct.c` by
+    installing a thread-cleanup handler routine. To test it, we cancel the first worker
+    thread if the user passes `1` as the second parameter to our demo program, the 
+    `ch16/cleanup_hdlr.c`. program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here. To view
+    the complete source code, build and run it. The entire tree is available for cloning
+    from GitHub: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is the cleanup handler function and the re-worked wrapper routine – now
+    with the cleanup handler push and pop APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, `main()` sets up the thread-cancelation as required:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A quick test run confirms that, upon cancelation, the cleanup handler is indeed
+    invoked and cleanup performed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Threads and signaling
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In [Chapter 11](99fafa09-8972-4d9f-b241-46caf9de98f3.xhtml), *Signaling - Part
+    I*, and [Chapter 12](657b6be0-ebc8-40dd-81b6-4741b04602b1.xhtml), *Signaling -
+    Part II*, we covered signaling in detail. We are still on the same Unix/Linux
+    platform; signaling and its usage for the application designer/developer does
+    not simply disappear just because we are now working on MT applications! We still
+    have to handle signals (recall that you can list your platform's available signals
+    with a simple `kill -l` on the shell).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The issue
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So, what's the problem? There is a significant difference in how we handle signals
+    in MT apps. Why? The fact is that the traditional manner of handling signals does
+    not really mix well with the pthreads framework. If you can avoid the usage of
+    signals in your MT app, please do so. If not (often the case in real-world MT
+    apps), then read on—we shall detail how to handle signals when within an MT application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But why is signaling now an issue? It''s quite straightforward: signals were
+    designed and meant for the process model. Consider this: how does one process
+    send a signal to another process? It''s quite clear - using the `kill(2)` system
+    call:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int kill(pid_t pid, int sig);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clearly, the first parameter, pid, is the PID of the process to deliver the
+    `sig` signal (number) to. But, and here we see it, a process can be multithreaded—which
+    particular thread will receive, and which particular thread will handle, the signal? The
+    POSIX standard cowardly states that "any ready thread cna handle a given signal". What
+    if all threads are ready? Then who does? All of them? It's ambiguous, to say the
+    least.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The POSIX solution to handling signals on MT
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The good news is that the POSIX committee has come up with a recommendation
+    to the developers of MT applications for signal-handling. This solution rests
+    on an interesting design fact; although a process has a table of signal dispositions
+    (set up by the kernel and the `sigaction(2)` system call), every thread within
+    the process has its own discrete signal mask (using which it can selectively block
+    signals) and signal pending mask (by which the kernel remembers which signals are
+    pending delivery to the thread).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Knowing this, the POSIX standard recommends that a developer handle signals
+    in a pthreads application as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mask (block) all signals in the main thread.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now any thread created by main inherits its signal mask, implying that signals
+    will be blocked in all subsequently created threads—this is what we want.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Create a special thread that is dedicated to performing signal-handling for
+    the entire application. Its job is to catch (trap) all required signals and handle
+    them (in a synchronous fashion).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that although it's possible to trap signals via the `sigaction(2)` system
+    call, the semantics of signal-handling in MT apps often lead to using the blocking
+    variants of signaling APIs—the `sigwait(3)`, `sigwaitinfo(3)`, and `sigtimedwait(3)`
+    library APIs. It is usually a good idea to use one of these blocking APIs within
+    our dedicated signal-handler thread to block all required signals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, whenever a signal does arrive, the signal-handler thread is unblocked,
+    and it receives the signal; also (assuming we're using the `sigwait(3)` API),
+    the signal number is updated in the second parameter to `sigwait(3)`. It can now
+    perform the required signal-processing on behalf of the application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code example – handling signals in an MT app
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A quick demonstration of the POSIX recommended technique for handling signals
+    in an MT application  follows (`ch16/tsig.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed here. To view
+    the complete source code, build and run it. The entire tree is available for cloning
+    from GitHub: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The worker threads don''t do much—they just invoke our `DELAY_LOOP` macro to
+    simulate some work. Here, see the signal-handler thread routine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: We leave it as a quick exercise to the reader to try it out, noting the output. By
+    the way, how will you finally kill it? Just open another Terminal window and issue `kill
+    -9 <PID>` from there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the reader's convenience, we repeat an important tip originally shown in [Chapter
+    12](657b6be0-ebc8-40dd-81b6-4741b04602b1.xhtml), *Signaling - Part II*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An important point to note: neither the `sigwait(3)`, `sigwaitinfo(2)`, nor
+    `sigtimedwait(2)` APIs can wait for synchronously generated signals from the kernel—typically
+    the ones that indicate a failure of some sort, such as the `SIGFPE` and the `SIGSEGV`.
+    These can only be caught in the normal asynchronous fashion—via `signal(2)` or 
+    via `sigaction(2)`. For such cases, as we have repeatedly shown, the `sigaction(2)`
+    system call would be the superior choice.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, to mask signals in a MT app, don't use the `sigprocmask(2)` API—it's not
+    thread-safe. Instead, use the `pthread_sigmask(3)` library routine, which is.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that the following APIs are available to send signals to threads within the
+    process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_kill(3)`: An API to send a signal to a particular thread within the
+    same process'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tgkill(2)`: An API to send a signal to a particular thread within a given
+    thread group.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tkill(2)`: A deprecated predecessor of `tgkill`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Look up the details on their respective man pages. Having said this, it's far
+    better to kill a thread via the pthreads cancelation framework than by sending
+    it a signal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threads vs processes – look again
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Right from the start of this trilogy ( [Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml),* Multithreading
+    with Pthreads Part I - Essentials*, [Chapter 15](5e7e9c60-48d8-41bd-adef-31bbfd598c78.xhtml),
+    *Multithreading with Pthreads Part II - Synchronization*, and [Chapter 16](4df10c19-b400-4805-8e6e-51a8f43dcfa4.xhtml),
+    *Multithreading with Pthreads Part III*) on multithreading with pthreads, with
+    regard to the multiprocess (single-threaded) versus multithreaded argument, we
+    have repeatedly said that it's not all advantages or disadvantages—there is always
+    some of both, a trade–off.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Table 4* and *Table 5 *describe some of the pros and cons of the multiprocess
+    (several single-threaded processes) versus the multithreaded (several threads
+    within a single process) approaches.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The multiprocess vs the multithreading model – pros of the MT model
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here are some pros of the MT model over the single-threaded process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Context** | **Multiprocess (single-threaded) model** | **Multithreaded
+    (MT) model** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Design for parallelized workloads |'
+  prefs: []
+  type: TYPE_TB
+- en: Cumbersome
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Non-intuitive
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the fork/wait semantics repeatedly (creating a large number of processes)
+    isn't simple or intuitive either
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lends itself to building parallelized software; calling the `pthread_create(3)` in
+    a loop is easy and intuitive as well
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Achieving a logical separation of tasks becomes easy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The OS will have threads take advantage of multicore systems implicitly; for
+    the Linux OS, the granularity of scheduling is a thread, not a process (more on
+    this in the next chapter*)*
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Overlapping CPU with IO becomes easy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Creation/ destruction performance | Much slower | Much faster than processes; resource-sharingguarantees
+    this |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Context switching | Slow | Much faster between the threads of a process |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Data sharing | Done via IPC (Inter-Process Communication) mechanisms; involves
+    a learning curve, can be fairly complex; synchronization (via the semaphore) required
+    | Inherent; all global and static data items are implicitly shared between threads
+    of a given process; synchronization (via the mutex) is required |'
+  prefs: []
+  type: TYPE_TB
+- en: Table 4: Multiprocess versus multithreading model – pros of the MT model
+  prefs: []
+  type: TYPE_NORMAL
+- en: The multiprocess vs the multithreading model – cons of the MT model
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here are some cons of the MT model over the single-threaded process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Context** | **Multiprocess (single-threaded) model** | **Multithreaded
+    (MT) model** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Thread-safety | No such requirement; processes always have address space
+    separation. | The most serious downside: every function in the MT application
+    that can be run in parallel by threads must be written, verified, and documented
+    to be thread-safe. This includes the app code and the project libraries, as well as
+    any third-party libraries it links into. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Application integrity | In a large MT app, if any one thread encounters a
+    fatal error (such as a segfault), the entire app is now buggy and will have to
+    shut down. | In a multiprocess app, *o*nly the process that encounters a fatal
+    error will have to shut down; the rest of the project keeps running[1]. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Address space constraints | On 32-bit CPUs, the VAS (virtual address space)
+    available to user mode apps is fairly small (either 2 GB or 3 GB), but still large
+    enough for a typical single-threaded app; on 64-bit CPUs the VAS is enormous (2^64
+    = 16 EB). | On a 32-bit system (still common on many embedded Linux products),
+    the available VAS to user mode will be small (2/3 GB). Considering sophisticated
+    MT apps with many threads, that''s not a lot! In fact, it''s one of the reasons
+    embedded vendors are aggressively moving products to 64-bit systems. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| The Unix everything''s a file semantics | The semantic holds true: files
+    (descriptors), devices, sockets, terminals, and so on can all be treated as files;
+    also, each process has its own copy of a given resource. | Resource-sharing, seen
+    as an advantage, can also be seen as a downside:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The sharing can defeat the traditional Unix model advantage
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The sharing of open files, memory regions, IPC objects, paging tables, resource
+    limits, and so on implies synchronization overhead upon access
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Signal-handling | Designed for the process model. | Not designed for the
+    MT model; can be done, but a bit clumsy to handle signals. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Designing, maintaining, and debugging | Quite straightforward compared to
+    the MT model. | Increases complexity because the programmer has to track (in this
+    mind) the state of several threads simultaneously, including notoriously complex
+    locking scenarios. Debugging deadlock (and other) situations can be quite difficult
+    (tools such as GDB and helgrind help, but the human still needs to track things).
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Table 5: Multiprocess versus multithreading model – cons of the MT model'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[1] The Google Chrome open source project architecture is based on the multiprocess
+    model; see their comic adaptation on why: [http://www.google.com/googlebooks/chrome/med_00.html](http://www.google.com/googlebooks/chrome/med_00.html).
+    From a software-design viewpoint, the site is very interesting.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pthreads – a few random tips and FAQs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To conclude this chapter, we provide answers to FAQs on multithreading as well
+    as a brief note on how to debug a MT application using GDB. Do read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every function in your MT application that can be run in parallel by threads must
+    be written, verified, and documented to be thread-safe. This includes your MT
+    app code, your project  libraries, as well as any third-party libraries you link
+    into.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pthreads – some FAQs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Q: What happens in a multithreaded process when a thread calls one of the `exec*()`
+    routines?'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A: The calling application (the predecessor) is completely replaced by the successor
+    process, which will be only the thread that called exec. Note that no TSD destructors
+    or thread-cleanup handlers are called.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Q: What happens in a multithreaded process when a thread calls `fork(2)`?'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A: It's OS-dependent. On modern Linux, only the thread that called `fork(2)`
+    is replicated in the new child process. All other threads that existed prior to
+    the fork are gone. No TSD destructors or thread cleanup handlers are called. Calling
+    fork in a multithreaded application can lead to difficulties; it is not recommended.
+    Find a link in the *Further reading* section on the GitHub repository regarding
+    this very question.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Think of it this way: calling `fork` in an MT application for multiprocessing
+    is considered the wrong approach; invoking fork for the sole purpose of executing
+    another program is okay (via the typical fork-exec-wait semantic we learned about).
+    In other words, the newly born child process should only call functions documented
+    as being async-signal-safe and/or the exec* routines to invoke another application.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, you can set up handlers to run when fork is invoked via the `pthread_atfork(3)`
+    API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Q: What is the effect on Resource Limits (see ulimit/prlimit) in a multithreaded
+    application?'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A: All resource limits—except the stack size limit, of course—are shared by
+    all threads in the process. On older Linux kernels, this was not the case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Debugging multithreaded (pthreads) applications with GDB
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'GDB supports debugging MT apps; almost all the usual commands work normally,
+    just  a few commands tend to be thread-specific. Here are the key ones to be aware
+    of:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'See all visible threads:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Switch context to a particular thread by using the `thread <thread#>`command*.*
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Apply a given command to all threads of the process: `(gdb) thread apply all
+    <cmd>`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Show the stack (GDB''s backtrace or `bt` command) of all threads (the following
+    example output is from our earlier MT app, `mt_iobuf_rfct_dbg`; first, we show
+    the threads via the `thread find .` command):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Some miscellaneous tips and tricks with regard to MT programming with pthreads (including
+    several we have already come across), are in a blog article mentioned in the *Further
+    reading* section on the GitHub repository (Pthreads Dev - common programming mistakes
+    to avoid); please do check it out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we covered several safety aspects of working with threads that
+    the powerful pthreads framework provides. We looked at thread-safe APIs, what
+    they are, why they are required, and how to make a thread routine thread-safe.
+    We also learned how to have one thread cancel (effectively, kill off) a given
+    thread, and how to have the victim thread deal with any required cleanup.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The remainder of the chapter focused on how to safely mix threads with the signaling
+    interfaces; we also compared and contrasted – giving pros and cons (some food
+    for thought, really)—the typical multiprocess single-threaded with several processes
+    versus multithreaded (with one process) approaches. Tips and FAQs round off this
+    trilogy of chapters ([Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml), *Multithreading
+    with Pthreads Part I - Essentials* and in this chapter).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, the reader will be taken through details on CPU scheduling
+    on the Linux platform, and very interestingly, how the application developer can
+    exploit CPU scheduling (with a multithreaded application demo).
+  prefs: []
+  type: TYPE_NORMAL

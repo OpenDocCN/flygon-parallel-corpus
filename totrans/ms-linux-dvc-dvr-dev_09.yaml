@@ -1,0 +1,1976 @@
+- en: '*Chapter 7*: Demystifying V4L2 and Video Capture Device Drivers'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Video has long been inherent in embedded systems. Given that Linux is the favorite
+    kernel used in such systems, it goes without saying that it natively embeds its
+    support for video. This is the so-called **V4L2**, which stands for **Video 4
+    (for) Linux 2**. Yes! *2* because there was a first version, *V4L*. V4L2 augments
+    V4L with memory management features and other elements that make this framework
+    as generic as possible. Through this framework, the Linux kernel is able to deal
+    with camera devices and the bridge to which they are connected, as well as the
+    associated DMA engines. These are not the only elements supported by V4L2\. We
+    will begin with an introduction to framework architecture, learning how it is
+    organized, and walk through the main data structures it comprises. Then, we will
+    learn how to design and write the bridge device driver, the one responsible for
+    DMA operations, and finally, we will delve into sub-device drivers. That said,
+    in this chapter, the following topics will be covered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Framework architecture and the main data structures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Bridge video device drivers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The concept of sub-devices
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: V4L2 control infrastructure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following are prerequisites for this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Advanced computer architecture knowledge and C programming skills
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Framework architecture and the main data structures
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Video devices are becoming increasingly complex. In such devices, hardware often
+    comprises several integrated IPs that need to cooperate with one another in a
+    controlled manner, and this leads to complex V4L2 drivers. This requires figuring
+    out the architecture prior to delving into the code and this is precisely the
+    requirement that this section addresses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is known that drivers normally mirror the hardware model in programming.
+    In the V4L2 context, the diverse IP components are modeled as software blocks
+    called sub-devices. V4L2 sub-devices are usually kernel-only objects. Moreover,
+    if the V4L2 driver implements the media device API (which we will discuss in the
+    next chapter, [*Chapter 8*](B10985_08_ePub_AM.xhtml#_idTextAnchor342), *Integrating
+    with V4L2 Async and Media Controller Frameworks*), those sub-devices will automatically
+    inherit from media entities, allowing applications to enumerate the sub-devices
+    and to discover the hardware topology using the media framework's entities, pads,
+    and link-related enumeration APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notwithstanding making sub-devices discoverable, drivers can likewise decide
+    to make them configurable by applications in a straightforward manner. When both
+    the sub-device driver and the V4L2 device driver uphold this, sub-devices will
+    feature a character device node on which **ioctls** (**input/output controls**)
+    can be invoked in order to query, read, and write sub-device capabilities (including
+    controls), or to even negotiate image formats on individual sub-device pads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At the driver level, V4L2 does a lot of work for the driver developer so that
+    they just have to implement the hardware-related code and register the relevant
+    device. Before going further, we must introduce several important structures that
+    constitute the core of V4L2:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct v4l2_device`: A hardware device may contain multiple child devices,
+    such as a TV card in addition to a capture device, and possibly a VBI device or
+    FM tuner. `v4l2_device` is the root node of all of these devices and is responsible
+    for managing all child devices.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct video_device`: The main purpose of this structure is to provide the
+    well-known `/dev/videoX` or `/dev/v4l-subdevX` device nodes. This structure mainly
+    abstracts the capture interface, also known as the `/dev/v4l-subdevX` nodes and
+    their file operations. From within the sub-device driver, only the core accesses
+    this structure in the underlying sub-device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct vb2_queue`: For me, this is the main data structure in the video driver,
+    as it is used in the real logic of data streaming and the center part of the DMA
+    operations, along with `struct vb2_v4l2_buffer`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct v4l2_subdev`: This is the sub-device responsible for implementing specific
+    functions and abstracting a specific function in the video system of the SoC.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct video_device` can be regarded as the base class for all devices and
+    sub-devices. When we write our own drivers, access to this data structure may
+    be direct (if we are dealing with a bridge driver) or indirect (if we are dealing
+    with a sub-device, because sub-device APIs abstract and hide the underlying `struct
+    video_device` embedded into each sub-device data structure).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now we are aware of the data structures this framework is made of. Moreover,
+    we introduced their relationships and their respective purposes. It is now time
+    for us to go deeper into the details by introducing how to initialize and register
+    a V4L2 device with the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Initializing and registering a V4L2 device
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Prior to being used or part of the system, the V4L2 device must be initialized
+    and registered, and this is the main topic of this section. Once the framework
+    architecture description is complete, we can start going through the code. In
+    this kernel, a V4L2 device is an instance of the `struct v4l2_device` structure.
+    This is the highest data structure in the media framework, maintaining a list
+    of sub-devices the media pipe is comprised of and acting as the parent of the
+    bridge device. V4L2 drivers should include `<media/v4l2-device.h>`, which will
+    bring in the following definition of a `struct v4l2_device`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Unlike other video-related data structures that we will introduce in the following
+    sections, there are only a few fields in this structure. Their meanings are as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`dev` is a pointer to the parent `struct device` for this V4L2 device. This
+    will be automatically set upon registration, and `dev->driver_data` will point
+    to this `v4l2` struct.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mdev` is a pointer to a `struct media_device` object to which this V4L2 device
+    belongs. This field deals with the media controller framework and will be introduced
+    in the related section. This may be `NULL` if integration with the media controller
+    framework is not required.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`subdevs` is the list of sub-devices for this V4L2 device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`lock` is the lock protecting access to this structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is a unique name for this V4L2 device. By default, it is derived from
+    the driver name plus the bus ID.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`notify` is a pointer to a notification callback, called by a sub-device to
+    inform this V4L2 device of some events.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ctrl_handler` is the control handler associated with this device. It keeps
+    track of all of the controls this V4L2 device has. This may be `NULL` if there
+    are no controls.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`prio` is the device''s priority state.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ref` is internally used by the core for reference counting.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`release` is the callback to be called when the last user of this structure
+    goes off.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This top-level structure is initialized and registered with the core by the
+    same function, `v4l2_device_register()`, whose prototype is the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first `dev` argument is normally the struct device pointer of the bridge
+    bus's related device-data structure. That is `pci_dev`, `usb_device`, or `platform_device`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the `dev->driver_data` field is `NULL`, this function will make it point
+    to the actual `v4l2_dev` object being registered. Moreover, if `v4l2_dev->name`
+    is empty, then it will be set to a value resulting from the concatenation of `dev
+    driver name + dev device name`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, if the `dev` parameter is `NULL`, then you must set `v4l2_dev->name`
+    before calling `v4l2_device_register()`. On the other hand, a previously registered
+    V4L2 device can be unregistered using `v4l2_device_unregister()` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Upon a call to this function, all sub-devices will be unregistered as well.
+    This is all about the V4L2 device. However, you should keep in mind that it is
+    the top-level structure, maintaining a list of sub-devices of the media device
+    and acting as the parent of the bridge device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are done with the main V4L2 device (the one that encompasses the
+    other device-related data structures) initialization and registration, we can
+    introduce specific device drivers, starting with the bridge driver, which is platform-specific.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing video device drivers – the bridge driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The bridge driver controls the platform `/USB/PCI/...` hardware that is responsible
+    for the DMA transfers. This is the driver that handles data streaming from the
+    device. One of the main data structures the bridge driver directly deals with
+    is `struct video_device`. This structure embeds the entire element needed to perform
+    video streaming, and one of its first interactions with the user space is to create
+    device files in the `/dev/` directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `struct video_device` structure is defined in `include/media/v4l2-dev.h`,
+    which means the driver code must contain `#include <media/v4l2-dev.h>`. The following
+    is what this structure looks like from the header file where it is defined:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Not only does the bridge driver play with this structure – this structure is
+    the main `v4l2` structure when it comes to representing V4L2-compatible devices,
+    including sub-devices. However, depending on the nature of the driver (be it a
+    bridge driver or sub-device driver), some elements may vary or may be `NULL`.
+    The following are descriptions of each element in the structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`entity`, `intf_node`, and `pipe` are part of the integration with the media
+    framework, as we will see in the section of the same name. The former abstracts
+    the video device (which becomes an entity) from within the media framework, while
+    `intf_node` represents the media interface device node, and `pipe` represents
+    the streaming pipe to which the entity belongs.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fops` represents the file operations for the video device''s file node. The
+    V4L2 core overrides the virtual device file operation with some extra logic required
+    by the subsystem.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cdev` is the character device structure, abstracting the underlying `/dev/videoX`
+    file node. `vdev->cdev->ops` is set with `v4l2_fops` (defined in `drivers/media/v4l2-core/v4l2-dev.c`)
+    by the V4L2 core. `v4l2_fops` is actually a generic (in term of ops implemented)
+    and V4L2-oriented (in terms of what these ops do) file op assigned to each `/dev/videoX`
+    char device and wraps the video device-specific ops defined in `vdev->fops`. At
+    their return paths, each callback in `v4l2_fops` will call its counterpart in
+    `vdev->fops`. `v4l2_fops` callbacks perform a sanity check prior to invoking the
+    real ops in `vdev->fops`. For example, on a `mmap()` system call issued by the
+    user space on a `/dev/videoX` file, `v4l2_fops->mmap` will be invoked first, which
+    will make sure that `vdev->fops->mmap` is set prior to calling it and printing
+    a debug message if needed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ctrl_handler`: The default value is `vdev->v4l2_dev->ctrl_handler`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`queue` is the buffer management queue associated with this device node. This
+    is one of the data structures only the bridge driver can play with. This may be
+    `NULL`, especially when it comes to non-bridge video drivers (sub-devices, for
+    example).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`prio` is a pointer to `&struct v4l2_prio_state` with the device''s priority
+    state. If this state is `NULL`, then `v4l2_dev->prio` will be used.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is the name of the video device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`vfl_type` is the V4L device type. Possible values are defined by `enum vfl_devnode_type`,
+    containing the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_GRABBER`: For video input/output devices'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_VBI`: For vertical blank data (undecoded)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_RADIO`: For radio cards'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_SUBDEV`: For V4L2 sub-devices'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_SDR`: Software-defined radio'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_TYPE_TOUCH`: For touch sensors'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vfl_dir` is a V4L receiver, transmitter, or memory-to-memory (denoted m2m
+    or mem2mem) device. Possible values are defined by `enum vfl_devnode_direction`,
+    containing the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '– `VFL_DIR_RX`: For capture devices'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_DIR_TX`: For output devices'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VFL_DIR_M2M`: should be mem2mem devices (read mem-to-mem, and also known
+    as memory-to-memory devices). A mem2mem device is a device that uses memory buffers
+    passed by user space applications for both the source and destination. This is
+    distinct from current and existing drivers that use memory buffers for only one
+    of those at a time. Such a device would be of both the **OUTPUT** and **CAPTURE**
+    types in terms of V4L2\. Although no such devices are present in the V4L2 framework,
+    a demand for such a model exists, for example, for ''resizer devices'' or for
+    the V4L2 loopback driver.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`v4l2_dev` is the `v4l2_device` parent device of this video device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dev_parent` is the device parent for this video device. If not set, the core
+    will set it with `vdev->v4l2_dev->dev`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ioctl_ops` is a pointer to `&struct v4l2_ioctl_ops`, which defines a set of
+    ioctl callbacks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`release` is a callback called by the core when the last user of the video
+    device exits. This must be non-`NULL`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`lock` is a mutex serializing access to this device. It is the principal serialization
+    lock by means of which all ioctls are serialized. It is common for bridge drivers
+    to set this field with the same mutex as the *queue->lock*, which is the lock
+    for serializing access to the queue (serializing streaming). However, if *queue->lock*
+    is set, then the streaming ioctls are serialized by that separate lock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num` is the actual device node index assigned by the core. It corresponds
+    to the *X* in `/dev/videoX`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` are video device flags. You should use bit operations to set/clear/test
+    flags. They contain a set of `&enum v4l2_video_device_flags` flags.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fh_list` is a list of `struct v4l2_fh`, which describes a V4L2 file handler,
+    enabling tracking of the number of opened file handles for this video device.
+    `fh_lock` is the lock associated with this list.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`class` corresponds to the sysfs class. It is assigned by the core. This class
+    entry corresponds to the `/sys/video4linux/` sysfs directory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Initializing and registering the video device
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Prior to its registration, the video device can be allocated either dynamically
+    using `video_device_alloc()` (which simply invokes `kzalloc()`), or statically
+    embedded into a dynamically allocated structure, which is the device state structure
+    most of time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The video device is dynamically allocated using `video_device_alloc()`, as
+    in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding excerpt, the last line provides the `release` method for the
+    video device since the `.release` field must be non-`NULL`. The `video_device_release()`
+    callback is provided by the kernel. It just calls `kfree()` to free the allocated
+    memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When it is embedded into a device state structure, the code becomes as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the video device must not be released alone as it is part of a bigger
+    picture. When the video device is embedded into another structure, as in the preceding
+    example, it does not require anything to be deallocated. At this point, since
+    the release callback must be non-`NULL`, we can assign an empty function, such
+    as `video_device_release_empty()`, also provided by the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We are done with allocation. At this point, we can use `video_register_device()`
+    in order to register the video device. The following is the prototype of this
+    function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding prototype, `type` specifies the type of bridge device being
+    registered. It will be assigned to the `vdev->vfl_type` field. In the remainder
+    of the chapter, we will consider it set to `VFL_TYPE_GRABBER` since we are dealing
+    with the video capture interface. `nr` is the desired device node number (*0 ==
+    /dev/video0*, *1 == /dev/video1*, ...). However, setting its value to `-1` will
+    instruct the kernel to pick the first free index and use it. Specifying a fixed
+    index may be useful to build fancy *udev* rules since the device node name is
+    known in advance. In order for the registration to succeed, the following requirements
+    must be met:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, you *MUST* set the `vdev->release` function as it can't be empty. If
+    you don't need it, you can pass the V4L2 core's empty release method.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Second, you *MUST* set the `vdev->v4l2_dev` pointer; it should point to the
+    V4L2 parent of the video device.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Finally, but not mandatorily, you should set `vdev->fops` and `vdev->ioctl_ops`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`video_register_device()` returns `0` when successful. However, it might fail
+    if there is no free minor, if the device node number could be found, or if the
+    registration of the device node failed. In either error case, it returns a negative
+    error number. Each registered video device creates a directory entry in `/sys/class/video4linux`
+    with some attributes inside.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Minor numbers are allocated dynamically unless the kernel is compiled with the
+    kernel option `CONFIG_VIDEO_FIXED_MINOR_RANGES`. In that case, minor numbers are
+    allocated in ranges depending on the device node type (video, radio, and so on),
+    with a total limit for `VIDEO_NUM_DEVICES`, which is set to `256`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `vdev->release()` callback will never be called if registration fails. In
+    this case, you need to call `video_device_release()` to free the allocated `video_device`
+    struct if it has been allocated dynamically, or free your own struct if the `video_device`
+    was embedded in it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the unloading path of the driver, or when the video nodes are no longer
+    needed, you should call `video_unregister_device()` on the video device in order
+    to unregister it so that its nodes can be removed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: After the preceding call, the device sysfs entries will be removed, causing
+    *udev* to remove nodes in `/dev/`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we have only discussed the simplest part of the registration process,
+    but there are some complex fields in the video device that need to be initialized
+    prior to registration. Those fields extend the driver capabilities by providing
+    the video device file operations, a coherent set of ioctl callbacks, and, most
+    importantly, the media's queue and memory management interface. We will discuss
+    these in the forthcoming sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Video device file operations
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The video device (by means of its driver) is meant to be exposed to the user
+    space as a special file in the `/dev/` directory, which the user space can use
+    to interact with the underlying device: streaming the data. In order for the video
+    device to be able to address user space queries (by means of system calls), a
+    set of standard callbacks has to be implemented from within the driver. These
+    callbacks form what are known today as `struct v4l2_file_operations` type, defined
+    in `include/media/v4l2-dev.h` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'These can be regarded as top-level callbacks as they are actually called (following
+    a number of sanity checks, of course) by another low-level device file op associated
+    with the `vdev->cdev` field this time, and which is set with `vdev->cdev->ops
+    = &v4l2_fops;` upon file node creation. This allows the kernel to implement an
+    extra logic and enforce sanity:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`owner` is the pointer to the module. Most of the time, it is `THIS_MODULE`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`open` should contain operations needed to implement the `open()` system call.
+    Most of the time, this could be set to `v4l2_fh_open`, which is a V4L2 helper
+    that simply allocates and initializes a `v4l2_fh` struct and adds it to the `vdev->fh_list`
+    list. However, if your device requires some extra initialization, perform your
+    initialization inside, and then call `v4l2_fh_open(struct file * filp)`. In any
+    case, you *MUST* deal with `v4l2_fh_open`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`release` should contain operations needed to implement the `close()` system
+    call. This callback must deal with `v4l2_fh_release`. It can be set to either
+    of the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: – `vb2_fop_release`, which is a videobuf2-V4L2 release helper that will clean
+    up any ongoing streaming. This helper will call `v4l2_fh_release`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – Your custom callback, undoing what has been done in `.open`, and which must
+    call `v4l2_fh_release` either directly or indirectly (using the `_vb2_fop_release()`
+    helper, for example, in order for the V4L2 core to handle the cleanup of any ongoing
+    streaming).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`read` should contain operations needed to implement the `read()` system call.
+    Most of the time, the videobuf2-V4L2 helper `vb2_fop_read` is enough.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`write` is not needed in our case as it is for an OUTPUT type device. However,
+    using `vb2_fop_write` here does the job.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`unlocked_ioctl` must be set to `video_ioctl2` if you use `v4l2_ioctl_ops`.
+    The next section explains this in detail. This V4L2 core helper is a wrapper around
+    `__video_do_ioctl()`, which handles the real logic, and which routes each ioctl
+    to the appropriate callback in `vdev->ioctl_ops`, which is where individual ioctl
+    handlers are defined.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mmap` should contain operations needed to implement the `mmap()` system call.
+    Most of the time, the videobuf2-V4L2 helper `vb2_fop_mmap` is enough, unless additional
+    elements are required prior to performing mapping. Video buffers in the kernel
+    (allocated in response to the `VIDIOC_REQBUFS` ioctl) have to be mapped individually
+    prior to being accessed in the user space. This is the purpose of this `.mmap`
+    callback, which just has to map one, and only one, video buffer to the user space.
+    Information needed to map a buffer to a user space is queried to the kernel using
+    the `VIDIOC_QUERYBUF` ioctl. Given the `vma` parameter, you can grab a pointer
+    to the corresponding video buffer as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`poll` should contain operations needed to implement the `poll()` system call.
+    Most of the time, the videobuf2-V4L2 helper `vb2_fop_call` is enough. If this
+    helper doesn''t know how to lock (neither `queue->lock` nor `vdev->lock` are set),
+    then you shouldn''t be using it, but you should write your own, which can rely
+    on the `vb2_poll()` helper that does not handle locking.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In either of these callbacks, you can use the `v4l2_fh_is_singular_file()`
+    helper in order to check whether the given file is the only file handle opened
+    for the associated `video_device`. Its alternative is `v4l2_fh_is_singular()`,
+    which relies on `v4l2_fh` this time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To summarize, the following is what a capture video device driver''s file operation
+    may look like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can observe that in the preceding block, we used only standard core helpers
+    in our ﬁle operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mem2mem devices may use their related v4l2-mem2mem-based helpers. Have a look
+    at `drivers/media/v4l2-core/v4l2-mem2mem.c`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 ioctl handling
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Let's talk a bit more about the `v4l2_file_operations.unlocked_ioctl` callback.
+    As we have seen in the previous section, it should be set to `video_ioctl2`. `video_ioctl2`
+    takes care of argument copying between the kernel and user space and performs
+    some sanity checks (for example, whether the ioctl command is valid) prior to
+    dispatching each individual `ioctl()` call to the driver, which ends up in a callback
+    entry in the `video_device->ioctl_ops` field, which is of the `struct v4l2_ioctl_ops`
+    type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `struct v4l2_ioctl_ops` structure contains callbacks for every possible
+    ioctl in the V4L2 framework. However, you should only set these depending on the
+    type of your device and the capability of the driver. Each callback in the structure
+    maps an ioctl, and the structure is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: This structure has more than 120 entries describing operations for each and
+    every possible V4L2 ioctl, whatever the device type is. In the preceding excerpt,
+    only those that may be of interest to us are listed. We will not introduce callbacks
+    into this structure. However, when you reach [*Chapter 9*](B10985_09_ePub_AM.xhtml#_idTextAnchor396),
+    *Leveraging V4L2 API from the User Space*, I encourage you to come back to this
+    structure and things will be clearer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That said, because you have provided a callback, it remains accessible. There
+    are situations where you may want a callback that you had specified in `v4l2_ioctl_ops`
+    to be ignored. This tends to be needed if, based on external factors (for example,
+    which card is being used), you want to turn off certain features in `v4l2_ioctl_ops`
+    without having to make a new struct. In order for the core to be aware of that
+    and to ignore the callback, you should call `v4l2_disable_ioctl()` on the ioctl
+    commands in question before `video_register_device()` is called:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is an example: `v4l2_disable_ioctl(&tea->vd, VIDIOC_S_HW_FREQ_SEEK);`.
+    The previous call will mark the `VIDIOC_S_HW_FREQ_SEEK` ioctl to be ignored on
+    the `tea->vd` video device.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The videobuf2 interface and APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The videobuf2 framework is used to connect the V4L2 driver layer to the user
+    space layer, providing a channel for data exchange that can allocate and manage
+    video frame data. The videobuf2 memory management backend is fully modular. This
+    allows custom memory management routines for devices and platforms with non-standard
+    memory management requirements to be plugged in, without changing the high-level
+    buffer management functions and API. The framework provides the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementation of streaming I/O V4L2 ioctls and file operations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: High-level video buffer, video queue, and state management functions
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Video buffer memory allocation and management
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Videobuf2 (or just vb2) facilitates driver development, reduces the code size
+    of drivers, and aids in the proper and consistent implementation of the V4L2 API
+    in drivers. V4L2 drivers are then charged with the task of acquiring video data
+    from a sensor (usually via some sort of DMA controller) and feeding to the buffer
+    managed by the vb2 framework.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This framework implements many ioctl functions, including buffer allocation,
+    enqueue, dequeue, and data flow control. It then deprecates any vendor-specific
+    solutions, reducing significantly the media framework code size and easing efforts
+    required to write V4L2 device drivers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every videobuf2 helper, API, and data structure is prefixed with `vb2_`, while
+    the version 1 (videobuf, defined in `drivers/media/v4l2-core/videobuf-core.c`)
+    counterpart used the `videobuf_` prefix.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This framework includes a number of concepts that may be familiar to some of
+    you, but that need to be discussed in detail nevertheless.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Concept of buffers
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A buffer is the unit of data exchanged in a single shot between vb2 and the
+    user space. From the point of view of user space code, a V4L2 buffer represents
+    the data corresponding to a video frame (in the case of a capture device, for
+    example). Streaming entails exchanging buffers between the kernel and user spaces.
+    vb2 uses the `struct vb2_buffer` data structure to describe a video buffer. This
+    structure is defined in `include/media/videobuf2-core.h` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding data structure, those fields of no interest to us have been
+    removed. The remaining fields are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vb2_queue` is the `vb2` queue to which this buffer belongs. This will lead
+    us to the next section, where we introduce the concept of queues according to
+    videobuf2.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`index` is the ID for this buffer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`type` is the type of buffer. It is set by `vb2` at the time of allocation.
+    It matches the type of queue it belongs to: `vb->type = q->type`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`memory` is the type of memory model used to make the buffers visible on user
+    spaces. The value of this field is of the `enum vb2_memory` type, which matches
+    its V4L2 user space counterpart, `enum v4l2_memory`. This field is set by `vb2`
+    at the time of buffer allocation and reports the vb2 equivalent of the user space
+    value assigned to the `.memory` field of `v4l2_requestbuffers` given to `vIDIOC_REQBUFS`.
+    Possible values include the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '– `VB2_MEMORY_MMAP`: Its equivalent that is assigned in user space is `V4L2_MEMORY_MMAP`,
+    which indicates that the buffer is used for memory mapping I/O.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VB2_MEMORY_USERPTR`: Its equivalent that is assigned in user space is `V4L2_MEMORY_USERPTR`,
+    indicating that the user allocates buffers in the user space, and passes a pointer
+    via the `buf.m.userptr` member of `v4l2_buffer`. The purpose of `USERPTR` in V4L2
+    is to allow users to pass buffers allocated in user space directly by `malloc()`
+    or statically.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_MEMORY_DMABUF`. Its equivalent that is assigned in user space is `V4L2_MEMORY_DMABUF`,
+    indicating that the memory is allocated by the driver and exported as a DMABUF
+    file handler. This DMABUF file handler may be imported in another driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`state` is of the `enum vb2_buffer_state` type and represents the current state
+    of this video buffer. Drivers can use the `void vb2_buffer_done(struct vb2_buffer
+    *vb, enum vb2_buffer_state state)` API in order to change this state. Possible
+    state values include the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_DEQUEUED` means the buffer is under user space control. It
+    is set by the videobuf2 core in the execution path of the `VIDIOC_REQBUFS` ioctl.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_PREPARING` means the buffer is being prepared in videobuf2\.
+    This flag is set by the videobuf2 core in the execution path of the `VIDIOC_PREPARE_BUF`
+    ioctl for drivers supporting it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_QUEUED` means the buffer is queued in videobuf, but not yet
+    in the driver. This is set by the videobuf2 core in the execution path of the
+    `VIDIOC_QBUF` ioctl. However, the driver must set the state of all buffers to
+    `VB2_BUF_STATE_QUEUED` if it fails to start streaming. This is the equivalent
+    of returning the buffer back to videobuf2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_ACTIVE` means the buffer is actually queued in the driver and
+    possibly used in a hardware operation (DMA, for example). There is no need for
+    the driver to set this flag as it is set by the core right before calling the
+    buffer `.buf_queue` callback.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_DONE` means the driver should set this flag on the success
+    path of the DMA operation on this buffer in order to pass the buffer to vb2\.
+    This means to the videobuf2 core that the buffer is returned from the driver to
+    videobuf, but is not yet dequeued to the user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `VB2_BUF_STATE_ERROR` is the same as the above, but the operation on the buffer
+    has ended with an error, which will be reported to the user space when it is dequeued.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the concept of buffer skills appears complex to you after this, then I encourage
+    you to first read [*Chapter 9*](B10985_09_ePub_AM.xhtml#_idTextAnchor396), *Leveraging
+    V4L2 API from the User Space*, prior to coming back here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The concept of planes
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: There are devices that require data for each input or output video frame to
+    be placed in discontiguous memory buffers. In such cases, one video frame has
+    to be addressed using more than one memory address, in other words, one pointer
+    per "plane." A plane is a sub-buffer of the current frame (or a chunk of the frame).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, on a single-planar system, a plane represents a whole video frame, whereas
+    it represents only a chunk of the video frame in a multi-planar system. Because
+    memory is discontiguous, multi-planar devices use Scatter/Gather DMA.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The concept of queue
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The queue is the central element of streaming and is the DMA engine-related
+    part of the bridge driver. In fact, it is the element through which the driver
+    introduces itself to videobuf2\. It helps us to implement the data flow management
+    module in the driver. A queue is represented through the following structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The structure should be zeroed, and the preceding fields filled in. The following
+    are the meanings of each element in the structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`type` is the buffer type. This should be set with one of the values present
+    in `enum v4l2_buf_type`, defined in `include/uapi/linux/videodev2.h`. This must
+    be `V4L2_BUF_TYPE_VIDEO_CAPTURE` in our case.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`io_modes` is a bitmask describing what types of buffers can be handled. Possible
+    values include the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '– `VB2_MMAP`: Buffers allocated within the kernel and accessed via `mmap()`;
+    vmalloc''ed and contiguous DMA buffers will usually be of this type.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VB2_USERPTR`: This is for buffers allocated in user space. Normally, only
+    devices that can do Scatter/Gather I/O can deal with user space buffers. However,
+    contiguous I/O to huge pages is not supported. Interestingly, videobuf2 supports
+    contiguous buffers allocated by the user space. The only way to get those, though,
+    is to use some sort of special mechanism, such as the out-of-tree Android `pmem`
+    driver.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '– `VB2_READ, VB2_WRITE`: These are user space buffers provided via the `read()`
+    and `write()` system calls.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`lock` is the mutex for serialization locks for the streaming ioctls. It is
+    common to set this lock with the same mutex as `video_device->lock`, which is
+    the main serialization lock. However, if some of the non-streaming ioctls were
+    to take a long time to execute, then you might want to have a different lock here
+    to prevent `VIDIOC_DQBUF` from being blocked while waiting for another action
+    to finish.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` represents the driver-specific callbacks to set up this queue and control
+    streaming operations. It is of the `struct vb2_ops` type. We will examine this
+    structure in detail in the next section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The `mem_ops` field is where the driver tells videobuf2 what kind of buffers
+    it is actually using; it should be set to one of `vb2_vmalloc_memops`, `vb2_dma_contig_memops`,
+    or `vb2_dma_sg_memops`. These are the three basic types of buffer allocation videobuf2
+    implements:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: – The first one is the `vmalloc()` and is thus virtually contiguous in the kernel
+    space and is not guaranteed to be physically contiguous.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – The second one is the `vb2_mem_ops` in order to meet that need. There are
+    no limits.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may not care about `buf_ops` as it is provided by the `vb2` core if not
+    set. However, it contains callbacks to deliver buffer information between the
+    user space and kernel space.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`min_buffers_needed` is the minimum number of buffers needed before you can
+    start streaming. If that is non-zero, then `vb2_queue->ops->start_streaming` won''t
+    be called until at least that many buffers have been queued up by the user space.
+    In other words, it represents the number of available buffers the DMA engine needs
+    to have before it can be started.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bufs` is an array of pointers to buffers in this queue. Its maximum is `VB2_MAX_FRAME`,
+    which corresponds to the maximum number of buffers allowed per queue by the `vb2`
+    core. It is set to `32`, which is already a quite considerable value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_buffers` is the number of allocated/used buffers in the queue.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Driver-speciﬁc streaming callbacks
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'A bridge driver needs to expose a collection of functions for managing buffer
+    queues, including queue and buffer initialization. These functions will handle
+    buffer allocation, queueing, and streaming-related requests coming from the user
+    space. This can be done by setting up an instance of `struct vb2_ops`, defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are the purpose of each callback in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`queue_setup`: This callback function is called by the driver''s `v4l2_ioctl_ops.vidioc_reqbufs()`
+    method (in response to `VIDIOC_REQBUFS` and `VIDIOC_CREATE_BUFS` ioctls) to adjust
+    the buffer count and size. This callback''s goal is to inform videobuf2-core of
+    how many buffers and planes per buffer it requires, as well as the size and allocator
+    context for each plane. In other words, the chosen vb2 memory allocator calls
+    this method for negotiating with the driver about the number of buffers and planes
+    per buffer to be used during streaming. `3` is a good choice for the minimum number
+    of buffers since most DMA engines need at least `2` buffers in the queue. The
+    parameters of this callback are defined as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: – `q` is the `vb2_queue` pointer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `num_buffers` is the pointer to the number of buffers requested by the application.
+    The driver should then set the granted number of buffers allocated in this `*num_buffers`
+    field. Since this callback can be called twice during the negotiation process,
+    you should check `queue->num_buffers` to have an idea of the number of buffers
+    already allocated prior to setting this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `num_planes` contains the number of distinct video planes needed to hold a
+    frame. This should be set by the driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `sizes` contains the size (in bytes) of each plane. For a single-planar system,
+    only `size[0]` should be set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `alloc_devs` is an optional per-plane allocator-specific device array. Consider
+    it as a pointer to the allocation context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is an example of the `queue_setup` callback:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`buf_init` is called once on a buffer after memory has been allocated for it,
+    or after a new `USERPTR` buffer is queued. This can be used, for example, to pin
+    pages, verify contiguity, and set up IOMMU mappings.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`buf_prepare` is called on the execution path of the `VIDIOC_QBUF` ioctl. It
+    should prepare the buffer for queueing to the DMA engine. The buffer is prepared
+    and the user space virtual address or user address is converted into a physical
+    address.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`buf_finish` is called on each `DQBUF` ioctl. It can be used, for example,
+    for cache syncing and copying back from bounce buffers.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`buf_cleanup` is called before freeing/releasing memory. It can be used for
+    unmapping memory and suchlike.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`buf_queue`: The videobuf2 core sets the `VB2_BUF_STATE_ACTIVE` flag in the
+    buffer right before invoking this callback. However, it is invoked on behalf of
+    the `VIDIOC_QBUF` ioctl. The user space queues buffers one by one, one after the
+    other. Moreover, buffers may be queued faster than the bridge device grabs data
+    from the capture device to the buffer. In the meantime, `VIDIOC_QBUF` may be called
+    several times before issuing `VIDIOC_DQBUF`. It is recommended for the driver
+    to maintain a list of buffers queued for DMA, so that in the event of any DMA
+    completion, the filled buffer is moved off the list, given to the `vb2` core at
+    the same time by filling its timestamp and adding the buffer to the videobuf2''s
+    done buffers list, and DMA pointers are updated if necessary. Roughly speaking,
+    this callback function should add a buffer to the driver DMA queue and start DMA
+    on that buffer. In the meantime, it is common for drivers to reimplement their
+    own buffer data structure, built on top of the generic `vb2_v4l2_buffer` structure,
+    but adding a list in order to address the queueing issue we just described. The
+    following is an example of such a custom buffer data structure:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`start_streaming` starts the DMA engine for streaming. Prior to starting streaming,
+    you must first check whether the minimum number of buffers have been queued. If
+    not, you should return `-ENOBUFS` and the `vb2` framework will call this function
+    again the next time a buffer has been queued until enough buffers are available
+    to actually start the DMA engine. You should also enable streaming on the sub-devices
+    if the following is supported: `v4l2_subdev_call(subdev, video, s_stream, 1)`.
+    You should get the next frame from the buffer queue and start DMA on it. Typically,
+    interrupts happen after a new frame has been captured. It is the job of the handler
+    to remove the new frame from the internal buffers (using the `list_del()`) list
+    and give it back to the `vb2` framework (by means of `vb2_buffer_done()`), updating
+    the sequence counter field and timestamp at the same time.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`stop_streaming` stops all pending DMA operations, stops the DMA engine, and
+    releases DMA channel resources.You should also disable streaming on the sub-devices
+    if the following is supported: `v4l2_subdev_call(subdev, video, s_stream, 0)`.
+    Disable interruptions if necessary. Since the driver maintains a list of buffers
+    queued for DMA, all buffers queued in that list must be returned to vb2 in the
+    ERROR state.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Initializing and releasing the vb2 queue
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'In order for the driver to complete the queue initialization, it should call
+    the `vb2_queue_init()` function, given the queue as an argument. However, the
+    `vb2_queue` structure should first be allocated by the driver. Additionally, the
+    driver must have cleared its content and set initial values for some requisite
+    entries before calling this function. Those required values are `q->ops`, `q->mem_ops`,
+    `q->type`, and `q->io_modes`. Otherwise, the queue initialization will fail, as
+    shown in the following `vb2_core_queue_init()` function, which is invoked and
+    whose return value is checked from within `vb2_queue_init()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding excerpt shows the body of `vb2_core_queue_init()` in the kernel.
+    This internal API is a pure basic initialization method that simply does some
+    sanity checks and initializes basic data structures (lists, mutexes, and spinlocks).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The concept of sub-devices
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the early days of the V4L2 subsystem, there were just two main data structures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct video_device`: This is the structure through which `/dev/<type>X` appears.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct vb2_queue`: This is responsible for buffer management.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This was enough in an era when there were not that many IP blocks embedded with
+    the video bridge. Nowadays, image blocks in SoCs embed so many IP blocks, each
+    of which plays a specific role by offloading specific tasks, such as image resizing,
+    image converting, and video deinterlacing functionalities. In order to use a modular
+    approach for addressing this diversity, the concept of the sub-device has been
+    introduced. This brings a modular approach to the software modeling of the hardware,
+    allowing to abstract each hardware component as a software block.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this approach, each IP block (except the bridge device) participating in
+    the processing pipe is seen as a sub-device, even the camera sensor itself. Whereas
+    the bridge video device node has the `/dev/videoX` pattern, sub-devices on their
+    side use the `/dev/v4l-subdevX` pattern (assuming they have the appropriate flag
+    set prior to having their nodes created).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For a better understanding of the difference between the bridge device and
+    the sub-devices, you can consider the bridge device as the final element in the
+    processing pipeline, sometimes the one responsible for the DMA transactions. One
+    example is the Atmel-`drivers/media/platform/atmel/atmel-isc.c`: `Sensor-->PFE-->WB-->CFA-->CC-->GAM-->CSC-->CBC-->SUB-->RLP-->DMA`.
+    You are encouraged to have a look in this driver for the meaning of each element.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'From a coding point of view, the driver should include `<media/v4l-subdev.h>`,
+    which defines the `struct v4l2_subdev` structure, which is the abstraction data
+    structure used to instantiate a sub-device in the kernel. This structure is defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `entity` field of this structure will be discussed in the next chapter,
+    [*Chapter 8*](B10985_08_ePub_AM.xhtml#_idTextAnchor342)*, Integrating with V4L2
+    Async and Media Controller Frameworks*. In the meantime, there are fields of no
+    interest to us that have been removed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, the other fields in the structure are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`list` is of the `list_head` type, and is used by the core to insert the current
+    sub-device in the list of sub-devices maintained by `v4l2_device` to which it
+    belongs.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`owner` is set by the core and represents the module owning this structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` represents the sub-device flags that the driver can set and that can
+    have the following values:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '– `V4L2_SUBDEV_FL_IS_I2C`: You should set this flag if this sub-device is actually
+    an I2C device.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_SUBDEV_FL_IS_SPI` should be set if this sub-device is an SPI device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_SUBDEV_FL_HAS_DEVNODE` should be set if the sub-device needs a device
+    node (the famous `/dev/v4l-subdevX` entry). An API using this flag is `v4l2_device_register_subdev_nodes()`,
+    which is discussed later and called by the bridge in order to create the sub-device
+    node entries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_SUBDEV_FL_HAS_EVENTS` means this sub-device generates events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`v4l2_dev` is set by the core on the sub-device registration and is a pointer
+    to the `struct 4l2_device` to which this sub-device belongs.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is optional. This is a pointer to `struct v4l2_subdev_ops`, which represents
+    a set of operations and which should be set by the driver to provide the callbacks
+    the core can rely upon for this sub-device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ctrl_handler` is a pointer to `struct v4l2_ctrl_handler`. It represents the
+    list of controls provided by this sub-device, as we will see in the *V4L2 controls
+    infrastructure* section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is a unique name for the sub-device. It should be set by the driver
+    after the sub-device has been initialized. For the I2C variant''s initialization,
+    the default name assigned by the core is `("%s %d-%04x", driver->name, i2c_adapter_id(client->adapter),
+    client->addr)`. When including the support of **media controller**, this name
+    is used as the media entity name.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`grp_id` is driver-specific and provided by the core when in asynchronous mode,
+    and is used to group similar sub-devices.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dev_priv` is the pointer to the device''s private data, if any.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`host_priv` is a pointer to private data used by the device where the sub-device
+    is attached.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`devnode` is the device node for this sub-device, set by the core upon a call
+    to `v4l2_device_register_subdev_nodes()`, not to be confused with the bridge device
+    built on top of the same structure. You should keep in mind that every `v4l2`
+    element (be they sub-devices or bridges) is a video device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dev` is the pointer to the physical device, if any. The driver can set this
+    value using `void` `v4l2_set_subdevdata(struct v4l2_subdev *sd, void *p)` or can
+    get it using `void *v4l2_get_subdevdata(const struct v4l2_subdev *sd)`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode` is the firmware node object handle for this sub-device. In older kernel
+    versions, this member used to be `struct device_node *of_node` and pointed to
+    the `struct fwnode_handle`, as it allows switching to/from the device-tree node/acpi
+    device according to which it is used on the platform. In other words, it is either
+    `dev->of_node->fwnode` or `dev->fwnode`, whichever is non-`NULL`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The `async_list`, `asd`, `subdev_notifier`, and `notifier` elements are part
+    of the v4l2-async framework, as we will see in the next section. However, brief
+    descriptions of these elements are provided here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`async_list`: When registered with the async core, this member is used by the
+    core to link this sub-device to a global `subdev_list` (which is a list of orphan
+    sub-devices that do not belong to any notifier, meaning this sub-device has been
+    registered prior to its parent, the bridge) or to its parent bridge''s `notifier->done`
+    list. We discuss this in detail later in the next chapter, [*Chapter 8*](B10985_08_ePub_AM.xhtml#_idTextAnchor342)*,
+    Integrating with V4L2 Async and Media Controller Frameworks*.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`asd`: This field is of the `struct v4l2_async_subdev` type and abstracts this
+    sub-device in the async core.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`subdev_notifier`: This is the notifier implicitly registered by this sub-device
+    in case it needs to be notified of the probing of some other sub-devices. It is
+    commonly used on systems where the streaming pipeline involves several sub-devices,
+    where the sub-device N needs to be notified of the probing of the sub-device N-1.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`notifier`: This is set by the async core and corresponds to the notifier with
+    which its underlying `.asd` async sub-device is matched.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pdata`: This is a common part of the sub-device platform data.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sub-device initialization
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Each sub-device driver must have a `struct v4l2_subdev` structure, either standalone
+    or embedded in the larger and device-specific structure. The second case is recommended
+    as it allows the device state to be tracked. The following is an example of a
+    typical device-specific structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Prior to being accessed, a V4L2 sub-device need to be initialized using the
+    `v4l2_subdev_init()` API. However, when it comes to sub-devices with an I2C- or
+    SPI-based control interface (typically camera sensors), the kernel provides `v4l2_spi_subdev_init()`
+    and `v4l2_i2c_subdev_init()` variants:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All of these APIs take a pointer to the `struct v4l2_subdev` structure as a
+    first argument. Registering our sub-device using our device-specific data structure
+    would then appear as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `spi`/`i2c` variants wrap the `v4l2_subdev_init()` function. Additionally,
+    they require the underlying low-level, bus-specific structure as a second argument.
+    Moreover, these bus-specific variants will store the sub-device object (given
+    as the first argument) as low-level, bus-specific device data and vice versa by
+    storing the low-level, bus-specific structure as the sub-device's private data.
+    This way, `i2c_client` (or `spi_device`) and `v4l2_subdev` point to one another,
+    meaning that by having a pointer to the I2C client, for example, you can call
+    `i2c_set_clientdata()` (such as `struct v4l2_subdev *sd = i2c_get_clientdata(client);`)
+    in order to grab the pointer to our internal sub-device object, and use the `container_of`
+    macro (such as `struct mychip_struct *foo = container_of(sd, struct mychip_struct,
+    sd);`) in order to grab the pointer to the chip-specific structure. On the other
+    hand, having a pointer to the sub-device object, you can use `v4l2_get_subdevdata()`
+    in order to grab the underlying bus-specific structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Least but not last, these bus-specific variants will mangle the sub-device
+    name, as explained when introducing the `struct v4l2_subdev` data structure. An
+    excerpt of `v4l2_i2c_subdev_init()` can provide a better understanding of this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: In each of the preceding three initialization APIs, `ops` is the last argument
+    and is a pointer to a `struct v4l2_subdev_ops` representing operations exposed/supported
+    by the sub-device. However, let's discuss this in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Sub-device operations
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Sub-devices are devices that are somehow connected to the main bridge device.
+    In the whole media device, each IP (sub-device) has its set of functionalities.
+    These functionalities have to be exposed to the core by means of callbacks well
+    defined by kernel developers for commonly used functionalities. This is the purpose
+    of `struct v4l2_subdev_ops`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, some sub-devices can perform so many different and unrelated things
+    that even `struct v4l2_subdev_ops` has been split into small and categorized coherent
+    sub-structure ops, each gathering related functionalities so that `struct v4l2_subdev_ops`
+    becomes the top-level ops structure, described as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Operations should only be provided for sub-devices exposed to the user space
+    by an underlying char device file node. When registered, this device file node
+    will have the same file operations as discussed earlier, that is, `v4l2_fops`.
+    However, as we have seen earlier, these low-level ops only wrap (deal with) `video_device->fops`.
+    Therefore, in order to reach `v4l2_subdev_ops`, the core uses `subdev->video_device->fops`
+    as an intermediate and assigns it another file ops upon initialization (`subdev->vdev->fops
+    = &v4l2_subdev_fops;`), which will wrap and call the real subdev ops. The call
+    chain here is `v4l2_fops ==> v4l2_subdev_fops ==> our_custom_subdev_ops`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can see that the preceding top-level ops structure is made of pointers
+    to category ops structures, which are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`core` of the `v4l2_subdev_core_ops` type: This is the core ops category, providing
+    generic callbacks, such as logging and debugging. It also allows the provision
+    of additional and custom ioctls (especially useful if the ioctl does not fit in
+    any category).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`video` of the `v4l2_subdev_video_ops` type: `.s_stream` is called when streaming
+    starts. It writes different configuration values to a camera''s registers based
+    on the chosen frame size and format.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pad` of the `v4l2_subdev_pad_ops` type: For cameras that support multiple
+    frame sizes and image sample formats, these operations allow users to choose from
+    the available options.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`tuner`, `audio`, `vbi`, and `ir` are beyond the scope of this book.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sensor` of the `v4l2_subdev_sensor_ops` type: This covers camera sensor operations,
+    typically for known buggy sensors that need some frames or lines to be skipped
+    because they are corrupted.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each callback in each category structure corresponds to an ioctl. The routing
+    is actually done at a low level by `subdev_do_ioctl()`, defined in `drivers/media/v4l2-
+    core/v4l2-subdev.c`, and which is indirectly called by `subdev_ioctl()`, which
+    corresponds to `v4l2_subdev_fops.unlocked_ioctl`. The real call chain should be
+    `v4l2_fops ==> v4l2_subdev_fops.unlocked_ioctl ==> our_custom_subdev_ops`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The nature of this top-level `struct v4l2_subdev_ops` structure just confirms
+    how wide the range of devices is that may be supported by V4L2\. Ops categories
+    that are of no interest to the sub-device driver can be left `NULL`. Do also note
+    that the `.core` ops are common to all sub-devs. This does not mean it is mandatory;
+    it merely means that any sub-device driver of whatever category is free to implement
+    the `.core` ops as its callbacks are category-independent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: struct v4l2_subdev_core_ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This structure implements generic callbacks and has the following definition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding structure, fields of no interest to us have been removed.
+    Those remaining are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`.log_status` is for logging purposes. You should use the `v4l2_info()` macro
+    for this.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.s_power` puts the sub-device (the camera, for example) in power-saving mode
+    (`on==0`) or normal operation mode (`on==1`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `.load_fw` operation has to be called to load the sub-device's firmware.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.ioctl` should be defined if the sub-device provides extra ioctl commands.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.g_register` and `.s_register` are to be used for advanced debugging only
+    and require the kernel config option `CONFIG_VIDEO_ADV_DEBUG` to be set. These
+    operations allow the reading and writing of hardware registers in response to
+    the `VIDIOC_DBG_G_REGISTER` and `VIDIOC_DBG_S_REGISTER` ioctls. The `reg` parameters
+    (of the type `v4l2_dbg_register`, defined in `include/uapi/linux/videodev2.h`)
+    are filled and given by the application.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.interrupt_service_routine` is called by the bridge from within its IRQ handler
+    (it should use `v4l2_subdev_call` for this) when an interrupt status has been
+    raised due to this sub-device, in order for the sub-device to handle the details.
+    `handled` is an output parameter provided by the bridge driver, but has to be
+    filled by the sub-device driver in order to inform (as *true or false*) on the
+    result of its processing. We are in the IRQ context, so must not sleep. Sub-devices
+    behind I2C/SPI buses should probably schedule their work in a threaded context.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.subscribe_event` and `.unsubscribe_event` are used to subscribe or unsubscribe
+    to control change events. Please have a look at other V4L2 drivers implementing
+    this to see how to implement yours.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: struct v4l2_subdev_video_ops or struct v4l2_subdev_pad_ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: People often need to decide whether to implement `struct v4l2_subdev_video_ops`
+    or `struct v4l2_subdev_pad_ops`, because some of the callbacks are redundant in
+    both of these structures. The thing is, the callbacks of the `struct v4l2_subdev_video_ops`
+    structure are used when the V4L2 device was opened in video mode, which includes
+    TVs, camera sensors, and framebuffer. So far, so good. The concept of `struct
+    v4l2_subdev_pad_ops` is not needed either. However, the media controller framework
+    abstracts the sub-device by means of an entity object (we will see this later),
+    which connects to other elements via PAD. In this case, it makes sense to use
+    PAD-related functionalities instead of sub-device-related ones, hence, using `struct
+    v4l2_subdev_pad_ops` instead of `struct v4l2_subdev_video_ops`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Since we have not introduced the media framework yet, we are only interested
+    in the `struct v4l2_subdev_video_ops` structure, which is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding excerpt, for the sake of readability, I removed the TV and
+    video output-related callbacks as well as those not related to camera devices,
+    which are also somehow useless for us. For the commonly used ones, they are defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`querystd`: This is the callback for the `VIDIOC_QUERYSTD()` ioctl handler
+    code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s_stream`: This is used to notify the driver that a video stream will start
+    or has stopped, depending on the value of the `enable` parameter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`g_frame_interval`: This is the callback for the `VIDIOC_SUBDEV_G_FRAME_INTERVAL()`
+    ioctl handler code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s_frame_interval`: This is the callback for the `VIDIOC_SUBDEV_S_FRAME_INTERVAL()`
+    ioctl handler code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: struct v4l2_subdev_sensor_ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: There are sensors that produce initial garbage frames when they start streaming.
+    Such sensors possibly require some time in order to ensure the stability of some
+    of their properties. This structure makes it possible to inform the core of the
+    number of frames to skip in order to avoid garbage. Moreover, some sensors may
+    always produce images with a certain number of corrupted lines at the top, or
+    embed their metadata in these lines. In both cases, the resulting frames they
+    produce are always corrupted. This structure also allows us to specify the number
+    of lines to skip on each frame before it is grabbed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is the definition of the `v4l2_subdev_sensor_ops` structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`g_skip_top_lines` is used to specify the number of lines to skip in each image
+    of the sensors, while `g_skip_frames` allows us to specify the initial number
+    of frames to skip in order to avoid garbage, as in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `lines` and `frames` parameters are output parameters. Each callback should
+    return `0`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Calling sub-device operations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'After all, if `subdev` callbacks are provided, then they are intended to be
+    called. That said, invoking an ops callback is as simple as calling it directly,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'However, there is a more convenient and safer way to achieve this, by using
+    the `v4l2_subdev_call()` macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The macro, defined in `include/media/v4l2-subdev.h`, will perform the following
+    actions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It will first check whether the sub-device is `NULL` and return `-ENODEV` otherwise.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It will return `-ENOIOCTLCMD` if either the category (`subdev->video` in our
+    example) or the callback itself (`subdev->video->s_stream` in our example) is
+    `NULL`, or it will return the actual result of the `subdev->ops->video->s_stream`
+    ops.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'It is also possible to call all, or a subset, of the sub-devices:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Any sub-device that does not support this callback is skipped and error results
+    are ignored. If you want to check for errors, use the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: Any error except `-ENOIOCTLCMD` will exit the loop with that error. If no errors
+    (except `- ENOIOCTLCMD`) occurred, then `0` is returned.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traditional sub-device (un)registration
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are two ways for a sub-device to be registered with the bridge, depending
+    on the nature of the media device:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Synchronous mode**: This is the traditional method. In this mode, the bridge
+    driver has the responsibility of registering sub-devices. The sub-device driver
+    is either implemented from within the bridge driver or you have to find a way
+    for the bridge driver to grab the handles of sub-devices it is responsible for.
+    This is usually achieved by means of platform data, or by the bridge driver exposing
+    a set of APIs that will be used by the sub-device drivers, which would allow the
+    bridge driver to be aware of these sub-devices (by tracking them in a private
+    internal list, for example).With this method, the bridge driver must be aware
+    of the sub-devices connected to it, and know exactly when to register them. This
+    is typically the case for internal sub-devices, such as video data processing
+    units within SoCs or complex PCI(e) boards, or camera sensors in USB cameras or
+    connected to SoCs.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Asynchronous mode**: This is where information about sub-devices is made
+    available to the system independently of the bridge devices, which is typically
+    the case on devicetree-based systems. This will be discussed in the next chapter,
+    [*Chapter 8*](B10985_08_ePub_AM.xhtml#_idTextAnchor342), *Integrating with V4L2
+    Async and Media Controller Frameworks*.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'However, in order for a bridge driver to register a sub-device, it has to call
+    `v4l2_device_register_subdev()`, while it has to call `v4l2_device_unregister_subdev()`
+    to unregister this sub-device. In the meantime, after registering sub-devices
+    with the core, it might be necessary to create their respective char file nodes,
+    `/dev/v4l-subdevX`, only for sub-devices with the flag `V4L2_SUBDEV_FL_HAS_DEVNODE`
+    set. You can use `v4l2_device_register_subdev_nodes()` to this end:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`v4l2_device_register_subdev()` will insert `sd` into `v4l2_dev->subdevs`,
+    which is the list of sub-devices maintained by this V4L2 device. This can fail
+    if the `subdev` module disappeared before it could be registered. After this function
+    has been called successfully, the `subdev->v4l2_dev` field points to the `v4l2_device`.
+    This function returns `0` in the event of success or `v4l2_device_unregister_subdev()`
+    will take `sd` off that list. Then, `v4l2_device_register_subdev_nodes()` walks
+    through `v4l2_dev->subdevs` and creates a special char file node (`/dev/v4l-subdevX`)
+    for each sub-device with the flag `V4L2_SUBDEV_FL_HAS_DEVNODE` set.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `/dev/v4l-subdevX` device nodes allow direct control of the advanced and
+    hardware-specific features of sub-devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have learned about sub-device initialization, operations, and registration,
+    let's look at V4L2 controls in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 controls infrastructure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Some devices have controls that are settable by the user in order to modify
+    some defined properties. Some of these controls may support a list of predefined
+    values, a default value, an adjustment, and so on. The thing is, different devices
+    may provide different controls with different values. Moreover, while some of
+    these controls are standard, others may be vendor-specific. The main purpose of
+    the control framework is to present controls to the user without assumptions relating
+    to their purpose. In this section, we only address standard controls.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The control framework relies on two main objects, both defined in `include/media/v4l2-
+    ctrls.h`, like the rest of the data structures and APIs provided by this framework.
+    The first is `struct v4l2_ctrl`. This structure describes the control properties
+    and keeps track of the control''s value. The second and final one is `struct v4l2_ctrl_handler`,
+    which keeps track of all the controls. Their detailed definitions are presented
+    here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding definition excerpt of `struct v4l2_ctrl_handler`, `ctrls`
+    represents the list of controls owned by this handler. `notify` is a notify callback
+    that is called whenever the control changes value. This callback is invoked with
+    the handler''s `lock` held. At the end, `notify_priv` is the context data given
+    as the argument to notify. The next one is `struct v4l2_ctrl`, defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This structure represents the control on its own, with important members present.
+    These are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`node` is used to insert the control in the handler''s control list.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`handler` is the handler to which this control belongs.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is of the `struct v4l2_ctrl_ops` type and represents the get/set operations
+    for this control.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`id` is the ID of this control.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is the name of the control.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`minimum` and `maximum` are the minimum and maximum values accepted by the
+    control, respectively.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`default_value` is the default value of the control.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`step` is the incrementation/decrementation step for this non-menu control.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` covers the control''s flags. While the whole flag list is defined in
+    `include/uapi/linux/videodev2.h`, some of the commonly used ones are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: – `V4L2_CTRL_FLAG_DISABLED`, which means the control is disabled
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_CTRL_FLAG_READ_ONLY`, for a read-only control
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_CTRL_FLAG_WRITE_ONLY`, for a write-only control
+  prefs: []
+  type: TYPE_NORMAL
+- en: – `V4L2_CTRL_FLAG_VOLATILE`, for a volatile control
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`is_private`, if set, will prevent this control from being added to any other
+    handlers. It makes this control private to the initial handler where it is added.
+    This can be used to prevent making a `subdev` control available in the V4L2 driver
+    controls.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`enum` usually) like a kind of menu, hence the name *menu control*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'V4L2 controls are identified by a unique ID. They are prefixed with `V4L2_CID_`
+    and are all available in `include/uapi/linux/v4l2-controls.h`. The common standard
+    controls supported in video capture devices are as follows (the following list
+    is non-exhaustive):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding list includes standard controls only. To support a custom control,
+    you should add its ID based on the control''s base class descriptor and make sure
+    that the ID is not a duplication. To add control support to the driver, the control
+    handler should first be initialized using the `v4l2_ctrl_handler_init()` macro.
+    This macro accepts the handler to be initialized as well as the number of controls
+    this handler can refer to, as shown in its following prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once finished with the control handler, you can call `v4l2_ctrl_handler_free()`
+    on this control handler in order to release its resources. Once the control handler
+    is initialized, controls can be created and added to it. When it comes to standard
+    V4L2 controls, you can use `v4l2_ctrl_new_std()` in order to allocate and initialize
+    the new control:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This function will, in most fields, be based on the control ID. For custom
+    controls, however (not discussed here), you should use the `v4l2_ctrl_new_custom()`
+    helper instead. In the preceding prototype, the following elements are defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`hdl` represents the control handler initialized previously.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is of the `struct v4l2_ctrl_ops` type and represents the control ops.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`id` is the control ID, defined as `V4L2_CID_*`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`min` is the minimum value this control can accept. Depending on the control
+    ID, this value can be mangled by the core.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`max` is the maximum value this control can accept. Depending on the control
+    ID, this value can be mangled by the core.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`step` is the control''s step value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`def` is the control''s default value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Controls are meant to be set/get. This is the purpose of the preceding ops argument.
+    This means that prior to initializing a control, you should first define the ops
+    that will be called when setting/getting this control's value. That said, the
+    whole control list can be addressed by the same ops. In this case, the ops callback
+    will have to `switch ... case` to handle different controls.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we have seen earlier, control operations are of the `struct v4l2_ctrl_ops`
+    type and are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding structure is made of three callbacks, each with a specific purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`g_volatile_ctrl` gets the new value for the given control. Providing this
+    callback only makes sense for volatile (those changed by the hardware itself,
+    and that are read-only most of the time, such as the signal strength or autogain,
+    for example) controls.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`try_ctrl`, if set, is invoked to test whether the control''s value to be applied
+    is valid. Providing this callback only makes sense if the usual min/max/step checks
+    are insufficient.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s_ctrl` is invoked to set the control''s value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Optionally, you can call `v4l2_ctrl_handler_setup()` on the control handler
+    in order to set up this handler''s controls to their default values. This helps
+    to ensure that the hardware and the driver''s internal data structures are in
+    sync:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function iterates over all the controls in the given handler and calls
+    the `s_ctrl` callback with each control's default value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To summarize what we have seen throughout this V4L2 control interface section,
+    let's now study in more detail an excerpt of the `OV7740` camera sensor's driver
+    (present in `drivers/media/i2c/ov7740.c`), especially the part dealing with V4L2
+    controls.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we have the implementation of the control `ops->sg_ctrl` callback:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding callback only addresses the control ID of `V4L2_CID_AUTOGAIN`.
+    It makes sense as the gain value may be changed by the hardware while in *auto*
+    mode. This driver implements the `ops->s_ctrl` control as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding code block also shows how easy it is to implement a menu control
+    using the `V4L2_CID_EXPOSURE_AUTO` control as an example and whose possible values
+    are enumerated in `enum v4l2_exposure_auto_type`. Finally, the control ops structure
+    that will be given for control creation is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once defined, this control op can be used to initialize controls. The following
+    is the `ov7740_init_controls()` method (invoked in the `probe()` function) excerpt,
+    mangled and shrunk for the purposes of readability:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can see the control handler being assigned to the sub-device at the return
+    path of the preceding function. Finally, somewhere in the code (the ov7740''s
+    driver does this from within the sub-device''s `v4l2_subdev_video_ops.s_stream`
+    callback), you should set all controls to their default values:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is more on V4L2 controls at [https://www.kernel.org/doc/html/v4.19/media/kapi/v4l2-controls.html](https://www.kernel.org/doc/html/v4.19/media/kapi/v4l2-controls.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A word about control inheritance
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: It is common for sub-device drivers to implement controls already implemented
+    by the bridge's V4L2 driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When `v4l2_device_register_subdev()` is invoked on `v4l2_subdev` and `v4l2_device`
+    and the `ctrl_handler` fields of both are set, then the sub-device's controls
+    will be added (by means of the `v4l2_ctrl_add_handler()` helper, which adds a
+    given handler's control to another handler) to the `v4l2_device` controls. Sub-device
+    controls that are already implemented by `v4l2_device` will be skipped. This means
+    that a V4L2 driver can always override a `subdev` control.
+  prefs: []
+  type: TYPE_NORMAL
+- en: That said, a control may perform low-level, hardware-specific operations on
+    a given sub-device and the sub-device driver may not want this control to be available
+    to the V4L2 driver (and so is not added to its control handler). In this case,
+    the sub-device driver has to set the `is_private` member of the control to `1`
+    (or `true`). This will make the control private to the sub-device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Even though sub-device controls are added to the V4L2 device, they remain accessible
+    through the control device node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we dealt with V4L2 bridge device driver development, as well
+    as the concept of sub-devices. We learned about the V4L2 architecture and are
+    now familiar with its data structures. We studied the videobuf2 API and are now
+    able to write platform bridge device drivers. Moreover, we should be able to implement
+    sub-device operations, and to leverage the videobuf2 core.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter can be regarded as the first part of a big picture, since the next
+    chapter still addresses V4L2, but we will deal with the async core and integration
+    with the media controller frameworks.
+  prefs: []
+  type: TYPE_NORMAL

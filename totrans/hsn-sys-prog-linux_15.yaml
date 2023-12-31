@@ -1,0 +1,2636 @@
+- en: Multithreading with Pthreads Part II - Synchronization
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One of the key reasons that multithreading is powerful and makes a big impact
+    performance-wise is that it lends itself to the notion of parallelism or concurrency;
+    from what we learned in the previous [Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml),
+    *Multithreading with Pthreads Part I - Es**sential**s*, we understand that multiple
+    threads of a process can (and indeed do) execute in parallel. On large multicore
+    systems (multicore is pretty much the norm now, even in embedded systems), the
+    effect is magnified.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, as experience teaches us, there's always a trade-off. With parallelism
+    comes the ugly potential for races and the subsequent defects. Not only that,
+    situations like this typically become extremely hard to debug, and therefore,
+    fix.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we shall attempt to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Make the reader aware as to where and what exactly these concurrency (race)
+    defects are
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How to avoid them with good design and coding practices in multithreaded applications
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Again, this chapter divides itself into two broad areas:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the first part, we clearly explain the problem(s), such as how atomicity matters
+    and deadlock issues.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: in the latter part of this chapter, we present the locking (and other) mechanisms
+    that the pthreads API set makes available to the application developer to help
+    tackle and avoid these issues altogether.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The racing problem
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: First and foremost, let's attempt to understand what and where exactly the problem we
+    are trying to resolve is. In the previous chapter, we learned that all threads
+    of a process share everything except for the stack; each thread has its own private
+    stack memory space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Look carefully again at [Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml),
+    *Multithreading with Pthreads Part I-Essentials: Fig 2*, (leaving out the kernel
+    stuff); the virtual address space—the text and data segments, but not the stack
+    segment—are shared between all threads of a process. The data segment, of course,
+    is where global and static variables reside.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At the risk of overstating these facts, this implies that all the threads of
+    a given process truly (if not poss, then make COW also normal font not **Copy
+    On Write** (**COW**)) share the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The text segment
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The data segments—initialized data, uninitialized data (earlier referred to
+    as the BSS), and the heap segment
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Pretty much all the kernel-level objects and data maintained for the process
+    by the OS (again, refer to [Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml), *Multithreading
+    with Pthreads Part I-Essentials* *: Fig 2*)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'A really important point to understand is that sharing the text segment is not
+    a problem at all. Why? Text is code; the machine code—the opcodes and operands
+    that make up what we call the machine language — reside in these memory pages.
+    Recall from [Chapter 2](976fc2af-8bb4-4060-96cd-3b921682ed75.xhtml), *Virtual
+    Memory*, that all pages of text (code) have the same permissions: **read-execute**
+    (**r-x**). This is important, since multiple threads executing text (code) in
+    parallel is not only fine—it''s encouraged! This is what parallelism is all about,
+    after all. Think about it; if we only read and execute code, we do not modify
+    it in any manner whatsoever; therefore, it''s completely safe, even when being
+    executed in parallel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the other hand, data pages have permissions of **read-write** (**rw**). This
+    implies that a thread, A, working on a page of data in parallel—concurrently with
+    another thread, B,—is inherently dangerous. Why? It''s fairly intuitive: they
+    can end up clobbering the memory values within the page. (One can imagine both
+    threads writing to, for example, a global linked list simultaneously.) The key
+    point is that shared writable memory has to be protected against concurrent access
+    so that data integrity is preserved at all times.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To really understand why we care so much about these issues, please read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Concurrency and atomicity
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Concurrent execution implies that multiple threads can run truly in parallel
+    on multiple CPU cores. When this happens on text (code), it's good; we get higher
+    throughput. However, the moment we run concurrently while working on shared writable
+    data, we will have a problem with data integrity. This is because text is read-only
+    (and executable), whereas data is read-write.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What we would really like, of course, is to be greedy and have the best of
+    both worlds: execute code concurrently via multiple threads, but the moment we
+    must work on shared data, stop the concurrency (parallelism), and have just one
+    thread run through the data section sequentially until it''s done, then resume
+    parallel execution.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The pedagogical bank account example
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A classic (pedagogical) example is that of the faulty bank account software
+    application. Imagine that Kaloor (needless to say, fictional names and figures
+    have been employed here), a freelance sculptor, has an account with his bank;
+    his current balance is $12,000.00\. Two transactions, deposits of $3,000 and $8,000,
+    which are payments for work he has successfully completed, are issued simultaneously. It
+    does not take a genius to see that (assuming that there are no other transactions),
+    very soon, his account balance should reflect an amount of $23,000.00.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the purpose of this example, let's visualize that the banking software application
+    is a multithreaded process; to keep things very simple, we consider that a thread
+    is spawned off to handle a transaction. The server system that the software runs
+    upon is a powerful multicore machine—it has, say, 12 CPU cores. This, of course,
+    implies that threads can run in parallel on different cores simultaneously.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, let''s visualize that for each of Kaloor''s transactions we have a thread
+    running to perform it—thread A and thread B. Thread A (running on, say, CPU #0)
+    works upon the first deposit of $3,000 and thread B (running on, say, CPU #1)
+    works upon the (almost immediate) second deposit of $8,000.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We consider two cases here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The case where, by chance, the transactions go through successfully. The following
+    diagram clearly shows this case:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![](img/d972a362-4cc9-438d-b07a-427fa3231681.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1: The bank account; correct, by chance'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The case where, again by chance, the transactions do not go through successfully.
+    The following diagram shows this case:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![](img/286e0061-b9fd-4086-b167-6d94cd2df5c1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: The bank account; incorrect, by chance'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The problem area is highlighted in the preceding tables: It''s quite clear
+    that thread B has performed an invalid read on the balance—it has read a stale
+    value of $12,000 (the value as of time **t4**) instead of fetching the actual
+    current value of $15,000—resulting in an effective loss of $3,000 for poor Kaloor.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How did this happen? In a nutshell, a race condition has caused the problem.
+    To understand the race, look carefully at the preceding table and visualize the
+    activity:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The variable representing the current balance in the account; balance is global:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is residing in the data segment
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is shared by all threads of the process
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**At time t3**, **thread A on CPU #0**: A deposit of $3,000 is made; the `balance`
+    is still $12,000 (not updated yet)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**At time t4**, **thread B on CPU #1**: A deposit of $8,000 is made; the balance
+    is still $12,000 (not updated yet)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**At time t5**:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread A on CPU #0: update the balance'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Simultaneously, but on the other core:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread B on CPU #1: update the balance'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'By chance, what if thread B ran on CPU #1 a few microseconds before thread
+    A on CPU #0 could update the balance variable!?'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Then, thread B reads the balance as $12,000 ($3,000 short!) This is called a
+    dirty readand is at the heart of the problem. This very situation is called a
+    race; a race being a situation in which the outcome is undefined and unpredictable. In
+    most cases, this will be a problem (as it is here); in some rare cases where it
+    does not matter, it's referred to as a benign race.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The fact to be emphasized is that the operation of depositing funds and updating
+    the balance (or the converse, withdrawing funds and updating the balance) has
+    to be guaranteed to be atomic. They cannot race, as that would be a defect (a
+    bug).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The phrase atomic operation (or atomicity) in a software programming context
+    implies that the operation, once begun, will run to completion without interruption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Critical sections
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'How do we fix the preceding race? It''s quite straightforward, really: we have
+    to ensure that, as stated earlier, the banking operations—deposits, withdrawals,
+    and so on—are guaranteed to do two things:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Be the only thread running the code at that point in time
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Be atomic — run to completion, without interruption
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Once this is achieved, the shared data will be safe from corruption. The section
+    of code that must run in the fashion described previously is called a critical
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our fictional banking application, the threads running the code to perform
+    a banking operation (a deposit or a withdrawal) must do so in a critical section,
+    shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/4f210b98-b336-46d2-b12e-96597699f140.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 3: The critical section'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, now, let''s say that the banking application is corrected to take these
+    facts into account; the vertical timeline execution path of thread A and thread
+    B would now be as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/6e4698e1-51d8-4dec-914b-66b6eaf8efd4.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 4: Correct banking application—critical section'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, both thread A and thread B, once they begin their (deposit) operations,
+    run it alone and to completion (without interruption); hence, sequentially and
+    atomically.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To sum this up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A critical section is code that must:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Run without interference from other threads in the process (as it works upon
+    some shared resource such as global data)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Run atomically (to completion, without interruption)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the code of the critical section can run in parallel with other threads,
+    this is a defect (a bug), called a race
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To prevent races, we have to guarantee that the code of the critical section
+    runs alone and atomically
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To do so, we must synchronize critical sections
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Now, the question is: how do we synchronize a critical section? Read on.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locking concepts
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There are several forms of synchronization in software; one of the commonly
+    encountered ones, and indeed one that we shall be working with quite a bit, is
+    called **locking**. A lock, in programming terms, and as seen by the application
+    developer, is ultimately a data structure instantiated as a variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When one requires a critical section, just encapsulate the code of the critical
+    section between a lock and a corresponding unlock operation. (For now, don't worry
+    about the code-level API details; we shall cover that later. Here, we are just
+    focusing on getting the concepts right.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s represent the critical section, along with the synchronization mechanism—a
+    lock— using a diagram (a superset of the preceding* Figure 3*):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/6889d1bb-3e14-4d0c-9c7a-12ca130fe2ea.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 5: Critical section with locking'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The basic premise of a lock is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Only one thread can hold or own a lock at any given point in time; that thread
+    is the owner of the lock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Upon the unlock, when more than one thread attempts to get or take the lock, the
+    kernel will guarantee that exactly one thread will get the lock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The thread that gets the lock is called the winner (or the lock owner); the
+    threads that tried for but did not get the lock are called the losers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'So, visualize this: say that we have three threads, A, B, and C, running in
+    parallel on different CPU cores, all attempting to take a lock. The guarantee
+    of the lock is that exactly one thread gets it—let''s say that thread C  wins,
+    taking the lock (thus thread C is the winner or owner of the lock); threads A
+    and B are the losers. What happens after that?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The winner thread sees the lock operation as a non-blocking call; it continues
+    into the critical section (probably working on some shared writable resource,
+    such as global data).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The loser threads see the lock operation as a blocking call; they now block
+    (wait), but on what exactly? (Recall that a blocking call is one in which we wait
+    upon an event occurring and get unblocked once it occurs.) Well, the unlock operation,
+    of course!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The winner thread, upon (atomically) completing the critical section, performs
+    the unlock operation.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Either thread A or B will now get the lock, and the whole sequence repeats.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In a more generic manner, we can now understand it as: if N threads are in
+    competition for a lock, the guarantee of the lock operation (by the OS) is that exactly
+    one thread—the winner—will get the lock. So, we shall have one winner and N-1 losers.
+    The winner thread proceeds into the code of the critical section; in the interim,
+    all the N-1 loser threads wait (block) upon the unlock operation. At some point
+    in the future (hopefully soon), the winner performs the unlock; this re-triggers
+    the whole sequence again: the N-1 losers again compete for the lock; we shall
+    have one winner and N-2 losers; the winner thread proceeds into the code of the critical
+    section. In the interim, all the N-2 loser threads wait (block) upon the unlock operation
+    and so on, until all the loser threads have become winners and have hence run
+    the code of the critical section.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Is it atomic?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The preceding discussion on the necessity for atomic execution of a critical
+    section might make you, the programmer, apprehensive: perhaps you are wondering,
+    how does one recognize a critical section? Well, that''s easy: if you have the
+    potential for parallelism (multiple threads can run through the code path in parallel) and
+    the code path is working on some shared resource (usually global or static data),
+    then you have a critical section, implying that you will protect it via locking.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A quick thumb rule: in the majority of cases, multiple threads will be running
+    through code paths. Thus, in a general sense, the mere presence of some writable shared
+    resource of any sort—a global, a static, an IPC shared-memory region, (even) a
+    data item representing a hardware register in a device driver— makes the code
+    path into a critical section. The rule is this: just protect it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The fictional bank account example we saw in the previous section makes it
+    amply clear that we had a critical section which required protection (via locking).
+    However, one does come across cases in which it is perhaps not as apparent whether
+    we indeed require locking. Take this example: we have a global integer `g` in
+    a multithreaded C application program; at some point, we increment its value,
+    such as: `g ++;`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It looks simple, but wait! It's a writeable shared resource—global data; multiple
+    threads might run through this code in parallel, thus rendering it a critical
+    section which requires protection (via a lock). Yes? Or no?
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the face of it, a simple increment (or decrement) operation might appear
+    to be atomic (recall that atomic runs to completion without interruption) in and
+    of itself, thus requiring no special protection via locks or any other form of
+    synchronization. But is this really the case?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before we go any further, there is (yet) another key fact to be aware of which
+    is, the only thing guaranteed to be atomic on a modern microprocessor in a single
+    machine language instruction. After every machine instruction completes, the control
+    unit on the CPU checks whether it has to service anything else, typically a hardware
+    interrupt or (software) exception condition; if so, it sets the program counter
+    (IP or PC) to that address and branches off; if not, execution continues sequentially
+    with the PC register being appropriately incremented.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, think carefully about this: whether or not an increment operation `g++` is
+    atomic or not really depends on two factors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Instruction Set Architecture** (**ISA**) of the microprocessor being used
+    (in simpler terms, it depends on the CPU itself)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How the C compiler for that processor generates code
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the compiler generates a single machine language instruction for the `g++` C
+    code, then execution will indeed be atomic. But will it? Let's find out! (the
+    importance of being empirical - experimenting, trying things out—is a critical
+    feature; our [Chapter 19](b6b41870-c02e-4379-af86-b5e501799c31.xhtml), *Troubleshooting
+    and Best Practices*, covers more on such points).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A very interesting website, [https://godbolt.org](https://godbolt.org) (screenshots
+    will follow),allows one to see how various compilers compile a given piece of
+    high-level language code (at the time of writing this book, it supports 14 languages,
+    including C and C++, and various compilers, including, of course, gcc(1) and clang(1).
+    Interestingly, with the language drop-down set to C++, one can also compile via
+    gcc for ARM!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s begin by visiting this website and then doing the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Select C as the language via the drop-down
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Select, in the right window pane, the compiler as x86_64 gcc 8.2
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In the left window pane, key in the following program:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f940d6e7-d28a-428c-9dcf-8d4dc50c6c5c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 6: g++ increment via gcc 8.2 on x86_64, no optimization'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Look at the right window pane—one can see the assembly language generated by
+    the compiler (which, of course, will subsequently become machine code corresponding
+    to the processor ISA). So? Note that the `g++` C high-level language statement
+    is highlighted in a pale yellow color in its left window pane; the same color
+    is used in the right window to highlight the corresponding assembly. What does
+    one, quite glaringly, notice? The single line of C code, `g++`; , has become four
+    assembly language instructions. Thus, by virtue of our preceding learning, this
+    code cannot be considered to be atomic in and of itself (but we can certainly force
+    it to be atomic by using a lock).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next experiment: leave everything the same, except notice that in the right
+    window pane there is a text widget into which you are allowed to type in option
+    switches to pass on to the compiler; we type `-O2`, implying that we would like
+    the compiler to use optimization level 2 (a fairly high optimization level). Now,
+    for the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/78e01152-0b99-40e6-a4d1-0271a63ff19b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7: g++ increment via gcc 8.2 on x86_64, optimization level 2'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `g++` C code now boils down to just one assembly instruction, thus indeed
+    becoming atomic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the ARM compiler, and no optimization, `g++` translates to several lines
+    of assembly— clearly, non-atomic:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9e172c33-992a-4810-9189-6d1ea542a5ca.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 8: g++ increment via gcc 7.2.1 on ARM, no optimization'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our conclusion? It is usually important for applications that the code we write
+    remains portable across (CPU) architectures. In the preceding example, we clearly
+    find that the code generated by the compiler for the simple `g++`operation is
+    sometimes atomic and sometimes not. (It will depend on several factors: the CPU''s
+    ISA, the compiler, and the optimization level `-On` that it''s compiled at, and
+    so on.) Hence, the only safe conclusion one can make is this: be safe, and wherever
+    there exists a critical section, protect it(with locks, or other means).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dirty reads
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Many programmers new to these topics make a fatal assumption, and think something
+    like this: Okay, I understand that when modifying a shared resource—like a global
+    data structure — I will be required to treat the code as a critical section and
+    protect it with locking, but, my code is only iterating over a global linked list;
+    it''s only reading it and never writing to it and hence, this is not a critical
+    section and does not require protection (I''ll even get brownie points for high
+    performance).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Burst the bubble, please! It is a critical section. Why? Visualize this: while
+    your code is iterating over the global linked list (only reading it), precisely
+    because you have not taken a lock or synchronized in some other manner, another
+    writer thread can very well be writing to the data structure while you are reading
+    it. Think about it: this is a recipe for disaster; it''s entirely possible that
+    your code will end up reading stale or half-written inconsistent data. This is
+    called a *dirty read*, and it can happen when you do not protect the critical
+    section. In fact, this is precisely the defect in our fictional banking application
+    example.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once again, we (re)stress these facts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the code is accessing a writable shared resource of any sort and there is
+    the potential for parallelism, then it's a critical section. Protect it.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Some side effects of this include the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If your code does have parallelism but works only on local variables, there
+    is no issue and it''s not a critical section. (Remember: each thread has its own
+    private stack, and so using local variables without explicit protection is fine.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If a global variable is marked as `const`, then of course it's fine—it's read-only,
+    in any case.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: (Note though, that the const keyword in C does not actually guarantee that the
+    value is indeed constant (as one typically understands it)! It just means that
+    the variable is read-only, but the data it refers to can still be changed if another
+    pointer has access to it from underneath using a macro instead might help).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using locks correctly has a learning curve, perhaps a bit steeper than other
+    programming constructs; this is because, one has to first learn to recognize critical
+    sections, and therefore the need for locks (covered in the previous section),
+    then learn and use good design locking guidelines, and third, understand and avoid
+    nasty deadlocks!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locking guidelines
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section, we will present a small but important set of heuristics or
+    guidelines for the developer to keep in mind while designing and implementing
+    multithreaded code that makes use of locks. These may or may not apply in a given
+    situation; with experience, one learns to apply the right guidelines at the appropriate
+    times.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Without further ado, here they are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Keep locking granularity fine enough**: lock data, not code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Simplicity is key**: Complex locking scenarios involving multiple locks and
+    threads lead to not just performance issues (the extreme case being deadlock),
+    but also to other defects. Keeping the design as simple as it can be is always
+    good practice.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Prevent Starvation**: Holding a lock for an arbitrarily long amount of time
+    leads to the loser threads starving; one has to design—and indeed test—to ensure
+    that, as a rule of thumb, every critical section (the code between the lock and
+    the unlock operations) completes as soon as possible. Good design ensures that
+    there is no possibility of a critical section of code taking far too long; using
+    a timeout in conjunction with the lock is one way to alleviate this issue (more
+    on this later).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'It’s really important to also understand that locking creates bottlenecks. Good
+    physical analogies for locking are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'A funnel: Think of the stem of the funnel as the critical section—it’s only
+    wide enough to allow one thread to go through at a time (the winner); the loser threads
+    remain blocked in the mouth of the funnel'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A single toll booth on a multi-lane busy highway
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thus, avoiding long critical sections is key:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Build synchronization into the design, and avoid the temptation that goes something
+    like, okay, I'll first write the code and then come back and look at locking. It
+    typically does not go well; locking is a complex business as it is; trying to
+    postpone its correct design and implementation only aggravates the issue.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's examine the first of these points in a bit more detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locking granularity
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'While working on an application, let''s say there are several places which
+    require data protection via locking—in other words, several critical sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/58bff04b-3089-46aa-99d8-fc7cbb9fa098.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 9: Timeline with several critical sections'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have shown the critical sections (the places that, as we have learned, require
+    synchronization—locking) with the solid red rectangles on the timeline. The developer
+    might well realize, why not simplify this? Just take a single lock at time **t1**
+    and unlock it at time **t6**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ca5dea18-639b-404e-91db-dda609ef947a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 10: Coarse granularity locking'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This will work in protecting all the critical sections. But this is at the cost
+    of performance. Think about it; each time a thread runs through the preceding
+    code path, it must take the lock, perform the work, and then unlock. That's fine,
+    but what about parallelism? It's effectively defeated; the code from **t1** to
+    **t6** is now serialized. This kind of over-amplified locking-of-all-critical-sections-with-one-big-fat-lock
+    is called coarse granularity locking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Recall our earlier discussion: code (text) is never an issue—there is no need
+    at all to lock here; just lock the places where writable shared data of any sort
+    is being accessed. These are the critical sections! This gives rise to fine granularity
+    locking—we only take the lock at the point in time where a critical section begins
+    and unlock where it ends; the following diagram reflects this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0bc4c06e-a618-4dad-8f18-263f0b664697.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 11: Fine granularity locking'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we stated previously, a good rule of thumb to keep in mind is to lock data,
+    not code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Is super-fine granularity locking always best? Perhaps not; locking is a complex
+    business. Practical work has shown that, sometimes, holding a lock while even
+    working on code (pure text—the code between the critical sections), is okay. It
+    is a balancing act; the developer must ideally use experience and trial-and-error
+    to judge locking granularity and efficiency, constantly testing and re-evaluating
+    the code paths for robustness and performance as one goes along.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Straying too far in either direction might be a mistake; too coarse a locking
+    granularity yields poor performance, but too fine a granularity can too.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deadlock and its avoidance
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A deadlock is the undesirable situation wherein it is impossible for the threads
+    in question to make further progress. The typical symptom of deadlock is that
+    the application (or device driver or whatever software it is) appears to hang.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Common deadlock types
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Thinking about a couple of typical deadlock scenarios will help the reader understand
+    it better. Recall that the basic premise of a lockis that there can only be one winner (the
+    thread that obtained the lock) and N-1 losers. Another key point is that only
+    the winnerthread can perform the unlock operation—no other thread can do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Self deadlock (relock)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Knowing the aforementioned information, visualize this scenario: there is one
+    lock (we just call it L1) and three threads in competition for it (let''s just
+    call them threads A, B, and C); let''s say thread B is the winner. That''s fine,
+    but what happens if thread B, within its critical section, again attempts to take
+    the same lock, L1? Well, think about it: lock L1 is currently in the locked state,
+    thus forcing thread B to block (wait) upon it getting unlocked. However, no thread
+    but thread B itself can possibly perform the unlock operation, so thread B will
+    end up waiting forever! There we have it: deadlock. This type of deadlock is termed
+    the self deadlock, or the relock error.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One might argue, and indeed the case does exist, can't a lock be taken recursively? Yes,
+    as we shall see later that this can be done within the pthreads API. However,
+    good design often argues against using recursive locks; indeed, the Linux kernel
+    does not allow it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ABBA deadlock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A more complex form of deadlock can emerge in a scenario which involves nested
+    locking: two or more competing threads and two or more locks. Here, let''s take
+    the simplest case: a scenario with two threads (A and B) working with two locks
+    (L1 and L2).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s say that this is what unfolds over the vertical timeline, as the following
+    table reveals:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Time** | **Thread A** | **Thread B** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t1 | Attempt to take lock L1 | Attempt to take lock L2 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t2 | Gets lock L1 | Gets lock L2 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t3 | <--- In critical section of L1 ---> |  <--- In critical section of L2
+    ---> |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t4 | Attempt to take lock L2 | Attempt to take lock L1 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t5 | Block on L2 being unlocked | Block on L1 being unlocked |'
+  prefs: []
+  type: TYPE_TB
+- en: '|  | <waits forever: deadlock> |  <waits forever: deadlock> |'
+  prefs: []
+  type: TYPE_TB
+- en: It's quite clear that each thread waits for the other to unlock the lock it
+    wants; thus, each thread waits forever, guaranteeing a deadlock. This kind of
+    deadlock is often called the deadly embrace or the ABBA deadlock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Avoiding deadlock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Avoiding deadlock is obviously something we would want to ensure. In addition
+    to the points covered in the *Locking guidelines* section,there is one more key
+    point, which is that the order in which multiple locks are taken matters; keeping
+    the lock ordering consistent throughout will provide protection against deadlocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To understand why, let''s re-look at the ABBA deadlock scenario we just covered
+    (refer to the preceding table). Look at the table again: notice that thread A
+    takes lock L1 and then attempts to take lock L2, while thread B does the opposite.
+    We shall now represent this scenario, but with a key caveat: lock ordering! This
+    time, we shall have a lock ordering rule; it could be as simple as this: first,
+    take lock L1, and then take lock L2:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: lock L1 --> lock L2
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With this lock ordering in mind, we find the scenario could play out as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Time** | **Thread A** | **Thread B** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t1 | Attempt to take lock L1 | Attempt to take lock L1 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t2 |  | Gets lock L1 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t3 | <Waits for L1 to be unlocked> | <--- In critical section of L1 --->
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t4 |  | Unlock L1 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t5 | Gets lock L1 |  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t6 | <--- In critical section of L1 ---> | Attempt to take lock L2 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t7 | Unlock L1 | Gets locks L2 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t8 | Attempt to take lock L2 | <--- In critical section of L2  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t9 | <Waits for L2 to be unlocked> |                                    
+                            ---> |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t10 |  | Unlock L2 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t11 | Gets lock L2 | <Continues with other work> |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t12 |  <--- In critical section of L2 ---> | ... |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t13 | Unlock L2 | ... |'
+  prefs: []
+  type: TYPE_TB
+- en: The key point here is that both threads attempt to take locks in a given order;
+    first L1, and then L2\. In the preceding table, we can visualize a case in which
+    thread B obtains the locks first, forcing thread A to wait. This is completely
+    fine and expected; no deadlock occurring is the whole point.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The precise ordering itself does not really matter; what does matter is the
+    fact that the designers and developers document the lock ordering to be followed
+    and stick to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The lock ordering semantics, and indeed developer comments regarding this key
+    point, can be often found within the source tree of the Linux kernel (ver 4.19,
+    as of this writing). Here's one example: `virt/kvm/kvm_main.c``...`
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`/*`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '` * Ordering of locks:`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '` *`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '` * kvm->lock --> kvm->slots_lock --> kvm->irq_lock`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '` */`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`...`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, looking back at our first table, we can now clearly see that the deadlock
+    occurred because the lock ordering rule was violated: thread B took lock L2 before taking
+    lock L1!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the pthread APIs for synchronization
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that we have covered the required theoretical background information, let''s
+    move on with the actual practice: for the remainder of this chapter, we shall
+    focus on how to use the pthreads API to perform synchronization, thus avoiding
+    races.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have learned that to protect writable shared data of any kind in a critical
+    section, we require locking. The pthreads API provides the mutex lock for exactly
+    this use case; we intend to hold the lock for a short while only—the duration
+    of the critical section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are scenarios, though, in which we require a different kind of synchronization—we
+    require to synchronize based on a certain data element's value; the pthreads API
+    provides the **condition variable** (**CV**) for this use case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's cover these in turn.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mutex lock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The word **mutex** is really an abbreviation for **mutual exclusion**; to the
+    mutual exclusion of all other (loser) threads, one thread—the winner—holds (or
+    owns) the mutex lock. Only when it is unlocked can another thread take the lock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An FAQ: What really is the difference between the semaphore and the mutex lock? Firstly,
+    the semaphore can be used in two ways—one, as a counter (with the counting semaphore
+    object), and two (relevant to us here), essentially as a mutex lock—the binary
+    semaphore.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Between the binary semaphore and the mutex lock, there exists two primary differences:
+    one, the semaphore is meant to be used to synchronize between processes and not
+    the threads internal to a single process (it is indeed a well-known IPC facility);
+    the mutex lock is meant to synchronize between the threads of a given (single)
+    process. (Having said that, it is possible to create a process-shared mutex, but
+    it''s never the default).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Two, the SysV IPC implementation of the semaphore provides the possibility
+    of having the kernel unlock the semaphore (via the `semop(2)` `SEM_UNDO` flag) if
+    the owner process is abruptly killed (always possible via signal #9); no such
+    possibility even exists for the mutex—the winner must unlock it (we shall cover
+    how the developer can ensure this later).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's get started with a simple example of initializing, using, and destroying
+    a mutex lock. In this program, we shall create three threads and merely increment
+    three global integers, once each within the worker routine of the threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed; to view the
+    complete source code, build, and run it. The entire tree is available for cloning
+    from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux)*.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Code: `ch15/mutex1.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In order to use a mutex lock, one must first initialize it to the unlocked
+    state; this can be done as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Alternatively, we could perform the initialization as a declaration, such as:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: In fact, there are a few mutex attributes that can be specified for the mutex
+    lock (via the `pthread_mutexattr_init(3)` API); we shall get to this later in
+    this chapter. For now, the attributes will be the system defaults.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, once we are done, we must destroy the mutex lock(s):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As usual, we then create the (three) worker threads in a loop (we do not show
+    this code here as it is repetitious). Here is the thread''s worker routine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Because the data we are working on with each thread is a writable shared (it's
+    in the data segment!) resource, we recognize that this is a critical section!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, we must protect it—here, we do so with a mutex lock. So, just prior to
+    entering the critical section, we first take the mutex lock and then work on the
+    global data, and then unlock our lock, rendering the operation safe against races.
+    (Notice that in the preceding code we only perform the locking and unlocking if the
+    variable called `locking` is true; this is a deliberate way to test our code.
+    In production, of course, please do away with the if condition and just perform
+    the locking!) The attentive reader will also notice that we have kept the critical
+    section quite short—it only encapsulates the global update and subsequent `printf(3)`,
+    nothing more. (This is important for good performance; recall what we learned
+    in the earlier section on *Locking granularity*.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As mentioned previously, we deliberately provide an option to the user to avoid using
+    locking altogether—this of course will, or rather, could, result in buggy behavior.
+    Let''s try it out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It does work as expected. Even if we pass the parameter as zero—thus turning
+    locking off— the program does (usually) seem to work correctly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Why? Ah, this is important to understand: recall what we learned in the earlier
+    section Is it atomic? With a simple integer increment and compiler optimization
+    set to a high level (`-O2` in fact, here), it''s quite possible that the integer
+    increments are atomic and thus do not really require locking. However, this may
+    not always be the case, especially when we do something more complex than mere
+    increments or decrements on an integer variable. (Think about reading/writing
+    a large global linked list, and so on)! The bottom line: we must always recognize
+    critical section(s) and ensure that we protect them.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Seeing the race
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To demonstrate exactly this issue (actually seeing the data race), we will
+    write another demo program. In this one, we will calculate the factorial of a
+    given number (a quick reminder: 3! = 3 x 2 x 1 = 6; recall from your school days—the
+    notation N! means factorial of N). Here''s the relevant code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed; to view the
+    complete source code, build, and run it. The entire tree is available for cloning
+    from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux)*.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Code: `ch15/facto.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In `main()`, we initialize our mutex lock (and create two worker threads; we
+    do not show the code to create the threads, destroy them, as well as the mutex):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The thread''s worker routine is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Recognizing the critical section, we take (and subsequently unlock) our mutex
+    lock. The code of the `factorize` function is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Read the preceding comment carefully; it''s key to this demo. Let''s try it
+    out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The results are correct (verify this for yourself). Now we rerun it with locking
+    off and verbose mode on:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Aha! In this case, `10!` works, but `12!` is wrong! We can literally see from
+    the preceding output that a dirty read has occurred (at the i==2 iteration of
+    the calculation for 12!), causing the defect. Well, of course: we did not protect
+    the critical section here (locking was turned off); it''s really no wonder that
+    it went wrong.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What we would like to stress, again, is that these races are delicate timing
+    coincidences; in a buggy implementation, your test cases might still succeed,
+    but of course that does not guarantee anything (it will likely fail in the field,
+    as Murphy's Law tells us!). (An unfortunate truth is that testing can reveal the
+    presence of errors but not their absence.  Importantly, [Chapter 19](b6b41870-c02e-4379-af86-b5e501799c31.xhtml),
+    *Troubleshooting and Best Practices*, covers such points).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reader will realize that, as these data races are delicate timing coincidences, they
+    may or may not occur exactly as shown here on your test systems. Retrying the
+    app a few times may help reproduce these scenarios.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We leave it to the reader to try out the use case with locking mode on and verbose
+    mode on; it should work, of course.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex attributes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A mutex lock can have several attributes associated with it. Furthermore, we
+    enumerate several of them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex types
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A mutex can be one of four types, the default usually—but not always (it depends
+    upon the implementation)—being the normal mutex. The type of mutex used affects
+    the behavior of the lock and unlock. The types are: PTHREAD_MUTEX_NORMAL, PTHREAD_MUTEX_ERRORCHECK,
+    PTHREAD_MUTEX_RECURSIVE, and PTHREAD_MUTEX_DEFAULT.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The system man page on `pthread_mutex_lock(3)` describes the behavior depending
+    on the mutex type with a table; for the reader's convenience, we have reproduced
+    the same here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If a thread attempts to relock a mutex that it has already locked, `pthread_mutex_lock(3)`
+    shall behave as described in the relock column of the following table. If a thread
+    attempts to unlock a mutex that it has not locked or a mutex which is unlocked,
+    `pthread_mutex_unlock(3)` shall behave as described in the **Unlock When Not Owner**
+    column of the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/2dfc4139-4ba1-47be-a5fe-8d878fbb3a0c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: If the mutex type is PTHREAD_MUTEX_DEFAULT, the behavior of `pthread_mutex_lock(3)`
+    may correspond to one of the three other standard mutex types, as described in
+    the preceding table. If it does not correspond to one of those three, the behavior
+    is undefined for the cases marked †.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The relock column directly corresponds to what we described earlier in this
+    chapter as the self-deadlock scenario, such as, what effect attempting to re-lock
+    an already-locked lock (poetic wording, perhaps?) will have. Clearly, except for
+    the recursive and error check mutex case, the end result is either undefined (which
+    means that anything can happen!) or a deadlock indeed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similarly, attempting to unlock a mutex by any thread except the owner either
+    results in an undefined behavior or an error.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One might wonder: why does the locking API behave differently—in terms of error
+    return or failures—depending on the type of the mutex? Why not just have one standard
+    behavior for all types and thus simplify the situation? Well, it''s the usual
+    trade-off between simplicity and performance: the way it''s implemented allows,
+    for example, a well-written, programmatically proven correct real-time embedded
+    application to forgo extra error checking and thus gain speed (which is especially
+    important on critical code paths). On the other hand, in a development or debug
+    environment, the developer might choose to allow extra checking to catch defects
+    before shipping. (The man page on `pthread_mutex_destroy(3)` has a section entitled *Tradeoff
+    Between Error Checks and Performance Supported* that describes this aspect in
+    some detail.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The pair of APIs to `get` and `set` a mutex''s type attribute (the first column
+    in the preceding table) are quite straightforward:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: The robust mutex attribute
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Glancing at the preceding table, one spies the robustness column; what does
+    it mean? Recall that only the owner thread of a mutex lock can possibly unlock
+    the mutex; now, we ask, what if, by some chance, the owner thread dies? (Well,
+    firstly, good design will ensure this never happens; secondly, even if it does, 
+    there are ways to protect against thread cancellation, a topic we will cover in
+    the next chapter.) On the face of it, there is no help for it; any other threads
+    waiting on the lock will now just deadlock (effectively, they will just hang).
+    This behavior is in fact the default; it''s also the behavior that''s set up by
+    the robust attribute known as PTHREAD_MUTEX_STALLED. To the (possible) rescue
+    in such a situation, there does exist another value for the robust mutex attribute: PTHREAD_MUTEX_ROBUST.
+    One can always query and set these attributes upon the mutex via the following
+    pair of APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If this attribute (the value PTHREAD_MUTEX_ROBUST) is set upon the mutex lock,
+    then if the owner thread dies while holding the mutex, a subsequent `pthread_mutex_lock(3)` upon
+    the lock will succeed,  returning the value `EOWNERDEAD`. Hang on, though! Even
+    though the call returns a (so-called) successful return, it''s important to understand
+    that the lock in question is now considered to be in an inconsistent state and
+    has to be reset into a consistent state via the `pthread_mutex_consistent(3)` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_mutex_consistent(pthread_mutex_t *mutex);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A return value of zero here indicates success; the mutex is now back in a consistent
+    (stable) state and can be used normally (use it, and at some point, you must of
+    course unlock it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To sum this up, to use the robust attribute mutex, use the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Initialize the mutex lock:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_mutexattr_t attr`;'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_mutexattr_init(&attr)`;'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Set the robust attribute on it: `pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST)`;'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Owner thread
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Lock it: `pthread_mutex_lock(&mylock)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now, assume that the thread owner abruptly dies (while holding the mutex lock)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Another thread (perhaps main) can assume ownership:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'First, detect the case:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ret = pthread_mutex_lock(&mylock);`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`if (ret == EOWNERDEAD) {`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Then, make it consistent:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_mutex_consistent(&mylock)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use it (or just unlock it)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Unlock it: `pthread_mutex_unlock(&mylock)`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Instead of duplicating the wheel, we point the reader to a simple, readable
+    example of using the robust mutex attribute feature described previously. Find
+    it within the man page of `pthread_mutexattr_setrobust(3)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Under the hood, the Linux pthreads mutex lock is implemented via the `futex(2)` system
+    call (and thus by the OS). The futex (fast user mutex) provides a fast, robust,
+    atomic-only instructions locking implementation. Links with more details can be
+    found in the *Further reading *section on the GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: IPC, threads, and the process-shared mutex
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Visualize a large application that consists of several independent multithreaded
+    processes. Now, if the processes want to communicate with each other (and they
+    often will want to), how can this be achieved? The answer, of course, is **Inter
+    -process Communication** (**IPC**)—mechanisms that exist for this very purpose.
+    Broadly speaking, there are several IPC mechanisms available on the typical Unix/Linux
+    platforms; these include shared memory (as well as the `mmap(2)`), message queues,
+    semaphores (typically for synchronization), named (FIFO) and unnamed pipes, sockets
+    (Unix and internet domain), and, to some extent, signals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unfortunately, due to space constraints, we do not cover process IPC mechanisms
+    in this book; we urge the interested reader to look into the links (and books)
+    provided on IPC in the *Further reading *section on the GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The thing to stress here is that all of these IPC mechanisms are meant for
+    communication between VM-isolated processes. So, our discussion here being focused
+    on multithreading, how do the threads within a given process communicate with
+    each other? Well, that''s quite simple, really: just as one can set up and use
+    a shared memory region to effectively and efficiently communicate between processes
+    (writing and reading into that region, synchronizing access via a semaphore),
+    threads can simply and effectively use a global memory buffer (or any appropriate
+    data structure) as a medium within which to communicate with each other, and,
+    of course, synchronize access to the global memory region via a mutex lock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Interestingly, it is possible to use a mutex lock as a synchronization primitive
+    between threads belonging to different processes. This is achieved by setting
+    up the mutex attribute called pshared, or process-shared. The pair of APIs to
+    get and set the pshared mutex attribute are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second parameter, `pshared`, can be set to one of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**PTHREAD_PROCESS_PRIVATE** : The default; here, the mutex is only visible
+    to threads within the process in which the mutex has been created.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**PTHREAD_PROCESS_SHARED**: Here, the mutex is visible to any threads that
+    have access to the memory region in which the mutex is created, including threads
+    of different processes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'But how does one actually ensure that the memory region in which the mutex
+    exists is shared between processes (without which it will not be possible for
+    the processes in question to use the mutex)? Well, it''s really back to basics:
+    we must make use of one of the IPC mechanisms we mentioned—shared memory turns
+    out to be the right one to use. So, we have the application set up a shared memory
+    region (via either the traditional SysV IPC `shmget(2)` or the newer POSIX IPC `shm_open(2)` system
+    calls), and have our process-shared mutex lock instantiated in this shared memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, let''s tie all this together with a simple application: we will write an application
+    that creates two shared memory regions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One, a small shared memory region to act as a shared space for a process-shared
+    mutex lock and an once-only initialization control (more on this in a minute)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Two, a shared memory region to act as a simple buffer to store IPC messages
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We will initialize a mutex with the process-shared attribute so that it can be
+    used between threads of differing processes to synchronize access; here, we fork
+    and have a thread of the original parent process and the newly born child process
+    compete for the mutex lock. Once they (sequentially) obtain it, they write a message
+    into the second shared memory segment. At the end of the app, we destroy the resources
+    and display the shared memory buffer (as a simple proof-of-concept).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s just try out our app (`ch15/pshared_mutex_demo.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have added some blank lines in the following code for readability.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the real world, things are not quite as simple as this; there does exist
+    an additional synchronization issue to think about: how can one ensure that the
+    mutex lock is initialized correctly and atomically (by only one process or thread),
+    and, only initialized once, should other threads attempt to use it? In our demo
+    program, we have used the `pthread_once(3)` API to achieve guaranteed once-only
+    initialization of the mutex object (but have ignored the have-threads-wait-and-only-use-it-once-initialized
+    issue). issue). (An interesting Q&A on Stack Overflow highlights this very concern;
+    take a look:  [https://stackoverflow.com/questions/42628949/using-pthread-mutex-shared-between-processes-correctly#](https://stackoverflow.com/questions/42628949/using-pthread-mutex-shared-between-processes-correctly#)*.)* 
+    However, the reality is that the `pthread_once(3)` API is meant to be used between
+    the threads of a process. Also, POSIX requires that the initialization of the
+    `once_control` is done statically; here, we have performed it at run time, so
+    it''s not perfect.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the main function, we set up and initialize the (IPC) shared memory segments;
+    we urge the reader to carefully go through the source code (reading all the comments)
+    and try it out for themselves as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed; to view the
+    complete source code, build, and run it. The entire tree is available for cloning
+    from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux)*.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `init_mutex`function which initializes the mutex with the process-shared
+    attribute is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The code of the worker thread—the worker routine—is shown in the following
+    code. Here, we need to operate upon the second shared memory segment, implying
+    of course that this is a critical section. Hence, we take the process-shared lock,
+    perform the work, and subsequently unlock the mutex:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice that the lock and unlock operations are carried out by macros; here
+    they are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: We leave it to the reader to look at the code where we fork and have the newly
+    born child process essentially do the same thing as the preceding worker thread—operate
+    upon the (same) second shared memory segment; being a critical section, it too
+    attempts to take the process-shared lock, and once it gets it, performs the work,
+    and subsequently unlocks the mutex.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unless there is some compelling reason not to do so, when setting up IPC between processes,
+    we suggest that you use one (or some) of the numerous IPC mechanisms that have
+    been explicitly designed for this very purpose. Using the process-shared mutex
+    as a synchronization mechanism between the threads of two or more processes is
+    possible, but ask yourself if it is really required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having said that, there are some advantages to using a mutex over the traditional
+    (binary) semaphore object; these include the fact that the mutex is always associated
+    with an owner thread, and only the owner can operate upon it (preventing some
+    illegal or defective scenarios), and that mutexes can be set up to use nested
+    (recursive) locking, and deal with the priority inversion problem effectively
+    (via the inheritance protocol and/or priority ceiling attributes).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Priority inversion, watchdogs, and Mars
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: An **Real Time Operating System **(**RTOS**) often has time-critical multithreaded
+    applications running on it. Very simplistically, but nevertheless true, the primary
+    rule for the RTOS scheduler to decide which thread to run next is the highest
+    priority runnable thread must be the thread that is running. (By the way, we shall
+    cover CPU scheduling with regard to the Linux OS in [Chapter 17](36229bac-c402-4d2f-b876-d1eb4aba8051.xhtml),
+    *CPU Scheduling on Linux*; don't worry about the details for now.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Priority inversion
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s visualize an application that contains three threads; one of them is
+    a high priority thread (let''s calls it thread A with priority 90), the other
+    is a low priority thread (let''s calls it thread B with priority 10) and finally
+    a medium priority thread, C. (The priority range for the SCHED_FIFO scheduling
+    policy is 1 to 99, with 99 being the highest possible priority; more on this in
+    a later chapter.) So, we can imagine that we have these three threads within a
+    process at differing priorities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thread A: high priority, 90'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread B: low priority, 10'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread C: medium priority, 45'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Furthermore, let's consider that we have some shared resource, X, which is coveted
+    by threads A and B; this, of course, constitutes a critical section, and thus,
+    we will need to synchronize access to it for correctness. We shall use a mutex
+    lock to do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The normal case might well work like this (let''s ignore thread C for now):
+    thread B is on the CPU running some code; thread A is working on something else
+    on another CPU core. Neither thread is in the critical section; thus, the mutex
+    is in the unlocked state.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now (at time **t1**), thread B hits the code of the critical section and takes
+    the mutex lock, thus becoming the owner. It now runs the code within the critical
+    section (working on X). In parallel, what if—at time **t2**— thread A too happens
+    to hit the critical section and thus attempts to take the mutex lock? Well, we
+    know that it''s already locked, and thus thread A will have to wait (block) upon
+    the unlock that will be performed (hopefully, soon) by thread B. Once thread B
+    unlocks the mutex (at time **t3**), thread A takes it (at time **t4**; we consider
+    that the delay **t4**-**t3** is very tiny), and life (quite happily) continues.
+    This seems fine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ebe8bb6c-fdc5-4d88-ae4a-6769f82daea6.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 12: Mutex locking: the normal good case'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, a potential bad case exists as well! Read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Watchdog timer in brief
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A watchdog is a mechanism which is used to periodically detect that the system
+    is in a healthy state, and, if it is deemed not to be, to reboot it. This is achieved
+    by setting up a (kernel) timer (to say, a 60 second timeout). If all's well, a
+    watchdog daemon process (a daemon is nothing but a system background process)
+    will consistently cancel the timer (before it expires, of course) and subsequently
+    re-enable it; this is known as **petting the dog**. If the daemon does not (due
+    to something having gone badly wrong), the watchdog is annoyed and reboots the
+    system! A pure software watchdog implementation will not be protected against
+    kernel bugs and faults; a hardware watchdog (which latches into the board reset
+    circuitry) will always be able to reboot the system as and when required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Often, the high priority threads of embedded applications are designed to have
+    very real deadlines within which they must complete some work; otherwise, the
+    system is considered to have failed. One wonders, what if at run time the OS itself—due
+    to an unfortunate bug— simply crashes or hangs (panics)? The application thread(s)
+    then cannot continue; we need a way to detect and get out of this mess. Embedded
+    designers often make use of **watchdog timer** (**WDT**) hardware circuitry (and
+    an associated device driver) to achieve precisely this. If the system or a critical
+    thread does not meet its deadline (fails to pet the dog), the system is rebooted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, back to our scenarios. Let''s say we have a deadline for the high priority
+    thread A of 100 ms; repeat the preceding locking scenario in your mind, but with
+    this difference (refer to *Fig 13*: as well):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Thread B** (the low priority thread), obtains the mutex lock at time **t1**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Thread A** also requests the mutex lock at time **t2** (but has to wait upon
+    the unlock by thread B).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Before thread B can complete the critical section, another medium priority thread
+    C (running on the same CPU core and at priority 45) wakes up! It will immediately preempt thread
+    B as its priority is higher (recall that the highest priority runnable thread
+    must be the thread that is running).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now, until thread C gets off the CPU, thread B cannot complete the critical
+    section, and therefore cannot perform the unlock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This, in turn, can significantly delay thread A, which is blocking upon the
+    yet-to-happen unlock by thread B:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: However, thread B has been preempted by thread C, hence it cannot perform the
+    unlock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What if the time to unlock exceeds the deadline for thread A (at time **t4**)?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Then the watchdog timer will expire, forcing a system reboot:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![](img/5d1e63a3-f58b-49e8-abf4-80d9eed4a655.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Fig 13: Priority inversion'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interesting, and unfortunate; did you notice that the highest priority thread
+    (A) was in effect forced to wait upon the lowest priority thread (B) on the system?
+    This phenomenon is in fact a documented software risk , formally called priority
+    inversion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Not only that, consider what might happen if several medium priority threads
+    woke up while thread B was in its critical section (and thus holding the lock)?
+    The potential time wait for thread A can now become very large; such situations
+    are known as unbounded priority inversion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Mars Pathfinder mission in brief
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Very interestingly, this precise scenario priority inversion  played out quite
+    dramatically in a literally out of this world setting: on the surface of Mars!
+    NASA successfully landed a robot spacecraft (the Pathfinder Lander) on the Martian
+    surface on July 4, 1997; it then proceeded to unload and deploy a smaller robot—the Sojourner
+    Rover—onto the surface. However, controllers found that the lander ran into problems—every
+    so often it would reboot. Detailed analysis of the live telemetry feed ultimately
+    revealed the underlying issue—it was the software, which had hit a priority inversion
+    issue! To their immense credit, NASA''s **Jet Propulsion Laboratory** (**JPL**)
+    team, along with engineers from Wind River, the company that supplied a custom VxWorks
+    RTOS to NASA, diagnosed and debugged the situation from Earth, determined the
+    root cause defect as a priority inversion issue, fixed it, uploaded the new firmware
+    to the rover, and it all worked:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/e0ce7e31-9f76-42ff-8936-e9358bb67eca.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 14: Photo from the Mars Pathfinder Lander'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The news spread (in a viral fashion) when an MS engineer, Mike Jones, at an
+    IEEE Real-Time Symposium, wrote an interesting email about what occurred with
+    NASA's Pathfinder mission; this was ultimately, and in detail, responded to by
+    the team leader of NASA's JPL, Glenn Reeves, with a now quite famous article entitled *What
+    Really Happened on Mars?*. Many interesting insights were captured in this and
+    subsequent articles written on the topic. In my opinion, all software engineers
+    would do themselves a favor by reading these! (Do look up the links provided in
+    the *Further reading* section on the GitHub repository under Mars Pathfinder and
+    Priority Inversion.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Glenn Reeves stresses a few important lessons learned and the reasons why they
+    were able to reproduce and fix the issue, and one of them is this: We strongly
+    believe in the test what you fly and fly what you test philosophy. In effect,
+    because of the design decisions to keep relevant detailed diagnostic and debug
+    information in trace/log ring buffers, which could be dumped at will (and sent
+    to Earth), they were able to debug the root issue at hand.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Priority inheritance – avoiding priority inversion
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Okay, great; but how does one fix such an issue as priority inversion? Interestingly,
+    this is a known risk, and the design of the mutex includes a built-in solution. Two
+    mutex attributes exist with regard to helping address the priority inversion issue—**priority
+    inheritance** (**PI**) and priority ceiling.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'PI is an interesting solution. Think about it, the key issue is the way in
+    which the OS schedules threads. In an OS (and especially on an RTOS), the scheduling
+    of a real-time thread—deciding who runs—is essentially directly proportional to
+    the priority of the competing threads: the higher your priority, the better the
+    chance you will run. So, let''s take a quick relook at our preceding scenario
+    example. Recall that we have these three threads at differing priorities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thread A: high priority, 90'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread B: low priority, 10'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread C: medium priority, 45'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The priority inversion occurred when thread B held the mutex lock for a long
+    while, thus forcing thread A to block on the unlock for perhaps far too long (over
+    the deadline). So, think about this: what if, the moment thread B grabs the mutex
+    lock, we increase its priority to that of the highest priority thread on the system
+    which is also waiting on the same mutex lock. Then, of course, thread B will get
+    priority 90 and thus cannot be preempted (by thread C or any other thread for
+    that matter)! This ensures that it completes its critical section quickly and
+    unlocks the mutex; the moment it unlocks it, it goes back to its original priority.
+    This solves the problem; this approach is termed PI.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The pthreads API set provides a pair of APIs to query and set the protocol mutex
+    attribute, upon which you can make use of PI:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: The value that the protocol parameter can take is one of the following:  PTHREAD_PRIO_INHERIT,
+  prefs: []
+  type: TYPE_NORMAL
+- en: PTHREAD_PRIO_NONE, or PTHREAD_PRIO_PROTECT (the default being PTHREAD_PRIO_NONE).
+    When a mutex has one of the INHERIT or PROTECT protocols, its owner thread is
+    affected in terms of scheduling priority.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A thread that holds the lock (owns it) on any mutexes initialized with the PTHREAD_PRIO_INHERIT protocol
+    will inherit the highest priority (and therefore execute at that priority) of
+    any thread that is blocked upon (waiting) on any of these mutexes (robust or non-robust)
+    that also uses this protocol.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A thread that holds the lock (owns it) on any mutexes initialized with the  PTHREAD_PRIO_PROTECT protocol
+    will inherit the highest priority ceiling (and therefore execute at that priority)
+    of any thread that also uses this protocol, regardless of whether or not they
+    are currently blocking upon (waiting) on any of these mutexes (robust or non-robust).
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a thread uses mutexes initialized with differing protocols, it will execute
+    at the highest priority defined among them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the Pathfinder mission, the RTOS used was the well-known VxWorks by Wind
+    River. The mutex (or semaphores) certainly had the PI attribute; it's just that
+    the JPL software team missed turning on the PI attribute of a mutex lock, resulting
+    in the priority inversion issue! (Actually, the software team was well aware of
+    it and used it in several places, but not the one place that struck — Murphy's
+    Law at work!)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Furthermore, the developer can make use of priority ceiling—this is the minimum
+    priority at which the owner thread will execute the code of the critical section.
+    Thus, being able to specify this, one can ensure that it's at a sufficiently high
+    value to guarantee that the owner thread does not get preempted while in the critical
+    section. The pthreads `pthread_mutexattr_getprioceiling(3)` and `pthread_mutexattr_setprioceiling(3)` API's
+    can be used to query and set the priority ceiling attribute of a mutex. (It must
+    fall within the valid SCHED_FIFO priority range, typically 1 to 99 on the Linux
+    platform).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Again, in practice, there are some challenges in using priority inheritance
+    and ceiling attributes, which are, mostly, performance overheads:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Heavier task/context switching can result
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Priority propagation can add overhead
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With many threads and many locks, there is performance overhead, as well the
+    potential for deadlock climbs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary of mutex attribute usage
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In effect, if you would like to thoroughly test and debug your application
+    and don''t really care about performance (right now, at least), then set up your
+    mutex as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set the robust attribute on it (allowing one to catch the owner-dies-without-unlocking case): `pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST)`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Set the type to error checking (allowing one to catch the self-deadlock / relock case):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ERRORCHECK)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, a well-designed and proven application that requires you
+    to squeeze out performance would use the normal (default) mutex type and attributes.
+    The preceding cases will not be caught (and will instead result in undefined behavior),
+    but then, they should never occur!
+  prefs: []
+  type: TYPE_NORMAL
+- en: If one requires a recursive lock, (obviously) set the mutex type to PTHREAD_MUTEX_RECURSIVE. With
+    the recursive mutex, it's important to realize that if the mutex lock is performed `n` times,
+    it must also be unlocked `n` times in order for it be considered to be truly in
+    the unlocked state (and therefore lockable again).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a multiprocess and multithreaded application, if there is a need to use a
+    mutex lock between threads of different processes, this can be achieved via the process-shared
+    attribute of the mutex object. Note that, in this case, the memory that contains
+    the mutex must itself be shared between the processes (we usually use a shared
+    memory segment).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The PI and the priority ceiling attributes allow the developer to safeguard
+    the application against a well-understood software risk: priority inversion.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex locking – additional variants
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This section helps one understand additional—slightly different semantics—to
+    mutex locking. We will cover the timeout mutex variant, the "busy-waiting" use
+    case, and the reader-writer lock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Timing out on a mutex lock attempt
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the earlier section, *Locking guidelines*, under the label prevent starvation,
+    we understood that holding a mutex lock for a long-ish time leads to performance
+    issues; noticeably, the loser threads will starve. A way to ward off this issue
+    (although, of course, fixing the underlying root cause of any starvation is the
+    important thing to do!) is to have the loser threads wait upon the mutex lock
+    for only a certain amount of time; if it takes longer to be unlocked, forget it.
+    This is precisely the functionality that the `pthread_mutex_timedlock(3)` API
+    provides:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It''s quite obvious: all locking semantics remains the same as they do for
+    the usual `pthread_mutex_lock(3)`, except that if the time spent blocking (waiting)
+    upon the lock exceeds the second parameter—the time specified as an absolute value,
+    where the API returns failure—the value returned will be `ETIMEDOUT`. (We have
+    already programmed timeouts in detail in [Chapter 13](1f621f72-e067-42db-b2eb-b82e20161dec.xhtml),
+    *Timers*.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note, though, that other error return values are possible (for example, `EOWNERDEAD`
+    for a robust mutex in which the previous owner terminates, `EDEADLK` for a deadlock
+    being detected on an error-checking mutex, and so on.). Please refer to the man
+    page on `pthread_mutex_timedlock(3)` for details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Busy-waiting (non-blocking variant) for the lock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We understand how a mutex lock works normally: if a lock is already locked,
+    then attempting to take the lock will cause that thread to block (wait upon) the
+    unlock occurring. What if one wants a design which goes something like this: if
+    the lock is locked, don't make me wait; I'll do some other work and retry? This
+    semantic is often referred to as busy-waiting or non-blocking, and is provided
+    by the trylock variant. As the name suggests, we try for the lock and if we get
+    it, great; if not, it's okay—we do not force the thread to wait. The lock might
+    be taken by any thread within the process (or even outside if it's a process-shared
+    mutex) including the same thread—if it's marked as recursive. But hold on; if
+    the mutex lock is indeed a recursive lock, then taking it will succeed immediately and
+    the call will return straight away.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The API for this is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`​int pthread_mutex_trylock(pthread_mutex_t *mutex);`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While this busy-waiting semantic is useful on occasion—specifically, it is
+    used to detect and prevent certain types of deadlock—be careful when using it.
+    Think about it: for a lightly contented lock (one which is not being used often,
+    in which the thread attempting to take the lock will very likely get it straight
+    away), using this busy-wait semantic might be useful. But for a heavily contented lock
+    (a lock on a hot code path, taken and released often), this can actually hurt
+    one''s chances of obtaining the lock! Why? Because you are not willing to wait
+    for it. (Funny how software mimics life sometimes, yes?)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reader-writer mutex lock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Visualize a multithreaded application with some ten worker threads; let''s
+    say that, most of the time (say 90% of the time), eight of the workers are busy
+    scanning a global linked list (or similar data structure). Now, of course, since
+    it''s global, we know that it''s a critical section; failing to protect it with
+    a mutex can easily result in a dirty read bug. But, this is at a major performance
+    cost: as each worker thread wants to search the list, it is forced to wait upon
+    the unlock event from the owner.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Computer scientists have come up with quite an innovate alternative for situations
+    like this (also referred to as the reader-writer problem), wherein the data accesses
+    are such that for the majority of time (shared) data is only being read and not
+    written to. We use a special variant of the mutex lock called the reader-writer lock:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice that it''s a new type of lock altogether: the `pthread_wrlock_t`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If a thread obtains a read lock for itself, the key point is this: the implementation
+    now trusts that this thread will only read and never write; thus, no actual locking
+    is done and the API will just return success! This way, readers actually run in
+    parallel, thus keeping performance high; there is no safety issue or race, as
+    they guarantee they will only read.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, the moment a thread wishes to write data, it must obtain a write lock: when
+    this happens, normal locking semantics apply. The writer thread must now wait
+    for all readers to perform the unlock, and then the writer gets the write lock
+    and proceeds. While it's within the critical section, no thread—reader nor writer—will
+    be able to intervene; they will have to, as is usual, block (wait) upon the writer's
+    unlock. Thus, both scenarios are now optimized.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The usual suspects—the APIs—for setting up the reader-writer mutex lock attributes
+    exist (in alphabetical order):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_destroy(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_getpshared(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_setkind_np(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_getkind_np(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_init(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlockattr_setpshared(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that the APIs suffixed with `_np` imply they are non-portable, and Linux-only.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Similarly, the reader-writer locking APIs follow the usual pattern—the timeout
+    and try variants are present as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_destroy(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_init(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_timedrdlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_tryrdlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_unlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_rdlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_timedwrlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_trywrlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_rwlock_wrlock(3P)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We expect the programmer to set up in a normal manner—initialize the rwlock attribute
+    object, initialize the rwlock itself (with `pthread_rwlock_init(3P)`), destroy
+    the attribute structure once done with it, and then perform the actual locking
+    as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note, though, that when using reader-writer locks, the application should be
+    carefully tested for performance; it has been noted to be a slower implementation
+    than the usual mutex lock. Also, there is the additional worry that, under load,
+    the reader-writer locking semantics might result in writer starvation. Think:
+    if readers keep coming up, the writer thread might have to wait for a long time
+    before it gets the lock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Apparently, with the reader-writer lock, the opposite dynamic can also occur:
+    the readers could be starved. Interestingly, Linux provides a non-portable API,
+    allowing the programmer to specify which kind of starvation to prevent—reader
+    or writer—with the default being that the writers starve. The API to invoke to
+    set this up is `pthread_rwlockattr_setkind_np(3)`. This allows some degree of
+    tuning based on your specific workload. (However, the implementation apparently
+    still suffers from a bug wherein, in effect, writer starvation remains the reality.
+    We do not attempt to go into this further; the reader is referred to the man page
+    if further aid is required.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nevertheless, the reader-writer lock variant is often useful; think of applications
+    that need to often scan some key-value map data structure and perform a table
+    lookup of some sort. (For example, an OS often has network code paths that often
+    look up the routing table but rarely update it.) The invariant is that the global
+    shared data in question is often read from but rarely written to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The spinlock variant
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A bit of repetition here: we already understand how a mutex lock works normally;
+    if a lock is already locked, then attempting to take the lock will cause that
+    thread to block (wait upon) the unlock occurring. Let''s dig a little deeper; how
+    exactly do the loser threads block—wait upon — the unlock of the mutex? The answer
+    is that, for the mutex lock, they do so by sleeping (being scheduled off CPU by
+    the OS). This, in fact, is one of the defining properties of the mutex lock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the other hand, there exists a different kind of lock altogether—the spinlock (very
+    commonly used within the Linux kernel) whose behavior is quite the opposite: it
+    works by having the loser threads wait upon the unlock operation by spinning (polling)—well,
+    the reality is that the actual spinlock implementation is a lot more refined 
+    and efficient than it''s made to sound here; this discussion is well beyond the
+    scope of this book, though. At first glance, polling seems to be a poor way to
+    have the loser threads wait on the unlock; the reason it works well with the spinlock
+    is that the time taken within the critical section is guaranteed to be very small
+    (technically, less than the time required to perform two context switches), thus
+    making the spinlock much more efficient to use than the mutex when the critical
+    section tiny.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though the pthreads implementation does provide the spinlock, one should be
+    clear on these points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The spinlock is only meant to be used by extreme performance real-time threads
+    that employ a real-time OS scheduling policy (SCHED_FIFO, and possibly SCHED_RR;
+    we discuss these in [Chapter 17](36229bac-c402-4d2f-b876-d1eb4aba8051.xhtml),
+    *CPU Scheduling on Linux*).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The default scheduling policy on the Linux platform is never a real-time one; it's
+    the non-real-time SCHED_OTHER policy, which is well-suited to non-deterministic
+    applications; using the mutex lock is the way to go.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using spinlocks in user space is not considered the right design approach; moreover,
+    the code will be a lot more susceptible to deadlock and (unbounded) priority inversion
+    scenarios.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For the preceding reasons, we refrain from delving into the following pthreads spinlock
+    APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_spin_init(3)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_spin_lock(3)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_spin_trylock(3)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_spin_unlock(3)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pthread_spin_destroy(3)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If required, do look them up within their respective manual pages (but also
+    be doubly careful if employing them!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A few more mutex usage guidelines
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In addition to the tips and guidelines that were provided earlier (refer to
+    the *Locking Guidelines* section), think upon this as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How many locks should one use?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With many lock instances, how to know which lock variable to use and when?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Test whether a mutex is locked or not.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's take these points up one by one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In small applications (like the kind shown here), perhaps using just a single
+    lock to protect critical sections is enough; it has the advantage of keeping things
+    simple (which is a big deal). However, in a large project, using just one lock
+    to perform locking on every critical section one might encounter has the potential
+    to become a major performance breaker! Think about why exactly this is: the moment
+    that one mutex lock is hit anywhere in the code, all parallelism stops, and the
+    code runs in a serialized fashion; if this happens often enough, performance will
+    rapidly degrade.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interestingly, the Linux kernel, for years, had a major performance headache
+    precisely because of one lock that was being used throughout large cross sections
+    of the codebase—so much so, that it was nicknamed the **big kernel lock** (**BKL**)
+    (a giant lock). It was finally gotten rid of only in the 2.6.39 version of the
+    Linux kernel (see the *Further reading* section on the GitHub repository for a
+    link to more on the BKL).
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, while there is no rule to decide exactly how many locks one should use,
+    the heuristic is to think about the simplicity versus performance trade off. As
+    a tip, in large production-quality projects (like the Linux kernel), we often
+    use a single lock to protect a single datum— a data object; typically, this is a
+    data structure. This would ensure that the global data is protected while accessed,
+    but only by the code paths that actually access it and not every code path, thus
+    ensuring both data safety as well as parallelism (performance).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Okay, great. Now, if we do follow this guideline, what if we end up with a
+    few hundred locks!? (Yes, this is entirely possible in large projects that have
+    a few hundred global data structures.) Now, we have another practical problem:
+    the developer must ensure that they use the correct lock to protect a given data
+    structure (of what use is using lock X meant for data structure X while accessing
+    data structure Y? That would be a serious defect). So, a practical issue is how
+    do I know for sure which data structure is protected by which lock or, another
+    way to state it: how (how do I know for sure which lock variable protects which
+    data structure?) The naive solution is to name each lock appropriately, perhaps
+    something like `lock_<DataStructureName>`. Hmm, not as simple as it appears!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Informal polls have revealed that, often, one of the hardest things a programmer
+    does is variable naming! (See the *Further reading* section on the GitHub repository
+    for a link to this.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, here''s a tip: embed the lock that protects a given data structure inside
+    the data structure itself; in other words, make it a member of the data structure
+    it protects! (Again, the Linux kernel often uses this approach.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Is the mutex locked?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In certain situations, the developer might be tempted to ask: given a mutex,
+    can I find out if it''s in the locked or unlocked state? Perhaps the reasoning
+    is: if locked, let''s unlock it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is a way to test this: with the `pthread_mutex_trylock(3)` API. If it
+    returns `EBUSY`, it implies that the mutex is currently locked (otherwise, it
+    should return `0`, implying it''s unlocked). But wait! There is an inherent race
+    condition here; just think about this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: By the time we reach time t2, there is no guarantee that another thread has
+    not, by now, locked the mutex in question! So, this approach is incorrect. (The
+    only realistic way to do this kind of synchronization is to abandon doing this
+    via mutex locks and use condition variables instead; that's what we cover in the
+    next section.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This concludes our (rather long) coverage on mutex locking. Before we are done,
+    we would like to point out another point of interest: we stated earlier that being atomic implies
+    being able to run the critical code section to completion without interruption.
+    But the reality is that our modern systems do interrupt us with (alarming) regularity—hardware
+    interruptions and exceptions being the norm! Thus, one should realize that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In user space, with it being impossible to mask hardware interrupts, processes
+    and threads will get interrupted at any point in time due to them. Thus, it's
+    essentially impossible to be truly atomic with user space code. (But so what if
+    we're interrupted by hardware interrupts/faults/exceptions? They will perform
+    their work and hand control back to us, all very quickly. It's highly unlikely
+    we race, sharing global writable data with these code entities).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In kernel space, though, we run with OS privilege, actually making it possible
+    to mask even hardware interrupts, and thus allowing us to run in a truly atomic fashion
+    (how do you think the well-known Linux kernel spinlock works?).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now that we have covered the typical APIs used for locking, we encourage the
+    reader to, one, work on trying out examples in a hands-on manner; and two, revisit
+    the sections covered earlier in sections, *Locking guidelines* and *Deadlock*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Condition variables
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A  CV is an inter-thread event notification mechanism. Where we use the mutex
+    lock to synchronize (serialize) access to a critical section, thus protecting
+    it, we use condition variables to facilitate efficient communication—in terms
+    of synchronizing based on the value of a data item—between the threads of a process.
+    The following discussion will make this clearer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Often, in multithreaded application design and implementation, one is faced
+    with this type of situation: a thread, B, is performing some work and another
+    thread, A, is awaiting the completion of that work. Only when thread B completes
+    the work should thread A continue; how can we efficiently implement this in code?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: No CV – the naive approach
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'One might recall that the exit status of a thread (via `pthread_exit(3)`) is
+    passed back to the thread that calls `pthread_join(3)`; could we make use of this
+    feature? Well, no: for one thing, it''s not necessarily the case that thread B
+    will terminate once the designated work is complete (it might only be a milestone
+    and not all of the job it has to perform), and two, even if it does terminate,
+    perhaps some other thread besides the one invoking `pthread_join(3)` might need
+    to know.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Okay; why not have thread A poll upon the completion by the simple technique
+    of having thread B set a global integer (call it `gWorkDone`) to 1 when the work
+    is complete (and having thread A poll on it, of course), perhaps something like
+    the following in pseudocode:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Time** | **Thread B** | **Thread A** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t0 | Initialize: `gWorkDone = 0` |  < common > |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t1 | Perform the work ... | `while (!gWorkDone) ;` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t2 | ... | ... |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t3 | Work done; `gWorkDone = 1` | ... |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t4 |  | Detected; break out of the loop and continue |'
+  prefs: []
+  type: TYPE_TB
+- en: 'It might work, but it doesn''t. Why not?:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One, polling on a variable for unbounded periods of time is very expensive in
+    CPU terms (and is just bad design).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Two, notice that we are operating upon a shared writable global variable without
+    protecting it;  this is exactly the way to introduce data races, and thus bugs,
+    into the application.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hence, the approach shown in the preceding table is considered to be a naive,
+    inefficient, and even possibly buggy (racy).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the condition variable
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The correct approach is to use a  CV. A condition variable is a way for threads to
+    synchronize upon the value of data in an efficient manner. It achieves the same
+    end result as the naive polling approach does, but in a far more efficient and,
+    even more importantly, correct manner.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Check out the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Time** | **Thread B** | **Thread A** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t0 | Initialize: gWorkDone = 0 ; init the {CV, mutex} pair |  < common >
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t1 |  | Wait upon signal from thread B : lock the associated mutex; `pthread_cond_wait()`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t2 | Perform the work ... |  < ... blocking ... > |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t3 | Work  done; lock the associated mutex; signal thread A : `pthread_cond_signal(`)
+    ; unlock the associated mutex |  ... |'
+  prefs: []
+  type: TYPE_TB
+- en: '| t4 |  | Unblocked; check to see that the work is really done, and if so,
+    unlock the associated mutex, and continue... |'
+  prefs: []
+  type: TYPE_TB
+- en: Though the preceding table shows us the sequence of steps, some explanation
+    is required. In the naive approach, we saw that one of the (serious) shortcomings
+    is the fact that the global shared data variable was being manipulated without
+    protection! The condition variable solves this by requiring that a condition variable
+    be always associated with a mutex lock; we can think of it as a **{CV, mutex}
+    pair**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The idea is simple: every time we intend to use the global predicate that tells
+    us whether or not the work has been completed (`gWorkDone`, in our example), we
+    lock the mutex, read/write the global, unlock the mutex, thus—importantly!—protecting
+    it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The beauty of the CV is that we do not require polling at all: the thread awaiting
+    work completion uses `pthread_cond_wait(3)` to block (wait) upon that event occurring, and
+    the thread that has completed work "signals" its counterpart via the `pthread_cond_signal(3)` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Though we use the word signal here, this has nothing to do with Unix/Linux signals
+    and signaling that we covered in earlier [Chapters 11](99fafa09-8972-4d9f-b241-46caf9de98f3.xhtml),
+    *Signaling - Part I*, and [Chapter 12](657b6be0-ebc8-40dd-81b6-4741b04602b1.xhtml),
+    *Signaling - II*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '(Notice how the {CV, mutex} pair go together). Of course, just as with threads,
+    we must first initialize the CV and its associated mutex lock; the CV is initialized
+    either statically via:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_cond_t cond = PTHREAD_COND_INITIALIZER; `'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Or dynamically (at runtime) via the following API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If specific, non-default attributes of the CV are to be set up, one can do
+    so via the `pthread_condattr_set*(3P)` APIs, or just set the CV to default by
+    first invoking the `pthread_condattr_init(3P)` API and passing the initialized
+    CV attribute object as the second parameter to `pthread_cond_init(3P)`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_condattr_init(pthread_condattr_t *attr);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Conversely, when done, use the following APIs to destroy the CV attribute object
+    and the CV itself:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: A simple CV usage demo application
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Too many inits/destroys? Looking at the following simple code (`ch15/cv_simple.c`) will
+    clarify their usage; we write a small program to demonstrate the usage of a condition
+    variable and its associated mutex lock. Here, we create two threads, A and B.
+    We then have thread B perform some work and thread A synchronize upon completion
+    of that work by using the {CV, mutex} pair:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed; to view the
+    complete source code, build and run it. The entire tree is available for cloning
+    from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, we again show the macros that implement the mutex lock
+    and unlock, the global predicate (Boolean) variable `gWorkDone`, and of course,
+    the {CV, mutex} pair of variables.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following code, in main, we initialize the CV attribute object and the
+    CV itself:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: The worker threads A and B are created and start their work (we do not repeat
+    the code showing thread creation here). Here, you will find the worker routine
+    for thread A— it must wait until thread B completes the work. We use the {CV,
+    mutex} pair to easily and efficiently achieve this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The library does, however, require the application to guarantee that prior to
+    invoking the `pthread_cond_wait(3P)` API, the associated mutex lock is taken (locked);
+    otherwise, this will result in undefined behavior (or an actual failure when the
+    mutex type is `PTHREAD_MUTEX_ERRORCHECK` or a robust mutex). Once the thread is
+    blocking upon the CV, the mutex lock is auto-released.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, if a signal is delivered while the thread is blocked upon the wait condition,
+    it shall be processed and the wait will be resumed; it could also cause a return
+    value of zero for a spurious wake up (more on this in a minute):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It''s very important to understand this: merely returning from the `pthread_cond_wait(3P)` does not necessarily
+    imply that the condition we were waiting (blocking) upon — in this case, thread
+    B completing the work—actually occurred! In software, receiving a spurious wakeup (a
+    false wakeup due to some other event — perhaps a signal) can occur; robust software
+    will literally recheck the condition in a loop to determine that the reason we
+    were awoken is the right one—in our case here, that the work has indeed been completed.
+    This is why we run in an infinite loop and, once unblocked from `pthread_cond_wait(3P)`,
+    check whether the global integer `gWorkDone` is actually having the value we expect
+    (1, in this case, signifying completion of the work).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All right, but think about this too: even reading a shared global becomes a
+    critical section (otherwise a dirty read could result); hence, we need to take
+    the mutex before doing so. Ah, this is where the {CV, mutex} pair idea has a built-in
+    automatic mechanism that really helps us out—the moment we call `pthread_cond_wait(3P)`, the
+    associated mutex lock is automatically and atomically released (unlocked), and
+    then we block upon the condition variable signal. The moment the other thread
+    (B, here) signals us (on the same CV, obviously), we are unblocked from `pthread_cond_wait(3P)` and
+    the associated mutex lock is automatically and atomically locked, allowing us
+    to recheck the global (or whatever). So, we do our work and then unlock it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s the code for the worker routine for thread B, which performs some sample
+    work and then signals thread A:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice the comment detailing why we again take the mutex lock just prior to
+    the signal. Okay, let''s try it out (we suggest you build and run the debug version
+    as then, the delay loop shows up correctly):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The API also provides a timeout variant of the blocking call:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: The semantics are identical to that of `pthread_cond_wait`, except that the
+    API returns (with a failure value of `ETIMEDOUT`) if the time specified in the
+    third parameter, abstime, has (already) passed. The clock used to measure the
+    time that's elapsed is an attribute of the CV and can be set via the `pthread_condattr_setclock(3P)`
+    API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: (Both `pthread_cond_wait` and the `pthread_cond_timedwait` are cancellation
+    points; this topic is dealt with in the next chapter.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: CV broadcast wakeup
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we saw previously, the `pthread_cond_signal(3P)` API is used to unblock
+    a thread that is blocked upon a particular CV. A variant of this API is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int pthread_cond_broadcast(pthread_cond_t *cond);`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This API allows you to unblock multiple threads that are blocking on the same
+    CV. So, for example, what if we have three threads blocking on the same CV; when
+    the application calls the `pthread_cond_broadcast(3P)`, which thread will run
+    first? Well, this is like asking, when threads are created, which one will run
+    first (recall these discussions from the previous chapter). The answer, of course,
+    is that, in the absence of particular scheduling policies, it is indeterminate.
+    The same answer holds for the question when applied to the CV unblock and run
+    on CPU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To continue, once the waiting threads are unblocked, recall that the associated
+    mutex will be taken, but of course only one of the unblocked threads will get
+    it first. Again, this depends on scheduling policy and priority. With all defaults,
+    it remains indeterminate which thread gets it first. In any case, in the absence
+    of real-time characteristics, this should not matter to the application (if the
+    application is real-time, then read our [Chapter 17](36229bac-c402-4d2f-b876-d1eb4aba8051.xhtml),
+    *CPU Scheduling on Linux*, and setting up real-time scheduling policies and priorities
+    first on each application thread).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, the manual page on these APIs clearly states that although the threads
+    invoking the preceding APIs (`pthread_cond_signal` and the `pthread_cond_broadcast`)
+    do not require that you hold the associated mutex lock when doing so (recall,
+    we always have a {CV, mutex} pair), pedantically correct semantics demand that
+    they do hold the mutex, perform the signal or broadcast, and then unlock the mutex
+    (our example app, `ch15/cv_simple.c`, does follow this guideline).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To round off this discussion on CVs, here are a few tips:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do not use the condition variable approach from within a signal handler; the
+    code is not considered to be async signal-safe (recall our earlier [Chapter 11](99fafa09-8972-4d9f-b241-46caf9de98f3.xhtml),
+    *Signaling - Part I*, and [Chapter 12](657b6be0-ebc8-40dd-81b6-4741b04602b1.xhtml),
+    *Signaling - Part II*).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Using the well-known Valgrind suite (recall that we covered Valgrind''s Memcheck tool
+    in [Chapter 6](406956b7-38f0-40c1-a76b-366ab36db17b.xhtml), *Debugging Tools for
+    Memory Issues*), specifically the tool named helgrind, is useful (sometimes) to
+    detect synchronization errors (data races) in pthreads multithreaded applications.
+    The usage is simple:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`$ valgrind --tool=helgrind [-v] <app_name> [app-params ...]`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: helgrind, though, like many tools of this type, can quite often raise many false
+    positives. For example, we find that eliminating `printf(3)` in the `cv_simple` application
+    we wrote previously removes plenty of (false positive) errors and warnings from helgrind!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Prior to invoking the `pthread_cond_signal` and/or the `pthread_cond_broadcast` APIs,
+    if the associated mutex lock is not first acquired (it's not required), helgrind complains.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Do try helgrind out (again, the *Further reading* section on the GitHub repository
+    has a link to its (really good) documentation).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We began this chapter by focusing on the key concepts of concurrency, atomicity,
+    and the need to recognize critical sections and protect them. Locking is a typical
+    way to achieve this; the pthreads API set provides the powerful mutex lock to
+    do so. However, using locks, especially on large projects, is fraught with hidden
+    problems and dangers—we discussed useful *Locking guidelines*, *Deadlock* *and
+    its avoidance*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter then went on to guide the reader in the usage of the pthreads mutex
+    lock. A lot of ground was covered here, including various mutex attributes, the
+    importance of recognizing and avoiding the priority inversion issue, and variations
+    on the mutex lock. Finally, we covered the need for and usage of the condition
+    variable (CV) and how it can be used to efficiently facilitate inter-thread event
+    notification.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter is the final one in this trilogy of chapters on multithreading;
+    in it, we shall focus on the important issues of thread safety (and thread-safe
+    APIs), thread cancellation and cleanup, mixing signals with MT, a few FAQs and
+    tips, and look at the pros and cons of the multiprocess vs the  multithreaded
+    model.
+  prefs: []
+  type: TYPE_NORMAL

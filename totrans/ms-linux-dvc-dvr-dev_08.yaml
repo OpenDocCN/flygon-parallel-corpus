@@ -1,0 +1,712 @@
+- en: '*Chapter 6*: ALSA SoC Framework – Delving into the Machine Class Drivers'
+  prefs: []
+  type: TYPE_NORMAL
+- en: While starting our ALSA SoC framework series, we noticed that neither platform
+    nor codec class drivers are intended to work on their own. The ASoC architecture
+    is designed in such a way that platform and codec class drivers must be bound
+    together in order to build the audio device. This binding can be done either from
+    a so-called machine driver or from within the device tree, each of which being
+    machine specific. It then goes without saying that the machine driver targets
+    a specific system, and it may change from one board to another. In this chapter,
+    we highlight the dark side of AsoC machine class drivers and discuss specific
+    cases we may encounter when we need to write a machine class driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will present the Linux ASoC driver architecture and implementation.
+    This chapter will be split into different parts, which are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introduction to machine class drivers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Machine routing considerations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clocking and formatting considerations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sound card registration
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Leveraging the simple-card machine driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You need the following for this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Strong knowledge of the concept of device trees
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Familiarity with both platform and codec class drivers (discussed in [*Chapter
+    5*](B10985_05_ePub_AM.xhtml#_idTextAnchor124)*,* *ALSA SoC Framework – Leveraging
+    Codec and Platform Class Drivers*)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introduction to machine class drivers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Codec and platform drivers cannot work alone. Machine drivers are responsible
+    for binding them together in order to finish audio information processing. The
+    machine driver class acts as the glue that describes and ties the other component
+    drivers together to form an ALSA sound card device. It manages any machine-specific
+    controls and machine-level audio events (such as turning on an amp at the start
+    of playback). The machine drivers describe and bind the CPU `struct snd_soc_dai_link`
+    structure and instantiates the sound card, `struct snd_soc_card`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Platform and codec drivers are generally reusable, but machine drivers are
+    not because they have specific hardware features that are non-reusable most of
+    time. The so-called hardware characteristics refer to the link between DAIs; opening
+    the amplifier through a GPIO; detecting the plug-in through a GPIO; using a clock
+    such as MCLK/External OSC as the reference clock source of I2; the codec module,
+    and so on. In general, machine driver responsibilities include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Populating the `struct snd_soc_dai_link` structure with appropriate CPU and
+    codec DAIs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Physical codec clock settings (if any) and codec initialization master/slave
+    configurations (if any)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Defining DAPM widgets to route through the physical codec internals and complete
+    the DAPM path as needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Propagating the runtime sampling frequency to the individual codec drivers as
+    needed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'To put it together, we have the following flow:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The codec driver registers a component driver, a DAI driver, and their operation
+    functions.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The platform driver registers a component driver, the PCM driver, the CPU DAI
+    driver, and their operation functions and sets playback and capture operations
+    as applicable.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The machine layer creates the DAI link between the codec and CPU and registers
+    the sound card and PCM devices.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Now that we have seen the development flow of a machine class driver, let's
+    start with the first step, which consists of populating the DAI link.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The DAI link
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A DAI link is the logical representation of the link between the CPU and the
+    codec DAIs. It is represented from within the kernel using `struct snd_soc_dai_link`,
+    defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The full `snd_soc_dai_link` data structure definition can be found at [https://elixir.bootlin.com/linux/v4.19/source/include/sound/soc.h#L880](https://elixir.bootlin.com/linux/v4.19/source/include/sound/soc.h#L880).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This link is set up from within the machine driver. It should specify the `cpu_dai`,
+    the `codec_dai`, and the platform that is used. Once set up, DAI links are fed
+    to `struct snd_soc_card`, which represents a sound card. The following list describes
+    the elements in the structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`name`: This is chosen arbitrarily. It can be anything.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`codec_dai_name`: This must match the `snd_soc_dai_driver.name` field from
+    within the codec chip driver. Codecs may have one or more DAIs. Refer to the codec
+    driver to identify the DAI names.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cpu_dai_name`: This must match the `snd_soc_dai_driver.name` field from within
+    the CPU DAI driver.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`stream_name`: This is the stream name of this link.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`init`: This is the DAI link initialization callback. It is typically used
+    to add DAI link-specific widgets or other types of one-time settings.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dai_fmt`: This should be set with the supported format and clock configuration,
+    which should be coherent for both CPU and CODEC DAI drivers. Possible bit flags
+    for this field are introduced later.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops`: This field is of the `struct snd_soc_ops` type. It should be set with
+    machine-level PCM operations of the DAI link: `startup`, `hw_params`, `prepare`,
+    `trigger`, `hw_free`, `shutdown`. This field is described in detail later.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`codec_name`: If set, this should be the name of the codec driver, such as
+    `platform_driver.driver.name` or `i2c_driver.driver.name`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`codec_of_node`: The device tree node associated with the codec.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cpu_name`: If set, this should be the name of the CPU DAI driver CPU.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cpu_of_node`: This is the device tree node associated with the CPU DAI.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`platform_name` or `platform_of_node`: This is the name or DT node reference
+    to the platform node, which provides DMA capabilities.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`playback_only` and `capture_only` are to be used in case of unidirectional
+    links, such as SPDIF. If this is an output only link (playback only), then `playback_only`
+    and `capture_only` must be set to `true` and `false` respectively. With an input-only
+    link, the opposite values should be used.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In most cases, `.cpu_of_node` and `.platform_of_node` are the same, since the
+    CPU DAI driver and the DMA PCM driver are implemented by the same device. That
+    being said, you must specify the link''s codec either by name or by `of_node`,
+    but not both. You must do the same for the CPU and platform. However, at least
+    one of the CPU DAI name or the CPU device name/node must be specified. This could
+    be summarized as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There is a key point it is worth noting here. How do we reference the platform
+    or CPU node in the DAI link? We will answer this question later. Let''s first
+    consider the following two device nodes. The first one (`ssi1`) is the SSI `cpu-dai`
+    node for the i.mx6 SoC. The second node (`sgtl5000`) represents the sgtl5000 codec
+    chip:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the SSI node, you can see the `dma-names = "rx", "tx";` property, which is
+    the expected DMA channel names requested by the pcmdmaengine framework. This may
+    also be an indication that the CPU DAI and platform PCM are represented by the
+    same node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will consider a system where an i.MX6 SoC is connected to an sgtl5000 audio
+    codec. It is common for machine drivers to grab either CPU or CODEC device tree
+    nodes by referencing those nodes (their `phandle` actually) as its properties.
+    This way, you can just use one of the `OF` helpers (such as `of_parse_phandle()`)
+    to grab a reference on these nodes. The following is an example of a machine node
+    that references both the codec and the platform by an `OF` node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding machine node, the codec and CPUE are passed by reference (their
+    `phandle`) via the `audio-codec` and `ssi-controller` properties. These property
+    names are not standardized as long as the machine driver is written by you (this
+    is not true if you use the `simple-card` machine driver, for example, which expects
+    some predefined names). In the machine driver, you''ll see something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding excerpt used `of_parse_phandle()` to obtain node references. This
+    is an excerpt from the `imx_sgtl5000` machine, which is `sound/soc/fsl/imx-sgtl5000.c`
+    in the kernel sources. Now that we are familiar with the way the DAI link should
+    be handled, we can proceed to audio routing from within the machine driver in
+    order to define the path the audio data should follow.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Machine routing consideration
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The machine driver can alter (or should I say append) the routes defined from
+    within the codec. It has the last word on which codec pins must be used, for example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Codec pins
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Codec pins are meant to be connected to the board connectors. The available
+    codec pins are defined in the codec driver using the `SND_SOC_DAPM_INPUT` and
+    `SND_SOC_DAPM_OUTPUT` macros. These macros can be searched with the `grep` command
+    in the codec driver in order to find the available PIN.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, the `sgtl5000` codec driver defines the following output and input:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the next sections, we will see how those pins are connected to the board.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Board connectors
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The board connectors are defined in the machine driver in the `struct snd_soc_dapm_widget`
+    part of the registered `struct snd_soc_card`. Most of the time, these board connectors
+    are virtual. They are just logical stickers that are connected with codec pins
+    (which are real this time). The following lists the connectors defined by the
+    `imx-sgtl5000` machine driver, `sound/soc/fsl/imx-sgtl5000.c` (whose documentation
+    is `Documentation/devicetree/bindings/sound/imx-audio- sgtl5000.txt`), which has
+    been given as an example so far:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The next section will connect this connector to the codec pins.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Machine routing
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The final machine routing can be either static (that is, populated from within
+    the machine driver itself) or populated from within the device tree. Moreover,
+    the machine driver can optionally extend the codec power map and become an audio
+    power map of the audio subsystem by connecting to the supply widget that has been
+    defined in the codec driver with either `SND_SOC_DAPM_SUPPLY` or `SND_SOC_DAPM_REGULATOR_SUPPLY`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Device tree routing
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s take the node of our machine as an example, which connects an i.MX6
+    SoC to an sgtl5000 codec (this excerpt can be found in the machine documentation):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Routing from the device tree expects the audio map to be given in a certain
+    format. That is, entries are parsed as pairs of strings, the first being the connection''s
+    sink, the second being the connection''s source. Most of the time, these connections
+    are materialized as codec pins and board connector mappings. Valid names for sources
+    and sinks depend on the hardware binding, which is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The codec**: This should have defined the pins whose names are used here.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The machine**: This should have defined the connectors or jacks whose names
+    are used here.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the preceding excerpt, what do you notice there? We can see `MIC_IN`, `HP_OUT`,
+    and `"Mic Bias"`, which are codec pins (coming from the codec driver), and `"Mic
+    Jack"` and `"Headphone Jack"`, which have been defined in the machine driver as
+    board connectors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order to use the route defined in the DT, the machine driver must call `snd_soc_of_parse_audio_routing()`,
+    which has the following prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding prototype, `card` represents the sound card for which the routes
+    are parsed, and `prop` is the name of the property that contains the routes in
+    the device tree node. This function returns `0` on success and a negative error
+    code on error.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Static routing
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Static routing consists of defining a DAPM route map from the machine driver
+    and assigning it to the sound card directly as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding snippet is an excerpt from `sound/soc/rockchip/rockchip_rt5645.c`.
+    By using it this way, it is not necessary to use `snd_soc_of_parse_audio_routing()`.
+    However, a con of using this method is that it is not possible to change the route
+    without recompiling the kernel. Next, we will be looking at clocking and formatting
+    considerations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clocking and formatting considerations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before delving deeper into this section, let''s spend some time on the `snd_soc_dai_link->ops`
+    field. This field is of type `struct snd_soc_ops`, defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: These callback fields in this structure should remind you of those defined in
+    the `snd_soc_dai_driver->ops` field, which is of type `struct snd_soc_dai_ops`.
+    From within the DAI link, these callbacks represent the machine-level PCM operations
+    of the DAI link, while in `struct snd_soc_dai_driver`, they are either codec-DAI-specific
+    or CPU-DAI-specific.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`startup()` is invoked by ALSA when a PCM substream is opened (when someone
+    has opened the capture/playback device), while `hw_params()` is called when setting
+    up the audio stream. The machine driver may configure DAI link data format from
+    within both of these callbacks. `hw_params()` offers the advantage of receiving
+    stream parameters (*channel count*, *format*, *sample rate*, and so forth).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The data format configuration should be consistent between the CPU DAI and
+    the codec. The ASoC core provides helper functions to change those configurations.
+    They are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding helper list, `snd_soc_dai_set_fmt` sets the DAI format for
+    things such as the clock master/slave relationship, audio format, and signal inversion;
+    `snd_soc_dai_set_pll` configures the clock PLL; `snd_soc_dai_set_sysclk` configures
+    the clock source; and `snd_soc_dai_set_clkdiv` configures the clock divider. Each
+    of these helpers will call the appropriate callback in the underlying DAI's driver
+    ops. For example, calling `snd_soc_dai_set_fmt()` with the CPU DAI will invoke
+    this CPU DAI's `dai->driver->ops->set_fmt` callback.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is the actual list of formats/flags that can be assigned either
+    to DAIs or the `dai_link.format` field:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`snd_soc_dai_set_fmt()`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'A) `SND_SOC_DAIFMT_CBM_CFM`: The CPU is the slave for the bit clock and frame
+    sync. This also means the codec is the master for both.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: b) `SND_SOC_DAIFMT_CBS_CFS`. The CPU is the master for the bit clock and frame
+    sync. This also means the codec is the slave for both.
+  prefs: []
+  type: TYPE_NORMAL
+- en: c) `SND_SOC_DAIFMT_CBM_CFS`. The CPU is the slave for the bit clock and the
+    master for frame sync. This also means the codec is the master for the former
+    and the slave for the latter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'B) `SND_SOC_DAIFMT_DSP_A`: Frame syncing is 1 bit-clock wide, 1-bit delay.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'b) `SND_SOC_DAIFMT_DSP_B`: Frame syncing is 1 bit-clock wide, 0-bit delay.
+    This format can be used for the TDM protocol.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'c) `SND_SOC_DAIFMT_I2S`: Frame syncing is 1 audio word wide, 1-bit delay, I2S
+    mode.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'd) `SND_SOC_DAIFMT_RIGHT_J`: Right justified mode.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'e) `SND_SOC_DAIFMT_LEFT_J`: Left justified mode.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'f) `SND_SOC_DAIFMT_DSP_A`: Frame syncing is 1 bit-clock wide,1-bit delay.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'g) `SND_SOC_DAIFMT_AC97`: AC97 mode.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'h) `SND_SOC_DAIFMT_PDM`: Pulse-density modulation.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'i) `SND_SOC_DAIFMT_DSP_B`: Frame sync is 1 bit-clock wide, 1-bit delay.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'C) `SND_SOC_DAIFMT_NB_NF`: Normal bit clock, normal frame sync. The CPU transmitter
+    shifts data out on the falling edge of the bit clock, the receiver samples data
+    on the rising edge. The CPU frame sync generator starts the frame on the rising
+    edge of the frame sync. This parameter is recommended for I2S on the CPU side.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'b) `SND_SOC_DAIFMT_NB_IF`: Normal bit clock, inverted frame sync. The CPU transmitter
+    shifts data out on the falling edge of the bit clock, and the receiver samples
+    data on the rising edge. The CPU frame sync generator starts the frame on the
+    falling edge of the frame sync.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'c) `SND_SOC_DAIFMT_IB_NF`: Inverted bit clock, normal frame sync. The CPU transmitter
+    shifts data out on the rising edge of the bit clock, and the receiver samples
+    data on the falling edge. The CPU frame sync generator starts the frame on the
+    rising edge of the frame sync.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'd) `SND_SOC_DAIFMT_IB_IF`: Inverted bit clock, inverted frame sync. The CPU
+    transmitter shifts data out on the rising edge of the bit clock, and the receiver
+    samples data on the falling edge. The CPU frame sync generator starts the frame
+    on the falling edge of the frame sync. This configuration can be used for PCM
+    mode (such as Bluetooth or modem-based audio chips).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`snd_soc_dai_set_sysclk()`. The following are the direction parameters letting
+    ALSA know which clock is used:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'a) `SND_SOC_CLOCK_IN`: This means an internal clock is used for sysclock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'b) `SND_SOC_CLOCK_OUT`: This means an external clock is used for sysclock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`snd_soc_dai_set_clkdiv()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The preceding flags are the possible values that can be set in the `dai_link->dai_fmt`
+    field or assigned to either codec or CPU DAIs from within the machine driver.
+    The following is a typical `hw_param()` implementation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding implementation of the `foo_hw_params()` function, we can see
+    how both codec and platform DAIs are configured, with both format and clock settings.
+    Now we come to the last step of machine driver implementation, which consists
+    of registering the audio sound card, which is the device through which audio operations
+    on the system are performed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Sound card registration
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A sound card is represented in the kernel as an instance of `struct snd_soc_card`,
+    defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For the sake of readability, only the relevant field has been listed, and the
+    full definition can be found at [https://elixir.bootlin.com/linux/v4.19/source/include/sound/soc.h#L1010](https://elixir.bootlin.com/linux/v4.19/source/include/sound/soc.h#L1010).
+    That being said, the following list describes the fields we have listed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`name` is the name of the sound card.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`owner` is the module owner for this sound card.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dai_link` is the array of DAI links this sound card is made of, and `num_links`
+    specifies the number of entries in the array.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`controls` is an array that contains the controls that are statically defined
+    and set by the machine driver, and `num_controls` specifies the number of entries
+    in the array.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`dapm_widgets` is an array that contains the DAPM widgets that are statically
+    defined and set by the machine driver, and `num_dapm_widgets` specifies the number
+    of entries in the array.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`damp_routes` is an array that contains the DAPM routes that are statically
+    defined and set by the machine driver, and `num_dapm_routes` specifies the number
+    of entries in the array.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`of_dapm_widgets` represents the DAPM widgets fed from the DT (via `snd_soc_of_parse_audio_simple_widgets()`),
+    and `num_of_dapm_widgets` is the actual number of widget entries.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`of_dapm_routes` represents the DAPM routes fed from the DT (via `snd_soc_of_parse_audio_routing()`),
+    and `num_of_dapm_routes` is the actual number of route entries.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'After the sound card structure has been set up, it can be registered by the
+    machine using the `devm_snd_soc_register_card()` method, whose prototype is as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding prototype, `dev` represents the underlying device used to manage
+    the card, and `card` is the actual sound card data structure that was set up previously.
+    This function returns `0` on success. However, when this function is called, every
+    component driver and DAI driver will be probed. As a result, the `component_driver->probe()`
+    and `dai_driver->probe()` methods will be invoked for both the CPU and CODEC.
+    Additionally, a new PCM device will be created for each successfully probed DAI
+    link.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following excerpts (from a Rockchip machine ASoC driver for boards using
+    a MAX90809 CODEC, implemented in `sound/soc/rockchip/rockchip_max98090.c` in kernel
+    sources) will show the entire sound card creation, from widgets to routes, through
+    DAI link configurations. Let''s start by defining a widget and control for this
+    machine, as well as the callback, which is used to configure the CPU and codec
+    DAIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding excerpt, `rk_aif1_hw_params` can be seen in the original code
+    implementation file. Now comes the data structure, which is used to build the
+    sound card, defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This sound card is finally created in the driver `probe` method as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Once again, the three preceding code blocks are excerpts from `sound/soc/rockchip/rockchip_max98090.c`.
+    So far, we have learned the main purpose of machine drivers, which is to bind
+    Codec and CPU drivers together and to define the audio path. That being said,
+    there are cases when we might need even less code. Such cases concern boards where
+    neither the CPU nor the Codecs need special hacks before being bound together.
+    In this case, the ASoC framework provides the **simple-card machine driver**,
+    introduced in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Leveraging the simple-card machine driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are cases when your board does not require any hacks from the Codec nor
+    the CPU DAI. The ASoC core provides the `simple-audio` machine driver, which can
+    be used to describe a whole sound card from the DT. The following is an excerpt
+    of such a node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: This is fully documented in `Documentation/devicetree/bindings/sound/simple-card.txt`.
+    In the preceding excerpt, we can see machine widgets and route maps being specified,
+    as well as both the codec and the CPU nodes, which are referenced. Now that we
+    are familiar with the simple-card machine driver, we can leverage it and try as
+    much as possible not to write our own machine driver. Having said that, there
+    are situations where the codec device can't be dissociated, and this changes the
+    way the machine should be written. Such audio devices are called codec-less sound
+    cards, and we discuss them in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Codec-less sound cards
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There may be situations where digital audio data is sampled from an external
+    system, such as when using the SPDIF interface, and the data is therefore preformatted.
+    In this case, the sound card registration is the same, but the ASoC core needs
+    to be aware of this particular case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the output, the DAI link object''s `.capture_only` field should be `false`,
+    while `.playback_only` should be `true`. The reverse should be done with the input.
+    Additionally, the machine driver must set the DAI link''s `codec_dai_name` and
+    `codec_name` to `"snd-soc-dummy-dai"` and `"snd-soc-dummy"` respectively. This
+    is, for example, the case for the `imx-spdif` machine driver (`sound/soc/fsl/imx-spdif.c`),
+    which contains the following excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can find the binding documentation of this driver in `Documentation/devicetree/bindings/sound/imx-audio-spdif.txt`.
+    At the end of machine class driver study, we are done with the whole ASoC class
+    driver development. In this machine class driver, in addition to bound CPU and
+    Codec in the code, as well as providing a setup callback, we have seen how to
+    avoid writing code by using the simple-card machine driver and implementing the
+    rest in the device tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we have gone through the architecture of ASoC machine class
+    drivers, which represents the last element in this ASoC series. We have learned
+    how to bind platform and subdevice drivers, but also how to define routes for
+    audio data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will cover another Linux media subsystem, that is, V4L2,
+    which is used to deal with video devices.
+  prefs: []
+  type: TYPE_NORMAL

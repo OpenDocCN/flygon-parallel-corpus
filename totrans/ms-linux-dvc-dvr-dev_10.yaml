@@ -1,0 +1,2294 @@
+- en: '*Chapter 8*: Integrating with V4L2 Async and Media Controller Frameworks'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Over time, media support has become a must and a saling argument for **System
+    on Chips** (**SoCs**), which keep becoming more and more complex. The complexity
+    of those media IP cores is such that grabbing sensor data requires a whole pipeline
+    (made of several sub-devices) to be set up by the software. The asynchronous nature
+    of a device tree-based system means the setup and probing of those sub-devices
+    are not straightforward. Thus entered the async framework, which addresses the
+    unordered probing of sub-devices in order for the media device to be popped on
+    time, when all of the media sub-devices are ready. Last but not least, because
+    of the complexity of the media pipe, it became necessary to find a way to ease
+    the configuration of the sub-devices it is made of. Thus came the media controller
+    framework, which wraps the whole media pipe in a single element, the media device.
+    It comes with some abstractions, one of which is that each sub-device is considered
+    as an entity, with either a sink pad, a source pad, or both.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter will focus on how both the async and media controller frameworks
+    work and how they are designed, and we will go through their APIs to learn how
+    to leverage them in **Video4Linux2** (**V4L2**) device driver development.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In other words, in this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The V4L2 async interface and the concept of graph binding
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The V4L2 async and graph-oriented API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The V4L2 async framework and APIs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Linux media controller framework
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, you''ll need the following elements:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Advanced computer architecture knowledge and C programming skills
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The V4L2 async interface and the concept of graph binding
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far, with V4L2 driver development, we have not actually dealt with the probing
+    order. That being said, we considered the synchronous approach, where bridge device
+    drivers register devices for all sub-devices synchronously during their probing.
+    However, this approach cannot be used with intrinsically asynchronous and unordered
+    device registration systems, such as the **flattened device tree**. To address
+    this, what we currently call the async interface has been introduced.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this new approach, bridge drivers register lists of sub-device descriptors
+    and notifier callbacks, and sub-device drivers register sub-devices that they
+    are about to probe or have successfully probed. The async core will take care
+    of matching sub-devices against hardware descriptors and calling bridge driver
+    callbacks when matches are found. Another callback is called when the sub-device
+    is unregistered. The async subsystem relies on device declaration in a special
+    way, called **graph binding**, which we will deal with in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Graph binding
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Embedded systems have a reduced set of devices, some of which are not discoverable.
+    The device tree, however, came into the picture to allow describing the actual
+    system (from a hardware point of view) to the kernel. Sometimes (if not always),
+    these devices are somehow interconnected.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While the `phandle` properties pointing to other nodes could be used in the
+    device tree to describe simple and direct connections, such as parent/child relationships,
+    there was no way to model compound devices made of several interconnections. There
+    were situations where the relationship modeling resulted in a quite complete graph
+    – for example, the i.MX6 **Image Processing Unit** (**IPU**), which is a logical
+    device on its own, but made up of several physical IP blocks whose interconnections
+    may result in a quite complex pipe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is where the so-called **Open Firmware** (**OF**) **graph** intervenes,
+    along with its API and some new concepts, the concepts of **port** and **endpoint**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **port** can be seen as an interface in a device (as in an IP block).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An **endpoint** can be seen as a pad, as it describes one end of a connection
+    to a remote port.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: However, `phandle` properties are still used to refer to other nodes in the
+    tree. More documentation on this can be found in `Documentation/devicetree/bindings/graph.txt`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Port and endpoint representations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A port is an interface to a device. A device can have one or several ports.
+    Ports are represented by port nodes contained in the node of the device they belong
+    to. Each port node contains an endpoint subnode for each remote device port to
+    which this port is connected. This means a single port can be connected to more
+    than one port on the remote device(s) and that each link must be represented by
+    an endpoint child node. Now, if a device node contains more than one port, if
+    there is more than one endpoint at a port, or a port node needs to be connected
+    to a selected hardware interface, a popular scheme using the `#address-cells`,
+    `#size-cells`, and `reg` properties is used to number the nodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following excerpt shows how to use the `#address-cells`, `#size-cells`,
+    and `reg` properties to handle those cases:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Complete documentation of this can be found in `Documentation/devicetree/bindings/graph.txt`.
+    Now that we are done with port and endpoint representation, we need to learn how
+    to link each with the other, as explained in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Endpoint linking
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For two endpoints to be linked together, each of them should contain a `remote-endpoint`
+    `phandle` property that points to the corresponding endpoint in the port of the
+    remote device. In turn, the remote endpoint should contain a `remote-endpoint`
+    property. Two endpoints with their `remote-endpoint` phandles pointing at each
+    other form a link between the containing ports, as in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Introducing the graph binding concept without talking at all about its API would
+    be a waste of time. Let's jump to the API that comes along with this new binding
+    method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The V4L2 async and graph-oriented API
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: This section heading must not mislead you since graph binding is not just intended
+    for the V4L2 subsystem. The Linux `DRM` subsystem also takes advantage of it.
+    That being said, the async framework heavily relies on the device tree to describe
+    either media devices along with their endpoints and connections, or links between
+    those endpoints along with their bus configuration properties.
+  prefs: []
+  type: TYPE_NORMAL
+- en: From the DT (of_graph_*) API to the generic fwnode graph API (fwnode_graph_*)
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `fwnode` graph API is a successful attempt at changing the device tree-only-based
+    OF graph API to a generic API, merging both ACPI and device tree OF APIs together
+    in order to have unified and generic APIs. This extends the concept of the graph
+    with ACPI by using the same APIs. By having a look at the `struct device_node`
+    and `struct acpi_device` structures, you can see the members they have in common:
+    `struct fwnode_handle fwnode`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding excerpt represents a device node from a device tree point of
+    view, while the following is related to ACPI:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `fwnode` member, which is of the `struct fwnode_handle` type, is a lower
+    level and generic data structure abstracting either `device_node` or `acpi_device`
+    as they both inherit from this data structure. This makes `struct fwnode_handle`
+    a good client for graph API homogenization so that an endpoint (by means of its
+    field of the `fwnode_handle` type) can refer to either an ACPI device or an OF-based
+    device. This abstraction model is now used in graph APIs, allowing us to abstract
+    an endpoint by a generic data structure (`struct fwnode_endpoint`, described as
+    follows) embedding a pointer to `struct fwnode_handle`, which may refer to either
+    an ACPI or OF node. In addition to the genericity, this allows the underlying
+    sub-device to this endpoint to be either ACPI- or OF-based:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: This structure deprecates the old `struct of_endpoint` structure and the member
+    of type `device_node*` leaves room for a member of the `fwnode_handle*` type.
+    In the preceding structure, `local_fwnode` points to the related firmware node,
+    `port` is the port number (that is, it corresponds to `0` in `port@0` or `1` in
+    `port@1`), and `id` is the index of this endpoint from within the port (that is,
+    it corresponds to the `0` in `endpoint@0` and to the `1` in `endpoint@1`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The V4L2 framework uses this model for abstracting V4L2-related endpoints by
+    means of `struct v4l2_fwnode_endpoint`, which is built on top of `fwnode_endpoint`,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This structure deprecates and replaces `struct v4l2_of_endpoint` since kernel
+    v4.13, formerly used by V4L2 to represent endpoint nodes in the era of the `base`
+    represents the `struct fwnode_endpoint` structure of the underlying ACPI or device
+    node. Other fields are V4L2-related, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`bus_type` is the type of media bus through which this sub-device streams data.
+    The value of this member determines which underlying bus structure should be filled
+    with the parsed bus properties from the `fwnode` endpoint (either device tree
+    or ACPI). Possible values are listed in `enum v4l2_mbus_type`, as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`bus` is the structure representing the media bus itself. Possible values are
+    already present in the union, and `bus_type` determines which one to consider.
+    These bus structures are all defined in `include/media/v4l2-fwnode.h`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`link_frequencies` is the list of frequencies supported by this link.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`nr_of_link_frequencies` is the number of elements in `link_frequencies`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: In kernel v4.19, the `bus_type` member is exclusively set according to the `bus-type`
+    property in `fwnode`. The driver can check the read value and adapt its behavior.
+    This means the V4L2 `fwnode` API will always base its parsing strategy on this
+    `fwnode` property. However, as of kernel v5.0, drivers have to set this member
+    to an expected bus type (prior to calling the parsing function), which will be
+    compared to the value of the `bus-type` property read in `fwnode` and will raise
+    an error if they don't match. If the bus type is not known or if the driver can
+    deal with several bus types, the `V4L2_MBUS_UNKNOWN` value has to be used. This
+    value is also part of `enum v4l2_mbus_type`, as of kernel v5.0.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the kernel code, you may find the `enum v4l2_fwnode_bus_type` enum type.
+    This is a V4L2 `fwnode` local enum type that is the counterpart of the global
+    `enum v4l2_mbus_type` enum type and whose values map each other. Their respective
+    values are kept in sync as the code evolves.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The V4L2-related binding then requires additional properties. Part of these
+    properties is used to build `v4l2_fwnode_endpoint`, while the other part is used
+    to build the underlying `bus` (the media bus, actually) structure. All are described
+    in a dedicated and video-related binding documentation, `Documentation/devicetree/bindings/media/video-
+    interfaces.txt`, which I strongly recommend checking out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is a typical binding between a bridge (`isc`) and a sensor sub-device
+    (`mt9v032`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding binding, `hsync-active`, `vsync-active`, `link-frequencies`,
+    and `pclk- sample` are all V4L2-specific properties and describe the media bus.
+    Their values are not coherent here and do not really make sense but fit well for
+    our learning purpose. This excerpt shows well the concepts of endpoint and remote
+    endpoint; the use of `struct v4l2_fwnode_endpoint` is discussed in detail in the
+    *The Linux media controller framework* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The part of V4L2 dealing with the `fwnode` API is called the `v4l2_fwnode_`,
+    while the second's API set is prefixed with `v4l2_of_`. Do note that in OF-only-based
+    APIs, an endpoint is represented by `struct of_endpoint`, and a V4L2-related endpoint
+    is represented by `struct v4l2_of_endpoint`. There are APIs that allow switching
+    from OF- to `fwnode`-based models and vice versa.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 `fwnode` and V4L2 OF are fully interoperable. For example, a sub-device
+    driver using V4L2 `fwnode` will work with a media device driver using V4L2 OF
+    without any effort, and vice versa! However, new drivers must use the `fwnode`
+    API, including `#include <media/v4l2- fwnode.h>`, which should replace `#include
+    <media/v4l2-of.h>` in the old driver when switching to the `fwnode` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That being said, `struct fwnode_endpoint`, which was discussed earlier, is
+    just for showing the underlying mechanisms. We could have completely skipped it
+    since only the core deals with this data structure. For a more generic approach,
+    instead of using `struct device_node` to refer to the device''s firmware node,
+    you''re better off using the new `struct fwnode_handle`. This definitely makes
+    sure that DT and ACPI bindings are compatible/interoperable using the same code
+    in the driver. The following is a short excerpt of how changes should look in
+    new drivers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some of the common `fwnode` node-related APIs are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The aforementioned APIs have the following description:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`fwnode_get_parent()` returns the parent handle of the node whose `fwnode`
+    value is given in an argument, or `NULL` otherwise.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_get_next_child_node()` takes a parent node as its first argument and
+    returns the next child (or `NULL` otherwise) after a given child (given as the
+    second argument) in this parent. If `child` (the second argument) is `NULL`, then
+    the first child of this parent will be returned.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_get_next_available_child_node()` is the same as `fwnode_get_next_child_node()`
+    but makes sure that the device actually exists (has been probed successfully)
+    prior to returning the `fwnode` handle.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_for_each_child_node()` iterates over the child in a given node (the
+    first argument) and the second argument is used as an iterator.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_for_each_available_child_node` is the same as `fwnode_for_each_child_node()`
+    but iterates only over nodes whose device is actually present on the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_get_named_child_node()` gets a child in a given node by its name.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_handle_get()` obtains a reference to a device node and `fwnode_handle_put()`
+    drops this reference.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Some of the `fwnode`-related properties are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Both property- and node-related `fwnode` APIs are available in `include/linux/property.h`.
+    However, there are helpers that allow switching back and forth between OF, ACPI,
+    and `fwnode`. The following is a short example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, and most important for us, is the `fwnode` graph API. In the following
+    code snippet, we enumerate the most important function of this API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Though the preceding function names talk about themselves, the following are
+    better descriptions of what they do:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`fwnode_graph_get_next_endpoint()` returns the next endpoint (or `NULL` otherwise)
+    in a given node (the first argument) after a previous endpoint (`prev`, the second
+    argument). If `prev` is `NULL`, then the first endpoint is returned. This function
+    obtains a reference to the returned endpoint that must be dropped after use. See
+    `fwnode_handle_put()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_graph_get_port_parent()` returns the parent of the port node given
+    in the argument.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_graph_get_remote_port_parent()` returns the firmware node of the remote
+    device containing the endpoint whose firmware node is given through the `fwnode`
+    argument.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_graph_get_remote_endpoint()` returns the firmware node of the remote
+    endpoint corresponding to a local endpoint whose firmware node is given through
+    the `fwnode` argument.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`fwnode_graph_parse_endpoint()` parses common endpoint node properties in `fwnode`
+    (the first argument) representing a graph endpoint node and stores the information
+    in `endpoint` (the second and output argument). The V4L2 firmware node API heavily
+    uses this.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The V4L2 firmware node (V4L2 fwnode) API
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The main data structure in the V4L2 fwnode API is `struct v4l2_fwnode_endpoint`.
+    This structure is nothing but `struct fwnode_handle` augmented with some V4L2-related
+    properties. However, there is a V4L2-related fwnode graph function that it is
+    worth talking about here: `v4l2_fwnode_endpoint_parse()`. This function''s prototype
+    is declared `include/media/v4l2-fwnode.h`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Given `fwnode_handle` (the first argument in the preceding function) of an endpoint,
+    you can use `v4l2_fwnode_endpoint_parse()` to parse all the fwnode node properties.
+    This function also recognizes and takes care of the V4L2-specific properties,
+    which are, if you remember, those documented in `Documentation/devicetree/bindings/media/video-interfaces.txt`.
+    `v4l2_fwnode_endpoint_parse()` uses `fwnode_graph_parse_endpoint()` to parse common
+    fwnode properties and uses V4L2-specific parser helpers to parse V4L2-related
+    properties. It returns `0` on success or a negative error code on failure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If we consider the `mt9v032` CMOS image sensor node in `dts`, we can have the
+    following code in the `probe` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code shows how you use the fwnode API, as well as its V4L2 version,
+    for accessing node and endpoint properties. There are, however, V4L2-specific
+    properties being parsed upon the `v4l2_fwnode_endpoint_parse()` call. These properties
+    describe the so-called **media bus** through which data is carried from one interface
+    to another. We will discuss this in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 fwnode or media bus types
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Most media devices support a particular media bus type. While endpoints are
+    linked together, they are actually connected through buses, whose properties need
+    to be described to the V4L2 framework. For V4L2 to be able to find this information,
+    it is provided as properties in the device's fwnode (DT or ACPI). As these are
+    specific properties, the V4L2 fwnode API is able to recognize and parse them.
+    Each bus has its specificities and properties.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First of all, let''s have a look at the currently supported buses, along with
+    their data structures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct v4l2_fwnode_bus_mipi_csi1`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct v4l2_fwnode_bus_mipi_csi1` too.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`HSYNC` and `VSYNC` signals. The structure used to represent this bus is `struct
+    v4l2_fwnode_bus_parallel`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`HSYNC`, `VSYNC`, and `BLANK`) in the data. These buses have a reduced number
+    of pins compared to the standard parallel bus. This framework uses `struct v4l2_fwnode_bus_parallel`
+    to represent this bus.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct v4l2_fwnode_bus_mipi_csi2` structure. However, this data structure
+    does not differentiate between D-PHY and C-PHY. This lack of differentiation is
+    addressed as of kernel v5.0.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As we will see later in the chapter, in the *The concept of a media bus* section,
+    this concept of a bus can be used to detect compatibility between a local endpoint
+    and its remote counterpart so that two sub-devices can't be linked together if
+    they don't have the same bus properties, which makes complete sense.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Earlier, in the *The V4L2 fwnode API* section, we saw that `v4l2_fwnode_endpoint_parse()`
+    is responsible for parsing the endpoint''s fwnode and filling the appropriate
+    bus structure. This function first calls `fwnode_graph_parse_endpoint()` in order
+    to parse the common fwnode graph-related properties, and then checks the value
+    of the `bus-type` property, as follows, in order to determine the appropriate
+    `v4l2_fwnode_endpoint.bus` data type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Depending on this value, a bus data structure will be chosen. The following
+    are expected possible values from the `fwnode` device:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0`: This means auto-detect. The core will try to guess the bus type according
+    to the properties present in the fwnode (MIPI CSI-2 D-PHY, parallel, or BT656).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`1`: This means MIPI CSI-2 C-PHY.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`2`: This means MIPI CSI-1.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`3`: This means CCP2.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For the CPP2 bus, for example, the device''s fwnode would contain the following
+    line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: As of kernel v5.0, drivers can specify the expected bus type in the `bus_type`
+    member of `v4l2_fwnode_endpoint` prior to giving it as a second argument to `v4l2_fwnode_endpoint_parse()`.
+    This way, parsing will fail if the value returned by the preceding `fwnode_property_read_u32`
+    does not match the expected one, except if the expected bus type was set to `V4L2_MBUS_UNKNOWN`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: BT656 and parallel buses
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Those bus types are all represented by `struct v4l2_fwnode_bus_parallel`, as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding data structure, `flags` represents the flags of the bus. Those
+    flags will be set according to the properties present in the device''s firmware
+    node. `bus_width` represents the number of data lines actively used, not necessarily
+    the total number of lines of the bus. `data_shift` is used to specify which data
+    lines are really used by specifying the number of lines to skip prior to reaching
+    the first active data line. The following are the binding properties of these
+    media buses, which are used to set up `struct v4l2_fwnode_bus_parallel`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`hsync-active`: Active state of the HSYNC signal; `0`/`1` for `LOW`/`HIGH`,
+    respectively. If this property''s value is `0`, then the `V4L2_MBUS_HSYNC_ACTIVE_LOW`
+    flag is set in the `flags` member. Any other value will set the `V4L2_MBUS_HSYNC_ACTIVE_HIGH`
+    flag instead.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`vsync-active`: Active state of the VSYNC signal; `0`/`1` for `LOW`/`HIGH`,
+    respectively. If this property''s value is `0`, then the `V4L2_MBUS_VSYNC_ACTIVE_LOW`
+    flag is set in the `flags` member. Any other value will set the `V4L2_MBUS_VSYNC_ACTIVE_HIGH`
+    flag instead.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`field-even-active`: The field signal level during the even field data transmission.
+    This is the same as the preceding, but the concerned flags are `V4L2_MBUS_FIELD_EVEN_HIGH`
+    and `V4L2_MBUS_FIELD_EVEN_LOW`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pclk-sample`: Sample data on the rising (`1`) or falling (`0`) edge of the
+    pixel clock signal, `V4L2_MBUS_PCLK_SAMPLE_RISING` and `V4L2_MBUS_PCLK_SAMPLE_FALLING`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`data-active`: Similar to `HSYNC` and `VSYNC`, specifies data line polarity,
+    `V4L2_MBUS_DATA_ACTIVE_HIGH` and `V4L2_MBUS_DATA_ACTIVE_LOW`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`slave-mode`: This is a Boolean property whose presence indicates that the
+    link is run in slave mode, and the `V4L2_MBUS_SLAVE` flag is set. Otherwise, the
+    `V4L2_MBUS_MASTER` flag will be set.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`data-enable-active`: Similar to `HSYNC` and `VSYNC`, specifies the data-enable
+    signal polarity.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bus-width`: This property concerns parallel buses only and represents the
+    number of data lines actively used. The `V4L2_MBUS_DATA_ENABLE_HIGH` or `V4L2_MBUS_DATA_ENABLE_LOW`
+    flags are set accordingly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`data-shift`: On parallel data buses where `bus-width` is used to specify the
+    number of data lines, this property can be used to specify which data lines are
+    really used; for example, `bus-width=<8>; data-shift=<2>;` means that lines 9:2
+    are used.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sync-on-green-active`: The active state of the `0`/`1` for `LOW`/`HIGH`, respectively.
+    The `V4L2_MBUS_VIDEO_SOG_ACTIVE_HIGH` or `V4L2_MBUS_VIDEO_SOG_ACTIVE_LOW` flags
+    are set accordingly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The type of these buses is either `V4L2_MBUS_PARALLEL` or `V4L2_MBUS_BT656`.
+    The underlying function responsible for parsing these buses is `v4l2_fwnode_endpoint_parse_parallel_bus()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MIPI CSI-2 bus
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'This is version 2 of MIPI Alliance''s CSI bus. This bus involves two PHYs:
+    either D- PHY or C-PHY. D-PHY has been around for a while and targets cameras,
+    displays, and lower-speed applications. C-PHY is a newer and more complex PHY,
+    where a clock is embedded into the data, rendering a separate clock lane unnecessary.
+    It has fewer wires, a smaller number of lanes, and lower power consumption, and
+    can achieve a higher data rate compared to D-PHY. C-PHY provides high throughput
+    performance over bandwidth-limited channels.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Both C-PHY- and D-PHY-enabled buses are represented using one data structure,
+    `struct` `v4l2_fwnode_bus_mipi_csi2`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding block, `flags` represents the flags of the bus and will be
+    set according to the properties present in the firmware node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`data-lanes` is an array of physical data lane indexes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`lane-polarities`: This property is valid for serial busses only. It is an
+    array of polarities of the lanes, starting from the clock lane and followed by
+    the data lanes, in the same order as in the `data-lanes` property. Valid values
+    are `0` (normal) and `1` (inverted). The length of this array should be the combined
+    length of the `data-lanes` and `clock-lanes` properties. Valid values are `0`
+    (normal) and `1` (inverted). If the `lane-polarities` property is omitted, the
+    value must be interpreted as `0` (normal).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-lanes` is the physical lane index of the clock lane. This is the clock
+    lane position.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-noncontinuous`: If present, the `V4L2_MBUS_CSI2_NONCONTINUOUS_CLOCK`
+    flag is set. Otherwise, `V4L2_MBUS_CSI2_CONTINUOUS_CLOCK` is set.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These buses have the `V4L2_MBUS_CSI2` type. Until Linux kernel v4.20, there
+    were no differences between C-PHY- and D-PHY-enabled CSI buses. However as of
+    Linux kernel v5.0, this difference has been introduced and `V4L2_MBUS_CSI2` has
+    been replaced with either `V4L2_MBUS_CSI2_DPHY` or `V4L2_MBUS_CSI2_CPHY`, respectively,
+    for D-PHY- or C-PHY-enabled buses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The underlying function responsible for parsing these buses is `v4l2_fwnode_endpoint_parse_csi2_bus()`.
+    An example is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: CPP2 and MIPI CSI-1 buses
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'These are older single data lane serial buses. Their type corresponds to either
+    `V4L2_FWNODE_BUS_TYPE_CCP2` or `V4L2_FWNODE_BUS_TYPE_CSI1`. The kernel uses `struct
+    v4l2_fwnode_bus_mipi_csi1` to represent these buses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are the meanings of the elements in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`clock-inv`: The polarity of the clock/strobe signal (false means not inverted,
+    true means inverted). `0` means false, and other values mean true.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`strobe`: False – data/clock, true – data/strobe.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`data-lanes`: The number of the data lanes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-lanes`: The number of the clock lanes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`lane-polarities`: This is the same as the preceding, but since CPP2 and MIPI
+    CSI-1 are single data serial buses, the array can have only two entries: the polarities
+    of the clock (index `0`) and data lanes (index `1`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The preceding data structure is filled with `v4l2_fwnode_endpoint_parse_csi1_bus()`
+    after parsing the given node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bus guessing
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Specifying the bus type to `0` (or `V4L2_MBUS_UNKNOWN`) will instruct the V4L2
+    core to try to guess the actual media bus according to the properties found in
+    the firmware node. It will first consider whether the device is on a CSI-2 bus
+    and try to parse the endpoint node accordingly, looking for CSI-2-related properties.
+    Fortunately, CSI-2 and parallel buses have no properties in common. This way,
+    if, and only if, no MIPI CSI-2-specific properties were found, the core will parse
+    the parallel video bus properties. The core does not guess `V4L2_MBUS_CCP2` nor
+    `V4L2_MBUS_CSI1`. For these buses, the `bus-type` property must be specified.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 async
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Because of the complexity of video-based hardware that sometimes integrates
+    non-V4L2 devices (sub-devices, actually) sitting on different buses, the need
+    has come for sub-devices to defer initialization until the bridge driver has been
+    loaded, and on the other hand, the bridge driver needs to postpone initializing
+    sub-devices until all required sub-devices have been loaded; that is, V4L2 async.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In asynchronous mode, sub-device probing can be invoked independently of bridge
+    driver availability. The sub-device driver then has to verify whether all the
+    requirements for a successful probing are satisfied. This can include a check
+    for master clock availability, a GPIO, or anything else. If any of the conditions
+    aren't satisfied, the sub-device driver might decide to return `-EPROBE_DEFER`
+    to request further re-probing attempts. Once all the conditions are met, the sub-device
+    will be registered with the V4L2 async core using the `v4l2_async_register_subdev()`
+    function. The unregistration is performed using the `v4l2_async_unregister_subdev()`
+    call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We saw earlier where synchronous registration applies. It is a mode where the
+    bridge driver is aware of the context of all the sub-devices it is responsible
+    for. It has the responsibility of registering all the sub-devices using `v4l2_device_register_subdev()`
+    on each of them during its probing, as is the case with the `drivers/media/platform/exynos4-is/media-dev.c`
+    driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the V4L2 async framework, the concept of a sub-device is abstracted. A sub-device
+    is known in the async framework as an instance of a `struct v4l2_async_subdev`
+    structure. Along with this structure, there is another `struct v4l2_async_notifier`
+    structure. Both are defined in `include/media/v4l2-async.h` and somehow form the
+    center part of the V4L2 async core. Prior to going further, we have to introduce
+    the center part of the V4L2 async framework, `struct v4l2_async_notifier`, as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding structure is mostly used by the bridge drivers and the async
+    core. In some cases, however, sub-device drivers may need to be notified by some
+    other sub-devices. In either case, the uses and meanings of the members are the
+    same:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ops` is a set of callbacks to be provided by the owner of this notifier that
+    are invoked by the async core as and when sub-devices waiting in this notifier
+    are probed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`v4l2_dev` is the V4L2 parent of the bridge driver that registered this notifier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sd`, if this notifier has been registered by a sub-device, will point to this
+    sub-device. We do not address this case here.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`subdevs` is an array of sub-devices for which the registrar of this notifier
+    (either the bridge driver or another sub-device driver) should be notified.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`waiting` is a list of the sub-devices in this notifier waiting to be probed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`done` is a list of the sub-devices actually bound to this notifier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_subdevs` is the number of sub-devices in `**subdevs`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`list` is used by the async core during the registration of this notifier in
+    order to link this notifier to the global list of notifiers, `notifier_list`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Back to our `struct v4l2_async_subdev` structure, which is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding data structure is a sub-device in the eyes of the V4L2 async
+    framework. Only the bridge driver (which allocates the async sub-device) and the
+    async core can play with this structure. The sub-device driver is not aware of
+    this at all. The meanings of its members are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`match_type` is of the `enum v4l2_async_match_type` type. A match is a comparison
+    of some criteria (occurring `struct v4l2_subdev` type and an async sub-device
+    of the `struct v4l2_async_subdev` type). Since each `struct v4l2_async_subdev`
+    structure must be associated with its `struct v4l2_subdev` structure, this field
+    specifies the algorithm used by the async core to match both. This field is set
+    by the driver (which is also responsible for allocating asynchronous sub-devices).
+    Possible values are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: --`V4L2_ASYNC_MATCH_DEVNAME`, which instructs the async core to use the device
+    name for the matching. In this case, the bridge driver must set the `v4l2_async_subdev.match.device_name`
+    field so that it can match the sub-device device name (that is, `dev_name(v4l2_subdev->dev)`)
+    when that sub-device will be probed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`V4L2_ASYNC_MATCH_FWNODE`, which means the async core should use the firmware
+    node for the match. In this case, the bridge driver must set `v4l2_async_subdev.match.fwnode`
+    with the firmware node handle corresponding to the sub-device's device node so
+    that they can match.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`V4L2_ASYNC_MATCH_I2C` is to be used to perform the match by checking for
+    the I2C adapter ID and address. Using this, the bridge driver must set both `v4l2_async_subdev.match.i2c.adapter_id`
+    and `v4l2_async_subdev.match.i2c.address`. These values will be compared with
+    the address and the adapter number of the `i2c_client` object associated with
+    `v4l2_subdev.dev`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`V4L2_ASYNC_MATCH_CUSTOM` is the last possibility and means the async core
+    should use the matching callback set by the bridge driver in `v4l2_async_subdev.match.custom.match`.
+    If this flag is set and there is no custom matching callback provided, any matching
+    attempt will immediately return true.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`list` is used to add this async sub-device waiting to be probed in the waiting
+    list of a notifier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Sub-device registration does not depend on the bridge availability anymore
+    and only consists of calling the `v4l2_async_unregister_subdev()` method. However,
+    prior to registering itself, the bridge driver will have to do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocate a notifier for later use. It is better to embed this notifier in a
+    larger device state data structure. This notifier object is of the `struct v4l2_async_notifier`
+    type.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Parse its port node(s) and create an async sub-device (`struct v4l2_async_subdev`)
+    for each sensor (or IP block) specified there and that it needs for its operations:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'a) This parsing is done using the `fwnode` graph API (old drivers still use
+    the `of_graph` API), such as the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`fwnode_graph_get_next_endpoint()` (or `of_graph_get_next_endpoint()` in old
+    drivers) to grab the `fw_handle` (or the `of_node` in old drivers) of an endpoint
+    from within the bridge's port subnode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`fwnode_graph_get_remote_port_parent()` (or `of_graph_get_remote_port_parent()`
+    in old drivers) to grab the `fw_handle` (or the device's `of_node` in old drivers)
+    corresponding to the parent of the remote port of the current endpoint.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optionally (in old drivers using the OF API), `of_fwnode_handle()` is used in
+    order to convert the `of_node` grabbed in the previous state into an `fw_handle`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: b) Set up the current async sub-device according to the matching logic that
+    should be used. It should set the `v4l2_async_subdev.match_type` and `v4l2_async_subdev.match`
+    members.
+  prefs: []
+  type: TYPE_NORMAL
+- en: c) Add this async sub-device to the list of async sub-devices of the notifier.
+    As of version 4.20 of the kernel, there is a helper, `v4l2_async_notifier_add_subdev()`,
+    allowing you to do this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Register the notifier object (this notifier will be stored in the global `notifier_list`
+    list defined in `drivers/media/v4l2-core/v4l2-async.c`) using the `v4l2_async_notifier_register(&big_struct->v4l2_dev,
+    &big_struct->notifier)` call. To unregister the notifier, the driver has to call
+    `v4l2_async_notifier_unregister(&big_struct->notifier)`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When the bridge driver invokes `v4l2_async_notifier_register()`, the async core
+    iterates over async sub-devices in the `notifier->subdevs` array. For each async
+    sub-device inside, the core checks whether this `asd->match_type` value is `V4L2_ASYNC_MATCH_FWNODE`.
+    If applicable, the async core makes sure `asd` is not present in the `notifier->waiting`
+    list or in the `notifier->done` list by comparing fwnodes. This provides assurance
+    that `asd` was not already set up for `fwnode` and it does not already exist in
+    the given notifier. If `asd` is not already known, it is added to `notifier->waiting`.
+    After this, the async core will test all async sub-devices in the `notifier->waiting`
+    list for a match with all sub-devices present in `subdev_list`, which is the list
+    of "kind-of" orphan sub-devices, those that were registered prior to their bridge
+    driver (thus prior to their notifier). The async core uses the `asd->match` value
+    of each current `asd` for this. If a match occurs (the `asd->match` callback returns
+    true), the current async sub-device (from `notifier->waiting`) and the current
+    sub-device (from `subdev_list`) will be bound, the async sub-device will be removed
+    from the `notifier->waiting` list, the sub-device will be registered with the
+    V4L2 core using `v4l2_device_register_subdev()`, and the sub-device will be moved
+    from the global `subdev_list` list to the `notifier->done` list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, the actual notifier being registered will be added to the global list
+    of notifiers, `notifier_list`, so that it can be used later for matching attempts
+    whenever a new sub-device is registered with the async core.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: What the async core does when the sub-device driver invokes `v4l2_async_register_subdev()`
+    can be guessed from the preceding matching and bounding logic descriptions. Effectively,
+    upon this call, the async core will attempt to match the current sub-device with
+    all the async sub-devices waiting in each notifier present in the `notifier_list`
+    global list. If no match occurs, it means this sub-device's bridge has not been
+    probed yet, and the sub-device is added to the global list of sub-devices, `subdev_list`.
+    If a match occurs, the sub-device will not be added to this list at all.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do also keep in mind that a match test is a comparison of some criteria, occurring
+    strictly between a sub-device of the `struct v4l2_subdev` type and an async sub-device
+    of the `struct v4l2_async_subdev` type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding paaragraphs, we said the async sub-device and the sub-device
+    are bound. But what does this mean? Here is where the `notifier->ops` member comes
+    into the picture. It is of the `struct v4l2_async_notifier_operations` type and
+    is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are the meanings of each callback in this structure despite the
+    fact that all three callbacks are optional:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`bound`: If set, this callback will be invoked by the async core in response
+    to a successful sub-device probing by its (sub-device) driver. This also implies
+    that an async sub-device has successfully matched this sub-device. This callback
+    takes as an argument the notifier that originated the match, as well as the sub-device
+    (`subdev`) and the async sub-device (`asd`) that matched. Most drivers simply
+    print debug messages here. However, you can perform additional setup on the sub-device
+    here – that is, `v4l2_subdev_call()`. If everything seems OK, it should return
+    a positive value; otherwise, the sub-device is unregistered.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`unbind` is invoked when a sub-device is removed from the system. In addition
+    to printing debug messages here, the bridge driver must unregister the video device
+    if the unbound sub-device was a requirement for it to work normally – that is,
+    `video_unregister_device()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`complete` is invoked when there are no more async sub-devices waiting in the
+    notifier. The async core can detect when the `notifier->waiting` list is empty
+    (which would mean sub-devices have been probed successfully and are all moved
+    into the `notifier->done` list). The complete callback is only executed for the
+    root notifier. Sub-devices that registered notifiers will not have their `.complete`
+    callback invoked. The root notifier is usually the one registered by the bridge
+    device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There is no doubt, then, that, prior to registering the notifier object, the
+    bridge driver must set the notifier's `ops` member. The most important callback
+    for us is `.complete`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While you can call `v4l2_device_register()` from within the bridge driver's
+    `probe` function, it is a common practice to register the actual video device
+    from within the `notifier.complete` callback, as all sub-devices would be registered,
+    and the presence of `/dev/videoX` would mean it is really usable. The `.complete`
+    callback is also suitable for both registering the actual video device's subnode
+    and registering the media device by means of `v4l2_device_register_subdev_nodes()`
+    and `media_device_register()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that `v4l2_device_register_subdev_nodes()` will create a device node (`/dev/v4l2-subdevX`,
+    actually) for every `subdev` object marked with the `V4L2_SUBDEV_FL_HAS_DEVNODE`
+    flag.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Async bridge and sub-device probing example
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We will go through this section with a simple use case. Consider the following
+    config:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One bridge device (our CSI controller) – let's say the `omap` ISP, with `foo`
+    as its name.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: One off-chip sub-device, the camera sensor, with `bar` as its name.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Both are connected this way: `CSI <-- Camera Sensor`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the `bar` driver, we could register an async sub-device as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `probe` function of the `foo` driver could be as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the following code, we implement the `foo` fwnode (or `of_node`) parser
+    helper, `foo_parse_nodes()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, both `of_graph_get_next_endpoint()` and `fwnode_graph_get_next_endpoint()`
+    have been used in order to show how to play with the two. That being said, you're
+    better off using the fwnode version, as it is much more generic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the meantime, we need to write `foo`''s notifier operations, which could
+    look as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the device tree, the V4L2 bridge device can be declared as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The camera node from within the I2C controller node can be declared as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now we are familiar with the V4L2 async framework and we have seen how the asynchronous
+    sub-device registration eases both the probe and the code. We ended with a concrete
+    example that highlights each aspect we have discussed. Now we can move forward
+    and integrate with the media controller framework, which is the last improvement
+    we can add to our V4L2 drivers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux media controller framework
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Media devices turn out to be very complex, involving several IP blocks of the
+    SoC and thus requiring video stream (re)routing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's consider a case where we have a much more sophisticated SoC made
+    of two more on-chip sub-devices – let's say a resizer and an image converter,
+    called `baz` and `biz`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the previous example in the *V4L2 async* section, the setup was made up of
+    one bridge device and one sub-device (the fact that it is off-chip does not matter),
+    the camera sensor. This was quite straightforward. Luckily, things worked. But
+    what if now we have to route the stream through the image converter or the image
+    resizer, or even through both IPs? Or, say we have to switch from one to the other
+    (dynamically)?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We could achieve this either via `sysfs` or `ioctls`, but this would have the
+    following problems:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It would be too ugly (no doubt) and probably buggy.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It would be too hard (a lot of work).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It would be deeply SoC vendor-dependent, with possibly a lot of code duplication,
+    no unified user space API and ABI, and no consistency between drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It would be not a very credible solution.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Many SoCs can reroute internal video streams – for example, capturing them from
+    a sensor and doing memory-to-memory resizing, or sending the sensor output directly
+    to the resizer. Since the V4L2 API did not support these advanced devices, SoC
+    manufacturers made their own custom drivers. However, V4L2 is undisputably the
+    Linux API for capturing images and is sometimes used for specific display devices
+    (these are mem2mem devices).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is becoming clear that we need another subsystem and framework that covers
+    the limits of V4L2\. This is how the Linux media controller framework was born.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The media controller abstraction model
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Discovering a device's internal topology and configuring it at runtime is one
+    of the goals of the media framework. To achieve this, it comes with a layer of
+    abstraction. With the media controller framework, hardware devices are represented
+    through an oriented graph made of **entities** whose **pads** are connected via
+    **links**. This set of elements put together forms the so-called **media device**.
+    A source pad can only generate data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding short description deserves some attention. There are three highlighted
+    words that are of high interest: entity, pad, and link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct media_entity` instance, defined in `include/media/media-entity.h`.
+    The structure is usually embedded into a higher-level structure, such as a `v4l2_subdev`
+    or `video_device` instance, although drivers can allocate entities directly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/dev/videoX` pad would be modeled as an input pad since it is the end of the
+    stream.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Links**: These links can be set, fetched, and enumerated through the media
+    device. The application, for a driver to properly work, is responsible for setting
+    up the links properly so that the driver understands the source and destination
+    of the video data.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'All the entities on the system, along with their pads and the connection links
+    between them, give the **media device** shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 8.1 – Media controller abstraction model'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_8.1_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 8.1 – Media controller abstraction model
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding diagram, `/dev/videoX` char device as it is the end of the
+    stream.
+  prefs: []
+  type: TYPE_NORMAL
+- en: V4L2 device abstraction
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'At a higher level, the media controller uses `struct media_device` to abstract
+    `struct v4l2_device` in the V4L2 framework. That being said, `struct media_device`
+    is to the media controller what `struct v4l2_device` is to V4L2, englobing other
+    lower-level structures. Back to `struct v4l2_device`, the `mdev` member is used
+    by the media controller framework to abstract this structure. The following is
+    an excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'However, from a media controller point of view, V4L2 video devices and sub-devices
+    are all seen as media entities, represented in this framework as instances of
+    `struct media_entity`. It is then obvious for the video device and sub-device
+    data structures to embed a member of this type, as shown in the following excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: The video device has additional members, `intf_devnode` and `pipe`. The former,
+    of the `struct media_intf_devnode` type, represents the media controller interface
+    to the video device node. This structure gives the media controller access to
+    information of the underlying video device node, such as its major and minor numbers.
+    The other additional member, `pipe`, which is of the `struct media_pipeline` type,
+    stores information related to the streaming pipeline of this video device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Media controller data structures
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The media controller framework is based on a few data structures, among which
+    is the `struct media_device` structure, which is on top of the hierarchy and defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This structure represents a high-level media device. It allows easy access
+    to entities and provides basic media device-level support:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`dev` is the parent device for this media device (usually a `&pci_dev`, `&usb_interface`,
+    or `&platform_device` instance).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`devnode` is the media device node, abstracting the underlying `/dev/mediaX`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`driver_name` is an optional but recommended field, representing the media
+    device driver name. If not set, it defaults to `dev->driver->name`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`model` is the model name of this media device. It doesn''t have to be unique.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`serial` is an optional member that should be set with the device serial number.
+    `hw_revision` is the hardware device revision for this media device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`topology_version`: Monotonic counter for storing the version of the graph
+    topology. Should be incremented each time the topology changes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`entities` is the list of registered entities.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pads` is the list of pads registered with this media device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`links` is the list of links registered with this media device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`entity_notify` is the notify callback list invoked when a new entity is registered
+    with this media device. Drivers may register this callback to take action via
+    `media_device_unregister_entity_notify()` and unregister it using `media_device_register_entity_notify()`.
+    All the registered `media_entity_notify` callbacks are invoked when a new entity
+    is registered.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`graph_mutex`: Protects access to `struct media_device` data. It should, for
+    example, be held when using `media_graph_*` family functions.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is of the `struct media_device_ops` type and represents the operation
+    handler callbacks for this media device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In addition to being manipulated by the media controller framework, `struct
+    media_device` is essentially used in the bridge driver, where it is initialized
+    and registered. That being said, the media device on its own is made up of several
+    entities. This concept of entities allows the media controller to be the central
+    authority when it comes to modern and complex V4L2 drivers that may also support
+    framebuffers, ALSA, I2C, LIRC, and/or DVB devices at the same time and is used
+    to inform user space of what is what.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A media entity is represented as an instance of `struct media_entity`, defined
+    in `include/media/media-entity.h` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is the second data structure in the media framework in terms of hierarchy.
+    The preceding definition has been shrunk to the minimum that we are interested
+    in. The following are the meanings of the members in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`name` is the name of this entity. It should be meaningful enough as it is
+    used as it is in user space with the `media-ctl` tool.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`type` is most of the time set by the core depending on the type of V4L2 video
+    data structure this struct is embedded in. It is the type of the object that implements
+    `media_entity` – for example, set with `MEDIA_ENTITY_TYPE_V4L2_SUBDEV` at the
+    sub-device initialization by the core. This allows runtime type identification
+    of media entities and safe casting to the correct object type using the `container_of`
+    macro, for instance. Possible values are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENTITY_TYPE_BASE`: This means the entity is not embedded in another.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENTITY_TYPE_VIDEO_DEVICE`: This indicates the entity is embedded in
+    a `struct video_device` instance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENTITY_TYPE_V4L2_SUBDEV`: This means the entity is embedded in a `struct
+    v4l2_subdev` instance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`function` represents the entity''s main function. This must be set by the
+    driver according to the value defined in `include/uapi/linux/media.h`. The following
+    are commonly used values while dealing with video devices:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_IO_V4L`: This flag means the entity is a data streaming input
+    and/or output entity.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_CAM_SENSOR`: This flag means this entity is a camera video sensor
+    entity.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_PROC_VIDEO_SCALER`: Means this entity can perform video scaling.
+    These entities have at least one sink pad, from which they receive frame(s) (on
+    the active one) and one source pad where they output the scaled frame(s).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_PROC_VIDEO_ENCODER`: Means this entity is capable of compressing
+    video. These entities must have one sink pad and at least one source pad.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_VID_MUX`: This is to be used for a video multiplexer. This entity
+    has at least two sink pads and one source pad and must pass the video frame(s)
+    received from the active sink pad to the source pad.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_ENT_F_VID_IF_BRIDGE`: Video interface bridge. A video interface bridge
+    entity should have at least one sink pad and one source pad. It receives video
+    frames on its sink pad from an input video bus of one type (HDMI, eDP, MIPI CSI-2,
+    and so on) and outputs them on its source pad to an output video bus of another
+    type (eDP, MIPI CSI-2, parallel, and so on).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`flags` is set by the driver. It represents the flags for this entity. Possible
+    values are the `MEDIA_ENT_FL_*` flag family defined in `include/uapi/linux/media.h`.
+    The following link may be of help to you to understand the possible values: [https://linuxtv.org/downloads/v4l-dvb-apis/userspace-api/mediactl/media-types.html](https://linuxtv.org/downloads/v4l-dvb-apis/userspace-api/mediactl/media-types.html).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`function` represents this entity''s function and by default is `MEDIA_ENT_F_V4L2_SUBDEV_UNKNOWN`.
+    Possible values are the `MEDIA_ENT_F_*` function family defined in `include/uapi/linux/media.h`.
+    For example, a camera sensor sub-device driver must contain `sd->entity.function
+    = MEDIA_ENT_F_CAM_SENSOR;`. You can follow this link to find detailed information
+    on what may be suitable for your media entity: https://linuxtv.org/downloads/v4l-dvb-apis/uapi/mediactl/media-types.html.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_pads` is the total number of pads of this entity (sink and source).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_links` is the total number of links of this entity (forward, back, enabled,
+    and disabled)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_backlinks` is the numbers of backlinks of this entity. Backlinks are used
+    to help graph traversal and are not reported to user space.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`internal_idx`: A unique entity number assigned by the media controller core
+    when the entity is registered.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pads` is the array of pads of this entity. Its size is defined by `num_pads`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`links` is the list of data links of this entity. See `media_add_link()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is of the `media_entity_operations` type and represents operations for
+    this entity. This structure will be discussed later.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`stream_count`: Stream count for the entity.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`use_count`: The use count for the entity. Used for power management purposes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pipe` is the media pipeline that this entity belongs to.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Naturally, the next data structure that seems obvious for us to introduce is
+    the `struct media_pad` structure, which represents a pad in this framework. A
+    pad is a connection endpoint through which an entity can interact with other entities.
+    Data (not restricted to video) produced by an entity flows from the entity''s
+    output to one or more entity inputs. Pads should not be confused with the physical
+    pins at chip boundaries. `struct media_pad` is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: Pads are identified by their entity and their 0-based `index` in the entity's
+    pads array. In the `flags` field, either `MEDIA_PAD_FL_SINK` (which indicates
+    that the pad supports sinking data) or `MEDIA_PAD_FL_SOURCE` (which indicates
+    that the pad supports sourcing data) can be set, but not both at the same time,
+    since a pad can't both sink and source.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Pads are meant to be bound together to allow data flow paths. Two pads, either
+    from the same entity or from different entities, are bound together by means of
+    point-to-point-oriented connections called links. Links are represented in the
+    media framework as instances of `struct media_link`, defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code block, only a few fields have been listed for the sake
+    of readability. The following are the meanings of those fields:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`list`: Used to associate this link with the entity or interface owning the
+    link.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`source`: Where this link originates from.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`sink`: The link target.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags`: Represents the link flags, as defined in `uapi/media.h` (with the
+    `MEDIA_LNK_FL_*` pattern). The following are the possible values:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`MEDIA_LNK_FL_ENABLED`: This flag means the link is enabled and is ready
+    for data transfer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_LNK_FL_IMMUTABLE`: This flag means the link enabled state can''t be
+    modified at runtime.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`MEDIA_LNK_FL_DYNAMIC`: This flag means the state of the link can be modified
+    during streaming. However, this flag is set by drivers but is read-only for applications.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`reverse`: Pointer to the link (the backlink, actually) for the reverse direction
+    of a pad-to-pad link.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`is_backlink`: Tells whether this link is a backlink.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Each entity has a list that points to all links originating at or targeting
+    any of its pads. A given link is thus stored twice, once in the source entity
+    and once in the target entity. When you want to link `A` to `B`, two links are
+    actually created:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One that corresponds to what was expected; the link is stored in the source
+    entity, and the source entity's `num_links` field is incremented.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Another one is stored in the sink entity. The sink and source remain the same,
+    with the difference being that the `is_backlink` member is set to `true`. This
+    corresponds to the reverse of the link you created. The sink entity's `num_backlinks`
+    and `num_links` fields will be incremented. This backlink is then assigned to
+    the original link's `reverse` member.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'At the end, the `mdev->topology_version` member is incremented twice. This
+    principle of link and backlink allows the media controller to numerate entities,
+    along with the possible and current links between entities, such as in the following
+    diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 8.2 – Media controller entity description'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_8.2_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 8.2 – Media controller entity description
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding diagram, if we consider **Entity-1** and **Entity-2**, then
+    **link** and **backlink** are essentially the same, except that **link** belongs
+    to **Entity-1** and **backlink** belongs to **Entity-2**. You should then consider
+    the backlink as a backup link. We can see that an entity can be either a sink,
+    a source, or both.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The data structures we have introduced so far may make the media controller
+    framework sound a bit scary. However, most of those data structures will be managed
+    under the hood by the framework by means of the APIs it offers. That being said,
+    the complete framework's documentation can be found in `Documentation/media-framework.txt`
+    in the kernel sources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Integrating media controller support in the driver
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: When the support of the media controller is needed, the V4L2 driver must first
+    initialize `struct media_device` within `struct v4l2_device` using the `media_device_init()`
+    function. Each entity driver must initialize its entities (actually `video_device->entity`
+    or `v4l2_subdev->entity`) and its pad arrays using the `media_entity_pads_init()`
+    function and, if needed, create pad-to-pad links using `media_create_pad_link()`.
+    After that, entities can be registered. However, the V4L2 framework will handle
+    this registration for you through either the `v4l2_device_register_subdev()` or
+    the `video_register_device()` methods. In both cases, the underlying registration
+    function that is invoked is `media_device_register_entity()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a final step, the media device has to be registered using `media_device_register()`.
+    It's worth mentioning that the media device registration should be postponed to
+    later in the future when we are sure that every sub-device (or should I say entities)
+    is registered and ready to be used. It definitely makes sense registering the
+    media device in the root notifier's `.complete` callback.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Initializing and registering pads and entities
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The same function is used to initialize both the entity and its pad array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding prototype, `*entity` is the entity to which the pads to be
+    registered belong, `*pads` is the array of pads to be registered, and `num_pads`
+    is the number of entities in the array that should be registered. The driver must
+    have set the type of every pad in the pads array before calling:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Drivers that need to unregister entities must call the following function on
+    the entity to be unregistered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, in order for a driver to free resources associated with an entity, it
+    should call the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: When a media device is unregistered, all of its entities are unregistered automatically.
+    No unregistration of manual entities is then required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Media entity operations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'An entity may be provided link-related callbacks, so that these can be invoked
+    by the media framework upon link creation and validation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Providing the preceding structure is optional. However, there may be situations
+    where additional stuff needs to be done or checked either at link setup or link
+    validation. In this case, note the following descriptions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`get_fwnode_pad`: Returns the pad number based on a fwnode endpoint or a negative
+    value on error. This operation can be used to map a fwnode to a media pad number
+    (optional).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`link_setup`: Notifies the entity of link changes. This operation can return
+    an error, in which case the link setup will be canceled (optional).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`link_validate`: Returns whether a link is valid from the entity point of view.
+    The `media_pipeline_start()` function validates all the links this entity is involved
+    in by calling this operation. This member is optional. However, if it has not
+    been set, then `v4l2_subdev_link_validate_default` will be used as the default
+    callback function, which ensures that the source pad and sink pad width, height,
+    and media bus pixels code are consistent; otherwise, it will return an error.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The concept of a media bus
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The main purpose of the media framework is to configure and control the pipeline
+    and its entities. Video sub-devices, such as cameras and decoders, connect to
+    video bridges or other sub-devices over specialized buses. Data is being transferred
+    over these buses in various formats. That being said, in order for two entities
+    to actually exchange data, their pad configs need to be the same.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Applications are responsible for configuring coherent parameters on the whole
+    pipeline and ensuring that connected pads have compatible formats. The pipeline
+    is checked for formats that are mismatching at `VIDIOC_STREAMON` time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The driver is responsible for applying the configuration of every block in the
+    video pipeline according to the requested (from the user) format at the pipeline
+    input and/or output.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Take the following simple data flow, `sensor ---> CPHY ---> csi ---> isp --->
+    stream`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order for the media framework to be able to configure the bus prior to streaming
+    data, the driver needs to provide some pad-level setter and getter for the media
+    bus properties, which are present in the `struct v4l2_subdev_pad_ops` structure.
+    This structure implements pad-level operations that have to be defined if the
+    sub-device driver intends to process the video and integrate with the media framework.
+    The following is its definition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are the meanings of the members in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`init_cfg`: Initializes the pad config to default values. This is the right
+    place to initialize `cfg->try_fmt`, which can be grabbed through `v4l2_subdev_get_try_format()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`enum_mbus_code`: Callback for the `VIDIOC_SUBDEV_ENUM_MBUS_CODE` ioctl handler
+    code. Enumerates the currently supported data format. This callback handles pixel
+    format enumeration.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`enum_frame_size`: Callback for the `VIDIOC_SUBDEV_ENUM_FRAME_SIZE` ioctl handler
+    code. Enumerates the frame (image) size supported by the sub-device. Enumerates
+    the currently supported resolution.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`enum_frame_interval`: Callback for the `VIDIOC_SUBDEV_ENUM_FRAME_INTERVAL`
+    ioctl handler code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get_fmt`: Callback for the `VIDIOC_SUBDEV_G_FMT` ioctl handler code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_fmt`: Callback for the `VIDIOC_SUBDEV_S_FMT` ioctl handler code. Sets
+    the output data format and resolution.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get_selection`: Callback for the `VIDIOC_SUBDEV_G_SELECTION` ioctl handler
+    code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_selection`: Callback for the `VIDIOC_SUBDEV_S_SELECTION` ioctl handler
+    code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`link_validate`: Used by the media controller code to check whether the links
+    that belong to a pipeline can be used for the stream.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The argument that all of these callbacks have in common is `cfg`, which is
+    of the `struct v4l2_subdev_pad_config` type and is used for storing sub-device
+    pad information. This structure is defined in `include/uapi/linux/v4l2-mediabus.h`
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code block, the main field we are interested in is `try_fmt`,
+    which is of the `struct v4l2_mbus_framefmt` type. This data structure is used
+    to describe the pad-level media bus format and is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding structure, `which` is the format type (try or active) and
+    `pad` is the pad number as reported by the media API. This field is set by user
+    space. `format` represents the frame format on the bus. The `format` term here
+    means a combination of the media bus data format, frame width, and frame height.
+    It is of the `struct v4l2_mbus_framefmt` type and its turn is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding bus frame format data structure, only the fields that are relevant
+    to us have been listed. `width` and `height`, respectively, represent the image
+    width and height. `code` is from `enum v4l2_mbus_pixelcode` and represents the
+    data format code. `field` indicates the used interlacing type, which should be
+    from `enum v4l2_field`, and `colorspace` represents the color space of the data
+    from `enum v4l2_colorspace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s pay more attention to the `get_fmt` and `set_fmt` callbacks. They
+    get and set, respectively, the data format on a sub-device pad. These ioctl handlers
+    are used to negotiate the frame format at specific sub-device pads in the image
+    pipeline. To set the current format applications, set the `.pad` field of `struct
+    v4l2_subdev_format` to the desired pad number as reported by the media API and
+    the `which` field (which is from `enum v4l2_subdev_format_whence`) to either `V4L2_SUBDEV_FORMAT_TRY`
+    or `V4L2_SUBDEV_FORMAT_ACTIVE`, and issue a `VIDIOC_SUBDEV_S_FMT` ioctl with a
+    pointer to this structure. This ioctl ends up calling the `v4l2_subdev_pad_ops->set_fmt`
+    callback. If `which` is set to `V4L2_SUBDEV_FORMAT_TRY`, then the driver should
+    set the `.try_fmt` field of the requested pad config with the values of the `try`
+    format given in the argument. However, if `which` is set to `V4L2_SUBDEV_FORMAT_ACTIVE`,
+    the driver must then apply the config to the device. It is common in this case
+    to store the requested "active" format in a driver-state structure and apply it
+    to the underlying device when the pipeline starts the stream. This way, the right
+    place to actually apply the format config to the device is from within a callback
+    invoked at the start of the streaming, such as `v4l2_subdev_video_ops.s_stream`,
+    for example. The following is an example from the RCAR CSI driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: Also, note that the driver is free to change the values in the requested format
+    to the one it actually supports. It is then up to the application to check for
+    it and adapt its logic according to the format granted by the driver. Modifying
+    those `try` formats leaves the device state untouched.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the other hand, when it comes to retrieving the current format, applications
+    should do the same as the preceding and issue a `VIDIOC_SUBDEV_G_FMT` ioctl. This
+    ioctl will end up calling the `v4l2_subdev_pad_ops->get_fmt` callback. The driver
+    fills the members of the `format` field either with the currently active format
+    values or with the last `try` format stored (most of the time in the driver-state
+    structure):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It is obvious that the `.try_fmt` field of the pad config should have been
+    initialized before it can be passed to the `get` callback for the first time,
+    and the `v4l2_subdev_pad_ops.init_cfg` callback is the right place for this initialization,
+    as in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The list of supported formats can be found in `include/uapi/linux/videodev2.h`
+    from the kernel source, and part of their documentation is available at this link:
+    [https://linuxtv.org/downloads/v4l-dvb-apis/userspace-api/v4l/subdev-formats.html](https://linuxtv.org/downloads/v4l-dvb-apis/userspace-api/v4l/subdev-formats.html).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are familiar with the concept of media, we can learn how to finally
+    make the media device part of the system by using the appropriate API to register
+    it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Registering the media device
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Drivers register media device instances by calling `__media_device_register()`
+    via the `media_device_register()` macro and unregister them by calling `media_device_unregister()`.
+    Upon successful registration, a character device named `media[0-9] +` will be
+    created. The device major and minor numbers are dynamic. `media_device_register()`
+    accepts a pointer to the media device to be registered and returns `0` on success
+    or a negative error code on error.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we said earlier, you''re better off registering the media device from within
+    the root notifier''s `.complete` callback in order to make sure that the actual
+    media device is registered only after all its entities have been probed. The following
+    is an excerpt from the TI OMAP3 ISP media driver (the whole code can be found
+    in `drivers/media/platform/omap3isp/isp.c` in the kernel sources):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code shows how you can take benefit of the root notifier's `.complete`
+    callback to register the final media device, by means of the `media_device_register()`
+    method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that the media device is part of the system, the time has come to leverage
+    it, particularly from user space. Let's now see how, from the command line, we
+    can take control of and interact with the media device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Media controller from user space
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Though it remains the streaming interface, `/dev/video0` is not the default
+    pipeline centerpiece anymore since it is wrapped by `/dev/mediaX`. The pipeline
+    can be configured through the media node (`/dev/media*`), and the control operations,
+    such as stream on/off, can be performed through the video node (`/dev/video*`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using media-ctl (the v4l-utils package)
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `media-ctl` application from the `v4l-utils` package is a user space application
+    that uses the Linux media controller API to configure pipelines. The following
+    are the flags to use with it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`--device <dev>` specifies the media device (`/dev/media0` by default).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--entity <name>` prints the device name associated with the given entity.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--set-v4l2 <v4l2>` provides a comma-separated list of formats to set up.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--get-v4l2 <pad>` prints an active format on a given pad.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--set-dv <pad>` configures DV timings on a given pad.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--interactive` modifies links interactively.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--links <linux>` provides a comma-separated list of link descriptors to set
+    up.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--known-mbus-fmts` lists known formats and their numeric values.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--print-topology` prints the device topology, or the short version, `-p`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`--reset` resets all links to inactive.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'That being said, the basic configuration steps for a hardware media pipeline
+    are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reset all links with `media-ctl --reset`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Configure links with `media-ctl --links`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Configure pad formats with `media-ctl --set-v4l2`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Configure sub-device properties with `v4l2-ctl` capture frames on the `/dev/video*`
+    device.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Using `media-ctl --links` to link an entity source pad to an entity sink pad
+    should follow the following pattern:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding line, `flags` can be either `0` (inactive) or `1` (active).
+    Additionally, to see the current settings of the media bus, use the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On some systems, media device `0` may not be the default one, in which case
+    you should use the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: The previous command would print the media topology associated with the specified
+    media device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Do note that `--print-topology` just dumps the media topology on the console
+    in an ASCII format. However, this topology can be better represented by generating
+    its `dot` representation, changing this representation into a graphic image that
+    is more human-friendly. The following are the commands to use:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For example, in order to set up a media pipe, the following commands have been
+    run on an UDOO QUAD board. The board has been shipped with an i.MX6 quad core
+    and an OV5640 camera plugged into the MIPI CSI-2 connector:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is a diagram representing the preceding setup:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 8.3 – Graph representation of a media device'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_8.3_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 8.3 – Graph representation of a media device
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you can see, it helps to visualize what the hardware components are. The
+    following are descriptions of these generated images:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dashed lines show possible connections. You can use these to determine the possibilities.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Solid lines show active connections.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Green boxes show media entities.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Yellow boxes show **Video4Linux** (**V4L**) endpoints.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'After that, you can see that solid lines correspond exactly to the setup that
+    was done earlier. We have five solid lines, which correspond to the number of
+    commands used to configure the media device. The following are the meanings of
+    these commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`media-ctl -l "''ov5640 2-003c'':0 -> ''imx6-mipi-csi2'':0[1]"` means linking
+    output pad number `0` of the camera sensor (`''ov5640 2-003c'':0`) to MIPI CSI-2
+    input pad number `0` (`''imx6-mipi-csi2'':0`) and setting this link active (`[1]`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`media-ctl -l "''imx6-mipi-csi2'':2 -> ''ipu1_csi1'':0[1]"` means linking output
+    pad number `2` of the MIPI CSI-2 entity (`''imx6-mipi-csi2'':2`) to the input
+    pad number `0` of the IPU capture sensor interface #1 (`'' ipu1_csi1'':0`) and
+    setting this link active (`[1]`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The same decoding rules apply to other command lines, until the last one, `media-ctl
+    -l "'ipu1_ic_prpenc':1 -> 'ipu1_ic_prpenc capture':0[1]"`, which means linking
+    output pad number `1` of `ipu1`'s image converter preprocessing encode entity
+    (`'ipu1_ic_prpenc':1`) to the capture interface input pad number `0` and setting
+    this link to active.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Do not hesitate to go back to the image and read those descriptions several
+    times in order to understand the concepts of entity, link, and pad.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the `dot` package is not installed on your target, you can download the `.dot`
+    file on your host (assuming it has the package installed) and convert it into
+    an image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: WaRP7 with an OV2680 example
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The WaRP7 is an i.MX7-based board, which, unlike the i.MX5/6 family, does not
+    contain an IPU. Because of this, there are fewer capabilities to perform operations
+    or manipulation of the capture frames. The i.MX7 image capture chain is made up
+    of three units: the camera censor interface, the video multiplexer, and the MIPI
+    CSI-2 receiver, which represent the media entities, described as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`imx7-mipi-csi2`: This is the MIPI CSI-2 receiver entity. It has one sink pad
+    to receive the pixel data from the MIPI CSI-2 camera sensor. It has one source
+    pad, corresponding to virtual channel `0`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`csi_mux`: This is the video multiplexer. It has two sink pads to select from
+    either camera sensors with a parallel interface or MIPI CSI-2 virtual channel
+    `0`. It has a single source pad that routes to the CSI.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`csi`: The CSI allows the chip to connect directly to the external CMOS image
+    sensor. The CSI can interface directly with parallel and MIPI CSI-2 buses. It
+    has 256 x 64 FIFO to store received image pixel data and embedded DMA controllers
+    to transfer data from the FIFO through the AHB bus. This entity has one sink pad
+    that receives from the `csi_mux` entity and a single source pad that routes video
+    frames directly to memory buffers. This pad is routed to a capture device node:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On this platform, an OV2680 MIPI CSI-2 module is connected to the internal
+    MIPI CSI-2 receiver. The following example configures a video capture pipeline
+    with an output of 800 x 600 in BGGR 10-bit Bayer format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding lines could be merged into one single command, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding commands, note the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`-r` means reset all links to inactive.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-l` sets up links in a comma-separated list of the links'' descriptors.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"ov2680 1-0036":0->"imx7-mipi-csis.0":0[1]` links output pad number `0` of
+    the camera sensor to MIPI CSI-2 input pad number `0` and sets this link to active.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"csi_mux":2->"csi":0[1]` links output pad number `2` of `csi_mux` to `csi`
+    input pad number `0` and sets this link to active.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"csi":1->"csi capture":0[1]` links output pad number `1` of `csi` to capture
+    the interface''s input pad number `0` and sets this link to active.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In order to configure the format on each pad, we can use the following commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once again, the preceding command lines could be merged into a single command,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE58]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding command lines could be translated as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`-f`: Sets up pad formats into a comma-separated list of format descriptors.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"ov2680 1-0036":0 [SGRBG10 800x600 (32,20)/800x600]`: Sets up the camera sensor
+    pad number `0` format to a RAW Bayer 10-bit image with a resolution (capture size)
+    of 800 x 600\. Sets the maximum allowed sensor window width by specifying the
+    crop rectangle.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"csi_mux":1 [SGRBG10 800x600]`: Sets up the `csi_mux` pad number `1` format
+    to a RAW Bayer 10-bit image with a resolution of 800 x 600.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"csi_mux":2 [SGRBG10 800x600]`: Sets up the `csi_mux` pad number `2` format
+    to a RAW Bayer 10-bit image with a resolution of 800 x 600.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`"csi":0 [UYVY 800x600]`: Sets up the `csi` pad number `0` format to a `YUV4:2:2`
+    image with a resolution of 800 x 600.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`video_mux`, `csi`, and `mipi-csi-2` are all part of the SoC, so they are declared
+    in the vendor `dtsi` file (that is, `arch/arm/boot/dts/imx7s.dtsi` in the kernel
+    sources). `video_mux` is declared as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE59]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code block, we have three ports, where ports `1` are `2` are
+    connected to remote endpoints. `csi` and `mipi-csi-2` are declared as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE60]'
+  prefs: []
+  type: TYPE_PRE
+- en: From the `csi` and `mipi-csi-2` nodes, we can see how they are linked to their
+    remote ports in the `video_mux` node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: More information on `video_mux` binding can be found in `Documentation/devicetree/bindings/media/video-mux.txt`
+    in the kernel sources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, most of the vendor-declared nodes are disabled by default, and need
+    to be enabled from within the board file (the `dts` file, actually). This is what
+    is done in the following code block. Moreover, the camera sensor is part of the
+    board, not the SoC. So, it needs to be declared in the board `dts` file, which
+    is `arch/arm/boot/dts/imx7s-warp.dts` in kernel sources. The following is an excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE61]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: More on i.MX7 entity binding can be found in both `Documentation/devicetree/bindings/media/imx7-csi.txt`
+    and `Documentation/devicetree/bindings/media/imx7-mipi-csi2.txt` in the kernel
+    sources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After this, the streaming can start. The `v4l2-ctl` tool can be used to select
+    any of the resolutions supported by the sensor:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE62]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As data streams from left to right, we can interpret the preceding console
+    logs as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`-> "imx7-mipi-csis.0":0 [ENABLED]`: This source pad feeds data to the entity
+    on its right, which is `"imx7-mipi-csis.0":0`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`<- "ov2680 1-0036":0 [ENABLED]`: This sink pad is fed by (that is, it queries
+    data from) the entity to its left, which is `"ov2680 1-0036":0`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We are now done with all the aspects of the media controller framework. We started
+    with its architecture, then described the data structure it is made of, and then
+    learned about its API in detail. We ended with its use from user space in order
+    to leverage the mode media pipe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we went through the V4L2 asynchronous interface, which eases
+    video bridge and sub-device driver probing. This is useful for intrinsically asynchronous
+    and unordered device registration systems, such as flattened device tree driver
+    probing. Moreover, we dealt with the media controller framework, which allows
+    leveraging V4L2 video pipelines. What we have seen so far lies in the kernel space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will see how to deal with V4L2 devices from user space,
+    thus leveraging features exposed by their device drivers.
+  prefs: []
+  type: TYPE_NORMAL

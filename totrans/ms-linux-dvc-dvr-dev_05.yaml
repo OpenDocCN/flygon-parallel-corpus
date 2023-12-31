@@ -1,0 +1,2290 @@
+- en: '*Chapter 4*: Storming the Common Clock Framework'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: From the beginning, embedded systems have always needed clock signals in order
+    to orchestrate their inner workings, either for synchronization or for power management
+    (for example, enabling clocks when the device is in active use or adjusting the
+    clock depending on some criteria, such as the system load). Therefore, Linux has
+    always had a clock framework. There has only ever been programming interface declaration
+    support for software management of the system clock tree, and each platform had
+    to implement this API. Different **System on Chips** (**SoCs**) had their own
+    implementation. This was okay for a while, but people soon found that their hardware
+    implementations were quite similar. The code also became bushy and redundant,
+    which meant it was necessary to use platform-dependent APIs to get/set the clock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This was rather an uncomfortable situation. Then, the **common clock framework
+    (CCF)** came in, allowing software to manage clocks available on the system in
+    a hardware-independent manner. The CCF is an interface that allows us to control
+    various clock devices (most of time, these are embedded in SoCs) and offers a
+    uniform API that can be used to control them (enabling/disabling, getting/setting
+    the rate, gating/un-gating, and so on). In this chapter, the concept of a clock
+    does not refer to **Real-Time Clocks** (**RTCs**), nor timekeeping devices, which
+    are other kinds of devices that have their own subsystems in the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The main idea behind the CCF is to unify and abstract the similar code that''s
+    spread in different SoC clock drivers. This standardized approach introduced the
+    concept of a clock provider and a clock consumer in the following manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Providers are Linux kernel drivers that connect with the framework and provide
+    access to hardware, thereby providing (making these available to consumers) the
+    clock tree (thanks to which one can dump the whole clock tree nowadays) according
+    to the SoC datasheet.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Consumers are Linux kernel drivers or subsystems that access the framework through
+    a common API.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: That being said, a driver can be both a provider and a consumer (it would then
+    either consume one or more clocks it provides, or one or more clocks provided
+    by others).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will introduce CCF data structures, and then focus on writing
+    clock provider drivers (regardless of the clock type) before introducing the consumer
+    API. We will do this by covering the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CCF data structures and interfaces
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Writing a clock provider device driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clock consumer device drivers and APIs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following are the technical requirements for this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Advanced computer architecture knowledge and C programming skills
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: CCF data structures and interfaces
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the old kernel days, each platform had to implement a basic API defined in
+    the kernel (to grab/release the clock, set/get the rate, enable/disable the clock,
+    and so on) that could be used by consumer drivers. Since the implementation of
+    these specific APIs was done by each machine's code, this resulted in a similar
+    file in each machine directory, with similar logic to implement the clock provider
+    functions. This had several drawbacks, among which there was a lot of redundant
+    code inside them. Later, the kernel abstracted this common code in the form of
+    a clock provider (`drivers/clk/clk.c`), which became what we now call the CCF
+    core.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before playing with the CCF, its support needs to be pulled into the kernel
+    by means of the `CONFIG_COMMON_CLK` option. The CCF itself is divided into two
+    halves:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct clk`, which unifies the framework-level code and the traditional platform-dependent
+    implementation that used to be duplicated across a variety of platforms. This
+    half also allows us to wrap the consumer interface (also called the `struct clk_ops`,
+    which must be provided by each clock provider.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk_ops` that corresponds to the callbacks that are used to let us
+    operate on the underlying hardware (these are invoked by the clock''s core implementation),
+    as well as the corresponding hardware-specific structures that wrap and abstract
+    the clock hardware.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The two halves are tied together by the `struct clk_hw` structure. This structure
+    helps us with implementing our own hardware clock type. In this chapter, this
+    is referenced as `struct clk_foo`. Since `struct clk_hw` is also pointed to within
+    `struct clk`, it allows for navigation between the two halves.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we can introduce CCF data structures. The CCF is built on top of common
+    heterogeneous data structures (in `include/linux/clk-provider.h`) that help keep
+    this framework as generic as possible. These are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct clk_hw`: This structure abstracts the hardware clock line and is used
+    in the provider code only. It ties the two halves introduced previously and allows
+    navigation to occur between them. Moreover, this hardware clock''s base structure
+    allows platforms to define their own hardware-specific clock structure, along
+    with their own clock operation callbacks, as long as they wrap an instance of
+    the `struct clk_hw` structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk_ops`: This structure represents the hardware-specific callbacks
+    that can operate on a clock line; that is, the hardware. This is why all of the
+    callbacks in this structure accept a pointer to a `struct clk_hw` as the first
+    parameter, though only a few of these operations are mandatory, depending on the
+    clock type.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk_init_data`: This holds `init` data that''s common to all clocks
+    that are shared between the clock provider and the common clock framework. The
+    clock provider is responsible for preparing this static data for each clock in
+    the system, and then handing it to the core logic of the clock framework.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk`: This structure is the consumer representation of a clock since
+    each consumer API relies on this structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk_core`: This is the CCF representation of a clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Discerning the difference between `struct clk_hw` and `struct clk` allows us
+    to move closer to a clear split between the consumer and provider clk APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have enumerated the data structures of this framework, we can go
+    through them and learn how they are implemented and what they are used for.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding struct clk_hw and its dependencies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`struct clk_hw` is the base structure for every clock type in the CCF. It can
+    be seen as a handle for traversing from a `struct clk` to its corresponding hardware-specific
+    structure. The following is the body of `struct clk_hw`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a look at the fields in the preceding structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`core`: This structure is internal to the framework core. It also internally
+    points back to this `struct clk_hw` instance.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clk`: This is a per-user `struct clk` instance that can operate with the `clk`
+    API. It is assigned and maintained by the clock framework and provided to the
+    clock consumer when needed. Whenever the consumer initiates access to the clock
+    device (that is, `clk_core`) in the CCF through `clk_get`, it needs to obtain
+    a handle, which is `clk`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`init`: This is a pointer to `struct clk_init_data`. In the process of initializing
+    the underlying clock provider driver, the `clk_register()` interface is called
+    to register the clock hardware. Prior to this, you need to set some initial data,
+    and this initial data is abstracted into a `struct clk_init_data` data structure.
+    During the initialization process, the data from `clk_init_data` is used to initialize
+    the `clk_core` data structure that corresponds to `clk_hw`. When the initialization
+    is completed, `clk_init_data` has no meaning.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`struct clk_init_data` is defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It holds initialization data that''s common to all clocks and is shared between
+    the clock provider and the common clock framework. Its fields are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`name`, which denotes the name of the clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops` is a set of operation functions related to the clock. This will be described
+    later in the *Providing clock ops* section. Its callbacks are to be provided by
+    the clock provider driver (in order to allow driving hardware clocks), and will
+    be invoked by drivers through the `clk_*` consumer API.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`parent_names` contains the names of all the parent clocks of the clock. This
+    is an array of strings that holds all possible parents.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_parents` is the number of parents. It should correspond to the number
+    of entries in the preceding array.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` represent the framework-level flags of the clock. We will explain this
+    in detail later in the *Providing clock ops* section, since these flags actually
+    modify some `ops`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct clk` and `struct clk_core` are private data structures and are defined
+    in `drivers/clk/clk.c`. The `struct clk_core` structure abstracts a clock device
+    to the CCF layer in such a way that each actual hardware clock device (`struct
+    clk_hw`) corresponds to a `struct clk_core`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are done with `struct clk_hw`, which is the centerpiece of the CCF,
+    we can learn how to register a clock provider with the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Registering/unregistering the clock provider
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The clock provider is responsible for exposing the clocks it provides in the
+    form of a tree, sorting them out, and initializing the interface through the provider
+    or the clock framework's core during system initialization.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the early kernel days (before the CCF), clock registration was unified by
+    the `clk_register()` interface. Now that we have `clk_hw`-based (provider) APIs,
+    we can get rid of `struct clk`-based APIs while registering clocks. Since it''s
+    recommended that clock providers use the new `struct clk_hw`-based API, the appropriate
+    registration interface to consider is `devm_clk_hw_register()`, which is the managed
+    version of `clk_hw_register()`. However, for historical reasons, the old `clk`-based
+    API name is still maintained, and you may find several drivers using it. A resource
+    managed version has even been implemented called `devm_clk_register()`. We''re
+    only discussing this old API is to let you understand the existing code, not to
+    help you implement new drivers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Based on this `clk_hw_register()` interface, the kernel also provides other
+    more convenient registration interfaces (which will be introduced later), depending
+    on the clock type to be registered. It is responsible for registering the clock
+    to the kernel and returning a `struct clk_hw` pointer representing the clock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It accepts a pointer to a `struct clk_hw` (since `struct clk_hw` is the provider
+    side representation of a clock) and must contain some of the information of the
+    clock to be registered. This will be populated with further data by the kernel.
+    The implementation logic for this is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assigning the `struct clk_core` space (`clk_hw->core`):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: --Initializing the field's name, `ops`, `hw`, `flags`, `num_parents`, and `parents_names`
+    of `clk` according to the information provided by the `struct clk_hw` pointer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --Calling the kernel interface, `__clk_core_init()`, on it to perform subsequent
+    initialization operations, including building the clock tree hierarchy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Assigning the `struct clk` space (`clk_hw->clk`) by means of the internal kernel
+    interface, `clk_create_clk()`, and returning this `struct clk` variable.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Even though `clk_hw_register()` wraps `clk_register()`, you should not use `clk_register()`
+    directly as it returns `struct clk`. This may lead to confusion and breaks the
+    strict separation between the provider and consumer interfaces.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following is the implementation of `clk_hw_register` in `drivers/clk/clk.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You should check the return value of `clk_hw_register()` prior to executing
+    further steps. Since the CCF framework is responsible for establishing the tree
+    structure of the entire abstract clock tree and maintaining its data, it does
+    this by means of two static linked lists that are defined in `drivers/clk/clk.c`,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Whenever you call `clk_hw_register()` (which internally calls `__clk_core_init()`
+    in order to initialize the clock) on a clock `hw`, if there is a valid parent
+    for this clock, it will end up in the `children` list of the parent. On other
+    hand, if `num_parent` is `0`, it is placed in `clk_root_list`. Otherwise, it will
+    hang inside `clk_orphan_list`, meaning that it has no valid parent. Moreover,
+    every time a new `clk` is clk_init'd, CCF will walk through `clk_orphan_list`
+    (the list of orphan clocks) and re-parent any that are children of the clock currently
+    being initialized. This is how CCF keeps the clock tree consistent with the hardware
+    topology.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, `struct clk` is the consumer-side instance of a clock device.
+    Basically, all user access to the clock device creates an access handle of the
+    `struct clk` type. When different users access the same clock device, although
+    the same `struct clk_core` instance is being used under the hood, the handles
+    they access (`struct clk`) are different.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: You should keep in mind that `clk_hw_register` (or its ancestor, `clk_register()`)
+    plays with `struct clk_core` under the hood since this is the CCF representation
+    of a clock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The CCF manages `clk` entities by means of a globally linked list declared
+    in `drivers/clk/clkdev.c`, along with a mutex to protect its access, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: This comes from the era where the device tree was not heavily used. Back then,
+    the clock consumer obtained clk by name (the name of the clk). This was used to
+    identify clocks. Knowing that the purpose of `clk_register()` is just to register
+    to the common clock framework, there was no way for the consumer to know how to
+    locate the clk. So, for the underlying clock provider driver, in addition to calling
+    the `clk_register()` function to register to the common clock framework, `clk_register_clkdev()`
+    also had to be called immediately after `clk_register()` in order to bind the
+    clock with a name (otherwise, the clock consumer wouldn't know how to locate the
+    clock). Therefore, the kernel used `struct clk_lookup`, as its name says, to look
+    up the available clock in case a consumer requested a clock (by name, of course).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This mechanism is still valid and supported in the kernel. However, in order
+    to enforce separation between the provider and consumer code using a `hw`-based
+    API, `clk_register()` and `clk_register_clkdev()` should be replaced with `clk_hw_register()`
+    and `clk_hw_register_clkdev()` in your code, respectively.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In other words, let''s say you have the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This should be replaced with the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Going back to the `struct clk_lookup` data structure, let''s take a look at
+    its definition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding data structure, `dev_id` and `con_id` are used to identify/find
+    the appropriate `clk`. This `clk` is the corresponding underlying clock. `node`
+    is the list entry that will hang inside the global clocks list, as shown in the
+    low-level `__clkdev_add()` function in the following excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding `__clkdev_add()` function is indirectly called from within `clk_hw_register_clkdev()`,
+    which actually wraps `clk_register_clkdev()`. Now that we''ve introduced the device
+    tree, things have changed. Basically, each clock provider became a node in DTS;
+    that is, each `clk` has a device node in the device tree that corresponds to it.
+    In this case, instead of bundling `clk` and a name, it is better to bundle `clk`
+    and your device nodes by means of a new data structure, `struct of_clk_provider`.
+    This specific data structure is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding structure, the following takes place:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`link` hangs in the `of_clk_providers` global list.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`node` represents the DTS node of the clock device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get_hw` is a callback for the decoding clock. For devices (consumers), it
+    is called through `clk_get()` to return the clock associated with the node or
+    `NULL`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get` is there for the old clk-based APIs for historical and compatibility
+    reasons.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'However, nowadays, due to the frequent and common use of the device tree, for
+    the underlying provider driver, the original `clk_hw_register()` + `clk_hw_register_clkdev()`
+    (or its old clk-based implementation, `clk_register()` + `clk_register_clkdev()`)
+    combination becomes a combination of `clk_hw_register` + `of_clk_add_hw_provider`
+    (formerly `clk_register` + `of_clk_add_provider` – this can be found in old and
+    non-`clk_hw`-based drivers). Also, a new globally linked list, `of_clk_providers`,
+    has been introduced in the CCF to help manage the correspondence between all DTS
+    nodes and clocks, along with a mutex to protect this list:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Although the `clk_hw_register()` and `clk_hw_register_clkdev()` function names
+    are quite similar, the goals of these two functions differ. With the former, the
+    clock provider can register a clock in the common clock framework. On the other
+    hand, `clk_hw_register_clkdev()`registers a `struct clk_lookup` in the common
+    clock framework, as its name suggests. This operation is mainly for finding clk.
+    If you have a device tree-only platform, you no longer need all the calls to `clk_hw_register_clkdev()`
+    (unless you have a strong reason to), so you should rely on one call to `of_clk_add_provider()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clock providers are recommended to use the new `struct clk_hw`-based API as
+    this allows us to move closer to a clear split of consumer and provider clk APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`clk_hw_*` interfaces are provider interfaces that should be used in clock
+    provider drivers, while `clk_*` is for the consumer side. Whenever you encounter
+    a `clk_*`-based API in provider code, note that this driver should be updated
+    to support the new hw-based interface.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some drivers still use both functions (`clk_hw_register_clkdev()` and `of_clk_add_hw_provider()`)
+    in order to support both clock lookup methods, such as SoC clock drivers, but
+    you should not use both unless you have a reason to do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So far, we have spent time discussing clock registration. However, it might
+    be necessary to unregister a clock, either because the underlying clock hardware
+    goes off the system or because things went wrong during hardware initialization.
+    Clock unregistration APIs are fairly straightforward:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The former targets `clk_hw`-based clocks, while the second targets clk-based
+    ones. When it comes to managed variants, unless the Devres core handles unregistration,
+    you should use the following APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: In both case, `dev` represents the underlying device structure associated with
+    the clock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With that, we have finished looking at clock registration/unregistration. That
+    being said, one of the main purposes of the driver is to expose device resources
+    to potential consumers, and this applies to clock devices as well. In the next
+    section, we'll learn how to expose clock lines to consumers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exposing clocks to others (in detail)
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Once the clocks have been registered with CCF, the next step consists of registering
+    this clock provider so that other devices can consume its clock lines. In the
+    old kernel days (when the device tree was not heavily used), you had to expose
+    clocks to the consumer by calling `clk_hw_register_clkdev()` on each clock line,
+    which resulted in registering a lookup structure for the given clock line. Nowadays,
+    the device tree is used for this purpose by calling the `of_clk_add_hw_provider()`
+    interface, as well as a certain number of arguments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a look at the arguments in this function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`np` is the device node pointer associated with the clock provider.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get` is a callback for the decoding clock. We will discuss this callback in
+    detail in the next section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`data` is the context pointer for the given `get` callback. This is usually
+    a pointer to the clock(s) that need to be associated with the device node. This
+    is useful for decoding.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This function returns `0` on a success path. It does the opposite to `of_clk_del_provider()`,
+    which consists of removing the provider from the global list and freeing its space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Its resource managed version, `devm_of_clk_add_hw_provider()`, can also be used
+    to get rid of the deletion function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The clock provider device tree node and its associated mechanisms
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For a quite some time now, the device tree is the preferred method to describe
+    (declare) devices on a system. The common clock framework does not escape this
+    rule. Here, we will try to figure out how clocks are described from within the
+    device tree and related driver code. To achieve this, we''ll need to consider
+    the following device tree excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Keep in mind that clocks are assigned to consumers through the `clocks` property,
+    and that a clock provider can be a consumer as well. In the preceding excerpt,
+    `clk54` is a fixed clock; we won't go into the details here. `cdce706` is a clock
+    provider that also consumes `clk54` (given as a `phandle` in the `clocks` property).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The most important piece of information that clock provider nodes need to specify
+    is the `#clock- cells` property, which determines the length of a clock specifier:
+    when it is `0`, this means that only the `phandle` property of this provider needs
+    to be given to the consumer. When it is `1` (or greater), this means that the
+    `phandle` property has multiple outputs and needs to be provided with additional
+    information, such as an ID indicating what output needs to be used. This ID is
+    directly represented by an immediate value. It is better to define the ID of all
+    clocks in the system in a header file. The device tree can include this header
+    file, such as `clocks = <&clock CLK_SPI0>`, where `CLK_SPI0` is a macro defined
+    in a header file.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's have a look at `clock-output-names`. This is an optional but recommended
+    property and should be a list of strings that correspond to the names of the output
+    (that is, provided) clock lines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Take a look at the following provider node excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding node defines a device that''s providing two clock output lines
+    named `ckout1` and `ckout2`, respectively. Consumer nodes should never use these
+    names directly to reference these clock lines. Instead, they should use an appropriate
+    clock specifier (referencing clocks by index in respect to `#clock-cells` of the
+    provider) that allows them to name their input clock line with respect to the
+    device''s needs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: This device consumes the two clock lines provided by `osc` and names its input
+    lines according to its needs. We will discuss consumer nodes at the end of this
+    chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When a clock line is assigned to a consumer device and when this consumer''s
+    driver calls `clk_get()` (or similar interfaces that are used to grab a clock),
+    this interface calls `of_clk_get_by_name()`, which, in turn, calls `__of_clk_get()`.
+    The function of interest here is `__of_clk_get()`. It is defined in `drivers/clk/clkdev.c`
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is totally normal for this function to return a pointer to `struct clk` instead
+    of a pointer to `struct clk_hw` as this interface operates from the consumer side.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The magic here comes from `of_parse_phandle_with_args()`, which parses lists
+    of `phandle` and its arguments, and then calls `__of_clk_get_from_provider()`,
+    which we will describe later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the of_parse_phandle_with_args() API
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The following is the prototype of `of_parse_phandle_with_args`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This function returns `0` on success and fills `out_args`; it returns an appropriate
+    `errno` value on error. Let''s take a look at its arguments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`np` is a pointer to a device tree node containing a list. In our case, it
+    will be the node corresponding to the consumer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`list_name` is the property name that contains a list. In our case, it is `clocks`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cells_name` is the property name that specifies the argument count of phandle.
+    In our case, it is `#clock-cells`. It helps us grab an argument (other cells)
+    after the `phandle` property in the specifier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`index` is the index of the `phandle` property and is used to parse out the
+    list.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`out_args` is an optional and output parameter that''s filled on the success
+    path. This parameter is of the `of_phandle_args` type and is defined as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: In `struct of_phandle_args`, the `np` element is the pointer to the node that
+    corresponds to the `phandle` property. In the case of the clock specifier, it
+    will be the device tree node of the clock provider. The `args_count` element corresponds
+    to the number of cells after the phandle in the specifier. It is can be used to
+    walk through `args`, which is an array containing the arguments in question.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at an example of using `of_parse_phandle_with_args()`, given the
+    following DTS excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, `node3` is a consumer. To get a `device_node` pointer to the `node2` node,
+    you can call `of_parse_phandle_with_args(node3, 'list', '#list-cells', 1, &args);`.
+    Since `&phandle2` is at index `1` (starting from `0`) in the list, we specified
+    `1` in the `index` parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the same way, to get the associated `device_node` of the `node1` node, you
+    can call `of_parse_phandle_with_args(node3, 'list', '#gpio-cells', 0, &args);`.
+    For this second case, if we look at the `args` output parameter, we will see that
+    `args->np` corresponds to `node3`, the value of `args->args_count` is `2` (as
+    this specifier requires `2` parameters), the value of `args->args[0]` is `1`,
+    and the value of `args->args[1]` is `2`, which would correspond to the `2` argument
+    in the specifier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: For further reading about the device tree API, take a look at `of_parse_phandle_with_fixed_args()`
+    and the other interfaces provided by the device tree core code in `drivers/of/base.c`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the __of_clk_get_from_provider() API
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The next function call in `__of_clk_get()` is `__of_clk_get_from_provider()`.
+    The reason why I''m providing its prototype is that you must not use this in your
+    code. However, this function simply walks through the clock providers (in the
+    `of_clk_providers` list) and when the appropriate provider is found, it calls
+    the underlying callback given as the second parameter to `of_clk_add_provider()`
+    to decode the underlying clock. Here, the clock specifier returned by `of_parse_phandle_with_args()`
+    is given as a parameter. As you may recall when you have to expose a clock provider
+    to other devices, we had to use `of_clk_add_hw_provider()`. As a second parameter,
+    this interface accepts a callback used by the CCF to decode the underlying clock
+    whenever the consumer calls `clk_get()`. The structure of this callback is as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This callback should return the underlying `clock_hw` according to its parameters.
+    `clkspec` is the clock specifier returned by `of_parse_phandle_with_args()`, while
+    `data` is the context data given as the third parameter to `of_clk_add_hw_provider()`.
+    Remember, `data` is usually a pointer to the clock(s) to be associated with the
+    node. To see how this callback is internally called, we need to have a look at
+    the definition of the `__of_clk_get_from_provider()` interface, which is defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Clock decoding callbacks
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: If we had to summarize the mechanisms behind getting a clock from the CCF, we
+    would say that, when a consumer calls `clk_get()`, the CCF internally calls `__of_clk_get()`.
+    This is given as the first parameter of the `device_node` property of this consumer
+    so that the CCF can grab the clock specifier and find the `device_node` property
+    (by means of `of_parse_phandle_with_args()`) that corresponds to the provider.
+    It then returns this in the form of `of_phandle_args`. This `of_phandle_args`
+    corresponds to the clock specifier and is given as a parameter to `__of_clk_get_from_provider()`,
+    which simply compares the `device_node` property of the provider in `of_phandle_args`
+    (that is, `of_phandle_args->np`) to those that exist in `of_clk_providers`, which
+    is the list of device tree clock providers. Once a match is found, the corresponding
+    `of_clk_provider->get()` callback of this provider is called and the underlying
+    clock is returned.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: If `__of_clk_get()` fails, this means there was no way to find a valid clock
+    for the given device node. This may also mean that the provider did not register
+    its clocks with the device tree interface. Therefore, when `of_clk_get()` fails,
+    the CCF code calls `clk_get_sys()`, which is a fall back to using a lookup for
+    a clock based on its name that's not on the device tree anymore. This is the real
+    logic behind `clk_get()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This `of_clk_provider->get()` callback often relies on the context data given
+    as a parameter to `of_clk_add_provider()` so that the underlying clock is returned.
+    Though it is possible to write your own callback (which should respect the prototype
+    that was already introduced in the previous section), the CCF framework provides
+    two generic decoding callbacks that cover the majority of cases. These are `of_clk_src_onecell_get()`
+    and `of_clk_src_simple_get()`, and both have the same prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`of_clk_hw_simple_get()` is used for simple clock providers, where no special
+    context data structure except for the clock itself is needed, such as the clock-gpio
+    driver (in `drivers/clk/clk-gpio.c`). This callback simply returns the data given
+    as a context data parameter as-is, meaning that this parameter should be a clock.
+    It is defined in `drivers/clk/clk.c` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On the other hand, `of_clk_hw_onecell_get()` is a bit more complex as it requires
+    a special data structure called `struct clk_hw_onecell_data`. This can be defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding structure, `hws` is an array of pointers to `struct clk_hw`,
+    and `num` is the number of entries in this array.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: In old clock provider drivers that do not implement clk_hw-based APIs yet, you
+    may see `struct clk_onecell_data`, `of_clk_add_provider()`, `of_clk_src_onecell_get()`,
+    and `of_clk_add_provider()` instead of the data structures and interfaces that
+    have been introduced in this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That being said, to keep a hand on the clocks stored in this data structure,
+    it is recommended to wrap them inside your context data structure, as shown in
+    the following example from `drivers/clk/sunxi/clk-sun9i-mmc.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You should then dynamically allocate space for these clocks according to the
+    number of clocks that should be stored:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the time of writing, the preceding excerpt, which has been taken from the
+    sunxi A80 SoC MMC config clocks/resets driver, still use the clk-based API (along
+    with the `struct clk`, `clk_register_gate()`, and `of_clk_add_src_provider()`
+    interfaces) instead of the `clk_hw` one. Therefore, for learning purposes, I've
+    modified this excerpt so that it uses the recommended `clk_hw` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you can see, the context data that''s given during clock registration is
+    `clk_hw_data`, which is of the `clk_hw_onecell_data` type. Moreover, `of_clk_hw_onecell_get`
+    is given as a clock decoder callback function. This helper simply returns the
+    clock at the index that was given as an argument in the clock specifier (which
+    is of the `of_phandle_args` type). Take a look at its definition to get a better
+    understanding:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Of course, depending on your needs, feel free to implement your own decoder
+    callback, similar to the one in the `max9485` audio clock generator, whose driver
+    is `drivers/clk/clk-max9485.c` in the kernel source's tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this section, we have learned about the device tree aspects of clock providers.
+    We have learned how to expose a device's clock source lines, as well as how to
+    assign those clock lines to consumers. Now, the time has come to introduce the
+    driver side, which also consists of writing code for its clock providers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Writing a clock provider driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'While the purpose of a device tree is to describe the hardware at hand (the
+    clock provider, in this case), it is worth noting that the code used to manage
+    the underlying hardware needs to be written. This section deals with writing code
+    for clock providers so that once their clock lines have been assigned to consumers,
+    they behave the way they were designed to. When writing clock device drivers,
+    it is a good practice to embed the full `struct clk_hw` (not a pointer) into your
+    private and bigger data structure, since it is given as the first parameter to
+    each callback in `clk_ops`. This lets you define a custom `to_<my-data-structure>`
+    helper upon the `container_of` macro, which gives you back a pointer to your private
+    data structure, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding example, `max9485_clk_hw` abstracts the `hw` clock (as it
+    contains `struct clk_hw`). Now, from the driver''s point of view, each `struct
+    max9485_clk_hw` represents a hw clock, allowing us to define another bigger structure
+    that will be used as the driver data this time: the `max9485_driver_data` struct.
+    You will notice some cross-referencing in the preceding structures, notably in
+    `struct max9485_clk_hw`, which contains a pointer to `struct max9485_driver_data`,
+    and `struct max9485_driver_data`, which contains a `max9485_clk_hw` array. This
+    allows us to grab the driver data from within any `clk_ops` callback, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Moreover, as shown in the following excerpt, it is a good practice to statically
+    declare the clock lines (abstracted by `max9485_clk_hw` in this case), as well
+    as the associated ops. This is because, unlike private data (which may change
+    from one device to another), this information never changes, regardless of the
+    number of clock chips of the same type that are present on the system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Though ops are embedded in the abstraction data structure, they could have
+    been declared separately, as in the `drivers/clk/clk-axm5516.c` file in the kernel
+    sources. On the other hand, it is better to dynamically allocate the driver data
+    structure as it would be easier for it to be private to the driver, thus allowing
+    private data per declared device, as shown in the following excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding excerpt, the driver calls `clk_hw_register()` (this is actually
+    `devm_clk_hw_register()`, which is the managed version) in order to register each
+    clock with the CCF. Now that we have looked at the basics of a clock provider
+    driver, we will learn how to allow interactions with the clock line thanks to
+    a set of operations that can be exposed in the driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Providing clock ops
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`struct clk_hw` is the base hardware clock structure on top of which the CCF
+    builds other clock variant structures. As a quick callback, the common clock framework
+    provides the following base clocks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**fixed-rate**: This type of clock can''t have its rate changed and is always
+    running.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**gate**: This acts as a gate to a clock source as is its parent. Obviously,
+    it can''t have its rate changed as it is just a gate.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**mux**: This type of clock cannot gate. It has two or more clock inputs: its
+    parents. It allows us to select a parent among those it is connected to. Moreover,
+    it allows us to get the rate from the selected parent.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**fixed-factor**: This clock type can''t gate/ungate but does divide and multiply
+    the parent rate by its constants.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**divider**: This type of clock cannot gate/ungate. However, it divides the
+    parent clock rate by using a divider that can be selected from among the various
+    arrays that are provided at registration.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**composite**: This is a combination of three of the base clocks we described
+    earlier: mux, rate, and gate. It allows us to reuse those base clocks to build
+    a single clock interface.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You may be wondering how the kernel (that is, the CCF) knows what the type
+    of a given clock is when giving `clk_hw` as a parameter to the `clk_hw_register()`
+    function. Actually, the CCF does not know this, and does not have to know anything.
+    This is the aim of the `clk_hw->init.ops` field, which is of the `struct clk_ops`
+    type. According to the callback functions set in this structure, you can guess
+    what type of clock it is facing. The following is a detailed presentation of this
+    set of operation functions for the clock in a `struct clk_ops`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: For clarity, some fields have been removed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each `prepare*`/`unprepare*`/`is_prepared` callback is allowed to sleep and
+    therefore must not be called from an atomic context, while each `enable*`/`disable*`/`is_enabled`
+    callback may not — and must not – sleep. Let''s take a look at this code in more
+    detail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`prepare` and `unprepare` are optional callbacks. What has been done in `prepare`
+    should be undone in `unprepare`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`is_prepared` is an optional callback that tells is whether the clock is prepared
+    or not by querying the hardware. If omitted, the clock framework core will do
+    the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: --Maintain a prepare counter (incremented by one when the `clk_prepare()` consumer
+    API is called, and decremented by one when `clk_unprepare()` is called).
+  prefs: []
+  type: TYPE_NORMAL
+- en: --Based on this counter, it will determine whether the clock is prepared.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`unprepare_unused`/`disable_unused`: These callbacks are optional and used
+    in the `clk_disable_unused` interface only. This interface is provided by the
+    clock framework core and called (in `drivers/clk/clk.c`: `late_initcall_sync(clk_disable_unused)`)
+    in the system-initiated late call in order to unprepare/ungate/close unused clocks.
+    This interface will call the corresponding `.unprepare_unused` and `.disable_unused`
+    functions of each unused clock on the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`enable`/`disable`: Enables/disables the clock atomically. These functions
+    must run atomically and must not sleep. For `enable`, for example, it should return
+    **only** when the underlying clock is generating a valid clock signal that can
+    be used by consumer nodes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`is_enabled` has the same logic as `is_prepared`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`recalc_rate`: This is an optional callback that queries the hardware to recalculate
+    the rate of the underlying clock, given the parent rate as an input parameter.
+    The initial rate is `0` if this op is omitted.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`round_rate`: This callback accepts a target rate (in Hz) as input and should
+    return the closest rate actually supported by the underlying clock. The parent
+    rate is an input/output parameter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`determine_rate`: This callback is given a targeted clock rate as a parameter
+    and returns the closest one supported by the underlying hardware.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_parent`: This concerns clocks with multiple inputs (multiple possible
+    parents). This callback accepts changing the input source when given the index
+    as a parameter (as a `u8`) of the parent to be selected. This index should correspond
+    to a parent that''s valid in either the `clk_init_data.parent_names` or `clk_init_data.parents`
+    arrays of the clock. This callback should return `0` on a success path or `-EERROR`
+    otherwise.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get_parent` is a mandatory callback for clocks with multiple (at least two)
+    inputs (multiple `parents`). It queries the hardware to determine the parent of
+    the clock. The return value is a `u8` that corresponds to the parent index. This
+    index should be valid in either the `clk_init_data.parent_names` or `clk_init_data.parents`
+    arrays. In other words, this callback translates the parent value that''s read
+    from the hardware into an array index.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_rate`: Changes the rate of the given clock. The requested rate should
+    be the return value of the `.round_rate` call in order to be valid. This callback
+    should return `0` on a success path or `-EERROR` otherwise.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`init` is a platform-specific clock initialization hook that will be called
+    when the clock is registered to the kernel. For now, no basic clock type implements
+    this callback.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Tip
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since `.enable` and `.disable` must not sleep (they are called with spinlocks
+    held), clock providers in discrete chips that are connected to sleepable buses
+    (such as SPI or I2C) cannot be controlled with spinlocks held and should therefore
+    implement their enable/disable logic in the prepare/unprepare hooks. The general
+    API will directly call the corresponding operation function. This is one of the
+    reasons why, from the consumer side (the clk-based API), a call to `clk_enable`
+    must be preceded by a call to `clk_prepare()` and a call to `clock_disable()`
+    should be followed by `clock_unprepare()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Last but not the least, the following difference should be noticed as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: SoC-internal clocks can be seen as fast clocks (controlled via simple MMIO register
+    writes), and can therefore implement `.enable` and `.disable`, while SPI/I2C-based
+    clocks can be seen as slow clocks and should implement `.prepare` and `.unprepare`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These functions are not mandatory for all clocks. Depending on the clock type,
+    some may be mandatory, while others may not be. The following array summarizes
+    which `clk_ops` callbacks are mandatory for which clock type, based on their hardware
+    capabilities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.1 – Mandatory clk_ops callbacks for clock types'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.1_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.1 – Mandatory clk_ops callbacks for clock types
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding array, the `round_rate` or `determine_rate` is required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding array, **y** means mandatory, while **n** means the concerned
+    callback is either invalid or otherwise unnecessary. Empty cells should be considered
+    as either optional or that they must be evaluated on a case-by-case basis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clock flags in clk_hw.init.flags
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Since we have already introduced the clock ops structure, we will now introduce
+    the different flags (defined in `include/linux/clk-provider.h`) and see how they
+    affect the behavior of some of the callbacks in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding code shows the different framework-level flags that can be set
+    in the `clk_hw->init.flags` field. You can specify multiple flags by OR''ing them.
+    Let''s take a look at them in more detail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CLK_SET_RATE_GATE`: When you change the rate of the clock, it must be gated
+    (disabled). This flag also ensures there''s rate change and rate glitch protection;
+    when a clock has the `CLK_SET_RATE_GATE` flag set and it has been prepared, the
+    `clk_set_rate()` request will fail.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CLK_SET_PARENT_GATE` : When you change the parent of the clock, it must be
+    gated.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CLK_SET_RATE_PARENT`: Once you''ve changed the rate of the clock, the change
+    must be passed to the upper parent. This flag has two effects:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: --When a clock consumer calls `clk_round_rate()` (which the CCF internally maps
+    to `.round_rate`) to get an approximate rate, if the clock does not provide the
+    `.round_rate` callback, the CCF will immediately return the cached rate of the
+    clock if `CLK_SET_RATE_PARENT` is not set. However, if this flag is set still
+    without `.round_rate` provided, then the request is routed to the clock parent.
+    This means the parent is queried and `clk_round_rate()` is called to get the value
+    that the parent clock can provide that's closest to the targeted rate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --This flag also modifies the behavior of the `clk_set_rate()` interface (which
+    the CCF internally maps to `.set_rate`). If set, any rate change request will
+    be forwarded upstream (passed to the parent clock).That is to say, if the parent
+    clock can get an approximate rate value, then by changing the parent clock rate,
+    you can get the required rate. This flag is usually set on the clock gate and
+    mux. Use this flag with care.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CLK_IGNORE_UNUSED`: Ignore the disable unused call. This is primarily useful
+    when there''s a driver that doesn''t claim clocks properly, but the bootloader
+    leaves them on. It is the equivalent of the `clk_ignore_unused` kernel boot parameters
+    but for a single clock. It''s not expected to be used in normal cases, but for
+    bring up and debug, it''s very useful to have the option to not gate (not disable)
+    unclaimed clocks that are still on.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CLK_IS_BASIC`: This is no longer used.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CLK_GET_RATE_NOCACHE`: There are chips where the clock rate can be changed
+    by internal hardware without the Linux clock framework being aware of that change
+    at all. This flag makes sure the clk rate from the Linux clock tree always matches
+    the hardware settings. In other words, the get/set rate does not come from the
+    cache and is calculated at the time.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: While dealing with the gate clock type, note that a gated clock is a disabled
+    clock, while an ungated clock is an enabled clock. See [https://elixir.bootlin.com/linux/v4.19/source/drivers/clk/clk.c#L931](https://elixir.bootlin.com/linux/v4.19/source/drivers/clk/clk.c#L931)
+    and [https://elixir.bootlin.com/linux/v4.19/source/drivers/clk/clk.c#L862](https://elixir.bootlin.com/linux/v4.19/source/drivers/clk/clk.c#L862)
+    for more details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are familiar with clock flags, as well as the way those flags may
+    modify the behavior of clock-related callbacks, we can walk through each clock
+    type and learn how to provide their associated ops.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fixed-rate clock case study and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: This is the simplest type of clock. Therefore, we will use this to build some
+    of the strong guidelines we must respect while writing clock drivers. The frequency
+    of this type of clock cannot be adjusted as it is fixed. Moreover, this type of
+    clock cannot be switched, cannot choose its parent, and does not need to provide
+    a `clk_ops` callback function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The clock framework uses the `struct clk_fixed_rate` structure (described as
+    follows) to abstract this type of clock hardware:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding structure, `hw` is the base structure and ensures there's a
+    link between the common and hardware-specific interfaces. Once given to the `to_clk_fixed_rate`
+    macro (which is based on `container_of`), you should get a pointer to `clk_fixed_rate`,
+    which wraps this `hw`. `fixed_rate` is the constant (fixed) rate of the clock
+    device. `flags` represents framework-specific flags.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s have a look at the following excerpt, which simply registers two fake
+    fixed-rate clock lines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'With that, we have defined our clocks. The following code shows how to register
+    these clocks on the system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: General simpliﬁcation considerations
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: In the previous excerpt, we used `clk_hw_register()` to register the clock.
+    This interface is the base registration interface and can be used to register
+    any type of clock. Its main parameter is a pointer to the `struct clk_hw` structure
+    that's embedded in the underlying clock-type structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clock initialization and registration through a call to `clk_hw_register()`
+    requires populating the `struct clk_init_data` (thus implementing `clk_ops`) object,
+    which gets bundled with `clk_hw`. As an alternative, you can use a hardware-specific
+    (that is, clock-type-dependent) registration function. Here, the kernel is responsible
+    for building the appropriate `init` data from arguments given to the function
+    according to the clock type, before internally calling `clk_hw_register(...)`.
+    With this alternative, the CCF will provide appropriate `clk_ops` according to
+    the clock hardware type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Generally, the clock provider does not need to use nor allocate the base clock
+    type directly, which in this case is `struct clk_fixed_rate`. This is because
+    the kernel clock framework provides dedicated interfaces for this purpose. In
+    a real-life scenario (where there''s a fixed clock), this dedicated interface
+    would be `clk_hw_register_fixed_rate()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `clk_register_fixed_rate()` interface uses the clock''s `name`, `parent_name`,
+    and `fixed_rate` as parameters to create a clock with a fixed frequency. `flags`
+    represents the framework-specific flags, while `dev` is the device that is registering
+    the clock. The `clk_ops` property of the clock is also provided by the clock framework
+    and does not require the provider to care about it. The kernel clock ops data
+    structure for this kind of clock is `clk_fixed_rate_ops`. It is defined in `drivers/clk/clk-fixed-rate.c`
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`clk_register_fixed_rate()` returns a pointer to the underlying `clk_hw` structure
+    of the fixed-rate clock. The code can then use the `to_clk_fixed_rate` macro the
+    grab a pointer to the original clock-type structure.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, you can still use the low-level `clk_hw_register()` registration interface
+    and reuse some of the CCF provided ops callbacks. The fact that the CCF provides
+    an appropriate ops structure for your clock does not mean you should use it as-is.
+    You may not wish to use the clock-type-dependent registration interface (using
+    `clock_hw_register()` instead) and instead use one or more of the individual ops
+    provided by the CCF. This does not just apply to adjustable clocks, as per the
+    following example, but to all other clock types that we will discuss in this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s have a look at an example from `drivers/clk/clk-stm32f4.c` for a clock
+    divider driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding excerpt, the driver only implements the `.set_rate` ops and
+    reuses the `.recalc_rate` and `.round_rate` properties of the CCF-provided clock
+    divider ops known as `clk_divider_ops`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fixed clock device binding
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'This type of clock can also be natively and directly supported by DTS configuration
+    without the need to write any code. This device tree-based interface is generally
+    used to provide dummy clocks. There are cases where some devices in the device
+    tree may require clock nodes to describe their own clock inputs. For example,
+    the *mcp2515* SPI to CAN converter needs to be provided with a clock to let it
+    know the frequency of the quartz it is connected to. For such a dummy clock node,
+    the compatible property should be `fixed-clock`. An example of this is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: The clock framework's core will directly extract the clock information provided
+    by DTS and will automatically register it to the kernel without any driver support.
+    `#clock-cells` is 0 here because only one fixed rate line is provided, and in
+    this case, the specifier only needs to be the `phandle` of the provider.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PWM clock alternative
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Because of the lack of output clock sources (clock pads), some board designers
+    (rightly or wrongly) use PWM output pads as the clock source for external components.
+    This kind of clock is only instantiated from the device tree. Moreover, since
+    PWM binding requires specifying the period of the PWM signal, `pwm-clock` falls
+    into the fixed-rate clock category. An example of such an instantiation can be
+    seen in the following code, which is an excerpt from `imx6qdl-sabrelite.dtsi`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, the `compatible` property should be `pwm-clock`, while `#clock-cells`
+    should be `<0>`. This clock-type driver is located at `drivers/clk/clk-pwm.c`,
+    and further reading about this can be found at `Documentation/devicetree/bindings/clock/pwm-clock.txt`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fixed-factor clock driver and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This type of clock divides and multiplies the parent rate by constants (hence
+    it being a fixed-factor clock driver). This clock cannot gate:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The frequency of the clock is determined by the frequency of the parent clock,
+    multiplied by `mult`, and then divided by `div`. It is actually a `CLK_SET_RATE_PARENT`
+    flag. Since the frequency of the parent clock can be changed, the fixed-factor
+    clock can also have its frequency changed, so callbacks such as `.recalc_rate`/`.set_rate/.round_rate`
+    are also provided. That being said, since the set rate request will be propagated
+    upstream if the `CLK_SET_RATE_PARENT` flag is set, the `.set_rate` callback of
+    such a clock needs to return 0 to ensure its call is a valid **nop** (**no-operation**):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For such clocks, you''re better off using the clock framework provider helper
+    ops known as `clk_fixed_factor_ops`, which is defined and implemented in `drivers/clk/clk-fixed-factor.c`
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The advantage of using this is that you don''t need to care about ops anymore
+    since the kernel has already set everything up for you. Its `round_rate` and `recalc_rate`
+    callbacks even take care of the `CLK_SET_RATE_PARENT` flag, which means we can
+    adhere to our simplification path. Moreover, you''re better off using the clock
+    framework helper interface to register such a clock; that is, `clk_hw_register_fixed_factor()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: This interface internally sets up a `struct clk_fixed_factor` that it allocates
+    dynamically, and then returns a pointer to the underlying `struct clk_hw`. You
+    can use this with the `to_clk_fixed_factor` macro to grab a pointer to the original
+    fixed-factor clock structure. The ops that's assigned to the clock is `clk_fixed_factor_ops`,
+    as discussed previously. In addition, this type of interface is similar to the
+    fixed-rate clock. You do not need to provide a driver. You only need to configure
+    the device tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Device tree binding for fixed-factor clocks
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'You can find binding documentation for such simple fixed factor rate clocks
+    at `Documentation/devicetree/bindings/clock/fixed-factor-clock.txt`, in the kernel
+    sources. The required properties are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`#clock-cells`: This will be set to 0 according to the common clock binding.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`compatible`: This will be `''fixed-factor-clock''`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-div`: Fixed divider.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-mult`: Fixed multiplier.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clocks`: The `phandle` of the parent clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Here''s an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that the fixed-factor clock has been addressed, the next logical step would
+    be to look at the gateable clock, another simple clock type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Gateable clock and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This type of clock can only be switched, so only providing `.enable`/`.disable`
+    callbacks makes sense here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a look at the preceding structure in more detail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`reg`: This represents the register address (virtual address; that is, MMIO)
+    for controlling the clock switch.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bit_idx`: This is the control bit of the clock switch (this can be 1 or 0
+    and sets the state of the gate).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clk_gate_flags`: This represents the gate-specific flags of the gate clock.
+    These are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`CLK_GATE_SET_TO_DISABLE`: This is the clock switch''s control mode. If set,
+    writing `1` turns off the clock, and writing `0` turns on the clock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_GATE_HIWORD_MASK`: Some registers use the concept of `reading-modifying-writing`
+    to operate at the bit level, while other registers only support `0` and `15`)
+    consists of changing the corresponding bit in the `16` lower bits (`0` to 15)
+    and masking the same bit index in the 16 higher bits (`16` to `31`, hence hiword
+    or High Word) in order to indicate/validate the change.For example, if bit `b1`
+    needs to be set as a gate, it also needs to indicate the change by setting the
+    hiword mask (`b1 << 16`). This means that the gate settings are truly in the lower
+    16 bits of the register, while the mask of gate bits is in the higher `16` bits
+    of this same register. When setting this flag, `bit_idx` should be no higher than
+    `15`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`lock`: This is the spinlock that should be used if the clock switch requires
+    mutual exclusion.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'As you have probably guessed, this structure assumes that the clock gate register
+    is mmio. As for the previous clock type, it is better to use the provided kernel
+    interface to deal with such a clock; that is, `clk_hw_register_gate()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some of the parameters of this interface are the same ones we described regarding
+    the clock-type structure. Moreover, the following are extra arguments that need
+    to be described:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`dev` is the device that is registering the clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is the name of the clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`parent_name` is the name of the parent clock, which should be NULL if it has
+    no parent.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` represents the framework-specific flags for this clock. It is common
+    to set the `CLK_SET_RATE_PARENT` flag for gate clocks that have a parent so that
+    rate change requests are propagated up one level.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clk_gate_flags` corresponds to the `.flags` in the clock-type structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This interface returns a pointer to the underlying `struct clh_hw` of the clock
+    gate structure. Here, you can use the `to_clk_gate` helper macro to grab the original
+    clock gate structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While setting up this clock and prior to its registration, the clock framework
+    assigns the `clk_gate_ops` ops to it. This is actually the default ops for the
+    gate clock. It relies on the fact that the clock is controlled through mmio registers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: The entire gate clock API is defined in `drivers/clk/clk-gate.c`. Such a clock
+    driver can be found in `drivers/clk/clk-asm9260.c`, while its device tree binding
+    can be found in `Documentation/devicetree/bindings/clock/alphascale,acc.txt`,
+    in the kernel source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I2C/SPI-based gate clock
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Not just mmio peripherals can provide gate clocks. There are also discrete
+    chips behind I2C/SPI buses that can provide such clocks. Obviously, you cannot
+    rely on the structure (`struct clk_gate`) or the interface helper (`clk_hw_register_gate()`)
+    that we introduced earlier to develop drivers for such chips. The main reasons
+    for this are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The aforementioned interface and data structure assume that the clock gate register
+    control is mmio, which is definitely not the case here.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The standard gate clock ops are `.enable` and `.disable`. However, these callbacks
+    don't need to sleep as they are called with spinlocks held, but we all know that
+    I2C/SPI register accesses may sleep.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Both of these restrictions have workarounds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead of using the gate-specific clock framework helper, you can want to use
+    the low-level `clk_hw_register()` interface to control the parameters of the clock,
+    from its flags to its ops.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can implement the `.enable`/`.disable` logic in the `.prepare`/`.unprepare`
+    callbacks. Remember, `.prepare`/`.unprepare` ops may sleep. This is guaranteed
+    to work as it is a requirement for the consumer side to call `clk_prepare()` prior
+    to calling `clk_enable()`, and then to follow a call to `clk_disable()` by a call
+    to `clk_unprepare()`. By doing so, any consumer call to `clk_enable()` (mapped
+    to the provider's `.enable` callback) will immediately return. However, since
+    it is always preceded by a consumer call to `clk_prepare()` (mapped to the `.prepare`
+    callback), we can be sure that our clock will be ungated. The same goes for `clk_disable`
+    (mapped to the `.disable` callback), which guarantees that our clock will be gated.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This clock driver implementation can be found in `drivers/clk/clk-max9485.c`,
+    while its device tree binding can found in `Documentation/devicetree/bindings/clock/maxim,max9485.txt`,
+    in the kernel source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GPIO gate clock alternative
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'This is a basic clock that can be enabled and disabled through a gpio output.
+    `gpio-gate-clock` instances can only be instantiated from the device tree. For
+    this, the `compatible` property should be `gpio-gate-clock` and `#clock-cells`
+    should be `<0>` as shown in the following excerpt from `imx6qdl-sr-som-ti.dtsi`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: This clock-type driver is located in `drivers/clk/clk-gpio.c`, and further reading
+    can be found in `Documentation/devicetree/bindings/clock/gpio-gate-clock.txt`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clock multiplexer and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A clock multiplexer has multiple input clock signals or parents, among which
+    only one can be selected as output. Since this type of clock can choose from among
+    multiple parents, the `.get_parent`/`.set_parent`/`.recalc_rate` callbacks should
+    be implemented. A mux clock is represented in the CCF by an instance of `struct
+    clk_mux`, which looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a look at the elements shown in the preceding structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`table` is an array of register values corresponding to the parent index.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mask` and `shift` are used to modify the `reg` bit field prior to getting
+    the appropriate value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`reg` is the mmio register used for parent selection. By default, when the
+    register''s value is 0, it corresponds to the first parent, and so on. If there
+    are exceptions, various `flags` can be used, as well as another interface.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` represents the unique flags of the mux clock, which are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`CLK_MUX_INDEX_BIT`: The register value is a power of 2\. We will look at
+    how this works shortly.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_MUX_HIWORD_MASK`: This uses the concept of the hiword mask, which we
+    explained earlier.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_MUX_INDEX_ONE`: The register value does not start from 0, instead starting
+    at 1\. This means that the final value should be incremented by one.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_MUX_READ_ONLY`: Some platforms have read-only clock muxes that are preconfigured
+    at reset and cannot be changed at runtime.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_MUX_ROUND_CLOSEST` : This flag uses the parent rate that is closest
+    to the desired frequency.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`lock`, if provided, is used to protect access to the register.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The CCF helper that''s used to register such a clock is `clk_hw_register_mux()`.
+    This looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some of the parameters in the preceding registration interface were introduced
+    when we described the mux clock structure. The remaining parameters are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`parent_names`: This is an array of strings that describes all possible parent
+    clocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`num_parents`: This specifies the number of parent clocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'While registering such a clock, depending on the `CLK_MUX_READ_ONLY` flag being
+    set or not, the CCF assigns different clock ops. If set, `clk_mux_ro_ops` is used.
+    This clock ops only implements the `.get_parent` ops as there would be no way
+    to change the parent. If this is not set, `clk_mux_ops` is used. This ops implements
+    `.get_parent`, `.set_parent`, and `.determine_rate`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'These clock ops are defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, there is a `.table` field. This is used to provide a
+    set of values according to the parent index. However, the preceding registration
+    interface, `clk_hw_register_mux()`, does not provide us with any way to feed this
+    table.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Due to this, there is another variant available in the CCF that allows us to
+    pass the table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE58]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The interface registers a mux to control an irregular clock through a table.
+    Whatever the registration interface is, the same internal ops are used. Now, let''s
+    pay special attention to the most important ones; that is, `.set_parent` and `.get_parent`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`clk_mux_set_parent`: When this is called, if `table` is not `NULL`, it gets
+    a register value from the index in `table`. If `table` is `NULL` and the `CLK_MUX_INDEX_BIT`
+    flag is set, this means the register value is a power of 2 according to `index`.
+    This value is then obtained with `val = 1 << index`; if `CLK_MUX_INDEX_ONE` is
+    set, this value is incremented by one. If `table` is `NULL` and `CLK_MUX_INDEX_BIT`
+    is not set, `index` is used as the default value. In either case, the final value
+    is left-shifted at `shift` time and OR''ed with a mask prior to us obtaining the
+    real value. This should be written into `reg` for parent selection:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE59]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`clk_mux_get_parent`: This reads the value in `reg`, shifts it `shift` time
+    to the right and applies (the AND operation) `mask` to it prior to getting the
+    real value. This value is then given to the `clk_mux_val_to_index()` helper, which
+    will return the right index according to the `reg` value. `clk_mux_val_to_index()`
+    first gets the number of parents for the given clock. If `table` is not `NULL`,
+    this number is used as the upper limit in a loop to walk through `table`. Each
+    iteration will check whether the `table` value at the current position matches
+    `val`. If it does, the current position in the iteration is returned. If no match
+    is found, an error is returned. `ffs()` returns the position of the first (least
+    significant) bit set in the word:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE60]'
+  prefs: []
+  type: TYPE_PRE
+- en: An example of such a driver can be found in `drivers/clk/microchip/clk-pic32mzda.c`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I2C/SPI-based clock mux
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: The aforementioned CCF interfaces that are used to handle clock muxes assume
+    that control is provided via mmio registers. However, there are some I2C/SPI-based
+    clock mux chips where you have to rely on the low-level `clk_hw` (using a `clk_hw_register()`
+    registration-based interface) interface and register each clock according to its
+    properties before providing the appropriate ops.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each mux input clock should be a parent of the mux output, which must have at
+    least `.set_parent` and `.get_parent` ops. Other ops are also allowed but not
+    mandatory. A concrete example is the Linux driver for the `Si5351a/b/c` programmable
+    I2C clock generator from Silicon Labs, available in `drivers/clk/clk-si5351.c`
+    in the kernel sources. Its device tree binding is available in `Documentation/devicetree/bindings/clock/silabs,si5351.txt`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: To write such clock drivers, you must learn how `clk_hw_register_mux` is implemented
+    and base your registration function on it, without the mmio/spinlock part, and
+    then provide your own ops according to the clock's properties.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GPIO mux clock alternative
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The GPIO mux clock can be represented as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.2 – GPIO mux clock'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.2_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.2 – GPIO mux clock
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is a limited alternative to clock multiplexing that only accepts two parents,
+    as stated in the following excerpt from its drivers, which are available in `drivers/clk/clk-gpio.c`.
+    In this case, the parent selection depends on the value of the gpio being used:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE61]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'According to its binding, it is only instantiable in the device tree. This
+    binding can be found in `Documentation/devicetree/bindings/clock/gpio-mux-clock.txt`,
+    in the kernel sources. The following example show how to use it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE62]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, we have looked at the clock multiplexer, which allows us to select a clock
+    source from its APIs and device tree binding. Moreover, we introduced the GPIO-based
+    clock multiplexer alternative, which does not require that we write any code.
+    The next clock type in this series is the divider clock, which, as its name suggests,
+    divides the parent rate by a given ratio.
+  prefs: []
+  type: TYPE_NORMAL
+- en: (Adjustable) divider clock and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This type of clock divides the parent rate and cannot gate. Since you can set
+    the divider ratio, providing a `.recalc_rate`/`.set_rate`/`.round_rate` callback
+    is a must. A clock divider is represented in the kernel as an instance of a `struct
+    clk_divider`. This can be defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE63]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s take a look at element in this structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`hw`: The underlying `clock_hw` structure that defined the provider side.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`reg`: This is the register that controls the clock division ratio. By default,
+    the actual divider value is the register value plus one. If there are other exceptions,
+    you can refer to the `flags` field descriptions for adapting.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`shift`: This controls the offset of the bit of the division ratio in the register.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`width`: This is the width of the divider bit field. It controls the bit number
+    of the division ratio. For example, if `width` is 4, this means the division ratio
+    is coded on 4 bits.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags`: This is the divider-clock-specific flag of the clock. Various flags
+    can be used here, some of which are as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_ONE_BASED`: When set, this means that the divider is the raw
+    value that''s read from the register since the default divisor is the value that''s
+    read from the register plus one. This also implies 0 is invalid, unless the `CLK_DIVIDER_ALLOW_ZERO`
+    flag is set.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_ROUND_CLOSEST`: This should be used when we want to be able
+    to round the divider to the closest and best calculated one instead of just rounding
+    up, which is the default behavior.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_POWER_OF_TWO`: The actual divider value is the register value
+    raised to a power of 2.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_ALLOW_ZERO`: The divider value can be 0 (no change, depending
+    on hardware support).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_HIWORD_MASK`: See the *Gateable clock and its ops* section for
+    more details on this flag.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`CLK_DIVIDER_READ_ONLY`: This flag shows that the clock has preconfigured
+    settings and instructs the framework not to change anything. This flag also affects
+    the ops that have been assigned to the clock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CLK_DIVIDER_MAX_AT_ZERO`: This allows a clock divider to have a max divisor
+    when it''s set to zero. So, if the field value is zero, the divisor value should
+    be 2 bits in width. For example, let''s consider a divisor clock with a 2-bit
+    field:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE64]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`table`: This is an array of value/divider pairs whose last entry should have
+    `div = 0`. This will be described shortly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`lock`: Like in other clock data structures, if provided, it is used to protect
+    access to the register.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clk_hw_register_divider()`: This is the most commonly used registration interface
+    for such clocks. It is defined as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE65]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function registers a divider clock with the system and returns a pointer
+    to the underlying `clk_hw` field. Here, you can can use the `to_clk_divider` macro
+    to grab a pointer to the wrapper's `clk_divider` structure. Except for `name`
+    and `parent_name`, which represent the name of the clock and the name of its parent,
+    respectively, the other arguments in this function match the fields described
+    in the `struct clk_divider` structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You may have noticed that the `.table` field is not being used here. This field
+    is kind of special as it is used for clock dividers whose division ratios are
+    uncommon. Actually, there are clock dividers where each individual clock line
+    has a number of division ratios that are not related to each other''s clock lines.
+    Sometimes, there is not even any linearity between each ratio and the register
+    value. For such cases, the best solution is to feed each clock line a table, where
+    each ratio corresponds to its register value. This requires us to introduce a
+    new registration interface that accepts such a table; that is, `clk_hw_register_divider_table`.
+    This can be defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE66]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This interface is used to register the clock with an irregular frequency division
+    ratio, compared to the preceding interface. The difference is that the relationship
+    between the value of the divider and the value of the register is determined by
+    a table of the `struct clk_div_table` type. This table structure can be defined
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE67]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code, `val` represents the register value, while `div` represents
+    the division ratio. Their relationship can also be changed byusing `clk_divider_flags`.
+    Regardless of what registration interface is used, the `CLK_DIVIDER_READ_ONLY`
+    flag determines the ops to be assigned to the clock, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE68]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Both these clock ops are defined in `drivers/clk/clk-divider.c`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE69]'
+  prefs: []
+  type: TYPE_PRE
+- en: While the former can set the clock rate, the last one cannot.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once again, so far, using the clock-type-dependent registration interface provided
+    by the kernel requires your clock to be mmio. Implementing such a clock driver
+    for a non-mmio-based (SPI or I2C-based) clock would require using the low-level
+    `hw_clk` registration interface and implementing the appropriate ops. An example
+    of such a driver for an I2C-based clock, along with the appropriate ops implemented,
+    can be found in `drivers/clk/clk-max9485.c`. Its binding can be found in `Documentation/devicetree/bindings/clock/maxim,max9485.txt`.
+    This is a much more adjustable clock driver than the divider one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The adjustable clock has no secrets for us anymore. Its APIs and ops have been
+    described, as well as how it deals with irregular ratios. Next, we''ll look at
+    our final clock type, which is a mix of all the clock types we have seen so far:
+    the composite clock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Composite clock and its ops
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This clock is used for clock branches that use a combination of mux, divider,
+    and gate components. This is the case on most Rockchip SoCs. The clock framework
+    abstracts such clocks by means of `struct clk_composite`, which looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE70]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The fields in this data structure are quite self-explanatory, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`hw`, as in other clock structures, is the handle between common and hardware-
+    specific interfaces.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mux_hw` represents the mux clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`rate_hw` represents the divider clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`gate_hw` represents the gate clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mux_ops`, `rate_ops`, and `gate_ops` are the clock ops for mux, rate, and
+    gate, respectively.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Such a clock can be registered through the following interface:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE71]'
+  prefs: []
+  type: TYPE_PRE
+- en: This may look a bit complicated, but if you went through the previous clock,
+    this one will be more or less obvious to you. Take a look at `drivers/clk/sunxi/clk-a10-hosc.c`
+    in the kernel source for an example of a composite clock driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Putting it all together – global overview
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'If you are still confused, then take a look at the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.3 – Clock tree example'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.3_B10985.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.3 – Clock tree example
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding clock tree shows an oscillator clock feeding three PLLs – that
+    is, `pll1`, `pll2`, and `pll3` – as well as a multiplexer. According to the multiplexer
+    (mux), `hw3_clk` can be derived from either the `pll2`, `pll3`, or `osc` clock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following device tree excerpt can be used to model the preceding clock
+    tree:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE72]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When it comes to the source code, the following excerpt shows how to register
+    `hw_clk3` as a mux (a clock multiplexer) and points out the parent relationship
+    of `pll2`, `pll3`, and `osc`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE73]'
+  prefs: []
+  type: TYPE_PRE
+- en: A downstream clock provider should use `of_clk_get_parent_name()` to obtain
+    its parent clock name. For a block with multiple outputs, `of_clk_get_parent_name()`
+    can return a valid clock name, but only when the `clock-output-names` property
+    is present.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we can look at the clock tree summary via the CCF *sysfs* interface, `/sys/kernel/debug/clk/clk_summary`.
+    This can be seen in the following excerpt:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE74]'
+  prefs: []
+  type: TYPE_PRE
+- en: With that, we are done with the clock producer side. We have learned about its
+    APIs and discussed its declaration in the device tree. Moreover, we have learned
+    how to dump their topology from *sysfs*. Now, let's look at clock consumer APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing clock consumer APIs
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Clock producer device drivers are useless without consumers at the other end
+    to leverage the clock lines that have been exposed. The main purpose of such drivers
+    is to assign their clock source lines to consumers. These clock lines are then
+    used for several purposes, and the Linux kernel provides consequent APIs and helpers
+    to achieve the required goal. Consumer drivers need to include `<linux/clk.h>`
+    in their code for its APIs to be used. Moreover, nowadays, the clock consumer
+    interface entirely relies on the device tree, meaning that consumers should be
+    assigned clocks they need from the device tree. The consumer binding should follow
+    the provider''s since the consumer specifier is determined by the provider''s
+    `#clock-cells` property. Take a look at the following UART node description, which
+    requires two clock lines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE75]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This represents a device with two clock inputs. The preceding node excerpt
+    allows us to introduce the device tree binding for the clock consumer, which should
+    have, at the very least, the following properties:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `clocks` property is where you should specify the source clock lines for
+    a device with respect to the `#clock-cells` property of the provider.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`clock-names` is the property used to name clocks in the same way they are
+    listed in `clocks`. In other words, this property should be used to list the input
+    name(s) for the clock(s) with respect to the consuming node. This name(s) should
+    reflect the consumer input signal name(s) and can/must be used in the code (see
+    `[devm_]clk_get()`) so that it matches the corresponding clock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clock consumer nodes must never directly reference the provider's `clock-output-names`
+    property.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The consumer has a reduced and portable API based on whatever the underlying
+    hardware clock is. Next, we'll take a look at the common operations that are performed
+    by consumer drivers, along with their associated APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Grabbing and releasing clocks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The following functions allow us to grab and release a clock, given its `id`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE76]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`dev` is the device using this clock, while `id` is the name given to the clock
+    in the device tree. On success, `clk_get` returns a pointer to a `struct clk`.
+    This can be given to any other `clk-consumer` API. `clk_put` actually releases
+    the clock line. The first two APIs in the preceding code are defined in `drivers/clk/clkdev.c`.
+    However, other clock consumer APIs are defined in `drivers/clk/clk.c`. `devm_clk_get`
+    is simply the managed version of `clk_get`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preparing/unpreparing clocks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To prepare a clock for use, you can use `clk_prepare()`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE77]'
+  prefs: []
+  type: TYPE_PRE
+- en: These functions may sleep, which means they cannot be called from within an
+    atomic context. It is worth always calling `clk_prepare()` before `clock_enable()`.
+    This may be useful if the underlying clock is behind a slow bus (SPI/I2C) since
+    such clock drivers must implement their enable/disable (which must not sleep)
+    code from within the prepare/unprepare ops (which are allowed to sleep).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enabling/disabling
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When it comes to gating/ungating the clock, you can use the following API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE78]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`clk_enable` must not sleep and actually ungates the clock. It returns 0 on
+    success or an error otherwise. `clk_disable` does the reverse. To enforce the
+    fact of calling prepare prior to calling enable, the clock framework provide the
+    `clk_prepare_enable` API, which internally calls both. The opposite can be done
+    with `clk_disable_unprepare`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE79]'
+  prefs: []
+  type: TYPE_PRE
+- en: Rate functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'For clocks whose rates can be changed, we can use the following function to
+    get/set the rate of the clock:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE80]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`clk_get_rate()`returns 0 if `clk` is `NULL`; otherwise, it will return the
+    rate of the clock; that is, the cached rate. However, if the `CLK_GET_RATE_NOCACHE`
+    flag is set, a new calculation will be done (by means of `recalc_rate()`) to return
+    the real clock rate. On the other hand, `clk_set_rate()` will set the rate of
+    the clock. However, its rate parameter can''t take any value. To see if the rate
+    you are targeting is supported or allowed by the clock, you should use `clk_round_rate()`,
+    along with the clock pointer and the target rate in Hz, as follows.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE81]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is the return value of `clk_round_rate(`) that must be given to `clk_set_rate()`,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE82]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Changing the clock rate may fail in the following cases:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The clock is drawing its source from a fixed-rate clock source (for example,
+    `OSC0`, `OSC1`, `XREF`, and so on).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The clock is in use by multiple modules/children, which would mean that `usecount`
+    is greater than 1.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The clock source is in use by more than one child.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that parent rates are returned if `.round_rate()` is not implemented.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Parent functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are clocks that are the children of other clocks, thus creating a parent/child
+    relationship. To either get/set the parent of a given clock, you can use the following
+    functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE83]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`clk_set_parent()` actually sets the parent of the given clock, while `clk_get_parent()`
+    returns the current parent.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Putting it all together
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To summarize this, take a look at the following excerpt of the i.MX serial
+    driver (`drivers/tty/serial/imx.c`), which deals with the preceding device node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE84]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code excerpt, we see can how the driver grabs the clock and
+    its current rate, and then enables it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we walked through the Linux Common Clock Framework. We introduced
+    both the provider and consumer sides, as well as the user space interface. We
+    then discussed the different clock types and learned how to write the appropriate
+    Linux drivers for each.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter deals with ALSA SoC, the Linux kernel framework for audio.
+    This framework heavily relies on the clock framework to, for example, sample audio.
+  prefs: []
+  type: TYPE_NORMAL

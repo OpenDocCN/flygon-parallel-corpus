@@ -1,0 +1,1236 @@
+- en: Chapter 3. All About Bootloaders
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The bootloader is the second element of embedded Linux. It is the part that
+    starts the system up and loads the operating system kernel. In this chapter, I
+    will look at the role of the bootloader and, in particular, how it passes control
+    from itself to the kernel using a data structure called a device tree, also known
+    as a **flattened device tree** or **FDT**. I will cover the basics of device trees
+    so that you will be able to follow the connections described in a device tree
+    and relate it to real hardware.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I will look at the popular open source bootloader U-Boot and see how to use
+    it to boot a target device and also how to customize it to a new device. Finally,
+    I will take a quick look at Barebox, a bootloader that shares its past with U-Boot
+    but which has, arguably, a cleaner design.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What does a bootloader do?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In an embedded Linux system, the bootloader has two main jobs: basic system
+    initialization and the loading of the kernel. In fact, the first job is somewhat
+    subsidiary to the second in that it is only necessary to get as much of the system
+    working as is needed to load the kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the first lines of bootloader code are executed, following power-on or
+    a reset, the system is in a very minimal state. The DRAM controller will not have
+    been set up so main memory is not accessible, likewise other interfaces will not
+    have been configured so storage accessed via NAND flash controllers, MMC controllers,
+    and so on, are also not usable. Typically, the only resources operational at the
+    beginning are a single CPU core and some on-chip static memory. As a result, system
+    bootstrap consists of several phases of code, each bringing more of the system
+    into operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The early boot phase stops once the interfaces required to load a kernel are
+    working. That includes main memory and the peripherals used to access the kernel
+    and other images, be they mass storage or network. The final act of the bootloader
+    is to load the kernel into RAM and create an execution environment for it. The
+    details of the interface between the bootloader and the kernel are architecture-specific
+    but, in all cases, it means passing a pointer to information about the hardware
+    that the bootloader knows about and passing a kernel command line, which is an
+    ASCII string containing essential information for Linux. Once the kernel has begun
+    executing, the bootloader is no longer needed and all the memory it was using
+    can be reclaimed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A subsidiary job of the bootloader is to provide a maintenance mode for updating
+    boot configurations, loading new boot images into memory and, maybe, running diagnostics.
+    This is usually controlled by a simple command-line user interface, commonly over
+    a serial interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The boot sequence
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In simpler times, some years ago, it was only necessary to place the bootloader
+    in non-volatile memory at the reset vector of the processor. NOR flash memory
+    was common at that time and, since it can be mapped directly into the address
+    space, it was the ideal method of storage. The following diagram shows such a
+    configuration, with the reset vector at 0xfffffffc at the top end of an area of
+    flash memory. The bootloader is linked so that there is a jump instruction at
+    that location that points to the start of the bootloader code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The boot sequence](img/B03982_03_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Boot in the old days
+  prefs: []
+  type: TYPE_NORMAL
+- en: From that point, it can initialize the memory controller so that the main memory,
+    the DRAM, becomes available and copies itself into DRAM. Once fully operational,
+    the bootloader can load the kernel from flash memory into DRAM and transfer control
+    to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, once you move away from a simple linearly addressable storage medium
+    like NOR flash, the boot sequence becomes a complex, multi-stage procedure. The
+    details are very specific to each SoC, but they generally follow each of the following
+    phases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Phase 1: ROM code'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In the absence of reliable external memory, the code that runs immediately
+    after a reset or power-on has to be stored on-chip in the SoC; this is known as
+    ROM code. It is programmed into the chip when it is manufactured, hence ROM code
+    is proprietary and cannot be replaced by an open source equivalent. The ROM code
+    can make very few assumptions about any hardware that is not on the chip, because
+    it will be different from one design to another. This applies even to the DRAM
+    chips used for the main system memory. Consequently, the only RAM that the ROM
+    code has access to is the small amount of static RAM (SRAM) found in most SoC
+    designs. The size of the SRAM varies from as little as 4 KiB up to a few hundred
+    KiB:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Phase 1: ROM code](img/B03982_03_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Phase 1 bootloader
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ROM code is capable of loading a small chunk of code from one of several
+    preprogrammed locations into the SRAM. As an example, TI OMAP and Sitara chips
+    will try to load code from the first few pages of NAND flash memory, or from flash
+    memory connected through **SPI** (**Serial Peripheral Interface**), or from the
+    first sectors of an MMC device (which could be an eMMC chip or an SD card), or
+    from a file named `MLO` on the first partition of an MMC device. If reading from
+    all of those memory devices fails, then it will try reading a byte stream from
+    Ethernet, USB, or UART; the latter is provided mainly as a means of loading code
+    into flash memory during production rather than for use in normal operation. Most
+    embedded SoCs have ROM code that works in a similar way. In SoCs where the SRAM
+    is not large enough to load a full bootloader like U-Boot, there has to be an
+    intermediate loader called the secondary program loader, or SPL.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the end of this phase, the next stage bootloader is present in on-chip memory
+    and the ROM code jumps to the beginning of that code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Phase 2: SPL'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The SPL must set up the memory controller and other essential parts of the
+    system preparatory to loading the **third stage program loader** (**TPL**) into
+    main memory, the DRAM. The functionality of the SPL is limited by its size. It
+    can read a program from a list of storage devices, as can the ROM code, once again
+    using preprogrammed offsets from the start of a flash device, or a well known
+    file name such as `u-boot.bin`. The SPL usually doesn''t allow for any user interaction
+    but it may print version information and progress messages which you will see
+    on the console. The following diagram explains the phase 2 architecture:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Phase 2: SPL](img/B03982_03_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Second stage boot
+  prefs: []
+  type: TYPE_NORMAL
+- en: The SPL may be open source, as is the case with the TI x-loader and Atmel AT91Bootstrap,
+    but it is quite common for it to contain proprietary code that is supplied by
+    the manufacturer as a binary blob.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the end of the second phase, the third stage loader is present in DRAM, and
+    the SPL can make a jump to that area.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Phase 3: TPL'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, at last, we are running a full bootloader like U-Boot or Barebox. Usually,
+    there is a simple command-line user interface that will let you perform maintenance
+    tasks such as loading new boot and kernel images into flash storage, loading and
+    booting a kernel, and there is a way to load the kernel automatically without
+    user intervention. The following diagram explains the phase 3 architecture:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Phase 3: TPL](img/B03982_03_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Third stage boot
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the end of the third phase, there is a kernel in memory, waiting to be started.
+    Embedded bootloaders usually disappear from memory once the kernel is running
+    and perform no further part in the operation of the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Booting with UEFI firmware
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Most embedded PC designs and some ARM designs have firmware based on the **Universal
+    Extensible Firmware Interface** (**UEFI**) standard, see the official website
+    at [http://www.uefi.org](http://www.uefi.org) for more information. The boot sequence
+    is fundamentally the same as described in the preceding section:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Phase 1**: The processor loads the UEFI boot manager firmware from flash
+    memory. In some designs, it is loaded directly from NOR flash memory, in others
+    there is ROM code on-chip which loads the boot manager from SPI flash memory.
+    The boot manager is roughly equivalent to the SPL, but may allow user interaction
+    through a text-based or graphical interface.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Phase 2**: The boot manager loads the boot firmware from the **EFI System
+    Partition** (**ESP**) or a hard disk or SSD, or from a network server via PXE
+    boot. If loading from a local disk drive, the EXP is identified by a well-known
+    GUID value of C12A7328-F81F-11D2-BA4B-00A0C93EC93B. The partition should be formatted
+    using the FAT32 format. The third stage bootloader should be in a file named `<efi_system_partition>/boot/boot<machine_type_short_name>.efi`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, the file path to the loader on an x86_64 system is: `/efi/boot/bootx64.efi`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Phase 3**: The TPL in this case has to be a bootloader that is capable of
+    loading a Linux kernel and an optional RAM disk into memory. Common choices are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**GRUB 2**: This is the GNU Grand Unified Bootloader, version 2, and it is
+    the most commonly used Linux loader on PC platforms. However, there is one controversy
+    in that it is licensed under GPL v3, which may make it incompatible with secure
+    booting since the license requires the boot keys to to be supplied with the code.
+    The website is [https://www.gnu.org/software/grub/](https://www.gnu.org/software/grub/).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**gummiboot**: This is a simple UEFI-compatible bootloader which has since
+    been integrated into systemd, and is licensed under LGPL v2.1 The website is [https://wiki.archlinux.org/index.php/Systemd-boot](https://wiki.archlinux.org/index.php/Systemd-boot).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Moving from bootloader to kernel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'When the bootloader passes control to the kernel it has to pass some basic
+    information to the kernel, which may include some of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On PowerPC and ARM architectures: a number unique to the type of the SoC'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Basic details of the hardware detected so far, including at least the size and
+    location of the physical RAM, and the CPU clock speed
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The kernel command line
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Optionally, the location and size of a device tree binary
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Optionally, the location and size of an initial RAM disk
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The kernel command line is a plain ASCII string which controls the behavior
+    of Linux, setting, for example, the device that contains the root filesystem.
+    I will look at the details of this in the next chapter. It is common to provide
+    the root filesystem as a RAM disk, in which case it is the responsibility of the
+    bootloader to load the RAM disk image into memory. I will cover the way you create
+    initial RAM disks in [Chapter 5](ch05.html "Chapter 5. Building a Root Filesystem"),
+    *Building a Root Filesystem*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The way this information is passed is dependent on the architecture and has
+    changed in recent years. For instance, with PowerPC, the bootloader simply used
+    to pass a pointer to a board information structure, whereas, with ARM, it passed
+    a pointer to a list of "A tags". There is a good description of the format of
+    the kernel source in `Documentation/arm/Booting`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In both cases, the amount of information passed was very limited, leaving the
+    bulk of it to be discovered at runtime or hard-coded into the kernel as "platform
+    data". The widespread use of platform data meant that each device had to have
+    a kernel configured and modified for that platform. A better way was needed, and
+    that way is the device tree. In the ARM world, the move away from A tags began
+    in earnest in February 2013 with the release of Linux 3.8 but there are still
+    quite a lot of devices in the field, and even in development, still using A tags.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing device trees
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You are almost certainly going to encounter device trees at some point. This
+    section aims to give you a quick overview of what they are and how they work but
+    there are many details that are not discussed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A device tree is a flexible way to define the hardware components of a computer
+    system. Usually, the device tree is loaded by the bootloader and passed to the
+    kernel, although it is possible to bundle the device tree with the kernel image
+    itself to cater for bootloaders that are not capable of handling them separately.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The format is derived from a Sun Microsystems bootloader known as OpenBoot,
+    which was formalized as the Open Firmware specification, IEEE standard IEEE1275-1994\.
+    It was used in PowerPC-based Macintosh computers and so was a logical choice for
+    the PowerPC Linux port. Since then, it has been adapted on a large scale by the
+    many ARM Linux implementations and, to a lesser extent, by MIPS, MicroBlaze, ARC,
+    and other architectures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I would recommend visiting [http://devicetree.org](http://devicetree.org) for
+    more information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Device tree basics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The Linux kernel contains a large number of device tree source files in `arch/$ARCH/boot/dts`,
+    and this is a good starting point for learning about device trees. There are also
+    a smaller number of sources in the U-boot source code in `arch/$ARCH/dts`. If
+    you acquired your hardware from a third party, the `dts` file forms part of a
+    board support package and you should expect to receive one along with the other
+    source files.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The device tree represents a computer system as a collection of components
+    joined together in a hierarchy, like a tree. The device tree begins with a root
+    node, represented by a forward slash, `/`, which contains subsequent nodes representing
+    the hardware of the system. Each node has a name and contains a number of properties
+    in the form `name = "value"`. Here is a simple example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here we have a root node which contains a `cpus` node and a memory node. The
+    `cpus` node contains a single CPU node named `cpu@0`. It is a common convention
+    that the names of nodes include an `@` followed by an address that distinguishes
+    them from any others.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both the root and CPU nodes have a compatible property. The Linux kernel uses
+    this to match this name against the strings exported by device drivers in a `struct
+    of_device_id` (more on this in [Chapter 8](ch08.html "Chapter 8. Introducing Device
+    Drivers"), *Introducing Device Drivers*). It is a convention that the value is
+    composed of a manufacturer name and a component name to reduce confusion between
+    similar devices made by different manufacturers, hence `ti,am33xx` and `arm,cortex-a8`.
+    It is also quite common to have more than one value for `compatible` where there
+    is more than one driver that can handle this device. They are listed with the
+    most suitable first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CPU node and the memory node have a `device_type` property which describes
+    the class of device. The node name is often derived from the `device_type`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reg property
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The memory and CPU nodes have a `reg` property, which refers to a range of units
+    in a register space. A `reg` property consists of two values representing the
+    start address and the size (length) of the range. Both are written down as zero
+    or more 32-bit integers, called cells. Hence, the memory node refers to a single
+    bank of memory that begins at 0x80000000 and is 0x20000000 bytes long.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Understanding `reg` properties becomes more complex when the address or size
+    values cannot be represented in 32 bits. For example, on a device with 64-bit
+    addressing, you need two cells for each:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The information about the number of cells required is held in `#address-cells`
+    and `#size_cells` declarations in an ancestor node. In other words, to understand
+    a `reg` property, you have to look backwards down the node hierarchy until you
+    find `#address-cells` and `#size_cells`. If there are none, the default values
+    are `1` for each – but it is bad practice for device tree writers to depend on
+    fall-backs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s return to the cpu and cpus nodes. CPUs have addresses as well:
+    in a quad core device they might be addressed as 0, 1, 2, and 3\. That can be
+    thought of as a one-dimensional array without any depth so the size is zero. Therefore,
+    you can see that we have `#address-cells = <1>` and `#size-cells = <0>` in the
+    cpus node, and in the child node, `cpu@0`, we assign a single value to the `reg`
+    property: node `reg = <0>`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Phandles and interrupts
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The structure of the device tree described so far assumes that there is a single
+    hierarchy of components, whereas in fact there are several. As well as the obvious
+    data connection between a component and other parts of the system, it might also
+    be connected to an interrupt controller, to a clock source and to a voltage regulator.
+    To express these connections, we have phandles.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Take an example of a system containing a serial port which can generate interrupts
+    and the interrupt controller:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: We have an interrupt-controller node which has the special property `#interrupt-cells`,
+    which tells us how many 4-byte values are needed to represent an interrupt line.
+    In this case, it is just one giving the IRQ number, but it is quite common to
+    use additional values to characterize the interrupt, for example `1 = low-to-high
+    edge triggered`, `2 = high-to-low edge triggered`, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking at the serial node, it has an `interrupt-parent` property which references
+    the interrupt-controller it is connected to by using its label. This is the phandle.
+    The actual IRQ line is given by the `interrupts` property, `72` in this case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `serial` node has other properties that we have not seen before: `clock-frequency`
+    and `ti,hwmods`. These are part of the bindings for this particular type of device,
+    in other words, the kernel device driver will read these properties to manage
+    the device. The bindings can be found in the Linux kernel source, in directory
+    `Documentation/devicetree/bindings/`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Device tree include files
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A lot of hardware is common between SoCs of the same family and between boards
+    using the same SoC. This is reflected in the device tree by splitting out common
+    sections into `include` files, usually with the extension `.dtsi`. The Open Firmware
+    standard defines `/include/` as the mechanism to be used, as in this snippet from
+    `vexpress-v2p-ca9.dts`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Look through the `.dts` files in the kernel, though, and you will find an alternative
+    `include` statement that is borrowed from C, for example in `am335x-boneblack.dts`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here is another example from `am33xx.dtsi`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Lastly, `include/dt-bindings/pinctrl/am33xx.h` contains normal C macros:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All of this is resolved if the device tree sources are built using kernel kbuild,
+    which first runs them through the C pre-processor, `cpp`, where the `#include`
+    and `#define` statements are processed into plain text that is suitable for the
+    device tree compiler. The motivation is shown in the previous example: it means
+    that device tree sources can use the same constant definitions as the kernel code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When we include files in this way the nodes are overlaid on top of one another
+    to create a composite tree in which the outer layers extend or modify the inner
+    ones. For example, `am33xx.dtsi,` which is general to all am33xx SoCs, defines
+    the first MMC controller interface like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Note that the status is `disabled`, meaning that no device driver should be
+    bound to it, and also that it has the label `mmc1`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In `am335x-bone-common.dtsi`, which is included with both BeagleBone and BeagleBone
+    Black, the same node is referenced by its phandle:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, `mmc1` is enabled (`status="okay"`) because both variants have a physical
+    MMC1 device, and the `pinctrl` is established. Then, in `am335x-boneblack.dts,`
+    you will see another reference to `mmc1` which associates it with a voltage regulator:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, layering source files like this gives flexibility and reduces the need for
+    duplicated code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Compiling a device tree
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The bootloader and kernel require a binary representation of the device tree,
+    so it has to be compiled using the device tree compiler, `dtc`. The result is
+    a file ending with `.dtb`, which is referred to as a device tree binary or a device
+    tree blob.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is a copy of `dtc` in the Linux source, in `scripts/dtc/dtc`, and it
+    is also available as a package on many Linux distributions. You can use it to
+    compile a simple device tree (one that does not use `#include`) like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Be wary of the fact that `dtc` does not give helpful error messages and it makes
+    no checks other than on the basic syntax of the language, which means that debugging
+    a typing error in a source file can be a lengthy business.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To build more complex examples, you will have to use the kernel `kbuild`, as
+    shown in the next chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing a bootloader
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Bootloaders come in all shapes and sizes. The kind of characteristics you want
+    from a bootloader are that they be simple and customizable with lots of sample
+    configurations for common development boards and devices. The following table
+    shows a number of them that are in general use:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Name | Architectures |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Das U-Boot | ARM, Blackfin, MIPS, PowerPC, SH |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Barebox | ARM, Blackfin, MIPS, PowerPC |'
+  prefs: []
+  type: TYPE_TB
+- en: '| GRUB 2 | X86, X86_64 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| RedBoot | ARM, MIPS, PowerPC, SH |'
+  prefs: []
+  type: TYPE_TB
+- en: '| CFE | Broadcom MIPS |'
+  prefs: []
+  type: TYPE_TB
+- en: '| YAMON | MIPS |'
+  prefs: []
+  type: TYPE_TB
+- en: We are going to focus on U-Boot because it supports a good number of processor
+    architectures and a large number of individual boards and devices. It has been
+    around for a long time and has a good community for support.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It may be that you received a bootloader along with your SoC or board. As always,
+    take a good look at what you have and ask questions about where you can get the
+    source code from, what the update policy is, how they will support you if you
+    want to make changes, and so on. You may want to consider abandoning the vendor-supplied
+    loader and use the current version of an open source bootloader instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: U-Boot
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: U-Boot, or to give its full name, Das U-Boot, began life as an open source bootloader
+    for embedded PowerPC boards. Then, it was ported to ARM-based boards and later
+    to other architectures, including MIPS, SH, and x86\. It is hosted and maintained
+    by Denx Software Engineering. There is plenty of information available, and a
+    good place to start is [www.denx.de/wiki/U-Boot](http://www.denx.de/wiki/U-Boot).
+    There is also a mailing list at `<[u-boot@lists.denx.de](mailto:u-boot@lists.denx.de)>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Building U-Boot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Begin by getting the source code. As with most projects, the recommended way
+    is to clone the git archive and check out the tag you intend to use which, in
+    this case, is the version that was current at the time of writing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Alternatively, you can get a tarball from [ftp://ftp.denx.de/pub/u-boot/](ftp://ftp.denx.de/pub/u-boot/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are more than 1,000 configuration files for common development boards
+    and devices in the `configs/` directory. In most cases, you can make a good guess
+    of which to use, based on the filename, but you can get more detailed information
+    by looking through the per-board `README` files in the `board/` directory, or
+    you can find information in an appropriate web tutorial or forum. Beware, though,
+    the way U-Boot is configured has undergone a lot of changes since the 2014.10
+    release. Double-check that the instructions you are following are appropriate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Taking the BeagleBone Black as an example, we find that there is a likely configuration
+    file named `am335x_boneblack_defconfig` in `configs/` and we find the text **The
+    binary produced by this board supports … Beaglebone Black** in the board `README`
+    files for the am335x chip, `board/ti/am335x/README`. With this knowledge, building
+    U-Boot for a BeagleBone Black is simple. You need to inform U-Boot of the prefix
+    for your cross compiler by setting the `make` variable `CROSS_COMPILE` and then
+    select the configuration file using a command of the type `make [board]_defconfig`,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The results of the compilation are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`u-boot`: This is U-Boot in ELF object format, suitable for use with a debugger'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`u-boot.map`: This is the symbol table'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`u-boot.bin`: This is U-Boot in raw binary format, suitable for running on
+    your device'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`u-boot.img`: This is `u-boot.bin` with a U-Boot header added, suitable for
+    uploading to a running copy of U-Boot'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`u-boot.srec`: This is U-Boot in Motorola `srec` format, suitable for transferring
+    over a serial connection'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The BeagleBone Black also requires a **Secondary Program Loader** (**SPL**),
+    as described earlier. This is built at the same time and is named `MLO`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: The procedure is similar for other targets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Installing U-Boot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Installing a bootloader on a board for the first time requires some outside
+    assistance. If the board has a hardware debug interface, such as JTAG, it is usually
+    possible to load a copy of U-Boot directly into RAM and set it running. From that
+    point, you can use U-Boot commands to copy it into flash memory. The details of
+    this are very board-specific and outside the scope of this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some SoC designs have a boot ROM built in which can be used to read boot code
+    from various external sources such as SD cards, serial interfaces, or USBs, and
+    this is the case with the AM335x chip in the BeagleBone Black. Here is how to
+    load U-Boot via the micro-SD card.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Firstly, format a micro-SD card so that the first partition is in FAT32 format,
+    and mark it as bootable. If you have a direct SD slot available, the card appears
+    as `/dev/mmcblk0`, otherwise, if you are using a memory card reader, it will be
+    seen as `/dev/sdb`, or `/dev/sdc`, and so on. Now, type the following command
+    to partition the micro-SD card, assuming that the card is seen as `/dev/mmcblk0`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Format the first partition as `FAT16`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, mount the partition you have just formatted: on some systems it is enough
+    to simply remove the micro-SD card and then plug it back in again, on others you
+    may have to click on an icon. On current versions of Ubuntu, it should be mounted
+    as `/media/[user]/boot` so I would copy U-Boot and the SPL to it like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Finally, unmount it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With no power on the BeagleBone board, insert the micro-SD card.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Plug in the serial cable. A serial port should appear on your PC as `/dev/ttyUSB0`
+    or similar.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Start a suitable terminal program such as `gtkterm`, `minicom`, or `picocom`
+    and attach to the port at 115,200 bps with no flow control:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Press and hold the **Boot Switch** button on the Beaglebone, power up the board
+    using the external 5V power connector, and release the button after about 5 seconds.
+    You should see a U-Boot prompt on the serial console:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using U-Boot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, I will describe some of the common tasks that you can use U-Boot
+    to perform.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Usually, U-Boot offers a command-line interface over a serial port. It gives
+    a command prompt which is customized for each board. In the examples, I will use
+    `U-Boot#`. Typing `help` prints out all the commands configured in this version
+    of U-Boot; typing `help <command>` prints out more information about a particular
+    command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default command interpreter is quite simple. There is no command-line editing
+    by pressing cursor left or right keys; there is no command completion by pressing
+    the *Tab* key; there is no command history by pressing the cursor up key. Pressing
+    any of these keys will disrupt the command you are currently trying to type and
+    you will have to type `Ctrl`+`C` and start over again. The only line editing key
+    you can safely use is the back space. As an option, you can configure a different
+    command shell called Hush, which has more sophisticated interactive support.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The default number format is hexadecimal. For example, as shown in this command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: This command will read 0x200000 bytes from offset 0x400000 from the start of
+    the NAND flash memory into RAM address 0x82000000.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Environment variables
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'U-Boot uses environment variables extensively to store and pass information
+    between functions and even to create scripts. Environment variables are simple
+    `name=value` pairs that are stored in an area of memory. The initial population
+    of variables may be coded in the board configuration header file, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can create and modify variables from the U-Boot command line using `setenv`.
+    For example `setenv foo bar` creates the variable `foo` with the value `bar`.
+    Note that there is no `=` sign between the variable name and the value. You can
+    delete a variable by setting it to a null string, `setenv foo`. You can print
+    all the variables to the console using `printenv`, or a single variable using
+    `printenv foo`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Usually, it is possible to use the `saveenv` command to save the entire environment
+    to permanent storage of some kind. If there is raw NAND or NOR flash, then an
+    erase block is reserved for this purpose, often with another used for a redundant
+    copy to guard against corruption. If there is eMMC or SD card storage it can be
+    stored in a file in a partition of the disk. Other options include storing in
+    a serial EEPROM connected via an I2C or SPI interface or non-volatile RAM.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Boot image format
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'U-Boot doesn''t have a filesystem. Instead, it tags blocks of information with
+    a 64-byte header so that it can track the contents. You prepare files for U-Boot
+    using the `mkimage` command. Here is a brief summary of its usage:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For example, to prepare a kernel image for an ARM processor, the command is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Loading images
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Usually, you will load images from removable storage such as an SD card or
+    a network. SD cards are handled in U-Boot by the `mmc` driver. A typical sequence
+    to load an image into memory would be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The command `mmc rescan` re-initializes the `mmc` driver, perhaps to detect
+    that an SD card has recently been inserted. Next, `fatload` is used to read a
+    file from a FAT-formatted partition on the SD card. The format is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`fatload <interface> [<dev[:part]> [<addr> [<filename> [bytes [pos]]]]]`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If `<interface>` is `mmc`, as in our case, `<dev:part>` is the device number
+    of the `mmc` interface counting from zero, and the partition number counting from
+    one. Hence `<0:1>` is the first partition on the first device. The memory location,
+    `0x82000000`, is chosen to be in an area of RAM that is not being used at this
+    moment. If we intend to boot this kernel, we have to make sure that this area
+    of RAM will not be overwritten when the kernel image is decompressed and located
+    at the runtime location, `0x80008000`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To load image files over a network you use the **Trivial File Transfer Protocol**
+    (**TFTP**). This requires you to install a TFTP daemon, tftpd, on your development
+    system and start it running. You also have to configure any firewalls between
+    your PC and the target board to allow the TFTP protocol on UDP port 69 to pass
+    through. The default configuration of tftpd allows access only to the directory
+    `/var/lib/tftpboot`. The next step is to copy the files you want to transfer to
+    the target into that directory. Then, assuming that you are using a pair of static
+    IP addresses, which removes the need for further network administration, the sequence
+    of commands to load a set of kernel image files should look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, let''s look at how to program images into NAND flash memory and read
+    them back, which is is handled by the `nand` command. This example loads a kernel
+    image via TFTP and programs it into flash:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now you can load the kernel from flash memory using `nand read`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: Booting Linux
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The `bootm` command starts a kernel image running. The syntax is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`bootm [address of kernel] [address of ramdisk] [address of dtb]`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The address of the kernel image is necessary, but the address of ramdisk and
+    dtb can be omitted if the kernel configuration does not need them. If there is
+    a dtb but no ramdisk, the second address can be replaced with a dash (`-`). That
+    would look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: Automating the boot with U-Boot scripts
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Plainly, typing a long series of commands to boot your board each time it is
+    turned on is not acceptable. To automate the process, U-Boot stores a sequence
+    of commands in environment variables. If the special variable named `bootcmd`
+    contains a script, it is run at power-up after a delay of `bootdelay` seconds.
+    If you are watching this on the serial console, you will see the delay counting
+    down to zero. You can press any key during this period to terminate the countdown
+    and enter into an interactive session with U-Boot.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The way that you create scripts is simple, though not easy to read. You simply
+    append commands separated by semicolons, which must be preceded by a backslash
+    escape character. So, for example, to load a kernel image from an offset in flash
+    memory and boot it, you might use the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Porting U-Boot to a new board
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Let's assume that your hardware department has created a new board called "Nova"
+    that is based on the BeagleBone Black and that you need to port U-Boot to it.
+    You will need to understand the layout of the U-Boot code and how the board configuration
+    mechanism works. In the 2014.10 release, U-Boot adopted the same configuration
+    mechanism as the Linux kernel, `Kconfig`. Over the next few releases, the existing
+    configuration settings will be moved from the current location in the header files
+    in `include/configs` into `Kconfig` files. As of the 2014.10 release, each board
+    had a `Kconfig` file which contains minimal information derived from the old `boards.cfg`
+    file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The main directories you will be dealing with are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`arch`: Contains code specific to each supported architecture in directories
+    arm, mips, powerpc, and so on. Within each architecture, there is a subdirectory
+    for each member of the family, for example, in `arch/arm/cpu`, there are directories
+    for the architecture variants, including amt926ejs, armv7, and armv8.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`board`: Contains code specific to a board. Where there are several boards
+    from the same vendor, they can be collected together into a subdirectory, hence
+    the support for the am335x evm board, on which the BeagelBone is based, is in
+    `board/ti/am335x`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`common`: Contains core functions including the command shells and the commands
+    that can be called from them, each in a file named `cmd_[command name].c`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`doc`: Contains several `README` files describing various aspects of U-Boot.
+    If you are wondering how to proceed with your U-Boot port, this is a good place
+    to start.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`include`: In addition to many shared header files, this contains the very
+    important subdirectory `include/configs` where you will find the majority of the
+    board configuration settings. As the move to `Kconfig` progresses, the information
+    will be moved out into `Kconfig` files but, at the time of writing, that process
+    has only just begun.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kconfig and U-Boot
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The way that `Kconfig` extracts configuration information from `Kconfig` files
+    and stores the total system configuration in a file named `.config` is described
+    in some detail in [Chapter 4](ch04.html "Chapter 4. Porting and Configuring the
+    Kernel"), *Porting and Configuring the Kernel*. U-Boot has adopted kconfig and
+    kbuild with one change. A U-Boot build can produce up to three binaries: a `normal
+    u-boot.bin`, a **Secondary Program Loader** (**SPL**), and a **Tertiary Program
+    Loader** (**TPL**), each with possibly different configuration options. Consequently,
+    lines in `.config` and default configuration files can be prefixed with the codes
+    shown in the following table to indicate which target they apply to:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| None | Normal image only |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `S:` | SPL image only |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `T:` | TPL image only |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ST:` | SPL and TPL images |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `+S:` | Normal and SPL images |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `+T:` | Normal and TPL images |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `+ST:` | Normal, SPL and TPL images |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Each board has a default configuration stored in `configs/[board name}_defconfig`.
+    For your Nova board, you will have to create a file named `nova_defonfig.` for
+    example, and add these lines to it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: On the first line, `CONFIG_SPL=y` causes the SPL binary, MLO, to be generated,
+    `CONFIG_ARM=y` causes the contents of `arch/arm/Kconfig` to be included on line
+    three. On line four, `CONFIG_TARGET_NOVA=y` selects your board. Note that lines
+    three and four are prefixed by `+S:` so that they apply to both the SPL and normal
+    binaries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You should also add a menu option to the ARM architecture `Kconfig` that allows
+    people to select Nova as a target:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Board-specific files
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Each board has a subdirectory named `board/[board name]` or `board/[vendor]/[board
+    name]` which should contain:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Kconfig`: Contains configuration options for the board'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`MAINTAINERS`: Contains a record of whether the board is currently maintained
+    and, if so, by whom'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Makefile`: Used to build the board-specific code'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`README`: Contains any useful information about this port of U-Boot, for example,
+    which hardware variants are covered'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In addition, there may be source files for board specific functions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Your Nova board is based on a BeagleBone which, in turn, is based on a TI AM335x
+    EVM, so, you can start by taking a copy of the am335x board files:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, change the `Kconfig` file to reflect the Nova board:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Setting `SYS_CPU` to `armv7` causes the code in `arch/arm/cpu/armv7` to be compiled
+    and linked. Setting `SYS_SOC` to `am33xx` causes the code in `arch/arm/cpu/armv7/am33xx`
+    to be included, setting `SYS_BOARD` to `nova` brings in `board/nova` and setting
+    `SYS_CONFIG_NAME` to `nova` means that the header file `include/configs/nova.h`
+    is used for further configuration options.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is one other file in `board/nova` that you need to change, the linker
+    script placed at `board/nova/u-boot.lds`, which has a hard-coded reference to
+    `board/ti/am335x/built-in.o`. Change this to use the copy local to `nova`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: Configuration header files
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Each board has a header file in `include/configs` which contains the majority
+    of the configuration. The file is named by the `SYS_CONFIG_NAME` identifier in
+    the board's `Kconfig`. The format of this file is described in detail in the `README`
+    file at the top level of the U-Boot source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the purposes of your Nova board, simply copy `am335x_evm.h to nova.h` to
+    `nova.h` and make a small number of changes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building and testing
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To build for the Nova board, select the configuration you have just created:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: Copy `MLO` and `u-boot.img` to the FAT partition of the micro-SD card you created
+    earlier and boot the board.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Falcon mode
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We are used to the idea that booting a modern embedded processor involves the
+    CPU boot ROM loading an SPL which loads `u-boot.bin` which then loads a Linux
+    kernel. You may be wondering if there is a way to reduce the number of steps,
+    thereby simplifying and speeding up the boot process. The answer is U-Boot "Falcon
+    mode", named after the Peregrine falcon which is claimed to be the fastest of
+    all birds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The idea is simple: have the SPL load a kernel image directly, missing out
+    `u-boot.bin`. There is no user interaction and there are no scripts. It just loads
+    a kernel from a known location in flash or eMMC into memory, passes it a pre-prepared
+    parameter block and starts it running. The details of configuring Falcon mode
+    are beyond this book. If you would like more information, take a look at `doc/README.falcon`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Barebox
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I will complete this chapter with a look at another bootloader that has the
+    same roots as U-Boot but takes a new approach to bootloaders. It is derived from
+    U-Boot and was actually called U-Boot v2 in the early days. The Barebox developers
+    aimed to combine the best parts of U-Boot and Linux, including a POSIX-like API
+    and mountable filesystems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Barebox project website is [www.barebox.org](http://www.barebox.org) and
+    the developer mailing list is `<[barebox@lists.infradead.org](mailto:barebox@lists.infradead.org)>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting Barebox
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To get Barebox, clone the git repository and check out the version you want
+    to use:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The layout of the code is similar to U-Boot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`arch`: Contains code specific to each supported architecture, which includes
+    all the major embedded architectures. SoC support is in `arch/[architecture]/mach-[SoC]`.
+    Support for individual boards is in `arch/[architecture]/boards`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`common`: Contains core functions, including the shell.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`commands`: Contains the commands that can be called from the shell.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Documentation`: Contains the templates for documentation files. To build it,
+    type "`make docs`". The results are put in `Documentation/html`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`drivers`: Contains the code for the device drivers.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`include`: Contains header files.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Building Barebox
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Barebox has used `kconfig/kbuild` for a long time. There are default configuration
+    files in `arch/[architecture]/configs`. As an example, assume that you want to
+    build Barebox for the BeagleBoard C4\. You need two configurations, one for the
+    SPL, and one for the main binary. Firstly, build MLO:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: The result is the secondary program loader, MLO.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, build Barebox:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Copy both to an SD card:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, boot up the board and you should see messages like these on the console:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: Barebox is continuing to evolve. At the time of writing, it lacks the breadth
+    of hardware support that U-Boot has, but it is worth considering for new projects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Every system needs a bootloader to bring the hardware to life and to load a
+    kernel. U-Boot has found favor with many developers because it supports a useful
+    range of hardware and it is fairly easy to port to a new device. Over the last
+    few years, the complexity and ever increasing variety of embedded hardware has
+    led to the introduction of the device tree as a way of describing hardware. The
+    device tree is simply a textual representation of a system that is compiled into
+    a **devicetree binary** (**dtb**) and which is passed to the kernel when it loads.
+    It is up to the kernel to interpret the device tree and to load and initialize
+    drivers for the devices it finds there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In use, U-Boot is very flexible, allowing images to be loaded from mass storage,
+    flash memory, or a network, and booted. Likewise, Barebox can achieve the same
+    but with a smaller base of hardware support. Despite its cleaner design and POSIX-inspired
+    internal APIs, at the time of writing it does not seem to have been accepted beyond
+    its own small but dedicated community.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having covered some of the intricacies of booting Linux, in the next chapter
+    you will see the next stage of the process as the third element of your embedded
+    project, the kernel, comes into play.
+  prefs: []
+  type: TYPE_NORMAL

@@ -1,0 +1,1336 @@
+- en: Advanced File I/O
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf)
+    , *File I/O Essentials*, we covered how an application developer can exploit the
+    available glibc library APIs as well as the typical system calls for performing
+    file I/O (open, read, write, and close). While they work, of course, the reality
+    is that performance is not really optimized. In this chapter, we focus on more
+    advanced file I/O techniques, and how the developer can exploit newer and better
+    APIs, for gaining performance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Often, one gets stressed about the CPU(s) and its/their performance. While important,
+    in many (if not most) real-world application workloads, it's really not the CPU(s)
+    that drag down performance but the I/O code paths that are the real culprit. This
+    is quite understandable; recall, from [Chapter 2](976fc2af-8bb4-4060-96cd-3b921682ed75.xhtml),
+    *Virtual Memory*, we showed that disk speed, in contrast with RAM, is orders of
+    magnitude slower. The case is similar with network I/O; thus, it stands to reason
+    that the real performance bottlenecks occur due to  heavy sustained disk and network
+    I/O.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, the reader will learn several approaches to improve I/O performance;
+    broadly speaking, these approaches will include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Taking full advantage of the kernel page cache
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Giving hints and advice to the kernel on file usage patterns
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using scatter-gather (vectored) I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Leveraging memory mapping for file I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learning about and using sophisticated DIO and AIO techniques
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learning about I/O schedulers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Utilities/tools/APIs/cgroups for monitoring, analysis, and bandwidth control
+    on I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I/O performance recommendations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The key point when performing I/O is realizing that the underlying storage (disk)
+    hardware is much, much slower than RAM. So, devising strategies to minimize going
+    to the disk and working more from memory will always help. In fact, both the library
+    layer (we have already discussed studio buffering in some detail), and the OS
+    (via the page cache and other features within the block I/O layers, and, in fact,
+    even within modern hardware) will perform a lot of work to ensure this. For the
+    (systems) application developer, a few suggestions to consider are made next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If feasible, use large buffers (to hold the data read or to be written) when
+    performing I/O operations upon a file—but how large? A good rule of thumb is to
+    use the same size for the local buffer as the I/O block size of the filesystem
+    upon which the file resides (in fact, this field is internally documented as block
+    size for filesystem I/O). To query it is simple: issue the  `stat(1)` command
+    upon the file in which you want to perform I/O. As an example, let''s say that
+    on an Ubuntu 18.04 system we want to read in the content of the currently running
+    kernel''s configuration file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: As can be seen from the code, `stat(1)` reveals several file characteristics
+    (or attributes) from the file's inode data structure within the kernel, among
+    them the I/O block size.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Internally, the `stat(1)` utility issues the `stat(2)` system call, which parses
+    the inode of the underlying file and supplies all details to user space. So, when
+    required programmatically, make use of the `[f]stat(2)` API(s).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further, if memory is not a constraint, why not just allocate a moderately-to-really-large
+    buffer and perform I/O via it; it will help. Determining how large requires some
+    investigation on your target platform; to give you an idea, in the earlier days,
+    pipe I/O used to use a kernel buffer of size one page; on the modern Linux kernels,
+    the pipe I/O buffer size is increased to a megabyte by default.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel page cache
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As we learned from [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*, when a process (or thread) performs file I/O by, say, using
+    the `fread(3)` or `fwrite(3)` library layer APIs, they ultimately are issued to
+    the underlying OS via the `read(2)` and `write(2)` system calls. These system
+    calls get the kernel to perform the I/O; though it seems intuitive, the reality
+    is that the read-and-write system calls are not synchronous; that is, they may
+    return before the actual I/O has completed. (Obviously, this will be the case
+    for writes to a file; synchronous reads have to return the data read to the user
+    space memory buffer; until then, the read blocks. However, using **Asynchronous
+    I/O** (**AIO**), even reads can be made asynchronous.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The fact is, within the kernel, every single-file I/O operation is cached within
+    a global kernel cache called the *page cache*. So, when a process writes data
+    to a file, the data buffer is not immediately flushed to the underlying block
+    device (disk or flash storage), it''s cached in the page cache. Similarly, when
+    a process reads data from the underlying block device, the data buffer is not
+    instantly copied to the user space process memory buffer; no, you guessed it,
+    it''s stored within the page cache first (and the process will actually receive
+    it from there). Refer again to [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*, *Figure 3: More detail—app to stdio I/O buffer to kernel
+    page cache*, to see this.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Why is this caching within the kernel''s page cache helpful? Simple: by exploiting
+    the key property of a cache, that it, the speed discrepancy between the cached
+    memory region (RAM) and the region it is caching (the block device), we gain tremendous
+    performance. The page cache is in RAM, thus keeping the contents of all file I/O
+    cached (as far as is possible) pretty much guarantees hits on the cache when applications
+    perform reads on file data; reading from RAM is far faster than reading from the
+    storage device. Similarly, instead of slowly and synchronously writing application
+    data buffers directly to the block device, the kernel caches the write data buffers
+    within the page cache. Obviously, the work of flushing the written data to the
+    underlying block devices and the management of the page cache memory itself is
+    well within the Linux kernel''s scope of work (we do not discuss these internal
+    details here).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The programmer can always explicitly flush file data to the underlying storage
+    device; we have covered the relevant APIs and their usage back in [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Giving hints to the kernel on file I/O patterns
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We now understand that the kernel goes ahead and caches all file I/O within
+    its page cache; this is good for performance. It''s useful to think about an example:
+    an application sets up and performs streaming reads on a very large video file
+    (to display it within some app window to the user; we shall assume the particular
+    video file is being accessed for the first time). It''s easy to understand that,
+    in general, caching a file as it''s read from the disk helps, but here, in this
+    particular case, it would not really help much, as, the first time, we still have
+    to first go to the disk and read it in. So, we shrug our shoulders and continue
+    coding it in the usual way, sequentially reading in chunks of video data (via
+    it''s underlying codec) and passing it along to the render code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Via the posix_fadvise(2) API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Can we do better? Yes, indeed: Linux provides the  `posix_fadvise(2)` system
+    call, allowing an application process to give hints to the kernel on it''s pattern
+    of access to file data, via a parameter called `advice`. Relevant to our example,
+    we can pass advice as the value `POSIX_FADV_SEQUENTIAL`, `POSIX_FADV_WILLNEED`,
+    to inform the kernel that we expect to read file data sequentially and that we
+    expect we shall require access to the file''s data in the near future. This advice
+    causes the kernel to initiate an aggressive read-ahead of the file''s data in
+    sequential order (lower-to-higher file offsets) into the kernel page cache. This
+    will greatly help increase performance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signature of the `posix_fadvise(2)` system call is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Clearly, the first parameter `fd` represents the file descriptor (we refer the
+    reader to [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*), and the second and third parameters, `offset` and `len`,
+    specify a region of the file upon which we pass the hint or advice via the fourth
+    parameter, `advice`. (The length is actually rounded up to the page granularity.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Not only that, the application, upon finishing processing upon a chunk of video
+    data, could even specify to the OS that it will not require that particular piece
+    of memory any longer by invoking `posix_fadvise(2)` with advice set to the value
+    `POSIX_FADV_DONTNEED`; this will be a hint to the kernel that it can free up the
+    page(s) of the page cache holding that data, thereby creating space for incoming
+    data of consequence (and for already cached data that may still be useful).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are some caveats to be aware of. First, it's important for the developer
+    to realize that this advice is really just a hint, a suggestion, to the OS; it
+    may or may not be honored. Next, again, even if the target file's pages are read
+    into the page cache, they could be evicted for various reasons, memory pressure
+    being a typical one. There's no harm in trying though; the kernel will often take
+    the advice into account, and it can really benefit performance. (More advice values
+    can be looked up, as usual, within the man page pertaining to this API.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Interestingly, and now understandably, `cat(1)` uses the `posix_fadvise(2)`
+    system call to inform the kernel that it intends to perform sequential reads until
+    EOF. Using the powerful `strace(1)` utility on `cat(1)` reveals the following:
+    `...fadvise64(3, 0, 0, POSIX_FADV_SEQUENTIAL) = 0`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't get stressed with the fadvise64; it's just the underlying system call
+    implementation on Linux for the `posix_fadvise(2)` system call.  Clearly, `cat(1)`
+    has invoked this on the file (descriptor 3), offset 0 and length 0—implying until
+    EOF, and with the advice parameter set to `POSIX_FADV_SEQUENTIAL`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Via the readahead(2) API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The Linux (GNU)-specific `readahead(2)` system call achieves a similar result
+    as the `posix_fadvise(2)` we just saw in terms of performing aggressive file read-ahead.
+    Its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The read-aheads are performed on the target file specified by `fd`, starting
+    from the file `offset` and for a maximum of `count` bytes (rounded up to page
+    granularity).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though not normally required, what if you want to explicitly empty (clean)
+    the contents of the Linux kernel''s page cache? If required, do this as the root user:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`# sync && echo 1 > /proc/sys/vm/drop_caches`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't miss the `sync(1)` first, or you risk losing data. Again, we stress that
+    flushing the kernel page cache should not be done in the normal course, as this
+    could actually hurt I/O performance. A collection of useful **command -line interface** (**CLI**)
+    wrapper utilities called linux-ftools is available on GitHub here: [https://github.com/david415/linux-ftools](https://github.com/david415/linux-ftools).
+    It provides the `fincore(1)` (that's read as f-in-core), `fadvise(1)`, and `fallocate(1)`
+    utilities; it's very educational to check out their GitHub README, read their
+    man pages, and try them out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MT app file I/O with the pread, pwrite APIs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Recall the `read(2)` and `write(2`) system calls that we saw in [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*;they form the basis of performing I/O to files. You will
+    also recall that, upon using these APIs, the underlying file offset will be implicitly
+    updated by the OS. For example, if a process opens a file (via `open(2)`), and
+    then performs a `read(2)` of 512 bytes, the file's offset (or the so-called seek position)
+    will now be 512\. If it now writes, say, 200 bytes, the write will occur from
+    position 512 up to position 712, thereby setting the new seek position or offset
+    to this number.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Well, so what? Our point is simply that the file''s offset being set implicitly
+    causes issues when a multithreaded application has multiple threads simultaneously
+    performing I/O upon the same underlying file. But wait, we have mentioned this
+    before: the file is required to be locked and then worked upon. But, locking creates
+    major performance bottlenecks. What if you design an MT app whose threads work
+    upon different portions of the same file in parallel? That sounds great, except
+    that the file''s offset would keep changing and thus ruin our parallelism and
+    thus performance (you will also recall from our discussions in [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*, that simply using  `lseek(2)` to set the file''s seek position
+    explicitly can result in dangerous races).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, what do you do? Linux provides the `pread(2)` and `pwrite(2)` system calls
+    (p for positioned I/O) for this very purpose; with these APIs, the file offset
+    to perform I/O at can be specified (or positioned) and the actual underlying file
+    offset is not changed by the OS. Their signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The difference between the `pread(2)`/`pwrite(2)` and the usual `read(2)`/`write(2)`
+    system calls is that the former APIs take an additional fourth parameter—the file
+    offset at which to perform the read or write I/O operation, without modifying
+    it. This allows us to achieve what we wanted: having an MT app perform high-performance
+    I/O by having multiple threads simultaneously read and write to different portions
+    of the file in parallel. (We leave the task of trying this out as an interesting
+    exercise to the reader.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few caveats to be aware of: first, just as with `read(2)` and `write(2)`,
+    `pread(2)`, and `pwrite(2)` too can return without having transferred all requested
+    bytes; it is the programmer''s responsibility to check and call the APIs in a
+    loop until no bytes remain to transfer (revisit [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*). Correctly using the read/write APIs, where issues such
+    as this are addressed). Secondly, when a file is opened with the `O_APPEND` flag
+    specified, Linux''s `pwrite(2)` system call always appends data to the EOF irrespective
+    of the current offset value; this violates the POSIX standard, which states that
+    the `O_APPEND` flag should have no effect on the start location where the write
+    occurs. Thirdly, and quite obviously (but we must state it), the file being operated
+    upon must be capable of being seeked upon (that is, the `fseek(3)` or `lseek(2)`
+    APIs are supported). Regular files always do support the seek operation, but pipes
+    and some types of devices do not).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Scatter – gather I/O
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To help explain this topic, let''s say that we are commissioned with writing
+    data to a file such that three discontiguous data regions A, B, and C are written
+    (filled with As, Bs, and Cs, respectively); the following diagram shows this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The discontiguous data file
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Notice how the files have holes—regions that do not contain any data content;
+    this is possible to achieve with regular files (files that are largely holes are
+    termed sparse files). How do you create the hole? Simple: just perform an `lseek(2)`
+    and then `write(2)` data; the length seeked forward determines the size of the
+    hole in the file.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, how can we achieve this data file layout as shown? We shall show two approaches—one,
+    the traditional manner, and two, a far more optimized-for-performance approach.
+    Let's get started with the traditional approach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Discontiguous data file – traditional approach
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'This seems quite simple: first seek to the required start offset and then write
+    the data content for the required length; this can be done via the pair of `lseek(2)`
+    and `write(2)` system calls. Of course, we will have to invoke this pair of system
+    calls three times. So, we write some code to actually perform this task; see the
+    (relevant snippets) of the code here (`ch18/sgio_simple.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For readability, only key parts of the source code are displayed; to view the
+    complete source code, build, and run it, the entire tree is available for cloning
+    from GitHub here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice how we have written the code to use an `{lseek, write}` pair of system
+    calls three times in succession; let''s try it out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: It worked; the file we created, `tmptest` (we have not shown the code to create
+    the file, allocate and initialize the buffers, and so on, here; please look it
+    up via the book's GitHub repository), is of length 222 bytes, although the actual
+    data content (the As, Bs, and Cs) is of length 20+30+42 = 92 bytes. The remaining
+    (222 - 92) 130 bytes are the three holes in the file (of length 10+100+20 bytes;
+    see the macros that define these in the code). The `hexdump(1)` utility conveniently
+    dumps the file's content; 0x41 being A, 0x42 is B, and 0x43 is C. The holes are
+    clearly seen as NULL-populated regions of the length we wanted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Discontiguous data file – the SG – I/O approach
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The traditional approach using the `{lseek, write}` pair of system calls three
+    times in succession worked, of course, but at a rather large performance penalty;
+    the fact is, issuing system calls is considered very expensive. A far superior
+    approach performance-wise is called *scatter-gather I/O* (SG-I/O, or vectored
+    I/O). The relevant system calls are `readv(2)` and `writev(2)`; this is their
+    signature:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'These system calls allow you to specify a bunch of segments to read or write
+    in one shot; each segment describes a single I/O operation via a structure called `iovec`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The programmer can pass along an array of segments describing the I/O operations
+    to perform; this is precisely the second parameter—a pointer to an array of struct
+    iovecs; the third parameter is the number of segments to process. The first parameter
+    is obvious—the file descriptor representing the file upon which to perform the
+    gathered read or scattered write.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, think about it: you can gather together discontiguous reads from a given
+    file into buffers (and their sizes) you specify via the I/O vector pointer, and
+    you can scatter discontiguous writes to a given file from buffers (and their sizes)
+    you specify via the I/O vector pointer; these types of multiple discontiguous
+    I/O operations are thus called scatter-gather I/O! Here is the really cool part:
+    the system calls are guaranteed to perform these I/O operations in array order
+    and atomically; that is, they will return only when all operations are done. Again,
+    though, watch out: the return value from `readv(2)` or `writev(2)` is the actual
+    number of bytes read or written, and `-1` on failure. It''s always possible that
+    an I/O operation performs less than the amount requested; this is not a failure,
+    and it''s up to the developer to check.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, for our earlier data file example, let''s look at the code that sets up
+    and performs the discontiguous scattered ordered-and-atomic writes via `writev(2)`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The end result is identical to that of the traditional approach; we leave it
+    to the reader to try it out and see. This is the key point: the traditional approach
+    had us issuing a minimum of six system calls (3 x `{lseek, write}` pairs) to perform
+    the discontiguous data writes into the file, whereas the SG-I/O code performs
+    the very same discontiguous data writes with just one system call. This results
+    in significant performance gains, especially for applications under heavy I/O
+    workloads.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The interested reader, delving into the full source code of the previous example
+    program (`ch18/sgio_simple.c`) will notice something that perhaps seems peculiar
+    (or even just wrong): the blatant use of the controversial `goto` statement! The
+    fact, though, is that the `goto` can be very useful in error handling—performing
+    the code cleanup required when exiting a deep-nested path within a function due
+    to failure. Please check out the links provided in the *Further reading* section
+    on the GitHub repository for more. The Linux kernel community has been quite happily
+    using the `goto` for a long while now; we urge developers to look into appropriate
+    usage of the same.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: SG – I/O variations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Recall from the *MT app file I/O with the pread, pwrite APIs *section, we could
+    use the `pread(2)` and `pwrite(2)` system calls to effectively perform file I/O
+    in parallel via multiple threads (in a multithreaded app). Similarly, Linux provides
+    the `preadv(2)` and the `pwritev(2)` system calls; as you can guess, they provide
+    the functionality of the `readv(2)` and `writev(2)` with the addition of a fourth
+    parameter offset; just as with the `readv(2)` and `writev(2)`, the file offset
+    at which SG-IO is to be performed can be specified and it will not be changed
+    (again, perhaps useful for an MT application). The signature of the `preadv(2)`
+    and `pwritev(2)` is shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Recent Linux kernels (version 4.6 onward for some) also provide a further variation
+    on the APIs: the `preadv2(2)` and the `pwritev2(2)` system calls. The difference
+    from the previous APIs is that they take an additional fifth parameter flag allowing
+    the developer to have more control over the behavior of the SG-I/O operations
+    by being able to specify whether they are synchronous (via the RWF_DSYNC and the RWF_SYNC
+    flags), high-priority (via the RWF_HIPRI flag), or non-blocking (via the RWF_NOWAIT
+    flag). We refer the reader to the man page on `preadv2(2)`/ `pwritev2(2)` for
+    details.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: File I/O via memory mapping
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Both in [Appendix A](https://www.packtpub.com/sites/default/files/downloads/File_IO_Essentials.pdf),
+    *File I/O Essentials*, and in this chapter, we have on several occasions mentioned
+    how the Linux kernel's page cache helps greatly enhance performance by caching
+    the content of files within it (alleviating the need to each time go to the really
+    slow storage device and instead just read or write data chunks within RAM). However,
+    though we gain performance via the page cache, there remains a hidden problem
+    with using both the traditional `read(2)`, `write(2)` APIs or even the faster
+    SG-I/O (the `[p][read|write][v][2](2)`) APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux I/O code path in brief
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To understand what the issue is, we must first gain a bit of a deeper understanding
+    of how the I/O code path actually works; the following diagram encapsulates the
+    points of relevance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ed260a42-11ae-4f52-bc88-a2347b755b7a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1: Page cache populated with'
+  prefs: []
+  type: TYPE_NORMAL
+- en: disk data
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reader should realize that though this diagram seems quite detailed, we're
+    actually seeing a rather simplistic view of the entire Linux I/O code path (or
+    I/O stack), only what is relevant to this discussion. For a more detailed overview
+    (and diagram), please see the link provided in the *Further reading *section on
+    the GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s say that a **Process P1** intends to read some 12 KB of data from a
+    target file that it has open (via the `open(2)` system call); we envision that
+    it does so via the usual manner:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocate a heap buffer of 12 KB (3 pages = 12,288 bytes) via the `malloc(3)`
+    API.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Issue the `read(2)` system call to read in the data from the file into the heap
+    buffer.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `read(2)` system call performs the work within the OS; when the read is
+    done, it returns (hopefully the value `12,288`; remember, it's the programmer's
+    job to check this and not assume anything).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This sounds simple, but there''s a lot more that happens under the hood, and
+    it is in our interest to dig a little deeper. Here''s a more detailed view of
+    what happens (the numerical points **1**, **2**, and **3** are shown in a circle
+    in the previous diagram; follow along):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Process P1** allocates a heap buffer of 12 KB via the `malloc(3)` API (len
+    = 12 KB = 12,288 bytes).'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Next, it issues a `read(2)` system call to read data from the file (specified
+    by fd) into the heap buffer buf just allocated, for length 12 KB.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'As `read(2)` is a system call, the process (or thread) now switches to kernel
+    mode (remember the monolithic design we covered back in [Chapter 1](c17af8c2-a426-4ab6-aabb-aa1374e56cc4.xhtml),
+    *Linux System Architecture*); it enters the Linux kernel''s generic filesystem
+    layer (called the **Virtual Filesystem Switch** (**VFS**)), from where it will
+    be auto-shunted on to its appropriate underlying filesystem driver (perhaps the
+    ext4 fs), after which the Linux kernel will first check: are these pages of the
+    required file data already cached in our page cache? If yes, the job is done,
+    (we short circuit to *step 7*), just copy back the pages to the user space buffer.
+    Let''s say we get a cache miss—the required file data pages aren''t in the page
+    cache.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Thus, the kernel first allocates sufficient RAM (page frames) for the page cache
+    (in our example, three frames, shown as pink squares within the page cache memory
+    region). It then fires off appropriate I/O requests to the underlying layers requesting
+    the file data.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The request ultimately ends up at the block (storage) driver; we assume it knows
+    its job and reads the required data blocks from the underlying storage device
+    controller (a disk or flash controller chip, perhaps). It then (here's the interesting
+    thing) is given a destination address to write the file data to; it's the address
+    of the page frames allocated (step 4) within the page cache; thus, the block driver
+    always writes the file data into the kernel's page cache and never directly back
+    to the user mode process buffers.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The block driver has successfully copied the data blocks from the storage device
+    (or whatever) into the previously allocated frames within the kernel page cache.
+    (In reality, these data transfers are highly optimized via an advanced memory
+    transfer technique called **Direct Memory Access** (**DMA**), wherein, essentially,
+    the driver exploits the hardware to directly transfer data to and from the device
+    and system memory without the CPU's intervention. Obviously, these topics are
+    well beyond the scope of this book.)
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The just-populated kernel page cache frames are now copied into the user space
+    heap buffer by the kernel.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The (blocking) `read(2)` system call now terminates, returning the value 12,288
+    indicating that all three pages of file data have indeed been transferred (again,
+    you, the app developer, are supposed to check this return value and not assume
+    anything).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'It''s all looking great, yes? Well, not really; think carefully on this: though
+    the `read(2)` (or `pread[v][2](2)`) API did succeed, this success came at a considerable
+    price: the kernel had to allocate RAM (page frames) in order to hold the file
+    data within its page cache (step 4) and, once data transfer was done (step 6)
+    then copied that content into the user space heap memory (step 7). Thus, we have
+    used twice the amount of RAM that we should have by keeping an extra copy of the
+    data. This is highly wasteful, and, obviously, the multiple copying around of
+    the data buffers between the block driver to the kernel page cache and then the
+    kernel page cache to the user space heap buffer, reduces performance as well (not
+    to mention that the CPU caches get unnecessarily caught up with all this trashing
+    their content). With the previous pattern of code, the issue of not waiting for
+    the slow storage device is taken care of (via the page cache efficiencies), but
+    everything else is really poor—we have actually doubled the required memory usage
+    and the CPU caches are overwritten with (unnecessary) file data while copying
+    takes place.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory mapping a file for I/O
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Here is a solution to these issues: memory mapping via the  `mmap(2)` system
+    call. Linux provides the very powerful `mmap(2)` system call; it enables the developer
+    to map any content directly into the process  **virtual address space** (**VAS**).
+    This content includes file data, hardware device (adapter) memory regions, or
+    just generic memory regions. In this chapter, we shall only focus on using  `mmap(2)`
+    to map in a regular file's content into the process VAS. Before getting into how the
+    `mmap(2)` becomes a solution to the memory wastage issue we just discussed, we
+    first need to understand more about using the `mmap(2)` system call itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signature of the `mmap(2)` system call is shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We want to map a given region of a file, from a given `offset` and for `length` bytes
+    into our process VAS; a simplistic view of what we want to achieve is depicted
+    in this diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/61b1e79e-6de8-4622-a1f7-3ee3b24b376e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: Memory mapping a file region into process VAS'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To achieve this file mapping to process VAS, we use the `mmap(2)` system call.
+    Glancing at its signature, it''s quite obvious what we need to do first: open
+    the file to be mapped via the `open(2)` (in the appropriate mode: read-only or
+    read-write, depending on what you want to do), thereby obtaining a file descriptor;
+    pass this descriptor as the fifth parameter to   `mmap(2)`. The file region to
+    be mapped into the process VAS can be specified via the sixth and second parameters
+    respectively—the file `offset` at which the mapping should begin and the `length`
+    (in bytes).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first parameter, `addr`, is a hint to the kernel as to where in the process
+    VAS the mapping should be created; the recommendation is to pass `0` (NULL) here,
+    allowing the OS to decide the location of the new mapping. This is the correct
+    portable way to use the `mmap(2)`; however, some applications (and, yes, some
+    malicious security hacks too!) use this parameter to try to predict where the
+    mapping will occur. In any case, the actual (virtual) address where the mapping
+    is created within the process VAS is the return value from the  `mmap(2)`; a NULL
+    return indicates failure and must be checked for.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is an interesting technique to fix the location of the mapping: first
+    perform a  `malloc(3)` of the required mapping size and pass the return value
+    from this `malloc(3)` to the `mmap(2)`''s first parameter (also set the flags parameter
+    to include the MAP_FIXED bit)! This will probably work if the length is above
+    MMAP_THRESHOLD (128 KB by default) and the size is a multiple of the system page
+    size. Note, again, this technique is not portable and may or may not work.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another point to note is that most mappings—and always file mappings—are performed
+    to page granularity, that is, in multiples of the page size; thus, the return
+    address is usually page-aligned.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The third parameter to `mmap(2)` is an integer bitmask `prot`—the memory protections
+    of the given region (recall we have already come across memory protections in [Chapter
+    4](0b4868f7-a8d0-4ced-831f-20af9929de9f.xhtml), *Dynamic Memory Allocation*, in
+    the *Memory protection* section). The `prot` parameter is a bitmask and can either
+    be just the `PROT_NONE` bit (implying no permissions) or the bitwise OR of the
+    remainder; this table enumerates the bits and their meaning:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Protection bit** | **Meaning** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PROT_NONE` | No access allowed on the page(s) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PROT_READ` | Reads allowed on the page(s) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PROT_WRITE` | Writes allowed on the page(s) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PROT_EXEC` | Execute access allowed on the page(s) |'
+  prefs: []
+  type: TYPE_TB
+- en: mmap(2) protection bits
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The page protections must match those of the file''s `open(2)`, of course.
+    Also note that, on older x86 systems, writable memory used to imply readable memory
+    (that is, `PROT_WRITE => PROT_READ`). This is no longer the case; you must explicitly specify
+    whether the mapped pages are readable or not (the same holds true for executable
+    pages too: it must be specified, the text segment being the canonical example).
+    Why would you use PROT_NONE? A guard page is one realistic example (recall the *Stack
+    guards *section from [Chapter 14](586f3099-3953-4816-8688-490c9cf2bfd7.xhtml),
+    *Multithreading with Pthreads Part I - Essentials*).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: File and anonymous mappings
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The next point to understand is that there are broadly two types of mappings;
+    a file-mapped region or an anonymous region. A file-mapped region quite obviously
+    maps the (full, or partial) content of a file (as shown in the previous figure).
+    We think of the region as being backed by a file; that is, if the OS runs short
+    of memory and decides to reclaim some of the file-mapped pages, it need not write
+    them to the swap partition—they're already available within the file that was
+    mapped. On the other hand, an anonymous mapping is a mapping whose content is
+    dynamic; the data segments (initialized data, BSS, heap), the data sections of
+    library mappings, and the process (or thread) stack(s) are excellent examples
+    of anonymous mappings. Think of them as not being file-backed; thus, if memory
+    runs short, their pages may indeed be written to swap by the OS. Also, recall
+    what we learned back in [Chapter 4](0b4868f7-a8d0-4ced-831f-20af9929de9f.xhtml), *Dynamic
+    Memory Allocation*, regarding the `malloc(3)`; the fact is that the glibc `malloc(3)`
+    engine uses the heap segment to service the allocation only when it's for a small
+    amount—less than MMAP_THRESHOLD (defaults to 128 KB). Any `malloc(3)` above that
+    will result in `mmap(2)` being internally invoked to set up an anonymous memory
+    region—a mapping!—of the required size. These mappings (or segments) will live
+    in the available virtual address space between the top of the heap and the stack
+    of main.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Back to the `mmap(2)`: the fourth parameter is a bitmask called `flags`; there
+    are several flags, and they affect many attributes of the mapping. Among them,
+    two flags determine the privacy of the mapping and are mutually exclusive (you
+    can only use any one of them at a time):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**MAP_SHARED**: The mapping is a shared one; other processes might work on
+    the same mapping simultaneously (this, in fact, is the generic manner in which
+    a common IPC mechanism—shared memory —can be implemented). In the case of a file
+    mapping, if the memory region is written to, the underlying file is updated! (You
+    can use the `msync(2)` to control the flushing of in-memory writes to the underlying
+    file.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**MAP_PRIVATE**: This sets up a private mapping; if it''s writable, it implies
+    COW  semantics (leading to optimal memory usage, as explained in [Chapter 10](607ad988-406d-4736-90a4-3a318672ab6e.xhtml),
+    *Process Creation*). A file-mapped region that is private will not carry through
+    writes to the underlying file. Actually, a private file-mapping is very common
+    on Linux: this is precisely how, at the time of starting to execute a process,
+    the loader (see the information box) brings in the text and data of both the binary
+    executable as well as the text and data of all shared libraries that the process
+    uses.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The reality is that when a process runs, control first goes to a program embedded
+    into your `a.out` binary executable—the loader (`ld.so` or `ld-linux[-*].so`).
+    It performs the key work of setting up the C runtime environment: it memory maps (via
+    the `mmap(2)`) the text (code) and initialized data segments from the binary executable
+    file into the process, thereby creating the segments in the VAS that we have been
+    talking about since [Chapter 2](976fc2af-8bb4-4060-96cd-3b921682ed75.xhtml), *Virtual
+    Memory*. Further, it sets up the initialized data segment, the BSS, the heap,
+    and the stack (of `main()`), and then it looks for and memory maps all shared
+    libraries into the process VAS.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Try performing a `strace(1)` on a program; you will see (early in the execution)
+    all the `mmap(2)` system calls setting up the process VAS! The `mmap(2)` is critical
+    to Linux: in effect, the entire setup of the process VAS, the segments or mappings—both
+    at process startup as well as later—are all done via the `mmap(2)` system call.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help get these important facts clear, we show some (truncated) output of
+    running  `strace(1)` upon `ls(1)`; (for example) see how the `open(2)` is done
+    upon glibc, file descriptor 3 is returned, and that in turn is used by the `mmap(2)`
+    to create a private file-mapped read-only mapping of glibc''s code (we can tell
+    by seeing that the offset in the first `mmap` is `0`) in the process VAS! (A detail:
+    the `open(2)` becomes the `openat(2)` function within the kernel; ignore that,
+    just as quite often on Linux, the `mmap(2)` becomes `mmap2(2)`.) The `strace(1)`
+    (truncated) output follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The kernel maintains a data structure called the **virtual memory area** (**VMA**)
+    for each such mapping per process; the proc filesystem reveals all mappings to
+    us in user space via `/proc/PID/maps`. Do take a look; you will literally see
+    the virtual memory map of the process user space. (Try `sudo cat /proc/self/maps` to
+    see the map of the cat process itself.) The man page on `proc(5)` explains in
+    detail how to interpret this map; please take a look.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mmap advantage
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that we understand how to use the `mmap(2)` system call, we revisit our
+    earlier discussion: recall, using the `read(2)`/`write(2)` or even the SG-I/O
+    type APIs (the `[p]readv|writev[2](2)`) resulted in a double-copy; memory wastage
+    (plus the fact that CPU caches get trashed as well).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The key to realizing why the `mmap(2)` so effectively solves this serious issue
+    is this: the `mmap(2)` sets up a file mapping by internally mapping the kernel
+    page caches pages that contain the file data (that was read in from the storage
+    device) directly into the process virtual address space. This diagram (*Figure
+    3*) puts this into perspective (and makes it self-explanatory):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/17d428b0-e611-49dc-9c50-908fa2bc0d98.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 3: Page cache populated with'
+  prefs: []
+  type: TYPE_NORMAL
+- en: disk data
+  prefs: []
+  type: TYPE_NORMAL
+- en: A mapping is not a copy; thus `mmap(2)`-based file I/O is called a zero-copy
+    technique: a way of performing work on an I/O buffer of which exactly one copy
+    is maintained by the kernel in it's page cache; no more copies are required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fact is that the device driver authors look to optimize their data path
+    using zero-copy techniques, of which the `mmap(2)` is certainly a candidate. See
+    more on this interesting advanced topic within links provided in the *Further
+    reading* section on the GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `mmap(2)` does incur significant overhead in setting up the mapping (the
+    first time), but, once done, I/O is very quick, as it is essentially performed
+    in memory. Think about it: to seek to a location within the file and perform I/O
+    there, just use your regular ''C'' code to move to a given location from the `mmap(2)`
+    return value (it''s just a pointer offset) and do the I/O work in memory itself
+    (via the `memcpy(3)`, `s[n]printf(3)`, or whatever you prefer); no `lseek(2)`,
+    no `read(2)`/`write(2)`, or SG-I/O system call overheads at all. Using the `mmap(2)`
+    for very small amounts of I/O work may not be optimal; it''s usage is recommended
+    when large and continuous I/O workloads are indicated.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code example
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To aid the reader in working with the `mmap(2)` for the purpose of file I/O,
+    we have provided the code of a simple application; it memory maps a given file
+    (the file's pathname, start offset, and length are provided as parameters) via
+    the `mmap(2)` and hexdumps (using a, slightly enhanced, open source `hexdump`
+    function) the memory region specified on to `stdout`. We urge the reader to look
+    up the code, build, and try it out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The complete source code for this book is available for cloning from GitHub
+    here: [https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux](https://github.com/PacktPublishing/Hands-on-System-Programming-with-Linux).
+    The aforementioned program is here within the source tree: `ch18/mmap_file_simple.c`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory mapping – additional points
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A quick summation of a few additional points to wrap up the memory mapping
+    discussion follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fourth parameter to `mmap(2)`, `flags`, can take on several other (quite
+    interesting) values; we refer the reader to the man page on `mmap(2)` to browse
+    through them: [http://man7.org/linux/man-pages/man2/mmap.2.html](http://man7.org/linux/man-pages/man2/mmap.2.html).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Directly analogous to how we can give hints or advice to the kernel regarding
+    kernel page cache pages with the `posix_fadvise(2)` API, you can provide similar
+    hints or advice to the kernel regarding memory usage patterns for a given memory
+    range (start address, length provided) via the `posix_madvise(3)` library API.
+    The advice values include being able to say that we expect random access to data
+    (thereby reducing read-ahead, via the `POSIX_MADV_RANDOM` bit), or that we expect
+    to access data in the specified range soon (via the `POSIX_MADV_WILLNEED` bit,
+    resulting in more read-ahead and mapping). This routine invokes the underlying
+    system call `madvise(2)` on Linux.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's say we have mapped a region of a file into our process address space;
+    how do we know which pages of the mapping are currently residing in the kernel
+    page (or buffer) cache? Precisely this can be determined via the `mincore(2)`
+    system call (read as "m-in-core").
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The programmer has explicit (and fine-tuned) control over synchronizing (flushing)
+    file-mapped regions (back to the file) via the `msync(2)` system call.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Once complete, the memory mapping should be unmapped via the `munmap(2)` system
+    call; the parameters are the base address of the mapping (the return value from
+    `mmap(2)`) and the length. If the process terminates, the mapping is implicitly
+    unmapped.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On `fork(2)`, a memory mapping is inherited by the child process.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What if an enormous file is memory mapped, and at runtime when allocating page
+    frames to hold the mapping in the process VAS (recall our discussion on demand-paging from [Chapter
+    4](0b4868f7-a8d0-4ced-831f-20af9929de9f.xhtml), *Dynamic Memory Allocation*),
+    the system runs out of memory (drastic, but it could occur); in cases such as
+    these, the process will receive the `SIGSEGV` signal (and thus it's up to the
+    app's signal-handling ability to gracefully terminate).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: DIO and AIO
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A significant downside of using both the blocking `[p]read[v](2)` / `[p]write[v](2)`
+    APIs as well as the `mmap(2)` (actually much more so with the `mmap`) is this:
+    they depend on the kernel page cache always being populated with the file''s pages
+    (that it''s working upon or mapping). If this is not the case—which can happen
+    when the data store is much larger than RAM size (that it, files can be enormous)—it
+    will result in a lot of meta-work by the kernel **memory management** (**mm**)
+    code to bring in pages from disk to page cache, allocating frames, stitching up
+    page table entries for them, and so on. Thus, the `mmap` technique works best
+    when the ratio of RAM to storage is as close to 1:1 as possible. When the storage
+    size is much larger than the RAM (often the case with enterprise-scale software
+    such as databases, cloud virtualization at scale, and so on), it can suffer from
+    latencies caused by all the meta work, plus the fact that significant amounts
+    of memory will be used for paging metadata.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Two I/O technologies—DIO and AIO—alleviate these issues (at the cost of complexity);
+    we provide a brief note on them next. (Due to space constraints, we focus on the
+    conceptual side of these topics; learning to use the relevant APIs is then a relatively
+    easy task. Do refer to the *Further reading* section on the GitHub repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Direct I/O (DIO)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: An interesting I/O technology is **Direct I/O** (**DIO**); to use it, specify
+    the `O_DIRECT` flag when opening the file via the `open(2)` system call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With DIO, the kernel page cache is completely bypassed, thereby immediately
+    giving the benefit that all the issues that can be faced with the `mmap` technique
+    now disappear. On the other hand, this does imply that the entire cache management
+    is to be completely handled by the user space app (large projects such as databases
+    would certainly require caching!). For regular small apps with no special I/O
+    requirements, using DIO will likely degrade performance; be careful, test your
+    workload under stress, and determine whether to use DIO or skip it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Traditionally, the kernel handles which pieces of I/O (the I/O requests) are
+    serviced when—in other words, I/O scheduling (it''s not directly related, but
+    also see the section on *I/O schedulers*). With DIO (and with AIO, seen next),
+    the application developer can essentially take over I/O scheduling by determining
+    when to perform I/O. This can be both a blessing and a curse: it provides the
+    flexibility to the (sophisticated) app developer to design and implement I/O scheduling,
+    but this is not a trivial thing to perform well; as usual, it''s a trade-off.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, you should realize that though we call the I/O path direct, it does not
+    guarantee that writes are immediately flushed to the underlying storage medium;
+    that's a separate feature, one that can be requested by specifying the `O_SYNC`
+    flag to the `open(2)` or of course explicitly flushing (via the `[f]sync(2)` system
+    calls).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Asynchronous I/O (AIO)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Asynchronous I/O** (**AIO**) is a modern high-performance asynchronous non-blocking
+    I/O technology that Linux implements. Think about it: non-blocking and asynchronous
+    implies that an application thread can issue a read (for file or network data);
+    the usermode API returns immediately; the I/O is queued up within the kernel;
+    the application thread can continue working on CPU-bound stuff; once the I/O request
+    completes, the kernel notifies the thread that the read is ready; the thread then
+    actually performs the read. This is high-performance—the app does not remain blocked
+    on I/O and can instead perform useful work while the I/O request is processed;
+    not only that, it is asynchronously notified when the I/O work is done. (On the
+    other hand, the multiplexing APIs such as `select(2)`, `poll(2)`, and `epoll(7)` are
+    asynchronous—you can issue the system call and return immediately—but they actually
+    are still blocking in nature because the thread must check for I/O completion—for
+    example, by using the `poll(2)` in tandem with a `read(2)` system call when it
+    returns—which is still a blocking operation.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With AIO, a thread can initiate multiple I/O transfers concurrently; each transfer
+    will require a context—called the *[a]iocb*—the [async] I/O control block data
+    structure (Linux calls the structure an iocb, the POSIX AIO framework (a wrapper
+    library) calls it aiocb). The [a]iocb structure contains the file descriptor,
+    the data buffer, the async event notification structure `sigevent`, and so on.
+    The alert reader will recall that we have already made use of this powerful `sigevent` structure
+    in [Chapter 13](1f621f72-e067-42db-b2eb-b82e20161dec.xhtml), *Timers*, within
+    the *Creating and using a POSIX (interval) timer *section. It's really via this `sigevent` structure
+    that the asynchronous notification mechanism is implemented (we had used it in [Chapter
+    13](1f621f72-e067-42db-b2eb-b82e20161dec.xhtml), *Timers*, to be asynchronously 
+    informed that our timer expired; this was done by setting `sigevent.sigev_notify` to
+    the value `SIGEV_SIGNAL`, thereby receiving a signal upon timer expiry). Linux
+    exposes five system calls for the app developer to exploit AIO; they are as follows: ​`io_setup(2)`, `io_submit(2)`, `io_cancel(2)`, `io_getevents(2)`,
+    and `io_destroy(2)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: AIO wrapper APIs are provided by two libraries—libaio and librt (which is released
+    along with glibc); you can use their wrappers which will ultimately invoke the
+    system calls of course. There are also the POSIX AIO wrappers; see the man page
+    on `aio(7)` for an overview on using it, as well as example code. (Also see the
+    articles in the *Further reading* section on the GitHub repository for more details
+    and example code.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: I/O technologies – a quick comparison
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following table provides a quick comparison to some of the more salient
+    comparison points between the four to five Linux I/O technologies we have seen,
+    namely: the blocking `read(2)`/`write(2)` (and the SG-I/O/positioned `[p]read[v](2)`/`[p]write[v](2)`),
+    memory mapping, non-blocking (mostly synchronous) DIO, and non-blocking asynchronous
+    AIO:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **I/O Type** | **APIs** | **Pros** | **Cons** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Blocking (regular and SG-IO / positioned) | `[p]read[v](2)` /`[p]write[v](2)`
+    | Easy to use | Slow; double-copy of data buffers  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Memory Mapping | `mmap(2)` | (Relatively) easy to use; fast (in memory I/O);
+    single copy of data (a zero-copy technique); works best when RAM:Storage :: ~
+    1:1 | MMU-intensive (high page table overhead, meta-work) when RAM: Storage ratio
+    is 1:N (N>>1) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| DIO (non-blocking, mostly synchronous) | `open(2)` with `O_DIRECT` flag |
+    Zero-copy technique; no impact on page cache; control over caching; some control
+    over I/O scheduling | Moderately complex to set up and use: app must perform its
+    own caching |'
+  prefs: []
+  type: TYPE_TB
+- en: '| AIO  (non-blocking, asynchronous) | <Various: see aio(7) - POSIX AIO, Linux
+    `io_*(2)`, and so on> | Truly async and non-blocking—required for high-performance
+    apps; zero-copy technique; no impact on page cache; full control over caching,
+    I/O and thread scheduling | Complex to set up and use |'
+  prefs: []
+  type: TYPE_TB
+- en: Linux I/O technologies—a quick comparison
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the *Further reading* section on the GitHub repository, we provide links
+    to two blog articles (from two real-world products: Scylla, a modern high-performance
+    distributed No SQL data store, and NGINX, a modern high-performance web server), that
+    discuss in depth how these alternative powerful I/O technologies (AIO, thread
+    pools) are used in (their respective) real-world products; do take a look.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Multiplexing or async blocking I/O – a quick note
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You often hear about powerful multiplexing I/O APIs—the `select(2)`, `poll(2)`,
+    and, more recently, Linux's powerful `epoll(7)` framework. These APIs, `select(2)`,
+    `poll(2)`, and/or `epoll(7)`, provide what is known as asynchronous blocking I/O.
+    They work well upon descriptors that remain blocked on I/O; examples are sockets,
+    both Unix and internet domain, as well as pipes—both unnamed and named pipes (FIFOs).
+  prefs: []
+  type: TYPE_NORMAL
+- en: These I/O technologies are asynchronous (you can issue the system call and return
+    immediately) but they actually are still blocking in nature because the thread
+    must check for I/O completion, for example, by using the `poll(2)` in tandem with
+    a `read(2)` system call, which is still a blocking operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These APIs are really very useful for network I/O operations, the canonical
+    example being a busy (web)server monitoring hundreds (and perhaps thousands) of
+    connections. First, each connection being represented by a socket descriptor makes
+    using the `select(2)` or `poll(2)` system calls appealing. However, the fact is
+    that `select(2)` is old and limited (to a maximum of 1,024 descriptors; not enough);
+    secondly, both `select(2)` and `poll(2)`''s internal implementations have an algorithmic
+    time complexity of O(n), which makes them non-scalable. The `epoll(7)` implementation
+    has no (theoretical) descriptor limit and uses an O(1) algorithm and what''s known
+    as edge-triggered notifications. This table summarizes these points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **API** | **Algorithmic Time-Complexity** | **Max number of clients** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `select(2)` | O(n) | FD_SETSIZE (1024) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `poll(2)` | O(n) | (theoretically) unlimited |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `epoll(7)` APIs | O(1) | (theoretically) unlimited |'
+  prefs: []
+  type: TYPE_TB
+- en: Linux asynchronous blocking APIs
+  prefs: []
+  type: TYPE_NORMAL
+- en: These features have thus made the `epoll(7)` set of APIs (`epoll_create(2)`,
+    `epoll_ctl(2)`, `epoll_wait(2)`, and `epoll_pwait(2)`) a favorite for implementing
+    non-blocking I/O on  network applications that require very high scalability.
+    (See a link to a blog article providing more details on using multiplexed I/O,
+    including the epoll, on Linux in the *Further reading* section on the GitHub repository.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: I/O – miscellaneous
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A few miscellaneous remaining topics to round off this chapter follow.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Linux's inotify framework
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: While brilliant for network I/O, these multiplexing APIs, though they can in
+    theory be used for monitoring regular file descriptors, will simply report them
+    as always being ready (for reading, writing, or an error condition has arisen),
+    thereby diminishing their usefulness (when used upon regular files).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Perhaps Linux's inotify framework, a means to monitor filesystem events including
+    events on individual files, might be what you are looking for. The inotify framework
+    provides the following system calls to help developers monitor files: `inotify_init(2)`, `inotify_add_watch(2)`
+    (which can be subsequently `read(2)`), and then `inotify_rm_watch(2)`. Check out
+    the man page on `inotify(7)` for more details: [http://man7.org/linux/man-pages/man7/inotify.7.html](http://man7.org/linux/man-pages/man7/inotify.7.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: I/O schedulers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'An important feature within the Linux I/O stack is a part of the kernel block
+    layer called the I/O scheduler. The issue being addressed here is basically this:
+    I/O requests are being more or less continually issued by the kernel (due to apps
+    wanting to perform various file data/code reads and writes); this results in a
+    continuous stream of I/O requests being ultimately received and processed by the
+    block driver(s). The kernel folks know that one of the primary reasons that I/O
+    sucks out performance is that the physical seek of a typical SCSI disk is really
+    slow (compared to silicon speeds; yes, of course, SSDs (solid state devices) are
+    making this a lot more palatable nowadays).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, if we could use some intelligence to sort the block I/O requests in a way
+    that makes the most sense in terms of the underlying physical medium, it would
+    help performance. Think of an elevator in a building: it uses a sort algorithm,
+    optimally taking people on and dropping them off as it traverses various floors.
+    This is what the OS I/O schedulers essentially try to do; in fact, the first implementation
+    was called Linus''s elevator.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Various I/O scheduler algorithms exist (deadline, **completely fair queuing**
+    (**cfq**), noop, anticipatory scheduler: these are now considered legacy; the
+    newest as of the time of writing seem to be the mq-deadline and **budget fair 
+    queuing** (**bfq**) I/O schedulers, with bfq looking very promising for heavy
+    or light I/O workloads (bfq is a recent addition, kernel version 4.16). The I/O
+    schedulers present within your Linux OS are a kernel feature; you can check which
+    they are and which is being used; see it being done here on my Ubuntu 18.04 x86_64
+    box:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, `bfq` is the I/O scheduler being used on my Fedora 28 system (with a
+    more recent kernel):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The default I/O scheduler here is `bfq`. Here''s the interesting bit: the user
+    can actually select between I/O schedulers, run their I/O stress workloads and/or
+    benchmarks, and see which one yields the maximum benefit! How? To select the I/O
+    scheduler at boot time, pass along a kernel parameter (via the bootloader, typically
+    GRUB on an x86-based laptop, desktop or server system, U-Boot on an embedded Linux);
+    the parameter in question is passed as `elevator=<iosched-name>`; for example,
+    to set the I/O scheduler to noop (useful for systems with SSDs perhaps), pass
+    the parameter to the kernel as `elevator=noop`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There''s an easier way to change the I/O scheduler immediately at runtime;
+    just `echo(1)` the one you want into the pseudo-file; for example, to change the
+    I/O scheduler to `mq-deadline`,do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, you can (stress) test your I/O workloads on different I/O schedulers, thus
+    deciding upon which yields the optimal performance for your workload.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ensuring sufficient disk space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Linux provides the `posix_fallocate(3)` API; its job is to guarantee that sufficient
+    disk space is available for a given range specific to a given file. What that
+    actually means is that whenever the app writes to that file within that range,
+    the write is guaranteed not to fail due to lack of disk space (if it does fail,
+    `errno` will be set to ENOSPC; that won''t happen). It''s signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here are some quick points to note regarding this API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The file is the one referred to by the descriptor `fd`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The range is from `offset` for `len` bytes; in effect, this is the disk space
+    that will be reserved for the file.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the current file size is less than what the range requests (that is, `offset`+`len`),
+    then the file is grown to this size; otherwise, the file's size remains unaltered.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`posix_fallocate(3)` is a portable wrapper over the underlying system call
+    `fallocate(2)`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For this API to succeed, the underlying filesystem must support the `fallocate`;
+    if not, it's emulated (but with a lot of caveats and issues; refer to the man
+    page for more).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Also, a CLI utility called `fallocate(1)` exists to perform the same task from,
+    say, a shell script.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These APIs and tools may come in very useful for software such as backup, cloud
+    provisioning, digitization, and so on, guaranteeing sufficient disk space is available
+    before a long I/O operation begins.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Utilities for I/O monitoring, analysis, and bandwidth control
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This table summarizes various utilities, APIs, tools, and even a cgroup blkio
+    controller; these tools/features will prove very useful in monitoring, analyzing
+    (to pinpoint I/O bottlenecks), and allocating I/O bandwidth (via the `ioprio_set(2)`
+    and the powerful cgroups blkio controller.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Utility name** | **What it does** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `iostat(1)`  | Monitors I/O and displays I/O statistics about devices and
+    storage device partitions. From the man page on `iostat(1)`: The `iostat` command
+    is used for monitoring system input/output device loading by observing the time
+    the devices are active in relation to their average transfer rates. The `iostat`
+    command generates reports that can be used to change system configuration to better
+    balance the input/output load between physical disks. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `iotop(1)` | In the style of `top(1)` (for CPU), iotop continually displays
+    threads sorted by their I/O usage. Must run as root. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ioprio_[get&#124;set](2)` | System calls to query and set I/O scheduling
+    class and priority of a given thread; see the man pages for details: [http://man7.org/linux/man-pages/man2/ioprio_set.2.html](http://man7.org/linux/man-pages/man2/ioprio_set.2.html);
+    see its wrapper utility `ionice(1)` as well. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| perf-tools | Among these tools (from B Gregg) is `iosnoop-perf(1)` and `iolatecy-perf(1)`
+    to snoop I/O transactions and observe I/O latencies respectively. Install these
+    tools from their GitHub repository here: [https://github.com/brendangregg/perf-tools](https://github.com/brendangregg/perf-tools).
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| cgroup blkio controller | Use the powerful Linux cgroup''s blkio controller
+    to limit I/O bandwidth for a process or group of processes in any required fashion
+    (heavily used in cloud environments, including Docker); see the relevant link
+    in the *Further reading* section on the GitHub repository. |'
+  prefs: []
+  type: TYPE_TB
+- en: Tools/utilities/APIs/cgroups for I/O monitoring, analysis, and bandwidth control
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note: the preceding mentioned utilities may not be installed on the Linux system
+    by default; (obviously) install them to try them out.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do also check out Brendan Gregg's superb Linux Performance blog pages and tools
+    (which include perf-tools, iosnoop, and iosnoop latency heat maps); please find
+    the relevant links in the *Further reading* section on the GitHub repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we learned powerful approaches to a critical aspect of working
+    with files: ensuring that I/O performance is kept as high as is possible, as I/O
+    is really the performance-draining bottleneck in many real-world workloads. These
+    techniques ranged from file access pattern advice passing to the OS, SG-I/O techniques
+    and APIs, memory mapping for file I/O, DIO, AIO, and so on.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter in the book is a brief look at daemon processes; what they
+    are and how to set them up. Kindly take a look at this chapter here: [https://www.packtpub.com/sites/default/files/downloads/Daemon_Processes.pdf](https://www.packtpub.com/sites/default/files/downloads/Daemon_Processes.pdf).
+  prefs: []
+  type: TYPE_NORMAL

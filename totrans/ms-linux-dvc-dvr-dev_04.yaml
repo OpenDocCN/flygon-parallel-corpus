@@ -1,0 +1,614 @@
+- en: '*Chapter 3*: Delving into the MFD Subsystem and Syscon API'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The increasingly dense integration of devices has led to a kind of device that
+    is made up of several other devices or IPs that can achieve a dedicated function.
+    With the advent of this device, a new subsystem appeared in the Linux kernel.
+    These are **MFDs**, which stands for **multi-function devices**. These devices
+    are physically seen as standalone devices, but from a software point of view,
+    these are represented in a parent-child relationship, where the children are subdevices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While some I2C- and SPI-based devices/subdevices might need either some hacks
+    or configurations prior to being added to the system, there are also MMIO-based
+    devices/subdevices where zero conf/hacks are required as they just need to share
+    the main device's register region between subdevices. The simple-mfd helper has
+    then been introduced to handle zero conf/hacks subdevice registering, and syscon
+    has been introduced for sharing a device's memory region with other devices. Since
+    regmap was handling MMIO registers and managed locking (aka synchronization) accesses
+    to memory, it has been a natural choice to build syscon on top of regmap. To get
+    familiar with the MFD subsystem, in this chapter, we will begin with an introduction
+    to MFD, where you will learn about its data structures and APIs, and then we will
+    look at device tree binding in order to describe these devices to the kernel.
+    Finally, we will talk about syscon and introduce the simple-mfd driver for a zero
+    conf/hacks subdevice.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This chapter will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing the MFD and syscon APIs and data structures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Device tree binding for MFD devices
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding syscon and simple-mfd
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In order to leverage this chapter, you will need the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: C programming skills
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Good knowledge of Linux device driver models
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introducing the MFD subsystem and Syscon APIs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Prior to delving into the syscon framework and its APIs, we will cover MFDs.
+    There are peripherals or hardware blocks exposing more than a single functionality
+    by means of subdevices they embed into them and that are handled by separate subsystems
+    in the kernel. That being said, a subdevice is a dedicated entity in a so-called
+    multifunction device, responsible for a specific task, and managed through a reduced
+    set of registers, in the chip''s register map. `ADP5520` is a typical example
+    of an MFD device, as it contains a backlight, a keypad, LEDs, and GPIO controllers.
+    Each of these is then considered as a subdevice, and as you can see, each of these
+    falls into a different subsystem. The MFD subsystem, defined in `include/linux/mfd/core.h`
+    and implemented in `drivers/mfd/mfd-core.c`, has been created to deal with these
+    devices, allowing the following features:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Registering the same device with multiple subsystems
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Multiplexing bus and register access, as there may be some registers shared
+    between subdevices
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Handling IRQs and clocks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Throughout this section, we will study the driver of the `da9055` device from
+    the dialog-semiconductor and located in `drivers/mfd/da9055-core.c` in the kernel
+    source tree. The datasheet for this device can be found at [https://www.dialog-semiconductor.com/sites/default/files/da9055-00-ids3a_20120710.pdf](https://www.dialog-semiconductor.com/sites/default/files/da9055-00-ids3a_20120710.pdf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In most cases, MFD device drivers consist of two parts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`drivers/mfd`, responsible for the main initialization and registering each
+    subdevice as a platform device (along with its platform data) on the system. This
+    driver should provide common services for the subdevice drivers. These services
+    include register access, control, and shared interrupt management. When a platform
+    driver for one of the subsystems is instantiated, the core initializes the chip
+    (which may be specified by the platform data). There can be support for multiple
+    block devices of the same type built into a single kernel image. This is possible
+    thanks to the mechanism of platform data. A platform-specific data abstraction
+    mechanism in the kernel is used to pass configurations to the core, and subsidiary
+    drivers make it possible to support multiple block devices of the same type.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The subdevice driver**, which is responsible for handling a specific subdevice
+    registered earlier by the core driver. These drivers are located in their respective
+    subsystem directories. Each peripheral (subsystem device) has a limited view of
+    the device, which is implicitly reduced to the specific set of resources that
+    the peripheral requires in order to function correctly.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The concept of subdevices in this chapter should not be confused with the concept
+    of the same name in [*Chapter 7*](B10985_07_ePub_AM.xhtml#_idTextAnchor287), *Demystifying
+    V4L2 and Video Capture Device Drivers*, which is slightly different, where a subdevice
+    also represents an entity in the video pipeline.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A subdevice is represented in the MFD subsystem by an instance of the `struct
+    mfd_cell` structure, which you can call a `struct mfd_cell` structure, you can
+    specify more advanced things, such as the resources used by the subdevice and
+    suspend-resume operations (to be called from the driver for the subdevice). This
+    structure is presented as follows, with some fields removed for simplicity reasons:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The new platform devices that are created will have the cell structure as their
+    platform data. The real platform data can then be accessed through `pdev->mfd_cell->platform_data`.
+    A driver can also use `mfd_get_cell()` in order to retrieve the MFD cell corresponding
+    to a platform device: `const struct mfd_cell *cell = mfd_get_cell(pdev);`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The functionality of each member of this structure is self-explanatory. However,
+    the following gives you more details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `.resources` element is an array that represents the resources specific
+    to the subdevice (which is also a platform device), and `.num_resources` in the
+    number of entries in the array. These are defined as it was done using `platform_data`,
+    and you probably want to name them for easy retrieval. The following is an example
+    from an MFD driver whose original core source file is `drivers/mfd/da9055-core.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following example shows how to retrieve the resource from the subdevice
+    driver, in this case, which is implemented in `drivers/rtc/rtc-da9055.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Actually, you should use `platform_get_resource()`, `platform_get_resource_byname()`,
+    `platform_get_irq()`, and `platform_get_irq_byname()` to retrieve the resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When using `.of_compatible`, the function has to be a child of the MFD (see
+    the *Device tree binding for MFD devices* section). You should statically fill
+    an array of this structure, containing as many entries as there are subdevices
+    on your device:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After the array of `struct mfd_cell` is filled, it has to be passed to the
+    `devm_mfd_add_devices()` function, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This method''s arguments are explained as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`dev` is the generic struct device structure of the MFD chip. It will be used
+    to set the subdevice''s parent.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`id`: Since subdevices are created as platform devices, they should be given
+    an ID. This field should be set with `PLATFORM_DEVID_AUTO` for automatic ID allocation,
+    in which case `mfd_cell.id` of the corresponding cell is ignored. Otherwise, you
+    should use `PLATFORM_DEVID_NONE`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`cells` is a pointer to a list (an array actually) of `struct mfd_cell` structures
+    that describe subdevices.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`n_dev` is the number of `struct mfd_cell` entries to use in the array to create
+    platform devices. To create as many platform devices as there are cells in the
+    array, you should use the `ARRAY_SIZE()` macro.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mem_base`: If not `NULL`, its `.start` field will be used as the base of each
+    resource of type `IORESOURCE_MEM` of each MFD cell in the previously mentioned
+    array. The following is an excerpt of the `mfd_add_device()` function showing
+    this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`irq_base`: This parameter is ignored if the domain is set. Otherwise, it behaves
+    like `mem_base` but for each resource of type `IORESOURCE_IRQ`. The following
+    is an excerpt of the `mfd_add_device()` function showing this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`domain`: For MFD chips that also play the role of IRQ controller for their
+    subdevices, this parameter will be used as the IRQ domain to create IRQ mappings
+    for these subdevices. It works this way: for each resource `r` of type `IORESOURCE_IRQ`
+    in each cell, the MFD core will create a new resource, `res`, of the same type
+    (actually, an IRQ resource, whose `res.start` and `res.end` fields are set with
+    the IRQ mapping in this domain that corresponds to the initial resource''s `.start`
+    field: `res[r].start = res[r].end = irq_create_mapping(domain, cell->resources[r].start);`).
+    New IRQ resources are then assigned to the platform device of the current cell
+    and correspond to its virqs. Please have a look at the preceding excerpt, in the
+    previous parameter description. Note that this parameter can be `NULL`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s now see how to put this all together with an excerpt of the `da9055`
+    MFD driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding excerpt, the driver defined some constants, along with a private
+    data structure, whose meaning will be clear as and when you read the code. After,
+    the IRQs are defined for the register map core, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding excerpt, `da9055_irqs` is an array of elements of type `regmap_irq`,
+    which describes a generic regmap IRQ. It is assigned to `da9055_regmap_irq_chip`,
+    which is of type `regmap_irq_chip` and represents the regmap IRQ chip. Both are
+    part of the regmap IRQ data structures set. Finally, the `probe` method is implemented,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding probe method, `da9055_regmap_irq_chip` (defined earlier) is
+    given as a parameter to `regmap_add_irq_chip()` in order to add a valid regmap
+    IRQ controller to the IRQ core. This function returns `O` on success. Moreover,
+    it also returns a fully configured `regmap_irq_chip_data` structure through its
+    last parameter, which can be used later as the runtime data structure for the
+    controller. This `regmap_irq_chip_data` structure will contain the IRQ domain
+    associated with the previously added IRQ controller. This IRQ domain is finally
+    given as a parameter to `devm_mfd_add_devices()`, along with the array of MFD
+    cells and its size in terms of the number of cells.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Do note that `devm_mfd_add_devices()` is actually the resource-managed version
+    of `mfd_add_devices()`, which has the following function call sequence:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are I2C chips where both the chip itself and internal subdevices have
+    different I2C addresses. Such I2C subdevices can''t be probed as I2C clients because
+    the MFD core only instantiates a platform device given an MFD cell. This issue
+    is addressed by the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a dummy I2C client given the subdevice's I2C address and the MFD chip's
+    adapter. This actually corresponds to the adapter (bus) managing the MFD device.
+    This can be achieved using `i2c_new_dummy()`. The returned I2C client should be
+    saved for later use – for example, with `i2c_unregister_device()`, which should
+    be called when the module is being unloaded.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If a subdevice needs its own regmap, then this regmap has to be built on top
+    of its dummy I2C client.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Storing either the I2C client only (for later removal) or with the regmap in
+    a private data structure that can be assigned to the underlying platform device.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To summarize the preceding steps, let's walk through the driver of a real MFD
+    device, the max8925 (which is mainly a power management IC, but is also made up
+    of a large group of subdevices). Our code is a summary (dealing with two subdevices
+    only) of the original one, with function names modified for the sake of readability.
+    That being said, the original driver can be found in `drivers/mfd/max8925-i2c.c`
+    in the kernel source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s jump to our excerpt, starting with the context data structure definition,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding excerpt, the driver defines the context data structure, `struct
+    priv_chip`, which contains subdevice regmaps, and then initializes the MFD device
+    regmap configuration as well as the subdevice''s own configuration. Then, the
+    `probe` method is defined, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For the sake of readability, the preceding excerpt omits an error check. Additionally,
+    the following code shows how to remove the dummy I2C clients:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, the following simplified code shows how the subdevice driver can grab
+    the pointer to either of the regmap data structures set up in the MFD driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: Though we have most of the knowledge required to develop MFD device drivers,
+    it is necessary to integrate this with the device tree in order to have a better
+    (that is, not hardcoded) description of our MFD device. This is what we will discuss
+    in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Device tree binding for MFD devices
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Even though we have the necessary tools and inputs to write our own MFD driver,
+    it is important for the underlying MFD device to have its description defined
+    in the device tree, since this lets the MFD core know what our MFD device is made
+    of and how to deal with it. Moreover, the device tree remains the right place
+    to declare devices, whether they are MFD or not. Please keep in mind that its
+    purpose is only to describe devices on the system. As subdevices are children
+    of the MFD device into which they are built (there is a parent-and-child bond
+    of belonging), it is good practice to declare these subdevice nodes beneath their
+    parent node, as in the following example. Moreover, the resources used by the
+    subdevices are sometimes part of the resources of the parent device. So, it enforces
+    the idea of putting the subdevice node beneath the main device node. In each subdevice
+    node, the compatible property should match either both the subdevice''s `cell.of_compatible`
+    field and one of the `.compatible` string entries in the subdevice''s `platform_driver.of_match_table`
+    array, or both the subdevice''s `cell.name` field and the subdevice''s `platform_driver.name`
+    field:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: The subdevice's `cell.of_compatible` and `cell.name` fields are those declared
+    in the subdevice's `mfd_cell` structure in the MFD core driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding device tree sample, the parent node (`da9062`, a `da9092`,
+    actually) node. Let''s focus on the subdevice''s `compatible` properties and use
+    `onkey` as an example. The MFD cell of this node is declared in the MFD core driver
+    (whose source file is `drivers/mfd/da9063-core.c`), as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, this `onekey` platform driver structure is declared (along with its `.of_match_table`
+    entry) in the driver (whose source file is `drivers/input/misc/da9063_onkey.c`),
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can see that both `compatible` strings match the node's `compatible` string
+    in the device's node. On the other hand, we can see that the same platform driver
+    may be used for two or more (sub)devices. Using name matching would be confusing,
+    then. That is why you would use a device tree for declaration and a `compatible`
+    string for matching. So far, we have learned how the MFD subsystem deals with
+    the device and vice versa. In the next section, we will extend these concepts
+    to syscon and simple-mfd, two frameworks that help with MFD driver development.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding Syscon and simple-mfd
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Syscon** stands for **system controller**. SoCs sometimes have a set of MMIO
+    registers dedicated to miscellaneous features that don''t relate to a specific
+    IP. Clearly, there can''t be a functional driver for this as these registers are
+    neither representative nor cohesive enough to represent a specific type of device.
+    The syscon driver handles this kind of situation. Syscon permits other nodes to
+    access this register space through the regmap mechanism. It is actually just a
+    set of wrapper APIs for regmap. When you request access to syscon, the regmap
+    is created, if it doesn''t exist yet.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The header required for using the syscon API is `<linux/mfd/syscon.h>`. As
+    this API is based on regmap, you must also include `<linux/regmap.h>`. The syscon
+    API is implemented in `drivers/mfd/syscon.c` in the kernel source tree. Its main
+    data structure is `struct syscon`, though this structure is not to be used directly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding structure, `np` is a pointer to the node acting as syscon.
+    It is also used for syscon lookup by the device node. `regmap` is the regmap associated
+    with this syscon, and `list` is used for implementing a kernel linked-lists mechanism,
+    used to link all the syscons in the system together to the system-wide list, `syscon_list`,
+    defined in `drivers/mfd/syscon.c`. This linked-list mechanism allows walking through
+    the whole syscon list, either for a match by node or for a match by regmap.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Syscons are declared exclusively from within the device tree, by adding `"syscon"`
+    to the compatible strings list in the device node that should act as Syscon. During
+    early-boot, each node having `syscon` in its compatible string list will have
+    its `reg` memory region IO-mapped and bound to an MMIO regmap, according to a
+    default regmap configuration, `syscon_regmap_config`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The syscon that is created is then added to the syscon framework-wide `syscon_list`,
+    protected by the `syscon_list_slock` spinlock, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Syscon binding requires the following mandatory properties:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`compatible`: This property value should be `"syscon"`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`reg`: This is the register region that can be accessed from syscon.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following are optional properties, used to mangle the default `syscon_regmap_config`
+    regmap config:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`reg-io-width`: The size (or width, in terms of bytes) of the IO accesses that
+    should be performed on the device'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`hwlocks`: Reference to a phandle of a hardware spinlock provider node'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'An example is shown in the following, an excerpt from the kernel docs, whose
+    full version is available in `Documentation/devicetree/bindings/mfd/syscon.txt`
+    in the kernel sources:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'From within the device tree, you can reference a syscon node in three different
+    ways: either by phandle (specified in the device node of this driver), by its
+    path, or by searching it using a specific compatible value, after which the driver
+    can interrogate the node (or associated OS driver of this regmap) to determine
+    the location of the registers, and finally, access the registers directly. You
+    can use one of the following syscon APIs in order to grab a pointer to the regmap
+    associated with a given syscon node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding APIs have the following descriptions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`syscon_regmap_lookup_by_compatible()`: Given one of the compatible strings
+    of the syscon device node, this function returns the associated regmap, or creates
+    one if it does not exist yet, before returning it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`syscon_node_to_regmap()`: Given a syscon device node as a parameter, this
+    function returns the associated regmap, or creates one if it does not exist yet,
+    before returning it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`syscon_regmap_lookup_by_phandle()`: Given a phandle property holding an identifier
+    of a syscon node, this function returns the regmap corresponding to this syscon
+    node.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Before showing an example of using the preceding APIs, let''s introduce the
+    following platform device node, for which we will write the `probe` function.
+    To better understand `syscon_node_to_regmap()`, let''s declare this node as a
+    child of the previous `gpr` node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now that the device tree node is defined, we can focus on the code of the driver,
+    implemented as follows and using the functions enumerated earlier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding example, if we consider that `syscon_name` contains the platform
+    device name for the `gpr` device, then the `by_node_regmap`, `by_compat_regmap`,
+    `by_pdevname_regmap`, and `by_phandle_regmap` variables will all point to the
+    same syscon regmap. However, the purpose here is just to explain the concept.
+    `my_pdev` could have been the sibling (or whatever relationship) node of `gpr`.
+    Using it here as its child was done for the sake of understanding the concept
+    and the code and showing that either API has its place, depending on the situation.
+    Now that we are familiar with the syscon framework, let's see how it can be used
+    along with simple-mfd.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing simple-mfd
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: For MMIO-based MFD devices, there may be no need to configure subdevices prior
+    to adding them to the system. As this configuration is done from within the MFD
+    core driver, the only goal of this MFD core driver would be to populate the system
+    with platform subdevices. As a lot of these MMIO-based MFD devices exist, there
+    would be a lot of redundant code. The simple MFD, which is a simple DT binding,
+    addresses this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the `simple-mfd` string is added to the list of compatible strings of a
+    given device node (considered here as the MFD device), it will make the `for_each_child_of_node()`
+    iterator. simple-mfd is implemented in `drivers/of/platform.c` as an alias of
+    simple-bus, and its documentation is located in `Documentation/devicetree/bindings/mfd/mfd.txt`
+    in the kernel source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Used in conjunction with syscon to create the regmap, it helps to avoid writing
+    an MFD driver, and the developer can put their effort into writing subdevice drivers.
+    The following is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding device tree excerpt, `snvs` is the main device. It is made
+    up of a power control subdevice (represented by a register subregion in the main
+    device register region), an `rtc` subdevice, as well as a power key, and so on.
+    The whole definition can be found in `arch/arm/boot/dts/imx6qdl.dtsi`, which is
+    the SoC vendor `dtsi` for the i.MX6 chip series. The respective drivers can be
+    found in the kernel source by grepping (searching for) the content of their `compatible`
+    properties. To summarize, for each subnode in the `snvs` node, the MFD core will
+    create a corresponding device along with its regmap, which would correspond to
+    their memory region from within the main device's memory region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section shows the way to ease into MFD driver development when it comes
+    to MMIO devices. Though SPI/I2C devices do not fall into this category, it covers
+    almost 95% of MMIO-based MFD devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter dealt with MFD devices, along with the syscon and regmap APIs.
+    Here, we discussed how MFD devices work and how deep regmap is embedded into syscon.
+    Having reached the end of this chapter, we can assume that you are able to develop
+    regmap-enabled IRQ controllers, as well as to design and use syscon to share register
+    regions between devices. The next chapter will deal with the common clock framework
+    and how this framework is organized, its implementation, how to use it, and how
+    to add your own clocks.
+  prefs: []
+  type: TYPE_NORMAL

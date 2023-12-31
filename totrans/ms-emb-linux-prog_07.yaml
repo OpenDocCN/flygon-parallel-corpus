@@ -1,0 +1,1826 @@
+- en: Chapter 7. Creating a Storage Strategy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The mass storage options for embedded devices have a great impact on the rest
+    of the system in terms of robustness, speed, and methods of in-field updates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Most devices employ flash memory in some form or other. Flash memory has become
+    much less expensive over the past few years as storage capacities have increased
+    from tens of megabytes to tens of gigabytes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, I will begin with a detailed look at the technology behind
+    flash memory and how different memory organization affects the low level driver
+    software that has to manage it, including the Linux memory technology device layer,
+    MTD.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For each flash technology, there are different choices of filesystem. I will
+    describe those most commonly found on embedded devices and complete the survey
+    with a section giving a summary of choices for each type of flash.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last sections consider techniques to make the best use of flash memory,
+    look at how to update devices in the field, and draw everything together into
+    a coherent storage strategy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Storage options
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Embedded devices need storage that takes little power, is physically compact,
+    robust, and reliable over a lifetime of perhaps tens of years. In almost all cases,
+    that means solid state storage, which was introduced many years ago with **read-only
+    memory** (**ROM**), but for the past 20 years it has been flash memory of some
+    kind. There have been several generations of flash memory in that time, progressing
+    from NOR to NAND to managed flash such as eMMC.
+  prefs: []
+  type: TYPE_NORMAL
+- en: NOR flash is expensive but reliable and can be mapped into the CPU address space,
+    which allows you to execute code directly from flash. NOR flash chips are low-capacity,
+    ranging from a few megabytes to a gigabyte or so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: NAND flash memory is much cheaper than NOR and is available in higher capacities,
+    in the range of tens of megabytes to tens of gigabytes. However, it needs a lot
+    of hardware and software support to turn it into a useful storage medium.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Managed flash memory consists of one or more NAND flash chips packaged with
+    a controller which handles the complexities of flash memory and presents a hardware
+    interface similar to that of a hard disk. The attraction is that it removes complexity
+    from the driver software and insulates the system designer against the frequent
+    changes in flash technology. SD cards, eMMC chips, and USB flash drives fit into
+    this category. Almost all of the current generation of smartphones and tablets
+    have eMMC storage, and that trend is likely to progress with other categories
+    of embedded devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hard drives are seldom found in embedded systems. One exception is digital video
+    recording in set-top boxes and smart TVs in which a large amount of storage is
+    needed with fast write times.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In all cases, robustness is of prime importance: you want the device to boot
+    and reach a functional state despite power failures and unexpected resets. You
+    should choose filesystems that behave well under such circumstances.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: NOR flash
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The memory cells in NOR flash chips are arranged into erase blocks of, for example,
+    128 KiB. Erasing a block sets all the bits to 1\. It can be programmed one word
+    at a time (8, 16 or 32 bits, depending on the data bus width). Each erase cycle
+    damages the memory cells slightly and, after a number of cycles, the erase block
+    becomes unreliable and cannot be used anymore. The maximum number of erase cycles
+    should be given in the data sheet for the chip but is usually in the range of
+    100K to 1M.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The data can be read word by word. The chip is usually mapped into the CPU address
+    space which means that you can execute code directly from NOR flash. This makes
+    it a convenient place to put the bootloader code as it needs no initialization
+    beyond hardwiring the address mapping. SoCs that support NOR flash in this way
+    have configurations that give a default memory mapping such that it encompasses
+    the reset vector of the CPU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel, and even the root filesystem, can also be located in flash memory,
+    avoiding the need for copying them into RAM and thus creating devices with small
+    memory footprints. The technique is known as **eXecute In Place**, or **XIP**.
+    It is very specialized and I will not examine it further here. There are some
+    references at the end of the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a standard register-level interface for NOR flash chips called the
+    **common flash interface** or **CFI**, which all modern chips support.
+  prefs: []
+  type: TYPE_NORMAL
+- en: NAND flash
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: NAND flash is much cheaper than NOR flash and has a higher capacity. First generation
+    NAND chips stored one bit per memory cell in what is now known as an **SLC** or
+    **single level cell** organization. Later generations moved on to two bits per
+    cell in **multi-level cell** (**MLC**) chips and now to three bits per cell in
+    **tri-level cell** (**TLC**) chips. As the number of bits per cell has increased,
+    the reliability of the storage has decreased, requiring more complex controller
+    hardware and software to compensate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As with NOR flash, NAND flash is organized into erase blocks ranging in size
+    from 16 KiB to 512 KiB and, once again, erasing a block sets all the bits to 1\.
+    However, the number of erase cycles before the block becomes unreliable is lower,
+    typically as few as 1K cycles for TLC chips and up to 100K for SLC. NAND flash
+    can only be read and written in pages, usually of 2 or 4 KiB. Since they cannot
+    be accessed byte-by-byte, they cannot be mapped into the address space and so
+    code and data have to be copied into RAM before they can be accessed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Data transfers to and from the chip are prone to bit flips, which can be detected
+    and corrected using Error Correction Codes. SLC chips generally use a simple hamming
+    code which can be implemented efficiently in software and can correct a single
+    bit error in a page read. MLC and TLC chips need more sophisticated codes such
+    as **BCH** (**Bose-Chaudhuri-Hocquenghem**) which can correct up to 8-bit errors
+    per page. These need hardware support.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The error correction codes have to be stored somewhere and so there is an extra
+    area of memory per page known as the **out of band** (**OOB**) area, or also the
+    spare area. MLC designs usually have 1 byte of OOB per 32 bytes of main storage
+    so, for a 2 KiB page device, the OOB is 64 bytes per page and for a 4 KiB page,
+    128 bytes. MLC and TLC chips have proportionally larger OOB areas to accommodate
+    more complex error correction codes. The following diagram shows the organization
+    of a chip with a 128 KiB erase block and 2 KiB pages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![NAND flash](img/B03982_07_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: During production, the manufacturer tests all the blocks and marks any that
+    fail by setting a flag in the OOB area of each page in the block. It is not uncommon
+    to find that brand new chips have up to 2% of their blocks marked bad in this
+    way. Furthermore, it is within the specification for a similar proportion of blocks
+    to give errors on erase before the erase cycle limit is reached. The NAND flash
+    driver should detect this and mark it as bad.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After space has been taken in the OOB area for a bad block flag and ECC bytes,
+    there are still some bytes left. Some flash filesystems make use of these free
+    bytes to store filesystem metadata. Consequently, lots of people are interested
+    in the layout of the OOB area: the SoC ROM boot code, the bootloader, the kernel
+    MTD driver, the filesystem code, and the tools to create filesystem images. There
+    is not much standardization so it is easy to get into a situation in which the
+    bootloader writes data using an OOB format that cannot be read by the kernel MTD
+    driver. It is up to you to make sure that they all agree.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Access to NAND flash chips requires a NAND flash controller, which is usually
+    part of the SoC. You will need the corresponding driver in the bootloader and
+    kernel. The NAND flash controller handles the hardware interface to the chip,
+    transferring data to and from pages, and may include hardware for error correction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a standard register-level interface for NAND flash chips known as the
+    **open NAND flash interface** or **ONFi** which most modern chips adhere to. See
+    [http://www.onfi.org](http://www.onfi.org).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Managed flash
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The burden of supporting flash memory in the operating system, NAND in particular,
+    becomes less if there is a well-defined hardware interface and a standard flash
+    controller that hides the complexities of the memory. This is managed flash memory
+    and it is becoming more and more common. In essence, it means combining one or
+    more flash chips with a micro controller that offers an ideal storage device with
+    a small sector size that is compatible with conventional filesystems. The most
+    important types of managed flash for embedded systems are **Secure Digital** (**SD**)
+    cards and the embedded variant known as **eMMC**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MultiMediaCard and secure digital cards
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The **MultiMediaCard** (**MMC**) was introduced in 1997 by SanDisk and Siemens
+    as a form of packaged storage using flash memory. Shortly after, in 1999, SanDisk,
+    Matsushita, and Toshiba created the SD card which is based on MMC but adds encryption
+    and DRM (that is the secure part). Both were intended for consumer electronics
+    such as digital cameras, music players, and similar devices. Currently, SD cards
+    are the dominant form of managed flash for consumer and embedded electronics,
+    even though the encryption features are seldom used. Newer versions of the SD
+    specification allow for smaller packaging (mini SD and micro SD which is often
+    written as uSD) and larger capacities: high capacity, SDHC, up to 32 GB and extended
+    capacity, SDXC, up to 2 TB.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The hardware interface for MMC and SD cards is very similar, and it is possible
+    to use fully-sized MMC in full-sized SD card slots (but not the other way round).
+    Early incarnations used a 1-bit **Serial Peripheral Interface** (**SPI**); more
+    recent cards use a 4-bit interface. There is a command set for reading and writing
+    memory in sectors of 512 bytes. Inside the package there is a microcontroller
+    and one or more NAND flash chips, as shown in the diagram that follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![MultiMediaCard and secure digital cards](img/B03982_07_07.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The microcontroller implements the command set and manages the flash memory,
+    performing the function of a flash translation layer, as described later on in
+    this chapter. They are pre-formatted with a FAT filesystem: FAT16 on SDSC cards,
+    FAT32 on SDHC, and exFAT on SDXC. The quality of the NAND flash chips and the
+    software on the microcontroller varies greatly between cards. It is questionable
+    whether any of them are sufficiently reliable for deep embedded use, and certainly
+    not with a FAT filesystem which is prone to file corruption. Remember that the
+    prime use case for MMC and SD cards is for removable storage on cameras, tablets,
+    and phones.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: eMMC
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '**eMMC** or **Embedded MMC** is simply MMC memory packaged so that it can be
+    soldered on to the motherboard, using a 4- or 8-bit interface for data transfer.
+    However, they are intended to be used as storage for an operating system so the
+    components are capable of performing that task. The chips are usually not pre-formatted
+    with any filesystem.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other types of managed flash
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: One of the first managed flash technologies was **CompactFlash** (**CF**), using
+    a subset of the **PCMCIA** (**Personal Computer Memory Card International Association**)
+    interface. CF exposes the memory through a parallel ATA interface and appears
+    to the operating system as a standard hard disk. They are common in x86-based
+    single board computers and professional video and camera equipment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One other format which we use every day is the USB flash drive. In this case,
+    the memory is accessed through a USB interface and the controller implements the
+    USB mass storage specification as well as the flash translation layer and interface
+    to the flash chip or chips. The USB mass storage protocol, in turn, is based on
+    the SCSI disk command set. As with MMC and SD cards, they are usually pre-formatted
+    with a FAT filesystem. Their main use case in embedded systems is exchanging data
+    with PCs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A recent addition to the list of options for managed flash storage is **universal
+    flash storage** (**UFS**). Like eMMC, it is packaged in a chip that is mounted
+    on the motherboard. It has a high-speed serial interface and can achieve data
+    rates greater than eMMC. It supports a SCSI disk command set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accessing flash memory from the bootloader
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In [Chapter 3](ch03.html "Chapter 3. All About Bootloaders"), *All About Bootloaders*,
+    I mentioned the need for the bootloader to load kernel binaries and other images
+    from various flash devices and to be able to perform system maintenance tasks
+    such as erasing and reprogramming flash memory. It follows that the bootloader
+    must have the drivers and infrastructure to support read, erase, and write operations
+    on the type of memory you have, whether it be NOR, NAND, or managed. I will use
+    U-Boot in the following example; other bootloaders follow a similar pattern.
+  prefs: []
+  type: TYPE_NORMAL
+- en: U-Boot and NOR flash
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'U-Boot has drivers for NOR CFI chips in `drivers/mtd` and has the commands
+    `erase` to erase memory and `cp.b` to copy data byte by byte, programming the
+    flash. Suppose that you have NOR flash memory mapped from 0x40000000 to 0x48000000,
+    of which 4MiB starting at 0x40040000 is a kernel image, then you would load a
+    new kernel into flash using these U-Boot commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The variable `filesize` in the preceding example is set by the `tftpboot` command
+    to the size of the file just downloaded.
+  prefs: []
+  type: TYPE_NORMAL
+- en: U-Boot and NAND flash
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'For NAND flash, you need a driver for the NAND flash controller on your SoC,
+    which you can find in `drivers/mtd/nand`. You use the `nand` command to manage
+    the memory using the sub-commands `erase`, `write`, and `read`. This example shows
+    a kernel image being loaded into RAM at 0x82000000 and then placed into flash
+    starting at offset 0x280000:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: U-Boot can also read files stored in the JFFS2, YAFFS2, and UBIFS filesystems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: U-Boot and MMC, SD and eMMC
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: U-Boot has drivers for several MMC controllers in `drivers/mmc`. You can access
+    the raw data using `mmc read` and `mmc write` at the user interface level, which
+    allows you to handle raw kernel and filesystem images.
+  prefs: []
+  type: TYPE_NORMAL
+- en: U-boot can also read files from the FAT32 and ext4 filesystems on MMC storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accessing flash memory from Linux
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Raw NOR and NAND flash memory is handled by the memory technology device sub-system,
+    or MTD, which provides basic interfaces to read, erase, and write blocks of flash
+    memory. In the case of NAND flash, there are functions to handle the OOB area
+    and to identify bad blocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For managed flash, you need drivers to handle the particular hardware interface.
+    MMC/SD cards and eMMC use the mmcblk driver; CompactFlash and hard drives use
+    the SCSI Disk driver, sd. USB flash drives use the usb_storage driver together
+    with the sd driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory technology devices
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The **memory technology** **devices** (**MTD**), sub-system was started by David
+    Woodhouse in 1999 and has been extensively developed over the intervening years.
+    In this section, I will concentrate on the way it handles the two main technologies,
+    NOR and NAND flash.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'MTD consists of three layers: a core set of functions, a set of drivers for
+    various types of chips, and user-level drivers that present the flash memory as
+    a character device or a block device, as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Memory technology devices](img/B03982_07_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The chip drivers are at the lowest level and interface with flash chips. Only
+    a small number of drivers are needed for NOR flash chips, enough to cover the
+    CFI standard and variations plus a few non-compliant chips which are now mostly
+    obsolete. For NAND flash, you will need a driver for the NAND flash controller
+    you are using; this is usually supplied as part of the board support package.
+    There are drivers for about 40 of them in the current mainline kernel in the directory
+    `drivers/mtd/nand`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MTD partitions
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In most cases, you will want to partition the flash memory into a number of
+    areas, for example, to provide space for a bootloader, a kernel image, or a root
+    filesystem. In MTD, there are several ways to specify the size and location of
+    partitions, the main ones being:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Through the kernel command line using `CONFIG_MTD_CMDLINE_PARTS`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Via the device tree using `CONFIG_MTD_OF_PARTS`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With a platform mapping driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In the case of the first option, the kernel command line option to use is `mtdparts`,
+    which is defined as follows in the Linux source code in `drivers/mtd/cmdlinepart.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Perhaps an example will help. Imagine that you have one flash chip of 128 MB
+    that is to be divided into five partitions. A typical command line would be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first element, before the colon, `:`, is `mtd-id`, which identifies the
+    flash chip, either by number or by the name assigned by the board support package.
+    If there is only one chip, as here, it can be left empty. If there is more than
+    one chip, the information for each is separated by a semicolon, `;`. Then, for
+    each chip, there is a comma-separated list of partitions, each with a size in
+    bytes, kilobytes, `k`, or megabytes, `m`, and a name in brackets. The `ro` suffix
+    makes the partition read-only to MTD and is often used to prevent accidental overwriting
+    of the bootloader. The size of the last partition for the chip may be replaced
+    by a dash, `-`, indicating that it should take up all the remaining space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can see a summary of the configuration at runtime by reading `/proc/mtd`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There is more detailed information for each partition in `/sys/class/mtd`,
+    including the erase block size and the page size, and it is nicely summarized
+    using `mtdinfo`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The equivalent partition information can be written as part of the device tree
+    like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A third alternative is to code the partition information as platform data in
+    an `mtd_partition` structure, as shown in this example taken from `arch/arm/mach-omap2/board-omap3beagle.c`
+    (NAND_BLOCK_SIZE is defined elsewhere to be 128K):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: MTD device drivers
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The upper level of the MTD sub-system is a pair of device drivers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A character device, with a major number of 90\. There are two device nodes
+    per MTD partition number, `N: /dev/mtdN` (*minor number=N*2*) and `/dev/mtdNro`
+    (*minor number=(N*2 + 1)*). The latter is just a read-only version of the former.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A block device, with a major number of 31 and a minor number of N. The device
+    nodes are in the form `/dev/mtdblockN`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The MTD character device, mtd
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The character devices are the most important: they allow you to access the
+    underlying flash memory as an array of bytes so that you can read and write (program)
+    the flash. It also implements a number of `ioctl` functions that allow you to
+    erase blocks and to manage the OOB area on NAND chips. The following list is in
+    `include/uapi/mtd/mtd-abi.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| IOCTL | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMGETINFO` | Gets basic MTD characteristic information |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMERASE` | Erases blocks in the MTD partition |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMWRITEOOB` | Writes out-of-band data for the page |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMREADOOB` | Reads out-of-band data for the page |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMLOCK` | Locks the chip (if supported) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMUNLOCK` | Unlocks the chip (if supported) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMGETREGIONCOUNT` | Gets the number of erase regions: non-zero if there
+    are erase blocks of differing sizes in the partition, which is common for NOR
+    flash, rare on NAND |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMGETREGIONINFO` | If `MEMGETREGIONCOUNT` is non-zero, this can be used
+    to get the offset, size, and block count of each region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMGETOOBSEL` | Deprecated |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMGETBADBLOCK` | Gets the bad block flag |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MEMSETBADBLOCK` | Sets the bad block flag |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `OTPSELECT` | Sets OTP (one-time programmable) mode, if the chip supports
+    it |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `OTPGETREGIONCOUNT` | Gets the number of OTP regions |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `OTPGETREGIONINFO` | Gets information about an OTP region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `ECCGETLAYOUT` | Deprecated |'
+  prefs: []
+  type: TYPE_TB
+- en: 'There is a set of utility programs known as `mtd-utils` for manipulating flash
+    memory that makes use of these `ioctl` functions. The source is available from
+    [http://git.infradead.org/mtd-utils.git](http://git.infradead.org/mtd-utils.git)
+    and is available as a package in the Yocto Project and Buildroot. The essential
+    tools are shown in the following list. The package also contains utilities for
+    the JFFS2 and UBI/UBIFS filesystems which I will cover later. For each of these
+    tools, the MTD character device is one of the parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**flash_erase**: Erases a range of blocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**flash_lock**: Locks a range of blocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**flash_unlock**: Unlocks a range of blocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**nanddump**: Dumps memory from NAND flash, optionally including the OOB area.
+    Skips bad blocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**nandtest**: Tests and diagnostics for NAND flash.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**nandwrite**: Writes (program) from a data file to NAND flash, skipping bad
+    blocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'You must always erase flash memory before writing new contents to it: `flash_erase`
+    is the command to do that.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To program NOR flash, you simply copy bytes to the MTD device node using the
+    `cp` command or similar.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unfortunately, this doesn't work with NAND memory as the copy will fail at the
+    first bad block. Instead, use `nandwrite`, which skips over any bad blocks. To
+    read back NAND memory, you should use `nanddump` which also skips bad blocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The MTD block device, mtdblock
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The mtdblock driver is little used. Its purpose is to present flash memory as
+    a block device which you can use to format and mount as a filesystem. However,
+    it has severe limitations because it does not handle bad blocks in NAND flash,
+    does not do wear leveling, and does not handle the mismatch in size between filesystem
+    blocks and flash erase blocks. In other words, it does not have a flash translation
+    layer, which is essential for reliable file storage. The only case where the mtdblock
+    device is useful is to mount read-only filesystems such as Squashfs on top of
+    reliable flash memory such as NOR.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you want a read-only filesystem on NAND flash, you should use the UBI driver,
+    as described later in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Logging kernel oops to MTD
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Kernel errors, or oopsies, are normally logged via the `klogd` and `syslogd`
+    daemons to a circular memory buffer or a file. Following a reboot, the log will
+    be lost in the case of a ring buffer and, even in the case of a file, it may not
+    have been properly written before the system crashed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A more reliable method is to write oops and kernel panics to an MTD partition
+    as a circular log buffer. You enable it with `CONFIG_MTD_OOPS` and you add `console=ttyMTDN`
+    to the kernel command line, `N` being the MTD device number to write the messages
+    to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Simulating NAND memory
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The NAND simulator emulates a NAND chip using system RAM. The main use is for
+    testing code that has to be NAND-aware without access to physical NAND memory.
+    In particular, the ability to simulate bad blocks, bit flips, and other errors
+    allows you to test code paths that are difficult to exercise using real flash
+    memory. For more information, the best place to look is in the code itself, which
+    has a comprehensive description of the ways you can configure the driver. The
+    code is in `drivers/mtd/nand/nandsim.c`. Enable it with the kernel configuration
+    `CONFIG_MTD_NAND_NANDSIM`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The MMC block driver
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: MMC/SD cards and eMMC chips are accessed using the mmcblk block driver. You
+    need a host controller to match the MMC adapter you are using, which is part of
+    the board support package. The drivers are located in the Linux source code in
+    `drivers/mmc/host`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MMC storage is partitioned using a partition table in exactly the same way you
+    would for hard disks, using fdisk or a similar utility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Filesystems for flash memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are several challenges when making efficient use of flash memory for
+    mass storage: the mismatch between the size of an erase block and a disk sector,
+    the limited number of erase cycles per erase block, and the need for bad block
+    handling on NAND chips. These differences are resolved by a **Flash Translation
+    Layer globally**, or **FTL**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Flash translation layers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A flash translation layer has the following features:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Sub allocation**: Filesystems work best with a small allocation unit, traditionally
+    a 512-byte sector. This is much smaller than a flash erase block of 128 KiB or
+    more. Therefore erase blocks have to be sub-divided into smaller units to avoid
+    wasting large amounts of space.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Garbage collection**: A consequence of sub-allocation is that an erase block
+    will contain a mixture of good data and stale data after the filesystem has been
+    in use for a while. Since we can only free up whole erase blocks, the only way
+    to reclaim the free space is to coalesce the good data into one place and return
+    the now empty erase block to the free list: this is garbage collection, and is
+    usually implemented as a background thread.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Wear leveling**: There is a limit on the number of erase cycles for each
+    block. To maximize the lifespan of a chip, it is important to move data around
+    so that each block is erased roughly the same number of times.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Bad block handling**: On NAND flash chips, you have to avoid using any block
+    marked bad and also mark good blocks as bad if they cannot be erased.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Robustness**: Embedded devices may be powered off or reset without warning,
+    so any filesystem should be able to cope without corruption, usually by incorporating
+    a journal or log of transactions.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There are several ways to deploy the flash translation layer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**In the filesystem**: as with JFFS2, YAFFS2, and UBIFS'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**In the block device driver**: the UBI driver, on which UBIFS depends, implements
+    some aspects of a flash translation layer'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**In the device controller**: as with managed flash devices'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When the flash translation layer is in the filesystem or the block driver, the
+    code is part of the kernel and so it is open source, meaning that we can see how
+    it works and we can expect that it will be improved over time. On the other hand,
+    the FTL is inside a managed flash device; it is hidden from view and we cannot
+    verify whether or not it works as we would want. Not only that, but putting the
+    FTL into the disk controller means that it misses out on information that is held
+    at the filesystem layer such as which sectors belong to files that have been deleted
+    and so do not contain useful data anymore. The latter problem is solved by adding
+    commands that pass this information between the filesystem and the device I will
+    describe in the section on the `TRIM` command later, but the question of code
+    visibility remains. If you are using managed flash, you just have to choose a
+    manufacturer you can trust.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Filesystems for NOR and NAND flash memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To use raw flash chips for mass storage, you have to use a filesystem that
+    understands the peculiarities of the underlying technology. There are three such
+    filesystems:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Journaling Flash File System 2, JFFS2**: This was the first flash filesystem
+    for Linux, and is still in use today. It works for NOR and NAND memory, but is
+    notoriously slow during mount.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Yet Another Flash File System 2, YAFFS2**: This is similar to JFFS2, but
+    specifically for NAND flash memory. It was adopted by Google as the preferred
+    raw flash filesystem on Android devices.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Unsorted Block Image File System, UBIFS**: This is the latest flash-aware
+    filesystem for both NOR and NAND memory, which is used in conjunction with the
+    UBI block driver. It generally offers better performance than JFFS2 or YAFFS2,
+    and so should be the preferred solution for new designs.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All of these use MTD as the common interface to flash memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: JFFS2
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The Journaling Flash File System had its beginnings in the software for the
+    Axis 2100 network camera in 1999\. For many years, it was the only flash filesystem
+    for Linux and has been deployed on many thousands of different types of devices.
+    Today, it is not the best choice, but I will cover it first because it shows the
+    beginning of the evolutionary path.
+  prefs: []
+  type: TYPE_NORMAL
+- en: JFFS2 is a log-structured filesystem that uses MTD to access flash memory. In
+    a log-structured filesystem, changes are written sequentially as nodes to the
+    flash memory. A node may contain changes to a directory, such as the names of
+    files created and deleted, or it may contain changes to file data. After a while,
+    a node may be superseded by information contained in subsequent nodes and becomes
+    an obsolete node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Erase blocks are categorized into three types:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**free**: It contains no nodes at all'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**clean**: It contains only valid nodes'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**dirty**: It contains at least one obsolete node'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: At any one time, there is one block receiving updates which is called the open
+    block. If power is lost or the system is reset, the only data that can be lost
+    is the last write to the open block. In addition, nodes are compressed as they
+    are written, increasing the effective storage capacity of the flash chip, which
+    is important if you are using expensive NOR flash memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the number of free blocks falls below a threshold, a garbage collector
+    kernel thread is started, which scans for dirty blocks and copies the valid nodes
+    into the open block, and then frees up the dirty block.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the same time, the garbage collector provides a crude form of wear leveling
+    because it cycles valid data from one block to another. The way that the open
+    block is chosen means that each block is erased roughly the same number of times
+    so long as it contains data that changes from time to time. Sometimes a clean
+    block is chosen for garbage collection to make sure that blocks containing static
+    data that is seldom written are also wear leveled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'JFFS2 filesystems have a write through cache, meaning that writes are written
+    to the flash memory synchronously as if they have been mounted with a `-o sync`
+    option. While improving reliability, it does increase the time to write data.
+    There is a further problem with small writes: if the length of a write is comparable
+    to the size of the node header (40 bytes) the overhead becomes high. A well-known
+    corner case is log files, produced, for example, by syslogd.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary nodes
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There is one overriding disadvantage to JFFS2: since there is no on-chip index,
+    the directory structure has to be deduced at mount-time by reading the log from
+    start to finish. At the end of the scan, you have a complete picture of the directory
+    structure of the valid nodes, but the time taken is proportional to the size of
+    the partition. It is not uncommon to see mount times of the order of one second
+    per megabyte, leading to total mount times of tens or hundreds of seconds.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To reduce the time to scan during mount, summary nodes became an option in Linux
+    2.6.15\. A summary node is written at the end of the open erase block just before
+    it is closed. The summary node contains all of the information needed for the
+    mount-time scan, thereby reducing the amount of data to process during the scan.
+    Summary nodes can reduce mount times by a factor of between two and five, at the
+    expense of an overhead of about 5% of the storage space. They are enabled with
+    the kernel configuration `CONFIG_JFFS2_SUMMARY`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clean markers
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: An erased block with all bits set to 1 is indistinguishable from a block that
+    has been written with 1's, but the latter has not had its memory cells refreshed
+    and cannot be programmed again until it is erased. JFFS2 uses a mechanism called
+    clean markers to distinguish between these two situations. After a successful
+    block erase, a clean marker is written, either to the beginning of the block,
+    or to the OOB area of the first page of the block. If the clean marker exists
+    then it must be a clean block.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a JFFS2 filesystem
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Creating an empty JFFS2 filesystem at runtime is as simple as erasing an MTD
+    partition with clean markers and then mounting it. There is no formatting step
+    because a blank JFFS2 filesystem consists entirely of free blocks. For example,
+    to format MTD partition 6, you would enter these commands on the device:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `-j` option to `flash_erase` adds the clean markers, and mounting with type
+    `jffs2` presents the partition as an empty filesystem. Note that the device to
+    be mounted is given as `mtd6`, not `/dev/mtd6`. Alternatively, you can give the
+    block device node `/dev/mtdblock6`. This is just a peculiarity of JFFS2\. Once
+    mounted, you can treat it like any filesystem and, when you next boot and mount
+    it, all the files will still be there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can create a filesystem image directly from the staging area of your development
+    system using `mkfs.jffs2` to write out the files in JFFS2 format and `sumtool`
+    to add the summary nodes. Both of these are part of the `mtd-utils` package.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As an example, to create an image of the files in `rootfs` for a NAND flash
+    device with an erase block size of 128 KB (0x20000) and with summary nodes, you
+    would use these two commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `-p` option adds padding at the end of the image file to make it a whole
+    number of erase blocks. The `-n` option suppresses the creation of clean markers
+    in the image, which is normal for NAND devices as the clean marker is in the OOB
+    area. For NOR devices, you would leave out the `-n` option. You can use a device
+    table with `mkfs.jffs2` to set the permissions and the ownership of files by adding
+    `-D` [device table]. Of course, Buildroot and the Yocto Project will do all this
+    for you.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can program the image into flash memory from your bootloader. For example,
+    if you have loaded a filesytem image into RAM at address 0x82000000 and you want
+    to load it into a flash partition begins at 0x163000 bytes from the start of the
+    flash chip and is 0x7a9d000 bytes long, the U-Boot commands would be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can do the same thing from Linux using the mtd driver like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To boot with a JFFS2 root filesystem, you need to pass the `mtdblock` device
+    on the kernel command line for the partition and a root `fstype` because JFFS2
+    cannot be auto-detected:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: YAFFS2
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The YAFFS filesystem was written by Charles Manning beginning in 2001, specifically
+    to handle NAND flash chips at a time when JFFS2 did not. Subsequent changes to
+    handle larger (2 KiB) page sizes resulted in YAFFS2\. The website for YAFFS is
+    [http://www.yaffs.net](http://www.yaffs.net).
+  prefs: []
+  type: TYPE_NORMAL
+- en: YAFFS is also a log-structured filesystem following the same design principles
+    as JFFS2\. The different design decisions mean that it has a faster mount-time
+    scan, simpler and faster garbage collection, and has no compression, which speeds
+    up reads and writes at the expense of less efficient use of storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'YAFFS is not limited to Linux; it has been ported to a wide range of operating
+    systems. It has a dual license: GPLv2 to be compatible with Linux, and a commercial
+    license for other operating systems. Unfortunately, the YAFFS code has never been
+    merged into mainline Linux so you will have to patch your kernel, as shown in
+    the following code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To get YAFFS2 and patch a kernel, you would:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Then, configure the kernel with `CONFIG_YAFFS_YAFFS2`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a YAFFS2 filesystem
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As with JFFS2, to create a YAFFS2 filesystem at runtime, you only need to erase
+    the partition and mount it but note that, in this case, you do not enable clean
+    markers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To create a filesystem image, the simplest thing to do is use the `mkyaffs2`
+    tool from [https://code.google.com/p/yaffs2utils](https://code.google.com/p/yaffs2utils)
+    using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here `-c` is the page size and `-s` the OOB size. There is a tool named `mkyaffs2image`
+    that is part of the YAFFS code, but it has a couple of drawbacks. Firstly, the
+    page and OOB size are hard-coded in the source: you will have to edit and recompile
+    if you have memory that does not match the defaults of 2,048 and 64\. Secondly,
+    the OOB layout is incompatible with MTD, which uses the first two byes as a bad
+    block marker, whereas `mkyaffs2image` uses those bytes to store part of the YAFFS
+    metadata.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To copy the image to the MTD partition from a Linux shell prompt, follow these
+    steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To boot with a YAFFS2 root filesystem, add the following to the kernel command
+    line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: UBI and UBIFS
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The **unsorted block image** (**UBI**) driver, is a volume manager for flash
+    memory which takes care of bad block handling and wear leveling. It was implemented
+    by Artem Bityutskiy and first appeared in Linux 2.6.22\. In parallel with that,
+    engineers at Nokia were working on a filesystem that would take advantage of the
+    features of UBI which they called UBIFS; it appeared in Linux 2.6.27\. Splitting
+    the flash translation layer in this way makes the code more modular and also allows
+    other filesystems to take advantage of the UBI driver, as we shall see later on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: UBI
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: UBI provides an idealized, reliable view of a flash chip by mapping **physical
+    erase blocks** (**PEB**) to **logical erase blocks** (**LEB**). Bad blocks are
+    not mapped to LEBs and so are never used. If a block cannot be erased, it is marked
+    as bad and dropped from the mapping. UBI keeps a count of the number of times
+    each PEB has been erased in the header of the LEB and changes the mapping to ensure
+    that each PEB is erased the same number of times.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'UBI accesses the flash memory through the MTD layer. As an extra feature, it
+    can divide an MTD partition into a number of UBI volumes, which improves wear
+    leveling in the following way. Imagine that you have two filesystems, one containing
+    fairly static data, for example, a root filesystem, and the other containing data
+    that is constantly changing. If they are stored in separate MTD partitions, the
+    wear leveling only has an effect on the second one, whereas, if you choose to
+    store them in two UBI volumes in a single MTD partition, the wear leveling takes
+    place over both areas of the storage and the lifetime of the flash memory is increased.
+    The following diagram illustrates this situation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![UBI](img/B03982_07_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'In this way, UBI fulfills two of the requirements of a flash translation layer:
+    wear leveling and bad block handling.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To prepare an MTD partition for UBI, you don''t use `flash_erase` as with JFFS2
+    and YAFFS2, instead you use the `ubiformat` utility, which preserves the erase
+    counts that are stored in the PED headers. `ubiformat` needs to know the minimum
+    unit of IO which, for most NAND flash chips, is the page size, but some chips
+    allow reading and writing in sub pages that are a half or a quarter of the page
+    size. Consult the chip data sheet for details and, if in doubt, use the page size.
+    This example prepares `mtd6` using a page size of 2,048 bytes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You use the `ubiattach` command to load the UBI driver on an MTD partition
+    that has been prepared in this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: This creates the device node `/dev/ubi0` through which you can access the UBI
+    volumes. You can use `ubiattach` multiple times for other MTD partitions, in which
+    case they can be accessed through `/dev/ubi1`, `/dev/ubi2`, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The PEB to LEB mapping is loaded into memory during the attach phase, a process
+    that takes time proportional to the number of PEBs, typically a few seconds. A
+    new feature was added in Linux 3.7 called the UBI fastmap which checkpoints the
+    mapping to flash from time to time and so reduces the attach time. The kernel
+    configuration option is `CONFIG_MTD_UBI_FASTMAP`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first time you attach to an MTD partition after a `ubiformat` there will
+    be no volumes. You can create volumes using `ubimkvol`. For example, suppose you
+    have a 128MB MTD partition and you want to split it into two volumes of 32 MB
+    and 96 MB using a chip with 128 KB erase blocks and 2 KB pages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, you have device the nodes `/dev/ubi0_0` and `/dev/ubi0_1`. You can confirm
+    the situation using `ubinfo`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that, since each LEB has a header to contain the meta information used
+    by UBI, the LEB is smaller than the PEB by one page. For example, a chip with
+    a PEB size of 128 KB and 2 KB pages would have an LEB of 126 KB. This is important
+    information that you will need when creating a UBIFS image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: UBIFS
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: UBIFS uses a UBI volume to create a robust filesystem. It adds sub-allocation
+    and garbage collection to create a complete flash translation layer. Unlike JFFS2
+    and YAFFS2, it stores index information on-chip and so mounting is fast, although
+    don't forget that attaching the UBI volume beforehand may take a significant amount
+    of time. It also allows for write-back caching like a normal disk filesystem,
+    which means that writes are much faster, but with the usual problem of potential
+    loss of data that has not been flushed from the cache to flash memory in the event
+    of power down. You can resolve the problem by making careful use of the `fsync(2)`
+    and `fdatasync(2)` functions to force a flush of file data at crucial points.
+  prefs: []
+  type: TYPE_NORMAL
+- en: UBIFS has a journal for fast recovery in the event power down. The journal takes
+    up some space, typically 4 MiB or more, so UBIFS is not suitable for very small
+    flash devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once you have created the UBI volumes, you can mount them using the device
+    node for the volume, `/dev/ubi0_0`, or by using the device node for the whole
+    partition plus the volume name, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Creating a filesystem image for UBIFS is a two-stage process: first you create
+    a UBIFS image using `mkfs.ubifs`, and then embed it into a UBI volume using `ubinize`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the first stage, `mkfs.ubifs` needs to be informed of the page size with
+    `-m`, the size of the UBI LEB with `-e`, remembering that the LEB is usually one
+    page shorter than the PEB, and the maximum number of erase blocks in the volume
+    with `-c`. If the first volume is 32 MiB and an erase block is 128 KiB, then the
+    number of erase blocks is 256\. So, to take the contents of the directory rootfs
+    and create a UBIFS image named `rootfs.ubi`, you would type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second stage requires you to create a configuration file for `ubinize`
+    which describes the characteristics of each volume in the image. The help page
+    (`ubinize -h`) gives details of the format. This example creates two volumes,
+    `vol_1` and `vol_2`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second volume has an auto-resize flag and so will expand to fill the remaining
+    space on the MTD partition. Only one volume can have this flag. From this information,
+    `ubinize` will create an image file named by the `-o` parameter, with the PEB
+    size `-p`, the page size `-m`, and the sub-page size `-s`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To install this image on the target, you would enter these commands on the
+    target:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If you want to boot with a UBIFS root filesystem, you would give these kernel
+    command line parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: Filesystems for managed flash
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As the trend towards managed flash technologies continues, particularly eMMC,
+    we need to consider how to use it effectively. While they appear to have the same
+    characteristics as hard disk drives, some NAND flash chips have the limitations
+    of large erase blocks with limited erase cycles and bad block handling. And, of
+    course, we need robustness in the event of losing power.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is possible to use any of the normal disk filesystems but we should try to
+    choose one that reduces disk writes and has a fast restart after an unscheduled
+    shutdown, typically provided by a journal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Flashbench
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To make optimum use of the underlying flash memory, you need to know the erase
+    block size and page size. Manufacturers do not publish these numbers, as a rule,
+    but it is possible to deduce them by observing the behavior of the chip or card.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Flashbench is one such tool. It was initially written by Arnd Bergman, as described
+    in the LWN article available at [http://lwn.net/Articles/428584](http://lwn.net/Articles/428584).
+    You can get the code from [https://github.com/bradfa/flashbench](https://github.com/bradfa/flashbench).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is a typical run on a SanDisk GiB SDHC card:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Flashbench reads blocks of, in this case, 1,024 bytes just before and just after
+    various power-of-two boundaries. As you cross a page or erase block boundary,
+    the reads after the boundary take longer. The rightmost column shows the difference
+    and is the one that is most interesting. Reading from the bottom, there is a big
+    jump at 4 KiB, which is the most likely size of a page. There is a second jump
+    from 52.4µs to 349µs at 8 KiB. This is fairly common and indicates that the card
+    can use multi-plane accesses to read two 4 KiB pages at the same time. Beyond
+    that, the differences are less well marked, but there is a clear jump from 485µs
+    to 805µs at 512 KiB, which is probably the erase block size. Given that the card
+    being tested is quite old, these are the sort of numbers you would expect.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Discard and TRIM
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Usually, when you delete a file, only the modified directory node is written
+    to storage while the sectors containing the file's contents remain unchanged.
+    When the flash translation layer is in the disk controller, as with managed flash,
+    it does not know that this group of disk sectors no longer contains useful data
+    and so it ends up copying stale data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the last few years, the addition of transactions that pass information about
+    deleted sectors down to the disk controller has improved the situation. The SCSI
+    and SATA specifications have a `TRIM` command and MMC has a similar command named
+    `ERASE`. In Linux, this feature is known as `discard`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To make use of `discard`, you need a storage device that supports it – most
+    current eMMC chips do – and a Linux device driver to match. You can check by looking
+    at the block system queue parameters in `/sys/block/<block device>/queue/`. The
+    ones of interest are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`discard_granularity`: The size of the internal allocation unit of the device'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`discard_max_bytes`: The maximum number of bytes that can be discarded in one
+    go'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`discard_zeroes_data`: If `1`, discarded data will be set to zero'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If the device or the device driver does not support `discard`, these values
+    are all set to zero. These are the parameters you will see from the eMMC chip
+    on the BeagleBone Black:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is more information in the kernel documentation file, `Documentation/block/queue-sysfs.txt`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can enable `discard` when mounting a filesystem by adding the option `-o
+    discard` to the `mount` command. Both ext4 and F2FS support it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Make sure that the storage device supports `discard` before using the `-o discard
+    mount` option, otherwise data loss can occur.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It is also possible to force `discard` from the command line independently
+    of how the partition is mounted, using the `fstrim` command which is part of the
+    `util-linux` package. Typically, you would run this command periodically, once
+    a week perhaps, to free up unused space. `fstrim` operates on a mounted filesystem
+    so, to trim the root filesystem `/`, you would type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding example uses the verbose option, `-v`, so that it prints out the
+    number of bytes potentially freed up. In this case 2,061,000,704 is the approximate
+    amount of free space in the filesystem, so it is the maximum amount of storage
+    that could have been freed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ext4
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The extended filesystem, ext, has been the main filesystem for Linux desktops
+    since 1992\. The current version, ext4, is very stable, well tested and has a
+    journal that makes recovery from an unscheduled shutdown fast and mostly painless.
+    It is a good choice for managed flash devices and you will find that it is the
+    preferred filesystem for Android devices that have eMMC storage. If the device
+    supports `discard`, you should mount with the option `-o discard`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To format and create an ext4 filesystem at runtime, you would type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To create a filesystem image, you can use the `genext2fs` utility, available
+    from [http://genext2fs.sourceforge.net](http://genext2fs.sourceforge.net). In
+    this example, I have specified the block size with `-B` and the number of blocks
+    in the image with `-b`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`genext2fs` can make use of a device table to set the file permissions and
+    ownership, as described in [Chapter 5](ch05.html "Chapter 5. Building a Root Filesystem"),
+    *Building a Root Filesystem*, with `-D [file table]`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As the name implies, this will actually generate an image in `.ext2` format.
+    You can upgrade using `tune2fs` as follows (details of the command options are
+    in the main page for `tune2fs`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: Both the Yocto Project and Buildroot use exactly these steps when creating images
+    in `.ext4` format.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While a journal is an asset for devices that may power down without warning,
+    it does add extra write cycles to each write transaction, wearing out the flash
+    memory. If the device is battery-powered, especially if the battery is not removable,
+    the chances of an unscheduled power down are small and so you may want to leave
+    the journal out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: F2FS
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The **Flash-Friendly File System**, **F2FS**, is a log-structured filesystem
+    designed for managed flash devices, especially eMMC and SD. It was written by
+    Samsung and was merged into mainline Linux in 3.8\. It is marked experimental,
+    indicating that it has not been extensively deployed as yet, but it seems that
+    some Android devices are using it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: F2FS takes into account the page and erase block sizes and tries to align data
+    on these boundaries. The log format gives resilience in the face of power down
+    and also gives good write performance, in some tests showing a two-fold improvement
+    over ext4\. There is a good description of the design of F2FS in the kernel documentation
+    in `Documentation/filesystems/f2fs.txt` and there are references at the end of
+    the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `mfs2.fs2` utility creates an empty F2FS filesystem with the label `-l`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: There isn't (yet) a tool to create F2FS filesystem images off-line.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FAT16/32
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The old Microsoft filesystems, FAT16 and FAT32, continue to be important as
+    a common format that is understood by most operating systems. When you buy an
+    SD card or USB flash drive, it is almost certain to be formatted as FAT32 and,
+    in some cases, the on-card microcontroller is optimized for FAT32 access patterns.
+    Also, some boot ROMs require a FAT partition for the second stage bootloader,
+    the TI OMAP-based chips for example. However, FAT formats are definitely not suitable
+    for storing critical files because they are prone to corruption and make poor
+    use of the storage space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Linux supports FAT16 through the `msdos` filesystem and both FAT32 and FAT16
+    through the `vfat` filesystem. In most cases, you need to include the `vfat` driver.
+    Then, to mount a device, say an SD card on the second `mmc` hardware adapter,
+    you would type this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the past, there have been licensing issues with the `vfat` driver which may
+    (or may not) infringe a patent held by Microsoft.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FAT32 has a limitation on the device size of 32 GiB. Devices of a larger capacity
+    may be formatted using the Microsoft exFAT format and it is a requirement for
+    SDXC cards. There is no kernel driver for exFAT, but it can be supported by means
+    of a user-space FUSE driver. Since exFAT is proprietary to Microsoft there are
+    certain to be licensing implications if you support this format on your device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Read-only compressed filesystems
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Compressing data is useful if you don''t have quite enough storage to fit everything
+    in. Both JFFS2 and UBIFS do on-the-fly data compression by default. However, if
+    the files are never going to be written, as is usually the case with the root
+    filesystem, you can achieve better compression ratios by using a read-only compressed
+    filesystem. Linux supports several of these: `romfs`, `cramfs`, and `squashfs`.
+    The first two are obsolete now, so I will describe only `squashfs`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: squashfs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`squashfs` was written by Phillip Lougher in 2002 as a replacement for `cramfs`.
+    It existed as a kernel patch for a long time, eventually being merged into mainline
+    Linux in version 2.6.29 in 2009\. It is very easy to use: you create a filesystem
+    image using `mksquashfs` and install it to the flash memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: The resulting filesystem is read-only so there is no mechanism to modify any
+    of the files at runtime. The only way to update a `squashfs` filesystem is to
+    erase the whole partition and program in a new image.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`squashfs` is not bad block-aware and so must be used with reliable flash memory
+    such as NOR flash. It can be used on NAND flash as long as you use UBI to create
+    an emulated, reliable, MTD volume on top of UBI. You have to enable kernel configuration
+    `CONFIG_MTD_UBI_BLOCK`, which will create a read-only MTD block device for each
+    UBI volume. The following diagram shows two MTD partitions, each with accompanying
+    `mtdblock` devices. The second partition is also used to create a UBI volume which
+    is exposed as a third, reliable, `mtdblock` device, which you can use for any
+    read-only filesystem that is not bad block-aware:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![squashfs](img/B03982_07_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Temporary filesystems
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There are always some files that have a short lifetime or which have no significance
+    after a reboot. Many such files are put into `/tmp`, and so it makes sense to
+    keep these files from reaching permanent storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The temporary filesystem, `tmpfs`, is ideal for this purpose. You can create
+    a temporary RAM-based filesystem by simply mounting `tmpfs`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: As with `procfs` and `sysfs`, there is no device node associated with `tmpfs`
+    so you have to supply a place-keeper string, `tmp_files` in the preceding example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The amount of memory used will grow and shrink as files are created and deleted.
+    The default maximum size is half the physical RAM. In most cases, it would be
+    a disaster if `tmpfs` grew that large, so it is a very good idea to cap it with
+    a `-o size` parameter. The parameter can be given in bytes, KiB (`k`), MiB (`m`),
+    or GiB (`g`), for example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In addition to `/tmp`, some subdirectories of `/var` contain volatile data
+    and it is good practice to use `tmpfs` for them as well, either by creating a
+    separate filesystem for each or, more economically, by using symbolic links. Buildroot
+    does it this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the Yocto Project, `/run` and `/var/volatile` are `tmpfs` mounts with symbolic
+    links pointing to them as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: Making the root filesystem read-only
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You need to make your target device able to survive unexpected events including
+    file corruption, and still be able to boot and achieve at least a minimum level
+    of function. Making the root filesystem read-only is a key part of achieving this
+    ambition because it eliminates accidental over-writes. Making it read-only is
+    easy: replace `rw` with `ro` on the kernel command line or use an inherently read-only
+    filesystem such as `squashfs`. However, you will find that there are a few files
+    and directories that are traditionally writable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`/etc/resolv.conf`: This file is written by network configuration scripts to
+    record the addresses of DNS name servers. The information is volatile, so you
+    simply have to make it a symlink to a temporary directory, for example, `/etc/resolv.conf
+    -> /var/run/resolv.conf`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/etc/passwd`: This file, along with `/etc/group`, `/etc/shadow`, and `/etc/gshadow`,
+    stores user and group names and passwords. They need to be symbolically linked
+    to an area of persistent storage in the same way as `resolv.conf`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/var/lib`: Many applications expect to be able to write to this directory
+    and to keep permanent data here as well. One solution is to copy a base set of
+    files to a `tmpfs` filesystem at boot time and then bind mount `/var/lib` to the
+    new location by putting a sequence of commands such as these into one of the boot
+    scripts:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`/var/log`: This is the place where syslog and other daemons keep their logs.
+    Generally, logging to flash memory is not desirable because of the many small
+    write cycles it generates. A simple solution is to mount `/var/log` using `tmpfs`,
+    making all log messages volatile. In the case of `syslogd`, BusyBox has a version
+    that can log to a circular ring buffer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you are using the Yocto Project, you can create a read-only root filesystem
+    by adding `IMAGE_FEATURES = "read-only-rootfs"` to `conf/local.conf` or to your
+    image recipe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Filesystem choices
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far we have looked at the technology behind solid state memory and at the
+    many types of filesystems. Now it is time to summarize the options.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In most cases, you will be able to divide your storage requirements into these
+    three categories:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Permanent, readable, and writable data**: Runtime configuration, network
+    parameters, passwords, data logs, and user data'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Permanent, read-only data**: Programs, libraries, and configurations files
+    that are constant, for example, the root filesystem'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Volatile data**: Temporary storage for example `/tmp`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The choices for read-write storage are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**NOR**: UBIFS or JFFS2'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**NAND**: UBIFS, JFFS2, or YAFFS2'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**eMMC**: ext4 or F2FS'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: For read-only storage, you can use all of the above mounted with the `ro` attribute.
+    Additionally, if you want to save space, you could use `squashfs`, in the case
+    of NAND flash using UBI `mtdblock` device emulation to handle the bad blocks for
+    you.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, for volatile storage, there is only one choice, `tmpfs`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Updating in the field
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There have been several well-publicized security flaws, including Heartbleed
+    (a bug in the OpenSSL libraries) and Shellshock (a bug in the bash shell), both
+    of which could have serious consequences for embedded Linux devices that are currently
+    deployed. For this reason alone, it is highly desirable to have a mechanism to
+    update devices in the field so that you can fix security problems as they arise.
+    There are other good reasons as well: to deploy other bug fixes and feature updates.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The guiding principle of update mechanisms is that they should do no harm,
+    remembering Murphy''s Law: if it can go wrong, it will go wrong, eventually. Any
+    update mechanism must be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Robust**: It must not render the device inoperable. I will talk about updates
+    being atomic; either the system is updated successfully or not updated at all
+    and continues to run as before.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Failsafe**: It must handle interrupted updates gracefully.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Secure**: It must not allow unauthorized updates, otherwise it will become
+    an attack mechanism.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Atomicity can be achieved by having duplicates of the things you want to update
+    and switching to the new copy when safe to do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Failsafety requires there to be a mechanism to detect a failed update, such
+    as a hardware watchdog, and a known good copy of software to fall back on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Security can be achieved in the case of updates that are local and attended
+    through authentication by a password or PIN code. But, if the update is remote
+    and automatic, some level of authentication via the network is needed. Ultimately,
+    you may want to add a secure bootloader and signed update binaries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some components are easier to update than others. The bootloader is very difficult
+    to update since there are usually hardware constraints that mean there can only
+    be one bootloader, and so there cannot be a backup if the update fails. On the
+    other hand, bootloaders are not often a cause of runtime bugs. The best advice
+    is to avoid bootloader updates in the field.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Granularity: file, package, or image?'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: This is the big question, and depends on your overall system design and your
+    desired level of robustness.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'File updates can be made atomic: the technique is to write the new content
+    to a temporary file in the same filesystem and then use the POSIX `rename(2)`
+    function to move it over the old file. It works because rename is guaranteed to
+    be atomic. However, this is only one part of the problem because there will be
+    dependencies between files which need to be considered.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Updating at the level of packages (`RPM`, `dpkg`, or `ipk`) is a better option,
+    assuming that you have a runtime package manager. This, after all, is how desktop
+    distributions have been doing it for years. The package manager has a database
+    of updates and can keep track of those which have been updated and those that
+    haven't. Each package has an update script that is designed to make sure that
+    the package update is atomic. The great advantage is that you can update existing
+    packages, install new ones, and delete obsolete ones with ease. If you are using
+    a root filesystem that is mounted as read-only, you will have to temporarily remount
+    read-write while updating, which opens up a small window for corruption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Package managers do have downsides as well. They are not able to update kernel
+    or other images in raw flash memory. After devices have been deployed and updated
+    several times, you may end up with a large number of combinations of packages
+    and package versions, which will complicate QA for each new update cycle. Package
+    managers are not bulletproof in the event of power failure during an update.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The third option is to update whole system images: the kernel, the root filesystem,
+    user applications, and so on.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Atomic image update
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to make the update atomic, we need two things: a second copy of the
+    operating system that can be used during the update, and a mechanism in the bootloader
+    to select which copy of the operating system to load. The second copy may be exactly
+    the same as the first, resulting in full redundancy of the operating system, or
+    it may be a small operating system dedicated to updating the main one.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the first scheme ,there are two copies of the operating system, each comprised
+    of the Linux kernel, the root filesystem, and system applications, as shown in
+    the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Atomic image update](img/B03982_07_05.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Initially, the boot flag is not set, so the bootloader loads copy 1\. To install
+    an update, the updater application, which is part of the operating system, overwrites
+    copy 2\. When complete, it sets the boot flag and reboots. Now, the bootloader
+    will load the new operating system. When a further update is installed, the updater
+    in copy 2 overwrites copy 1 and clears the boot flag and so you ping-pong between
+    the two copies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If an update fails, the boot flag is not changed and the last good operating
+    system is used. Even if the update consists of several components, a kernel image,
+    a DTB, a root filesystem, and a system application filesystem, the whole update
+    is atomic because the boot flag is only updated when all updates are completed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The main drawback with this scheme is that it requires storage for two copies
+    of the operating system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can reduce storage requirements by keeping a minimal operating system purely
+    for updating the main one, as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Atomic image update](img/B03982_07_06.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: When you want to install an update, set the boot flag and reboot. Once the recovery
+    operating system is running, it starts the updater which overwrites the main operating
+    system images. When done, it clears the boot flag and reboots again, this time
+    loading the new main operating system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The recovery operating system is usually a lot smaller than the main operating
+    system, maybe only a few megabytes, and so the storage overhead is not great.
+    In fact, this is the scheme adopted by Android. The main operating system is several
+    hundred megabytes, but the recovery mode operating system is a simple ramdisk
+    of a few megabytes only.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following resources have further information about the topics introduced
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*XIP: The past, the present... the future?*, *Vitaly Wool*, presentation at
+    FOSDEM 2007: [https://archive.fosdem.org/2007/slides/devrooms/embedded/Vitaly_Wool_XIP.pdf](https://archive.fosdem.org/2007/slides/devrooms/embedded/Vitaly_Wool_XIP.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*General MTD documentation*, [http://www.linux-mtd.infradead.org/doc/general.html](http://www.linux-mtd.infradead.org/doc/general.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Optimizing Linux with cheap flash drives*, *Arnd Bergmann*: [http://lwn.net/Articles/428584/](http://lwn.net/Articles/428584/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Flash memory card design*: [https://wiki.linaro.org/WorkingGroups/KernelArchived/Projects/FlashCardSurvey](https://wiki.linaro.org/WorkingGroups/KernelArchived/Projects/FlashCardSurvey)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*eMMC/SSD File System Tuning Methodology*: [http://elinux.org/images/b/b6/EMMC-SSD_File_System_Tuning_Methodology_v1.0.pdf](http://elinux.org/images/b/b6/EMMC-SSD_File_System_Tuning_Methodology_v1.0.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Flash-Friendly File System (F2FS)*: [http://elinux.org/images/1/12/Elc2013_Hwang.pdf](http://elinux.org/images/1/12/Elc2013_Hwang.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*An f2fS teardown*: [http://lwn.net/Articles/518988/](http://lwn.net/Articles/518988/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Building Murphy-compatible embedded Linux systems*, *Gilad Ben-Yossef*: [https://www.kernel.org/doc/ols/2005/ols2005v1-pages-21-36.pdf](https://www.kernel.org/doc/ols/2005/ols2005v1-pages-21-36.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Flash memory has been the storage technology of choice for embedded Linux from
+    the beginning and over the years Linux has gained very good support, from low-level
+    drivers up to flash-aware filesystems, the latest being UBIFS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, as the rate at which new flash technologies are introduced increases,
+    it is becoming harder to keep pace with the changes at the high end. System designers
+    are increasingly turning to managed flash in the form of eMMC to provide a stable
+    hardware and software interface which is independent of the memory chips inside.
+    Embedded Linux developers are beginning to get to grips with these new chips.
+    Support for TRIM in ext4 and F2FS is well established, and it is slowly finding
+    its way into the chips themselves. Also, the appearance of new filesystems that
+    are optimized to manage flash, such as F2FS, is a welcome step forward.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, the fact remains that flash memory is not the same as a hard disk drive.
+    You have to be careful to minimize the number of filesystem writes – especially
+    as the higher density TLC chips may be able to support as few as 1,000 erase cycles.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, it is essential to have a strategy for updating the files and images
+    stored on the device in the field. A crucial part of this is the decision to use
+    a package manager or not. A package manager gives you flexibility, but cannot
+    give you a fully Murphy proof update solution. Your choice depends on the balance
+    between convenience and robustness.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter describes how you control the hardware components of your system
+    through the use of device drivers, both in the conventional sense of drivers that
+    are part of the kernel, and also the extent to which you can control hardware
+    from the user space.
+  prefs: []
+  type: TYPE_NORMAL

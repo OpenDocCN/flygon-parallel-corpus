@@ -1,0 +1,851 @@
+- en: '*Chapter 13*: Watchdog Device Drivers'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A watchdog is a hardware (sometimes emulated by software) device intended to
+    ensure the availability of a given system. It helps make sure that the system
+    always reboots upon a critical hang, thus allowing to monitor the "normal" behavior
+    of the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Whether it is hardware-based or emulated by software, the watchdog is, most
+    of the time, nothing but a timer initialized with a reasonable timeout that should
+    be periodically refreshed by software running on the monitored system. If for
+    any reason the software stops/fails at refreshing the timer (and has not explicitly
+    shut it down) before it expires (it runs to timeout), this will trigger a (hardware)
+    reset of the whole system (the computer, in our case). Such a mechanism can even
+    help with recovering from a kernel panic. By the end of this chapter, you will
+    be able to do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Read/understand an existing watchdog kernel driver and use what it exposes in
+    user space.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Write new watchdog device drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Master some not-so-well-known concepts, such as *watchdog governor* and *pretimeout*.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will also address the concepts behind the Linux kernel
+    watchdog subsystem with the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Watchdog data structures and APIs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The watchdog user space interface
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before we start walking through this chapter, the following elements are required:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: C programming skills
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Basic electronics knowledge
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel v4.19.X sources, available at [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/refs/tags)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Watchdog data structures and APIs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this section, we will walk through the watchdog framework and learn how
+    it works under the hood. The watchdog subsystem has a few data structures. The
+    main one is `struct watchdog_device`, which is the Linux kernel representation
+    of a watchdog device, containing all the information about it. It is defined in
+    `include/linux/watchdog.h`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are descriptions of the fields in this data structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`id`: The watchdog''s ID allocated by the kernel during the device registration.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`parent`: Represents the parent for this device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`info`: This `struct watchdog_info` structure pointer provides some additional
+    information about the watchdog timer itself. This is the structure that is returned
+    to the user when calling the `WDIOC_GETSUPPORT` ioctl on the watchdog char device
+    in order to retrieve its capabilities. We will introduce this structure later
+    in detail.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ops`: A pointer to the list of watchdog operations. Once again, we will introduce
+    this data structure later.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`gov`: A pointer to the watchdog pretimeout governor. A governor is nothing
+    but a policy manager that reacts according to certain events or system parameters.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bootstatus`: The status of the watchdog device at boot. This is a bitmask
+    of reasons that triggered the system reset. Possible values will be enumerated
+    later when describing the `struct watchdog_info` structure.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`timeout`: This is the watchdog device''s timeout value in seconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pretimeout`: The concept of *pretimeout* can be explained as an event that
+    occurs sometime before the real timeout occurs, so if the system is in an unhealthy
+    state, it triggers an interrupt before the real timeout reset. These interrupts
+    are usually non-maskable ones (`pretimeout` field is actually the time interval
+    (the number of seconds) before triggering the real timeout''s interrupt. This
+    is not the number of seconds until the pretimeout. As an example, if you set the
+    timeout to `60` seconds and the pretimeout to `10`, you''ll have the pretimeout
+    event triggered in `50` seconds. Setting a pretimeout to `0` disables it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`min_timeout` and `max_timeout` are, respectively, the watchdog device''s minimum
+    and maximum timeout values (in seconds). These are actually the lower and upper
+    bounds for a valid timeout range. If the values are 0, then the framework will
+    leave a check for the watchdog driver itself.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`wd_data`: A pointer to the watchdog core internal data. This field must be
+    accessed via the `watchdog_set_drvdata()` and `watchdog_get_drvdata()` helpers.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`status` is a field that contains the device''s internal status bits. Possible
+    values are listed here:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '--`WDOG_ACTIVE`: Tells whether the watchdog is running/active.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`WDOG_NO_WAY_OUT`: Informs whether the `nowayout` feature is set. You can
+    use `watchdog_set_nowayout()` to set the `nowayout` feature; its signature is
+    `void watchdog_set_nowayout(struct watchdog_device *wdd, bool nowayout)`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`WDOG_STOP_ON_REBOOT`: Should be stopped on reboot.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`WDOG_HW_RUNNING`: Informs that the hardware watchdog is running. You can
+    use the `watchdog_hw_running()` helper to check whether this flag is set or not.
+    However, you should set this flag on the success path of the watchdog''s start
+    function (or in the probe function if for any reason you start it there or you
+    discover that the watchdog is already started). You can use the `set_bit()` helper
+    for this.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`WDOG_STOP_ON_UNREGISTER`: Specifies that the watchdog should be stopped
+    on unregistration. You can use the `watchdog_stop_on_unregister()` helper to set
+    this flag.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we introduced it previously, let''s delve in detail into the `struct watchdog_info`
+    structure, defined in `include/uapi/linux/watchdog.h`, actually, because it is
+    part of the user space API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This structure is also the one returned to the user space on the success path
+    of the `WDIOC_GETSUPPORT` ioctl. In this structure, the fields have the following
+    meanings:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`options` represents the supported capabilities of the card/driver. It is a
+    bitmask of the capabilities supported by the watchdog device/driver since some
+    watchdog cards offer more than just a countdown. Some of these flags may also
+    be set in the `watchdog_device.bootstatus` field in response to the `GET_BOOT_STATUS`
+    ioctl. These flags are listed as follows, with dual explanations given where necessary:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: --`WDIOF_SETTIMEOUT` means the watchdog device can have its timeout set. If
+    this flag is set, then a `set_timeout` callback has to be defined.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_MAGICCLOSE` means the driver supports the magic close char feature.
+    As the closing of the watchdog char device file does not stop the watchdog, this
+    feature means writing a *V* character (also called a magic character or magic
+    *V*) sequence in this watchdog file will allow the next close to turn off the
+    watchdog (if `nowayout` is not set).
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_POWERUNDER` means the device can monitor/detect bad powers or power
+    faults.. When set in `watchdog_device.bootstatus`, this flag means that it is
+    the fact that the machine showed an under-voltage that triggered the reset.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_POWEROVER`, on the other hand, means the device can monitor the operating
+    voltage. When set in `watchdog_device.bootstatus`, it means the system reset may
+    be due to an over-voltage status. Note that if one level is under and one over,
+    both bits will be set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_OVERHEAT` means the watchdog device can monitor the chip/SoC temperature.
+    When set in `watchdog_device.bootstatus`, it means the reason for the last machine
+    reboot via the watchdog was due to exceeding the thermal limit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_FANFAULT` informs us that this watchdog device can monitor the fan.
+    When set, it means a system fan monitored by the watchdog card has failed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some devices even have separate event inputs. If defined, electrical signals
+    are present on these inputs, which also leads to a reset. This is the aim of `WDIOF_EXTERN1`
+    and `WDIOF_EXTERN2`. When set in `watchdog_device.bootstatus`, it means the machine
+    was last rebooted because of an external relay/source 1 or 2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_PRETIMEOUT` means this watchdog device supports a pretimeout feature.
+  prefs: []
+  type: TYPE_NORMAL
+- en: --`WDIOF_KEEPALIVEPING` means this driver supports the `WDIOC_KEEPALIVE` ioctl
+    (it can be pinged via an ioctl); otherwise, the ioctl will return `-EOPNOTSUPP`.
+    When set in `watchdog_device.bootstatus`, this flag means the watchdog saw a keep-alive
+    ping since it was last queried.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '--`WDIOF_CARDRESET`: This is a special flag that may appear in `watchdog_device.bootstatus`
+    only. It means the last reboot was caused by the watchdog itself (its timeout,
+    actually).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`firmware_version` is the firmware version of the card.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`identity` should be a string describing the device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The other data structure without which nothing is possible is `struct watchdog_ops`,
+    defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding structure contains the list of operations allowed on the watchdog
+    device. Each operation''s meaning is presented in the following descriptions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`start` and `stop`: These are mandatory operations that, respectively, start
+    and stop the watchdog.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A `ping` callback is used to send a keep-alive ping to the watchdog. This method
+    is optional. If not defined, then the watchdog will be restarted via the `.start`
+    operation, as it would mean that the watchdog does not have its own ping method.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`status` is an optional routine that returns the status of the watchdog device.
+    If defined, its return value will be sent in response to a `WDIOC_GETBOOTSTATUS`
+    ioctl.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_timeout` is the callback to set the watchdog timeout value (in seconds).
+    If defined, you should also set the `X` option flag; otherwise, any attempt to
+    set the timeout will result in an `-EOPNOTSUPP` error.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`set_pretimeout` is the callback to set the pretimeout. If defined, you should
+    also set the `WDIOF_PRETIMEOUT` option flag; otherwise, any attempt to set the
+    pretimeout will result in an `-EOPNOTSUPP` error.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`get_timeleft` is an optional operation that returns the number of seconds
+    left before a reset.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`restart`: This is actually the routine to restart the machine (not the watchdog
+    device). If set, you may want to call `watchdog_set_restart_priority()` on the
+    watchdog device in order to set the priority of this restart handler prior to
+    registering the watchdog with the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ioctl`: You should not implement this callback unless you have to – for example,
+    if you need to handle extra/non-standard ioctl commands. If defined, this method
+    will override the watchdog core default ioctl, unless it returns `-ENOIOCTLCMD`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This structure contains the callback functions supported by the device according
+    to its capabilities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are familiar with the data structures, we can switch to watchdog
+    APIs and particularly see how to register and unregister such a device with the
+    system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Registering/unregistering a watchdog device
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The watchdog framework provides two elementary functions to register/unregister
+    watchdog devices with the system. These are `watchdog_register_device()` and `watchdog_unregister_device()`,
+    and their respective prototypes are the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding registration method returns zero on a success path or a negative
+    *errno* code on failure. On the other hand, `watchdog_unregister_device()` performs
+    the reverse operation. In order to no longer bother with unregistration, you can
+    use the managed version of this function, `devm_watchdog_register_device`, whose
+    prototype is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding managed version will automatically handle unregistration on driver
+    detach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The registration method (whatever it is, managed or not) will check whether
+    the `wdd->ops->restart` function is provided and will register this method as
+    a restart handler. Thus, prior to registering the watchdog device with the system,
+    the driver should set the restart priority using the `watchdog_set_restart_priority()`
+    helper, knowing that the priority value of the restart handler should follow the
+    following guidelines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0`: This is the lowest priority, which means using the watchdog''s restart
+    function as a last resort; that is, when there is no other restart handler provided
+    in the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`128`: This is the default priority, and means using this restart handler by
+    default if no other handler is expected to be available and/or if a restart is
+    sufficient to restart the entire system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`255`: This is the highest priority, preempting all other handlers.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The device registration should be done only after you have dealt with all the
+    elements we have discussed; that is, after providing the valid `.info`, `.ops`,
+    and timeout-related fields of the watchdog device. Prior to all this, memory space
+    should be allocated for the `watchdog_device` structure. Wrapping this structure
+    in a bigger and per-driver data structure is good practice, as shown in the following
+    example, which is an excerpt from `drivers/watchdog/imx2_wdt.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can see how the watchdog device data structure is embedded in a bigger
+    structure, `struct imx2_wdt_device`. Now comes the `probe` method, which initializes
+    everything and sets the watchdog device in the bigger structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Additionally, the bigger structure can be used in the `move` method to track
+    the device state, and particularly the watchdog data structure embedded inside.
+    This is what the preceding code excerpt highlights.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we have dealt with watchdog basics, walked through the base data structures,
+    and described the main APIs. Now, we can learn about fancy features such as pretimeouts
+    and governors in order to define the behavior of the system upon the watchdog
+    event.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handling pretimeouts and governors
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The concept of *governor* appears in several subsystems in the Linux kernel
+    (thermal governors, CPUFreq governors, and now watchdog governors). It is nothing
+    but a driver that implements policy management (sometimes in the form of an algorithm)
+    that reacts to some states/events of the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The way each subsystem implements its governor drivers may be different from
+    other subsystems, but the main idea remains the same. Moreover, governors are
+    identified by a unique name and the governor (policy manager) in use. They may
+    be changed on the fly, most often from within the sysfs interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, back to watchdog pretimeouts and governors. Support for them can be added
+    to the Linux kernel by enabling the `CONFIG_WATCHDOG_PRETIMEOUT_GOV` kernel config
+    option. There are actually two watchdog governor drivers in the kernel: `drivers/watchdog/pretimeout_noop.c`
+    and `drivers/watchdog/pretimeout_panic.c`. Their unique names are, respectively,
+    `noop` and `panic`. Either can be used by default by enabling `CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_NOOP`
+    or `CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The main goal of this section is to deliver the pretimeout event to the watchdog
+    governor that is currently active. This can be achieved by means of the `watchdog_notify_pretimeout()`
+    interface, which has the following prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we have discussed, some watchdog devices generate an IRQ in response to a
+    pretimeout event. The main idea is to call `watchdog_notify_pretimeout()` from
+    within this IRQ handler. Under the hood, this interface will internally find the
+    watchdog governor (by looking for its name in the global list of watchdog governors
+    registered with the system) and call its `.pretimeout` callback.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just for your information, the following is what a watchdog governor structure
+    looks like (you can find more information on watchdog governor drivers by looking
+    at the source in `drivers/watchdog/pretimeout_noop.c` or `drivers/watchdog/pretimeout_panic.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Obviously, its fields have to be filled in by the underlying watchdog governor
+    driver. For the real usage of a pretimeout notification, you can refer to the
+    IRQ handler of the i.MX6 watchdog driver, defined in `drivers/watchdog/imx2_wdt.c`.
+    An excerpt of this was shown earlier in the previous section. There, you will
+    notice that `watchdog_notify_pretimeout()` gets called from within the watchdog
+    (the pretimeout, actually) IRQ handler. Moreover, you will notice that the driver
+    uses a different `watchdog_info` structure depending on whether there is a valid
+    IRQ for the watchdog. If there is a valid one, the structure with the `WDIOF_PRETIMEOUT`
+    flag set in `.options` is used, meaning that the device has a pretimeout feature.
+    Otherwise, it uses the structure without the `WDIOF_PRETIMEOUT` flag set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we are familiar with the concept of governor and pretimeout, we can
+    think about learning an alternative way of implementing watchdogs, such as GPIO-based
+    ones.
+  prefs: []
+  type: TYPE_NORMAL
+- en: GPIO-based watchdogs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Sometimes, it may be better to use an external watchdog device instead of the
+    one provided by the SoC itself, such as for power efficiency reasons, for example,
+    as there are SoCs whose internal watchdog requires much more power than external
+    ones. Most of the time, if not always, this kind of external watchdog device is
+    controlled through a GPIO line and has the possibility to reset the system. It
+    is pinged by toggling the GPIO line to which it is connected. This kind of configuration
+    is used in UDOO QUAD (not checked on other UDOO variants).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux kernel is able to handle this device by enabling the `CONFIG_GPIO_WATCHDOG
+    config` option, which will pull the underlying driver, `drivers/watchdog/gpio_wdt.c`.
+    If enabled, it will periodically *ping* the hardware connected to the GPIO line
+    by toggling it from `1-to-0-to-1`. If that hardware does not receive its ping
+    periodically, it will reset the system. You should use this instead of talking
+    directly to the GPIOs using sysfs; it offers a better sysfs user space interface
+    than the GPIO and it integrates with kernel frameworks better than your user space
+    code could.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The support for this comes from the device tree only, and better documentation
+    on its binding can be found in `Documentation/devicetree/bindings/watchdog/gpio-wdt.txt`,
+    obviously from within the kernel sources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is a binding example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `compatible` property must always be `linux,wdt-gpio`. `gpios` is a GPIO
+    specifier that controls the watchdog device. `hw_algo` should be either `toggle`
+    or `level`. The former means that either low-to-high or high-to-low transitions
+    should be used to ping the external watchdog device, and that the watchdog is
+    disabled when the GPIO line is left floating or connected to a three-state buffer.
+    To achieve this, configuring the GPIO as input is sufficient. The second `algo`
+    means that applying a signal level (high or low) is enough to ping the watchdog.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The way it works is the following: when user space code pings the watchdog
+    through the `/dev/watchdog` device file, the underlying driver (`gpio_wdt.c`,
+    actually) will either toggle the GPIO line (`1-0-1` if `hw_algo` is `toggle`)
+    or assign a specific level (high or low if `hw_algo` is `level`) on that GPIO
+    line. For example, the UDOO QUAD uses `APX823-31W5`, a GPIO-controlled watchdog,
+    whose event output is connected to the i.MX6 PORB line (reset line, actually).
+    Its schematic is available here: [http://udoo.org/download/files/schematics/UDOO_REV_D_schematics.pdf](http://udoo.org/download/files/schematics/UDOO_REV_D_schematics.pdf).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, we are done with the watchdog on the kernel side. We went through the underlying
+    data structure, dealt with its APIs, introduced the concept of pretimeouts, and
+    even dealt with the GPIO-based watchdog alternative. In the next section, we will
+    look into user space implementation, which is a kind of consumer of the watchdog
+    services.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The watchdog user space interface
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On Linux-based systems, the standard user space interface to the watchdog is
+    the `/dev/watchdog` file, through which a daemon will notify the kernel watchdog
+    driver that the user space is still alive. The watchdog starts right after the
+    file is opened, and gets pinged by periodically writing into this file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the notification occurs, the underlying driver will notify the watchdog
+    device, which will result in resetting its timeout; the watchdog will then wait
+    for yet another `timeout` duration prior to resetting the system. However, if
+    for any reason the user space does not perform the notification before the timeout
+    is elapsed, the watchdog will reset the system (causing a reboot). This mechanism
+    provides a way to enforce the system availability. Let's start with the basics,
+    learning how to start and stop the watchdog.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Starting and stopping the watchdog
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The watchdog is automatically started once you open the `/dev/watchdog` device
+    file, as in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Only, closing the watchdog device file does not stop it. You will be surprised
+    to face a system reset after closing the file. To properly stop the watchdog,
+    you will first need to write the magic character *V* into the watchdog device
+    file. This instructs the kernel to turn off the watchdog next time the device
+    file is closed, as shown:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, you''ll need to close the watchdog device file in order to stop it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Important note
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is an exception when stopping the watchdog by closing the file device:
+    it is when the kernel''s `CONFIG_WATCHDOG_NOWAYOUT` config option is enabled.
+    When this option is enabled, the watchdog cannot be stopped at all. Hence, you
+    will need to service it all the time or it will reset the system. Moreover, the
+    watchdog driver should have set the `WDIOF_MAGICCLOSE` flag in its option; otherwise,
+    the magic close feature won''t work.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have seen how to start and stop the watchdog, it is time to learn
+    how to refresh the device in order to prevent the system from suddenly rebooting.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Pinging/kicking the watchdog – sending keep-alive pings
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There are two ways to kick or feed the watchdog:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Writing any character into `/dev/watchdog`: A write to the watchdog device
+    file is defined as a keep-alive ping. It is recommended not to write a `V` character
+    at all (as it has a particular meaning), even if it is in a string.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Using the `WDIOC_KEEPALIVE` ioctl, `ioctl(fd, WDIOC_KEEPALIVE,` `0);`: The
+    argument to the ioctl is ignored. The watchdog driver should have set the `WDIOF_KEEPALIVEPING`
+    flag in its options prior to this ioctl so that it works.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: It is good practice to feed the watchdog every half of its timeout value. This
+    means if its timeout is `30s`, you should feed it every `15s`. Now, let's learn
+    about gathering some information on how the watchdog is ruling our system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting watchdog capabilities and identity
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Getting the watchdog capabilities and/or identity consists of grabbing the underlying
+    `struct watchdog_info` structure associated with the watchdog. If you remember,
+    this info structure is mandatory and is provided by the watchdog driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To achieve this, you need to use the `WDIOC_GETSUPPORT` ioctl. The following
+    is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can go further by testing some fields in the capabilities, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can (or should I say "must") use this in order to check the watchdog features
+    prior to performing certain actions on it. Now, we can go further and learn how
+    to get and set more fancy watchdog properties.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting and getting the timeout and pretimeout
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Prior to setting/getting the timeout, the watchdog info should have the `WDIOF_SETTIMEOUT`
+    flag set. There are drivers with which it is possible to modify the watchdog timeout
+    on the fly using the `WDIOC_SETTIMEOUT` ioctl. These drivers must have the `WDIOF_SETTIMEOUT`
+    flag set in their watchdog info structure and provide a `.set_timeout` callback.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While the argument here is an integer representing the timeout value in seconds,
+    the return value is the real timeout applied to the hardware device, as it may
+    differ from the one requested in the ioctl due to hardware limitations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When it comes to querying the current timeout, you should use the `WDIOC_GETTIMEOUT`
+    ioctl, as in the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, when it comes to the pretimeout, the watchdog driver should have set
+    `WDIOF_PRETIMEOUT` in the options and provided a `.set_pretimeout` callback in
+    its ops. You should then use `WDIOC_SETPRETIMEOUT` with the pretimeout value as
+    a parameter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: If the desired pretimeout value is either `0` or bigger than the current timeout,
+    you will get an `-EINVAL` error.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have seen how to get and set the timeout/pretimeout on the watchdog
+    device, we can learn how to get the time left before the watchdog fires.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting the time left
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `WDIOC_GETTIMELEFT` ioctl allows checking how much time is left on the
+    watchdog counter before a reset occurs. Moreover, the watchdog driver should support
+    this feature by providing a `.get_timeleft()` callback; otherwise, you''ll have
+    an `EOPNOTSUPP` error. The following is an example showing how to use this ioctl:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `timeleft` variable is filled on the return path of the ioctl.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the watchdog fires, it triggers a reboot when it is configured to do so.
+    In the next section, we will learn how to get the last reboot reason, in order
+    to see whether the reboot was caused by the watchdog.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting the (boot/reboot) status
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are two ioctl commands to play with in this section. These are `WDIOC_GETSTATUS`
+    and `WDIOC_GETBOOTSTATUS`. The way that these are handled depends on the driver
+    implementation, and there are two types of driver implementations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Old drivers that provide watchdog features through a miscellaneous device. These
+    drivers do not use the generic watchdog framework interface and provide their
+    own `file_ops` along with their own `.ioctl` ops. Moreover, these drivers only
+    support `WDIOC_GETSTATUS`, while others may support both `WDIOC_GETSTATUS` and
+    `WDIOC_GETBOOTSTATUS`. The difference between the two is that the former will
+    return the raw content of the device's status register, while the latter is supposed
+    to be a bit smarter as it parses the raw content and only returns the boot status
+    flag. These drivers need to be migrated to the new generic watchdog framework.Note
+    that some of those drivers supporting both commands may return the same value
+    (the same `case` statement) for both ioctls, while others may return a different
+    one (each command has its own `case` statement).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: New drivers use the generic watchdog framework. These drivers rely on the framework
+    and do not care about `file_ops` anymore. Everything is done from within the `drivers/watchdog/watchdog_dev.c`
+    file (you can have a look, especially at how the ioctl command is implemented).
+    With these kinds of drivers, `WDIOC_GETSTATUS` and `WDIOC_GETBOOTSTATUS` are handled
+    by the watchdog core separately. This section will deal with these drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Now, let''s focus on the generic implementation. For these drivers, `WDIOC_GETBOOTSTATUS`
+    will return the value of the underlying `watchdog_device.bootstatus` field. For
+    `WDIOC_GETSTATUS`, if the watchdog `.status` ops is provided, it will be called
+    and its return value will be copied to the user; otherwise, the content of `watchdog_device.bootstatus`
+    will be tweaked with an `AND` operation in order to clear (or flag) the bits that
+    are not meaningful. The following code snippet shows how it is done in kernel
+    space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding code is a generic watchdog core function to get the watchdog
+    status. It is actually a wrapper that is responsible for calling the underlying
+    `ops.status` callback. Now, back to our user space usage. We can do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: Obviously, we can proceed to individual flag checking as we did earlier in the
+    *Getting watchdog capabilities and identity* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we have written code to play with the watchdog device. The next section
+    will show us how to deal with the watchdog from user space without writing code,
+    essentially using the sysfs interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The watchdog sysfs interface
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The watchdog framework offers the possibility of managing watchdog devices
+    from user space through the sysfs interface. This is possible if the `CONFIG_WATCHDOG_SYSFS`
+    config option is enabled in the kernel, and the root directory is `/sys/class/watchdogX/`.
+    `X` is the index of the watchdog device in the system. Each watchdog directory
+    in sysfs has the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`nowayout`: Gives `1` if the device supports the `nowayout` feature, and `0`
+    otherwise.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`status`: This is the sysfs equivalent of the `WDIOC_GETSTATUS` ioctl. This
+    sysfs file reports the watchdog''s internal status bits.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`timeleft`: This is the sysfs equivalent of the `WDIOC_GETTIMELEFT` ioctl.
+    This sysfs entry returns the time (the number of seconds, actually) left before
+    the watchdog resets the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`timeout`: Gives the current value of the timeout programmed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`identity`: Contains an identity string of the watchdog device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`bootstatus`: This is the sysfs equivalent of the `WDIOC_GETBOOTSTATUS` ioctl.
+    This entry informs whether the system reset was caused by the watchdog device
+    or not.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`state`: Gives the active/inactive status of the watchdog device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now that the preceding watchdog properties have been described, we can focus
+    on pretimeout management from user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handling a pretimeout event
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Setting the governor is done via sysfs. A governor is nothing but a policy manager
+    that takes certain actions depending on some external (but input) parameters.
+    There are thermal governors, CPUFreq governors, and now watchdog governors. Each
+    governor is implemented in its own driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can check the available governors for a watchdog (let''s say `watchdog0`)
+    using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, we can check whether pretimeout governors can be selected:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To check the pretimeout value, you can simply do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now we are familiar with using the watchdog sysfs interface from the user space.
+    Though we are not in the kernel, we can leverage the whole framework, particularly
+    playing with the watchdog parameters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we discussed all aspects of watchdog devices: their APIs,
+    the GPIO alternative, and how they help keep the system reliable. We saw how to
+    start, how (when it is possible) to stop, and how to service the watchdog devices.
+    Moreover, we introduced the concept of pretimeout and watchdog-dedicated governors.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will discuss some Linux kernel development and debugging
+    tips, such as analyzing kernel panic messages and kernel tracing.
+  prefs: []
+  type: TYPE_NORMAL

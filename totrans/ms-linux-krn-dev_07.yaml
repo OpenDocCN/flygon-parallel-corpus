@@ -1,0 +1,692 @@
+- en: Virtual Memory Management
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the first chapter, we had brief discussion about an important abstraction
+    called a *process.* We had discussed the process virtual address space and its
+    isolation, and also have traversed thorough the memory management subsystem and
+    gained a thorough understanding of various data structures and algorithms that
+    go into physical memory management. In this chapter, let''s extend our discussion
+    on memory management with details of virtual memory management and page tables.
+    We will look into the following aspects of the virtual memory subsystem:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process virtual address space and its segments
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory descriptor structure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory mapping and VMA objects
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: File-backed memory mappings
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Page cache
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Address translation with page tables
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Process address space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following diagram depicts the layout of a typical process address space
+    in Linux systems, which is composed of a set of virtual memory segments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00043.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Each segment is physically mapped to one or more linear memory blocks (made
+    out of one or more pages), and appropriate address translation records are placed
+    in a process page table. Before we get into the complete details of how the kernel
+    manages memory maps and constructs page tables, let''s understand in brief each
+    segment of the address space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Stack** is the topmost segment, which expands downward. It contains **stack
+    frames** that hold local variables and function parameters; a new frame is created
+    on top of the stack upon entry into a called function, and is destroyed when the
+    current function returns. Depending on the level of nesting of the function calls,
+    there is always a need for the stack segment to dynamically expand to accommodate
+    new frames. Such expansion is handled by the virtual memory manager through **page
+    faults**: when the process attempts to touch an unmapped address at the top of
+    the stack, the system triggers a page fault, which is handled by the kernel to
+    check whether it is appropriate to grow the stack. If the current stack utilization
+    is within `RLIMIT_STACK`, then it is considered appropriate and the stack is expanded.
+    However, if the current utilization is maximum with no further scope to expand,
+    then a segmentation fault signal is delivered to the process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Mmap** is a segment below the stack; this segment is primarily used for mapping
+    file data from page cache into process address space. This segment is also used
+    for mapping shared objects or dynamic libraries. User-mode processes can initiate
+    new mappings through the `mmap()` API. The Linux kernel also supports anonymous
+    memory mapping through this segment, which serves as an alternative mechanism
+    for dynamic memory allocations to store process data.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Heap** segment provides address space for dynamic memory allocation that
+    allows a process to store runtime data. The kernel provides the `brk()` family
+    of APIs, through which user-mode processes can expand or shrink the heap at runtime.
+    However, most programming-language-specific standard libraries implement heap
+    management algorithms for efficient utilization of heap memory. For instance,
+    GNU glibc implements heap management that offers the `malloc()` family of functions
+    for allocations.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The lower segments of the address space--**BSS**, **Data**, and **Text**--are
+    related to the binary image of the process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **BSS** stores **uninitialized** static variables, whose values are not
+    initialized in the program code. The BSS is set up through anonymous memory mapping.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **data** segment contains global and static variables initialized in program
+    source code. This segment is enumerated by mapping part of the program binary
+    image that contains initialized data; this mapping is created of type **private
+    memory mapping**, which ensures that changes to data variables' memory are not
+    reflected on the disk file.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **text** segment is also enumerated by mapping the program binary file from
+    memory; this mapping is of type `RDONLY`, resulting in a segmentation fault to
+    be triggered on an attempt to write into this segment.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The kernel supports the address space randomization facility, which if enabled
+    during build allows the VM subsystem to randomize start locations for **stack**,
+    **mmap**, and **heap** segments for each new process. This provides processes
+    with much-needed security from malicious programs that are capable of injecting
+    faults. Hacker programs are generally hard-coded with fixed start addresses of
+    memory segments of a valid process; with address space randomization, such malicious
+    attacks would fail. However, text segments enumerated from the binary file of
+    the application program are mapped to a fixed address as per the definition of
+    the underlying architecture; this is configured into the linker script, which
+    is applied while constructing the program binary file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process memory descriptor
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The kernel maintains all information on process memory segments and the corresponding
+    translation table in a memory descriptor structure, which is of type `struct mm_struct`.
+    The process descriptor structure `task_struct` contains a pointer `*mm` to the
+    memory descriptor for the process. We shall discuss a few important elements of
+    the memory descriptor structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`mmap_base` refers to the start of the mmap segment in the virtual address
+    space, and `task_size` contains the total size of the task in the virtual memory
+    space. `mm_users` is an atomic counter that holds the count of LWPs that share
+    this memory descriptor, `mm_count` holds the count of the number of processes
+    currently using this descriptor, and the VM subsystem ensures that a memory descriptor
+    structure is only released when `mm_count` is zero. The `start_code` and `end_code`
+    fields contain the start and end virtual addresses for the code block mapped from
+    the program''s binary file. Similarly, `start_data` and `end_data` mark the beginning
+    and end of the initialized data region mapped from the program''s binary file.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `start_brk` and `brk` fields represent the start and current end addresses
+    of the heap segment; while `start_brk` remains constant throughout the process
+    lifetime, `brk` is re-positioned while allocating and releasing heap memory. Therefore,
+    the total size of the active heap at a given moment in time is the size of the
+    memory between the `start_brk` and `brk` fields. The elements `arg_start` and
+    `arg_end` contain locations of the command-line argument list, and `env_start`
+    and `env_end` contain the start and end locations for environment variables:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00044.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Each linear memory region mapped to a segment in virtual address space is represented
+    through a descriptor of type `struct vm_area_struct`. Each VM area region is mapped
+    with a virtual address interval that contains a start and end virtual addresses
+    along with other attributes. The VM subsystem maintains a linked list of `vm_area_struct(VMA)`
+    nodes representing current regions; this list is sorted in ascending order, with
+    the first node representing the start virtual address interval and the node that
+    follows containing the next address interval, and so on. The memory descriptor
+    structure includes a pointer `*mmap`, which refers to this list of VM areas currently
+    mapped.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The VM subsystem will need to scan the `vm_area` list while performing various
+    operations on VM regions such as looking for a specific address within mapped
+    address intervals, or appending a new VMA instance representing a new mapping.
+    Such operations could be time consuming and inefficient especially for cases where
+    a large number of regions are mapped into the list. As a workaround, the VM subsystem
+    maintains a red-black tree for efficient access of `vm_area` objects. The memory
+    descriptor structure includes the root node of the red-black tree `mm_rb`. With
+    this arrangement, new VM regions can be quickly appended by searching the red-black
+    tree for the region preceding the address interval for the new region; this eliminates
+    the need to explicitly scan the linked list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct vm_area_struct` is defined in the kernel header `<linux/mm_types.h>`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`vm_start` contains the start virtual address (lower address) of the region,
+    which is the address of the first valid byte of the mapping, and `vm_end` contains
+    the virtual address of the first byte beyond the mapped region (higher address).
+    Thus, the length of the mapped memory region can be computed by subtracting `vm_start`
+    from `vm_end`. The pointers `*vm_next` and `*vm_prev` refer to the next and previous
+    VMA list, while the `vm_rb` element is for representing this VMA under the red-black
+    tree. The `*vm_mm` pointer refers back to the process memory descriptor structure.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vm_page_prot` contains access permissions for the pages in the region. `vm_flags`
+    is a bit field that contains properties for memory in the mapped region. Flag
+    bits are defined in the kernel header `<linux/mm.h>`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Flag bits** | **Description** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_NONE` | Indicates inactive mapping. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_READ` | If set, pages in the mapped area are readable. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_WRITE` | If set, pages in the mapped area are writable. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_EXEC` | This is set to mark a memory region as executable. Memory blocks
+    containing executable instructions are set with this flag along with `VM_READ`.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_SHARED` | If set, pages in the mapped region are shared. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_MAYREAD` | Flag to indicate that `VM_READ` can be set on a currently
+    mapped region. This flag is for use with the `mprotect()` system call. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_MAYWRITE` | Flag to indicate that `VM_WRITE` can be set on a currently
+    mapped region. This flag is for use with the `mprotect()` system call. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_MAYEXEC` | Flag to indicate that `VM_EXEC` can be set on currently mapped
+    region. This flag is for use with the `mprotect()` system call. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_GROWSDOWN` | Mapping can grow downward; the stack segment is assigned
+    this flag. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_UFFD_MISSING` | This flag is set to indicate to VM subsystem that `userfaultfd`
+    is enabled for this mapping, and is set to track page missing faults. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_PFNMAP` | This flag is set to indicate that the memory region is mapped
+    though PFN tracked pages, unlike regular page frames with page descriptors. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_DENYWRITE` | Set to indicate that the current file mapping is not writable.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_UFFD_WP` | This flag is set to indicate to the VM subsystem that `userfaultfd`
+    is enabled for this mapping, and is set to track write-protect faults. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_LOCKED` | Set when corresponding pages in the mapped memory region are
+    locked. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_IO` | Set when the device I/O area is mapped. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_SEQ_READ` | Set when a process declares its intention to access the memory
+    area within the mapped region sequentially. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_RAND_READ` | Set when a process declares its intention to access the
+    memory area within the mapped region at random. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_DONTCOPY` | Set to indicate to the VM to disable copying this VMA on
+    `fork()`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_DONTEXPAND` | Set to indicate that the current mapping cannot expand
+    on `mremap()`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_LOCKONFAULT` | Lock pages in the memory map when they are faulted in.
+    This flag is set when a process enables `MLOCK_ONFAULT` with the `mlock2()` system
+    call. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_ACCOUNT` | The VM subsystem performs additional checks to ensure there
+    is memory available when performing operations on VMAs with this flag. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_NORESERVE` | Whether the VM should suppress accounting. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_HUGETLB` | Indicates that the current mapping contains huge TLB pages.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_DONTDUMP` | If set, the current VMA is not included in the core dump.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_MIXEDMAP` | Set when the VMA mapping contains both traditional page frames
+    (managed through the page descriptor) and PFN-managed pages. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_HUGEPAGE` | Set when the VMA is marked with `MADV_HUGEPAGE` to instruct
+    the VM that pages under this mapping must be of type Transparent Huge Pages (THP).
+    This flag works only with private anonymous mappings. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_NOHUGEPAGE` | Set when the VMA is marked with `MADV_NOHUGEPAGE`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_MERGEABLE` | Set when the VMA is marked with `MADV_MERGEABLE`, which
+    enables the kernel same-page merging (KSM) facility. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_ARCH_1` | Architecture-specific extensions. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VM_ARCH_2` | Architecture-specific extensions. |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The following figure depicts the typical layout of a `vm_area` list as pointed
+    to by the memory descriptor structure of the process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00045.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: As depicted here, some memory regions mapped into the address space are file-backed
+    (code regions form the application binary file, shared library, shared memory
+    mappings, and so on). File buffers are managed by the kernel's page cache framework,
+    which implements its own data structures to represent and manage file caches.
+    The page cache tracks mappings to file regions by various user-mode process through
+    an `address_space` data structure. The `shared` element of the `vm_area_struct`
+    object enumerates this VMA into a red-black tree associated with the address space.
+    We'll discuss more about the page cache and `address_space` objects in the next
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Regions of the virtual address space such as heap, stack, and mmap are allocated
+    through anonymous memory mappings. The VM subsystem groups all VMA instances of
+    the process that represent anonymous memory regions into a list and represents
+    them through a descriptor of type `struct anon_vma`. This structure enables quick
+    access to all of the process VMAs that map anonymous pages; the `*anon_vma` pointer
+    of each anonymous VMA structure refers to the `anon_vma` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, when a process forks a child, all anonymous pages of the caller address
+    space are shared with the child process under copy-on-write (COW). This causes
+    new VMAs to be created (for the child) that represent the same anonymous memory
+    regions of the parent. The memory manager would need to locate and track all VMAs
+    that refer to the same regions for it to be able to support unmap and swap-out
+    operations. As a solution, the VM subsystem uses another descriptor called `struct
+    anon_vma_chain` that links all `anon_vma` structures of a process group. The `anon_vma_chain`
+    element of the VMA structure is a list element of the anonymous VMA chain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each VMA instance is bound to a descriptor of type `vm_operations_struct`,
+    which contains operations performed on the current VMA. The `*vm_ops` pointer
+    of the VMA instance refers to the operations object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The routine assigned to the `*open()` function pointer is invoked when the VMA
+    is enumerated into the address space. Similarly, the routine assigned to the `*close()`
+    function pointer is invoked when the VMA is detached from the virtual address
+    space. The function assigned to the `*mremap()` interface is executed when the
+    memory area mapped by the VMA is to be resized. When the physical region mapped
+    by the VMA is inactive, the system triggers a page fault exception, and the function
+    assigned to the `*fault()` pointer is invoked by the kernel's page-fault handler
+    to read corresponding data of the VMA region into the physical page.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel supports direct access operations (DAX) for files on storage devices
+    that are similar to memory, such as nvrams, flash storage, and other persistent
+    memory devices. Drivers for such storage devices are implemented to perform all
+    read and write operations directly on storage, without any caching. When a user
+    process attempts to map a file from a DAX storage device, the underlying disk
+    driver directly maps the corresponding file pages to process the virtual address
+    space. For optimal performance, user-mode processes can map large files from DAX
+    storage by enabling `VM_HUGETLB`. Due to the large page sizes supported, page
+    faults on DAX file maps cannot be handled through regular page fault handlers,
+    and filesystems supporting DAX need to assign appropriate fault handlers to the
+    `*pmd_fault()` pointer of the VMA.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Managing virtual memory areas
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The kernel's VM subsystem implements various operations to manipulate the virtual
+    memory regions of a process; these include functions to create, insert, modify,
+    locate, merge, and delete VMA instances. We will discuss a few of the important
+    routines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locating a VMA
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `find_vma()` routine locates the first region in the VMA list that satisfies
+    the condition for a given address (`addr < vm_area_struct->vm_end`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The function first checks for the requested address in the recently accessed
+    `vma` found in the per-thread `vma` cache. On a match, it returns the address
+    of the VMA, else it steps into the red-black tree to locate the appropriate VMA.
+    The root node of the tree is located in `mm->mm_rb.rb_node`. Through the helper
+    function `rb_entry()`, each node is verified for the address within the virtual
+    address interval of the VMA. If the target VMA with a lower start address and
+    higher end address than the specified address is located, the function returns
+    the address of the VMA instance. If the appropriate VMA is still not found, the
+    search continues its lookup into the left or right child nodes of the `rbtree`.
+    When a suitable VMA is found, a pointer to it is updated to the `vma` cache (anticipating
+    the next call to `find_vma()` to locate the neighboring address in the same region),
+    and it returns the address of the VMA instance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a new region is added immediately before or after an existing region (and
+    therefore also between two existing regions), the kernel merges the data structures
+    involved into a single structure —but, of course, only if the access permissions
+    for all the regions involved are identical and contiguous data is mapped from
+    the same backing store.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Merging VMA regions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'When a new VMA is mapped immediately before or after an existing VMA with identical
+    access attributes and data from a file-backed memory region, it is more optimal
+    to merge them into a single VMA structure. `vma_merge()` is a helper function
+    that is invoked to merge surrounding VMAs with identical attributes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`*mm` refers to the memory descriptor of the process whose VMAs are to be merged;
+    `*prev` refers to a VMA whose address interval precedes the new region; and the
+    `addr`, `end`, and `vm_flags` contain the start, end, and flags of the new region.
+    `*file` refers to the file instance whose memory region is mapped to the new region,
+    and `pgoff` specifies the offset of the mapping within the file data.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This function first checks if the new region can be merged with the predecessor:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For this, it invokes a helper function `can_vma_merge_after()`, which checks
+    if the end address of the predecessor corresponds to the start address of the
+    new region, and if access flags are identical for both regions, it also checks
+    offsets of file mappings to ensure that they are contiguous in file region, and
+    that both regions do not contain any anonymous mappings:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: It then checks if merging is a possibility with the successor region; for this
+    it invokes the helper function `can_vma_merge_before()`. This function carries
+    out similar checks as before and if both the predecessor and the successor regions
+    are found identical, then `is_mergeable_anon_vma()` is invoked to check if any
+    anonymous mappings of the predecessor can be merged with those of the successor.
+    Finally, another helper function `__vma_adjust()` is invoked to perform the final
+    merging, which manipulates the VMA instances appropriately.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similar types of helper functions exist for creating, inserting, and deleting
+    memory regions, which are invoked as helper functions from `do_mmap()` and `do_munmap()`,
+    called when user-mode applications attempt to `mmap()` and `unmap()` memory regions,
+    respectively. We will not discuss details of these helper routines any further.
+  prefs: []
+  type: TYPE_NORMAL
+- en: struct address_space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Memory caches are an integral part of modern memory management. In simple words,
+    a **cache** is a collection of pages used for specific needs. Most operating systems
+    implement a **buffer cache***,* which is a framework that manages a list of memory
+    blocks for caching persistent storage disk blocks. The buffer cache allows filesystems
+    to minimize disk I/O operations by grouping and deferring disk sync until appropriate
+    time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux kernel implements a **page cache** as a mechanism for caching; in
+    simple words, the page cache is a collection of page frames that are dynamically
+    managed for caching disk files and directories, and support virtual memory operations
+    by providing pages for swapping and demand paging. It also handles pages allocated
+    for special files, such as IPC shared memory and message queues. Application file
+    I/O calls such as read and write cause the underlying filesystem to perform the
+    relevant operation on pages in the page cache. Read operations on an unread file
+    cause the requested file data to be fetched from disk into pages of the page cache,
+    and write operations update the relevant file data in cached pages, which are
+    then marked *dirty* and flushed to disk at specific intervals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Groups of pages in cache that contain data of a specific disk file are represented
+    through a descriptor of type `struct address_space`, so each `address_space` instance
+    serves as an abstraction for a set of pages owned by either a file `inode` or
+    block device file `inode`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `*host` pointer refers to the owner `inode` whose data is contained in the
+    pages represented by the current `address_space` object. For instance, if a page
+    in the cache contains data of a file managed by the Ext4 filesystem, the corresponding
+    VFS `inode` of the file stores the `address_space` object in its `i_data` field.
+    The `inode` of the file and the corresponding `address_space` object is stored
+    in the `i_data` field of the VFS `inode` object. The `nr_pages` field contains
+    the count of pages under this `address_space`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For efficient management of file pages in cache, the VM subsystem needs to track
+    all virtual address mappings to regions of the same `address_space`; for instance,
+    a number of user-mode processes might map pages of a shared library into their
+    address space through `vm_area_struct` instances. The `i_mmap` field of the `address_space`
+    object is the root element of a red-black tree that contains all `vm_area _struct`
+    instances currently mapped to this `address_space`; since each `vm_area_struct`
+    instance refers back to the memory descriptor of the respective process, it would
+    always be possible to track process references.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All physical pages containing file data under the `address_space` object are
+    organized through a radix tree for efficient access; the `page_tree` field is
+    an instance of `struct radix_tree_root` that serves a root element for the radix
+    tree of pages. This structure is defined in the kernel header `<linux/radix-tree.h>`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each node of the radix tree is of type `struct radix_tree_node`; the `*rnode`
+    pointer of the previous structure refers to the first node element of the tree:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `offset` field specifies the node slot offset in the parent, `count` holds
+    the total count of child nodes, and `*parent` is a pointer to the parent node.
+    Each node can refer to 64 tree nodes (specified by the macro `RADIX_TREE_MAP_SIZE`)
+    through the slots array, where unused slot entries are initialized with NULL.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For efficient management of pages under an address space, it is important for
+    the memory manager to set a clear distinction between clean and dirty pages; this
+    is made possible through **tags** assigned for pages of each node of the `radix`
+    tree. The tagging information is stored in the `tags` field of the node structure,
+    which is a two-dimensional array . The first dimension of the array distinguishes
+    between the possible tags, and the second contains a sufficient number of elements
+    of unsigned longs so that there is a bit for each page that can be organized in
+    the node. Following is the list of tags supported:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The Linux `radix` tree API provides various operation interfaces to `set`,
+    `clear,` and `get` tags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following diagram depicts the layout of pages under the `address_space`
+    object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00046.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Each address space object is bound to a set of functions that implement various
+    low-level operations between address space pages and the back-store block device.
+    The `a_ops` pointer of the `address_space` structure refers to the descriptor
+    containing address space operations. These operations are invoked by VFS to initiate
+    data transfers between pages in cache associated with an address map and back-store
+    block device:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00047.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Page tables
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: All access operations on process virtual address regions are put through address
+    translation before reaching the appropriate physical memory regions. The VM subsystem
+    maintains page tables to translate linear page addresses into physical addresses.
+    Even though the page table layout is architecture specific, for most architectures,
+    the kernel uses a four-level paging structure, and we will consider the x86-64
+    kernel page table layout for this discussion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram depicts the layout of the page table for x86-64:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/00048.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The address of the page global directory, which is the top-level page table,
+    is initialized into control register cr3\. This is a 64-bit register following
+    bit break-up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Bits | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2:0 | Ignored |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 4:3 | Page level write-through and page-level cache disable |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 11:5 | Reserved |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 51:12 | Address of page global directory |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 63:52 | Reserved |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Out of 64 bit-wide linear addresses supported by x86-64, Linux currently uses
+    48 bits that enable 256 TB of linear address space, which is considered large
+    enough for current use. This 48-bit linear address is split into five parts, with
+    the first 12 bits containing the offset of the memory location in the physical
+    frame and rest of the parts containing offsets into appropriate page table structures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Linear address bits** | **Description** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 11:0 (12 bits) | Index of physical page |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 20:12 (9 bits) | Index of page table |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 29:21 (9 bits) | Index of page middle directory |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 38:30 (9 bits) | Index of page upper directory |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 47:39 (9 bits) | Index of page global directory |'
+  prefs: []
+  type: TYPE_TB
+- en: Each of the page table structures can support 512 records, of which each record
+    provides the base address of the next-level page structure. During translation
+    of a given linear address, MMU extracts the top 9 bits containing the index into
+    the page global directory (PGD), which is then added to the base address of PGD
+    (found in cr3); this lookup results in the discovery of the base address for page
+    upper directory (PUD). Next, MMU retrieves the PUD offset (9 bits) found in the
+    linear address, and adds it to the base address of PUD structure to reach the
+    PUD entry (PUDE) that yields the base address of page middle directory (PMD).
+    The PMD offset found in the linear address is then added to the base address of
+    PMD to reach the relevant PMD entry (PMDE), which yields the base address of the
+    page table. The page table offset (9 bits) found in the linear address is then
+    added to the base address discovered from the PMD entry to reach the page table
+    entry (PTE), which in turn yields the start address of the physical frame of the
+    requested data. Finally, the page offset (12 bits) found in the linear address
+    is added to the PTE discovered base address to reach the memory location to be
+    accessed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we focused on specifics of virtual memory management with respect
+    to process virtual address space and memory maps. We discussed critical data structures
+    of the VM subsystem, memory descriptor structure (`struct mm_struct`), and VMA
+    descriptor (`struct vm_area_struct`). We looked at the page cache and its data
+    structures (`struct address_space`) used in reverse mapping of file buffers into
+    various process address spaces. Finally, we explored the page table layout of
+    Linux, which is widely used in many architectures. Having gained a thorough understanding
+    of filesystems and virtual memory management, in the next chapter, we will extend
+    this discussion into the IPC subsystem and its resources.
+  prefs: []
+  type: TYPE_NORMAL

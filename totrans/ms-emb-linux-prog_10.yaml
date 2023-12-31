@@ -1,0 +1,1171 @@
+- en: Chapter 10. Learning About Processes and Threads
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the preceding chapters, we have considered the various aspects of creating
+    an embedded Linux platform. Now it is time to start looking at how you can use
+    the platform to create a working device. In this chapter, I will talk about the
+    implications of the Linux process model and how it encompasses multi-threaded
+    programs. I will look at the pros and cons of using single-threaded and multi-threaded
+    processes. I will also look at scheduling and differentiate between timeshare
+    and real-time scheduling policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While these topics are not specific to embedded computing, it is important for
+    a designer of an embedded device to have an overview of these topics. There are
+    many good reference works on the subject, some of which I reference at the end
+    of the chapter, but in general, they do not consider the embedded use cases. In
+    consequence, I will be concentrating on the concepts and design decisions rather
+    than on the function calls and code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process or thread?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Many embedded developers who are familiar with **real-time operating systems**
+    (**RTOS**) consider the Unix process model to be cumbersome. On the other hand,
+    they see a similarity between an RTOS task and a Linux thread and they have a
+    tendency to transfer an existing design using a one-to-one mapping of RTOS tasks
+    to threads. I have, on several occasions, seen designs in which the entire application
+    is implemented with one process containing 40 or more threads. I want to spend
+    some time considering if this is a good idea or not. Let's begin with some definitions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A process is a memory address space and a thread of execution, as shown in
+    the following diagram. The address space is private to the process and so threads
+    running in different processes. cannot access it. This memory separation is created
+    by the memory management subsystem in the kernel, which keeps a memory page mapping
+    for each process and re-programs the memory management unit on each context switch.
+    I will describe how this works in detail in [Chapter 11](ch11.html "Chapter 11. Managing
+    Memory"), *Managing Memory*. Part of the address space is mapped to a file which
+    contains the code and static data that the program is running:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Process or thread?](img/B03982_10_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'As the program runs, it will allocate resources such as stack space, heap memory,
+    references to files, and so on. When the process terminates, these resources are
+    reclaimed by the system: all the memory is freed up and all the file descriptors
+    are closed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Processes can communicate with each other using **inter process communication**
+    (**IPC**) such as local sockets. I will talk about IPC later on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A thread is a thread of execution within a process. All processes begin with
+    one thread that runs the `main()` function and is called the main thread. You
+    can create additional threads using the POSIX threads function `pthread_create(3)`,
+    causing additional threads to execute in the same address space, as shown in the
+    following diagram. Being in the same process, they share resources with each other.
+    They can read and write the same memory and use the same file descriptors, and
+    so communication between threads is easy, so long as you take care of the synchronization
+    and locking issues:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Process or thread?](img/B03982_10_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: So, based on these brief details, you could imagine two extreme designs for
+    a hypothetical system with 40 RTOS tasks being ported to Linux.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You could map tasks to processes, and have 40 individual programs communicating
+    through IPC, for example with messages sent through sockets. You would greatly
+    reduce memory corruption problems since the main thread running in each process
+    is protected from the others, and you would reduce resource leakage since each
+    process is cleaned up after it exits. However, the message interface between processes
+    is quite complex and, where there is tight cooperation between a group of processes,
+    the number of messages might be large and so become a limiting factor in the performance
+    of the system. Furthermore, any one of the 40 processes may terminate, perhaps
+    because of a bug causing it to crash, leaving the other 39 to carry on. Each process
+    would have to handle the case that its neighbors are no longer running and recover
+    gracefully.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the other extreme, you could map tasks to threads and implement the system
+    as a single process containing 40 threads. Cooperation becomes much easier because
+    they share the same address space and file descriptors. The overhead of sending
+    messages is reduced or eliminated and context switches between threads are faster
+    than between processes. The downside is that you have introduced the possibility
+    of one task corrupting the heap or the stack of another. If any one of the threads
+    encounters a fatal bug, the whole process will terminate, taking all the threads
+    with it. Finally, debugging a complex multi-threaded process can be a nightmare.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The conclusion you should draw is that neither design is ideal, and that there
+    is a better way. But before we get to that point, I will delve a little more deeply
+    into the APIs and the behavior of processes and threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Processes
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A process holds the environment in which threads can run: it holds the memory
+    mappings, the file descriptors, the user and group IDs, and more. The first process
+    is the `init` process, which is created by the kernel during boot and has a PID
+    of one. Thereafter, processes are created by duplication in an operation known
+    as forking.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a new process
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The `POSIX` function to create a process is `fork(2)`. It is an odd function
+    because, for each successful call, there are two returns: one in the process that
+    made the call, known as the parent, and one in the newly created process, known
+    as the child as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Creating a new process](img/B03982_10_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Immediately after the call, the child is an exact copy of the parent, it has
+    the same stack, the same heap, the same file descriptors, and executes the same
+    line of code, the one following `fork(2)`. The only way the programmer can tell
+    them apart is by looking at the return value of fork: it is zero for the child
+    and greater than zero for the parent. Actually, the value returned in the parent
+    is the PID of the newly created child process. There is a third possibility, which
+    is that the return is negative, meaning that the fork call failed and there is
+    still only one process.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although the two processes are initially identical, they are in separate address
+    spaces. Changes made to a variable by one will not be seen by the other. Under
+    the hood, the kernel does not make a physical copy of the parent's memory, which
+    would be quite a slow operation and consume memory unnecessarily. Instead, the
+    memory is shared but marked with a **copy-on-write** (**CoW**) flag. If either
+    parent or child modifies this memory, the kernel first makes a copy and then writes
+    to the copy. This has the benefit of an efficient fork function while retaining
+    the logical separation of process address spaces. I will discuss CoW in [Chapter
+    11](ch11.html "Chapter 11. Managing Memory"), *Managing Memory*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Terminating a process
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A process may be stopped voluntarily by calling the `exit(3)` function or, involuntarily,
+    by receiving a signal that is not handled. One signal in particular, `SIGKILL`,
+    cannot be handled and so will always kill a process. In all cases, terminating
+    the process will stop all threads, close all file descriptors, and release all
+    memory. The system sends a signal, `SIGCHLD`, to the parent so that it knows this
+    has happened.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Processes have a return value which is composed of either the argument to `exit(3)`,
+    if it terminated normally, or the signal number if it was killed. The chief use
+    for this is in shell scripts: it allows you to test the return from a program.
+    By convention, `0` indicates success and other values indicate a failure of some
+    sort.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The parent can collect the return value with the `wait(2)` or `waitpid(2)`
+    functions. This causes a problem: there will be a delay between a child terminating
+    and its parent collecting the return value. In that period, the return value must
+    be stored somewhere, and the PID number of the now dead process cannot be reused.
+    A process in this state is a `zombie`, state Z in ps or top. So long as the parent
+    calls `wait(2)` or `waitpid(2)`, whenever it is notified of a child''s termination
+    (by means of the `SIGCHLD` signal, see *Linux System Programming*, by *Robert
+    Love*, *O''Reilly Media* or *The Linux Programming Interface*, by *Michael Kerrisk*,
+    *No Starch Press* for details of handling signals), zombies exist for too short
+    a time to show up in process listings. They will become a problem if the parent
+    fails to collect the return value because you will not be able to create any more
+    processes.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is a simple example, showing process creation and termination:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `wait(2)` function blocks until a child process exits and stores the exit
+    status. When you run it, you see something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The child process inherits most of the attributes of the parent, including the
+    user and group IDs (UID and GID), all open file descriptors, signal handling,
+    and scheduling characteristics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running a different program
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The `fork` function creates a copy of a running program, but it does not run
+    a different program. For that, you need one of the `exec` functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each takes a path to the program file to load and run. If the function succeeds,
+    the kernel discards all the resources of the current process, including memory
+    and file descriptors, and allocates memory to the new program being loaded. When
+    the thread that called `exec*` returns, it returns not to the line of code after
+    the call, but to the `main()` function of the new program. Here is an example
+    of a command launcher: it prompts for a command, for example, `/bin/ls`, and forks
+    and executes the string you enter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: It might seem odd to have one function that duplicates an existing process and
+    another that discards its resources and loads a different program into memory,
+    especially since it is common for a fork to be followed almost immediately by
+    `exec`. Most operating systems combine the two actions into a single call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are distinct advantages, however. For example, it makes it very easy
+    to implement redirection and pipes in the shell. Imagine that you want to get
+    a directory listing, this is the sequence of events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You type `ls` at the shell prompt.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The shell forks a copy of itself.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The child execs `/bin/ls`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `ls` program prints the directory listing to `stdout` (file descriptor 1)
+    which is attached to the terminal. You see the directory listing.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `ls` program terminates and the shell regains control.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Now, imagine that you want the directory listing to be written to a file by
+    redirecting the output using the `>` character. The sequence is now as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You type `ls > listing.txt`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The shell forks a copy of itself.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The child opens and truncates the file `listing.txt`, and uses `dup2(2)` to
+    copy the file descriptor of the file over file descriptor 1 (`stdout`).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The child execs `/bin/ls`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The program prints the listing as before, but this time it is writing to `listing.txt`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `ls` program terminates and the shell regains control.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Note that there is an opportunity at step three to modify the environment of
+    the child process before executing the program. The `ls` program does not need
+    to know that it is writing to a file rather than a terminal. Instead of a file,
+    `stdout` could be connected to a pipe and so the `ls` program, still unchanged,
+    can send output to another program. This is part of the Unix philosophy of combining
+    many small components that each do a job well, as described in *The Art of Unix
+    Programming*, by *Eric Steven Raymond, Addison Wesley*; (23 Sept. 2003) ISBN 978-0131429017,
+    especially in the section *Pipes, Redirection, and Filters*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Daemons
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We have encountered daemons in several places already. A daemon is a process
+    that runs in the background, owned by the `init` process, `PID1`, and not connected
+    to a controlling terminal. The steps to create a daemon are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Call `fork()` to create a new process, after which the parent should exit, thus
+    creating an orphan which will be re-parented to `init.`
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The child process calls `setsid(2)`, creating a new session and process group
+    of which it is the sole member. The exact details do not matter here, you can
+    simply consider this as a way of isolating the process from any controlling terminal.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Change the working directory to the root.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Close all file descriptors and redirect `stdin`, `stdout`, and `sterr` (descriptors
+    0, 1, and 2) to `/dev/null` so that there is no input and all output is hidden.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Thankfully, all of the preceding steps can be achieved with a single function
+    call, `daemon(3)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inter-process communication
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Each process is an island of memory. You can pass information from one to another
+    in two ways. Firstly, you can copy it from one address space to the other. Secondly,
+    you can create an area of memory that both can access and so share the data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first is usually combined with a queue or buffer so that there is a sequence
+    of messages passing between processes. This implies copying the message twice:
+    first to a holding area and then to the destination. Some examples of this are
+    sockets, pipes, and POSIX message queues.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The second way requires not only a method of creating memory that is mapped
+    into two (or more) address spaces at once, but also a means of synchronizing access
+    to that memory, for example, by using semaphores or mutexes. POSIX has functions
+    for all of these.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is an older set of APIs known as System V IPC, which provides message
+    queues, shared memory, and semaphores, but it is not as flexible as the POSIX
+    equivalents so I will not describe it here. The man page on `svipc(7)` gives an
+    overview of the facilities and there is more detail in *The Linux Programming
+    Interface*, by *Michael Kerrisk*, *No Starch Press* and *Unix Network Programming,
+    Volume 2*, by *W. Richard Stevens*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Message-based protocols are usually easier to program and debug than shared
+    memory, but are slow if the messages are large.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Message-based IPC
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There are several options which I will summarize as follows. The attributes
+    that differentiate between them are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Whether the message flow is uni- or bi-directorial.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Whether the data flow is a byte stream, with no message boundary, or discrete
+    messages with boundaries preserved. In the latter case, the maximum size of a
+    message is important.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Whether messages are tagged with a priority.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following table summarizes these properties for FIFOs, sockets, and message
+    queues:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Property | FIFO | Unix socket: stream | Unix socket: datagram | POSIX message
+    queue |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Message boundary | Byte stream | Byte stream | Discrete | Discrete |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Uni/bi-directional | Uni | Bi | Uni | Uni |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Max message size | Unlimited | Unlimited | In the range 100 KiB to 250 KiB
+    | Default: 8 KiB, absolute maximum: 1 MiB |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Priority levels | None | None | None | 0 to 32767 |'
+  prefs: []
+  type: TYPE_TB
+- en: Unix (or local) sockets
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Unix sockets fulfill most requirements and, coupled with the familiarity of
+    the sockets API, they are by far the most common mechanism.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unix sockets are created with the address family `AF_UNIX` and bound to a path
+    name. Access to the socket is determined by the access permission of the socket
+    file. As with Internet sockets, the socket type can be `SOCK_STREAM` or `SOCK_DGRAM`,
+    the former giving a bi-directional byte stream, and the latter providing discrete
+    messages with preserved boundaries. Unix socket datagrams are reliable, meaning
+    that they will not be dropped or reordered. The maximum size for a datagram is
+    system-dependent and is available via `/proc/sys/net/core/wmem_max`. It is typically
+    100 KiB or more.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unix sockets do not have a mechanism for indicating the priority of a message.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FIFOs and named pipes
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: FIFO and named pipe are just different terms for the same thing. They are an
+    extension of the anonymous pipe that is used to communicate between parent and
+    child and are used to implement piping in the shell.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A FIFO is a special sort of file, created by the command `mkfifo(1)`. As with
+    Unix sockets, the file access permissions determine who can read and write. They
+    are uni-directional, meaning that there is one reader and usually one writer,
+    though there may be several. The data is a pure byte stream but with a guarantee
+    of atomicity of messages that are smaller than the buffer associated with the
+    pipe. In other words, writes less than this size will not be split into several
+    smaller writes and so the reader will read the whole message in one go, so long
+    as the size of the buffer at the reader end is large enough. The default size
+    of the FIFO buffer is 64 KiB on modern kernels and can be increased using `fcntl(2)`
+    with `F_SETPIPE_SZ` up to the value in `/proc/sys/fs/pipe-max-size`, typically
+    1 MiB.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is no concept of priority.
+  prefs: []
+  type: TYPE_NORMAL
+- en: POSIX message queues
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Message queues are identified by a name, which must begin with a forward slash
+    `/` and contain only one `/` character: message queues are actually kept in a
+    pseudo filesystem of the type `mqueue`. You create a queue and get a reference
+    to an existing queue through `mq_open(3)`, which returns a file. Each message
+    has a priority and messages are read from the queue in priority and then age order.
+    Messages can be up to `/proc/sys/kernel/msgmax` bytes long. The default value
+    is 8 KiB, but you can set it to be any size in the range 128 bytes to 1 MiB by
+    writing the value to `/proc/sys/kernel/msgmax` bytes. Each message has a priority.
+    They are read from the queue in priority then age order. Since the reference is
+    a file descriptor, you can use `select(2)`, `poll(2)`, and other similar functions
+    to wait for activity on the queue.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: See the Linux man page *mq_overview(7)*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary of message-based IPC
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Unix sockets are the most often used because they offer all that is needed,
+    except perhaps message priority. They are implemented on most operating systems,
+    and so they confer maximum portability.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FIFOs are less used, mostly because they lack an equivalent to a datagram. On
+    the other hand, the API is very simple, being the normal `open(2)`, `close(2)`,
+    `read(2)`, and `write(2)` file calls.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Message queues are the least commonly used of this group. The code paths in
+    the kernel are not optimized in the way that socket (network) and FIFO (filesystem)
+    calls are.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are also higher level abstractions, in particular dbus, which are moving
+    from mainstream Linux into embedded devices. Dbus uses Unix sockets and shared
+    memory under the surface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Shared memory-based IPC
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Sharing memory removes the need for copying data between address spaces but
+    introduces the problem of synchronizing accesses to it. Synchronization between
+    processes is commonly achieved using semaphores.
+  prefs: []
+  type: TYPE_NORMAL
+- en: POSIX shared memory
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'To share memory between processes, you first have to create a new area of memory
+    and then map it into the address space of each process that wants access to it,
+    as in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![POSIX shared memory](img/B03982_10_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: POSIX shared memory follows the pattern we encountered with message queues.
+    The segments are identified by names that begin with a `/` character and have
+    exactly one such character. The function `shm_open(3)` takes the name and returns
+    a file descriptor for it. If it does not exist already and the `O_CREAT` flag
+    is set, then a new segment is created. Initially it has a size of zero. Use the
+    (misleadingly named) `ftruncate(2)` to expand it to the desired size.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you have a descriptor for the shared memory, you map it into the address
+    space of the process using `mmap(2)`, and so threads in different processes can
+    access the memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The memory in Linux is taken from a `tmpfs` filesystem mounted in `/dev/shm`
+    or `/run/shm`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threads
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now it is time to look at multi-threaded processes. The programming interface
+    for threads is the POSIX threads API, which was first defined in IEEE POSIX 1003.1c
+    standard (1995), commonly known as Pthreads. It was implemented as an additional
+    part of the C library, `libpthread.so`. There have been two versions of Pthreads
+    over the last 15 years or so, Linux Threads and the **Native POSIX Thread Library**
+    (**NPTL**). The latter is much more compliant with the specification, particularly
+    with regard to the handling of signals and process IDs. It is pretty dominant
+    now, but you may come across some older versions of uClibc that use Linux Threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a new thread
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The function to create a thread is `pthread_create(3)`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: It creates a new thread of execution which begins at the function `start_routine`
+    and places a descriptor in `pthread_t` pointed to by `thread`. It inherits the
+    scheduling parameters of the calling thread but these can be overridden by passing
+    a pointer to the thread attributes in `attr`. The thread will begin to execute
+    immediately.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`pthread_t` is the main way to refer to the thread within the program but the
+    thread can also be seen from outside using a command like `ps -eLf`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The program `thread-demo` has two threads. The `PID` and `PPID` columns show
+    that they all belong to the same process and have the same parent, as you would
+    expect. The column marked `LWP` is interesting, though. `LWP` stands for Light
+    Weight Process which, in this context, is another name for thread. The numbers
+    in that column are also known as **Thread IDs** or **TIDs**. In the main thread,
+    the TID is the same as the PID, but for the others it is a different (higher)
+    value. Some functions will accept a TID in places where the documentation states
+    that you must give a PID, but be aware that this behavior is specific to Linux
+    and not portable. Here is the code for `thread-demo`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is a man page for `getttid(2)` which explains that you have to make the
+    Linux `syscall` directly because there isn't a C library wrapper for it, as shown.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a limit to the total number of threads that a given kernel can schedule.
+    The limit scales according to the size of the system from around 1,000 on small
+    devices up to tens of thousands on larger embedded devices. The actual number
+    is available in `/proc/sys/kernel/threads-max`. Once you reach this limit, `fork()`
+    and `pthread_create()` will fail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Terminating a thread
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A thread terminates when:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It reaches the end of its `start_routine`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It calls `pthread_exit(3)`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is canceled by another thread calling `pthread_cancel(3)`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The process which contains the thread terminates, for example, because of a
+    thread calling `exit(3)`, or the process receiving a signal that is not handled,
+    masked or ignored
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that, if a multi threaded program calls `fork(2)`, only the thread that
+    made the call will exist in the new child process. Fork does not replicate all
+    threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A thread has a return value, which is a void pointer. One thread can wait for
+    another to terminate and collect its return value by calling `pthread_join(2)`.
+    There is an example in the code for `thread-demo` mentioned in the preceding section.
+    This produces a problem that is very similar to the zombie problem among processes:
+    the resources of the thread, for example, the stack, cannot be freed up until
+    another thread has joined with it. If threads remain unjoined there is a resource
+    leak in the program.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Compiling a program with threads
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The support for POSIX threads is part of the C library, in the library `libpthread.so`.
+    However, there is more to building programs with threads than linking the library:
+    there have to be changes to the way the compiler generates code to make sure that
+    certain global variables, such as `errno`, have one instance per thread rather
+    than one for the whole process.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: When building a threaded program, you must add the switch `–pthread` at the
+    compile and link stages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inter-thread communication
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The big advantage of threads is that they share the address space and so can
+    share memory variables. This is also a big disadvantage because it requires synchronization
+    to preserve data consistency, in a similar way to memory segments shared between
+    processes but with the proviso that, with threads, all memory is shared. Threads
+    can create private memory using **thread local storage** (**TLS**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `pthreads` interface provides the basics necessary to achieve synchronization:
+    mutexes and condition variables. If you want more complex structures, you will
+    have to build them yourself.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is worth noting that all of the IPC methods described earlier work equally
+    well between threads in the same process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutual exclusion
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To write robust programs, you need to protect each shared resource with a mutex
+    lock and make sure that every code path that reads or writes the resource has
+    locked the mutex first. If you apply this rule consistently, most of the problems
+    should be solved. The ones that remain are associated with the fundamental behavior
+    of mutexes. I will list them briefly here, but will not go into detail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Deadlock**: This occurs when mutexes become permanently locked. A classic
+    situation is the deadly embrace in which two threads each require two mutexes
+    and have managed to lock one of them but not the other. Each block waits for the
+    lock the other has and so they remain as they are. One simple rule which avoids
+    the deadly embrace problem is to make sure that mutexes are always locked in the
+    same order. Other solutions involve timeouts and back off periods.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Priority inversion**: The delays caused by waiting for a mutex can cause
+    a real-time thread to miss deadlines. The specific case of priority inversion
+    happens when a high priority thread becomes blocked waiting for a mutex locked
+    by a low priority thread. If the low priority thread is preempted by other threads
+    of intermediate priority, the high priority thread is forced to wait for an unbounded
+    length of time. There are mutex protocols called priority inheritance and priority
+    ceiling which resolve the problem at the expense of greater processing overhead
+    in the kernel for each lock and unlock call.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Poor performance**: Mutexes introduce minimal overhead to code as long as
+    threads don''t have to block on them most of the time. If your design has a resource
+    that is needed by a lot of threads, however, the contention ratio becomes significant.
+    This is usually a design issue which can be resolved by using finer grained locking
+    or a different algorithm.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changing conditions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Cooperating threads need a method of alerting one another that something has
+    changed and needs attention. That thing is called a condition and the alert is
+    sent through a condition variable, `condvar`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A condition is just something that you can test to give a `true` or `false`
+    result. A simple example is a buffer that contains either zero or some items.
+    One thread takes items from the buffer and sleeps when it is empty. Another thread
+    places items into the buffer and signals the other thread that it has done so,
+    because the condition that the other thread is waiting on has changed. If it is
+    sleeping, it needs to wake up and do something. The only complexity is that the
+    condition is, by definition, a shared resource and so has to be protected by a
+    mutex. Here is a simple example which follows the producer-consumer relationship
+    described in the preceding section:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that, when the consumer thread blocks on the `condvar`, it does so while
+    holding a locked mutex, which would seem to be a recipe for deadlock the next
+    time the producer thread tries to update the condition. To avoid this, `pthread_condwait(3)`
+    unlocks the mutex after the thread is blocked and locks it again before waking
+    it and returning from the wait.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Partitioning the problem
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that we have covered the basics of processes and threads and the ways in
+    which they communicate, it is time to see what we can do with them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here are some of the rules I use when building systems:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 1**: Keep tasks that have a lot of interaction.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Minimize overheads by keeping closely inter-operating threads together in one
+    process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 2**: Don''t put all your threads in one basket.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On the other hand, try and keep components with limited interaction in separate
+    processes, in the interests of resilience and modularity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 3**: Don''t mix critical and non-critical threads in the same process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This is an amplification of Rule 2: the critical part of the system, which
+    might be the machine control program, should be kept as simple as possible and
+    written in a more rigorous way than other parts. It must be able to continue even
+    if other processes fail. If you have real-time threads, they, by definition, must
+    be critical and should go into a process by themselves.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 4**: Threads shouldn''t get too intimate.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: One of the temptations when writing a multi-threaded program is to intermingle
+    the code and variables between threads because it is all in one program and easy
+    to do. Don't keep threads modular with well-defined interactions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 5**: Don''t think that threads are for free.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is very easy to create additional threads but there is a cost, not least
+    in the additional synchronization necessary to coordinate their activities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Rule 6**: Threads can work in parallel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Threads can run simultaneously on a multi-core processor, giving higher throughput.
+    If you have a large computing job, you can create one thread per core and make
+    maximum use of the hardware. There are libraries to help you do this, such as
+    OpenMP. You probably shouldn't be coding parallel programming algorithms from
+    scratch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Android design is a good illustration. Each application is a separate Linux
+    process which helps to modularize memory management but especially ensures that
+    one app crashing does not affect the whole system. The process model is also used
+    for access control: a process can only access the files and resources which its
+    UID and GIDs allow it to. There are a group of threads in each process. There
+    is one to manage and update the user interface, one for handling signals from
+    the operating system, several for managing dynamic memory allocation and the freeing
+    up of Java objects and a worker pool of at least two threads for receiving messages
+    from other parts of the system using the Binder protocol.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To summarize, processes provide resilience because each process has a protected
+    memory space and, when the process terminates, all resources including memory
+    and file descriptors are freed up, reducing resource leaks. On the other hand,
+    threads share resources and so can communicate easily through shared variables,
+    and can cooperate by sharing access to files and other resources. Threads give
+    parallelism through worker pools and other abstractions which is useful on multi-core
+    processors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Scheduling
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The second big topic I want to cover in this chapter is scheduling. The Linux
+    scheduler has a queue of threads that are ready to run and its job is to schedule
+    them on CPUs as they become available. Each thread has a scheduling policy which
+    may be timeshared or real-time. The timeshared threads have a niceness value which
+    increases or reduces their entitlement to CPU time. The real-time threads have
+    a priority such that a higher priority thread will preempt a lower one. The scheduler
+    works with threads, not processes. Each thread is scheduled regardless of which
+    process it is running in.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The scheduler runs when:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A thread blocks by calling `sleep()` or in a blocking I/O call
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A timeshare thread exhausts its time slice
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An interrupt causes a thread to be unblocked, for example, because of I/O completing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For background information on the Linux scheduler, I recommend reading the
+    chapter on process scheduling in *Linux Kernel Development*, *3rd edition by Robert
+    Love*, *Addison-Wesley Professional*; (July 2, 2010) ISBN-10: 0672329468.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fairness versus determinism
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: I have grouped the scheduling polices into categories of timeshare and real-time.
+    Timeshare policies are based on the principal of fairness. They are designed to
+    make sure that each thread gets a fair amount of processor time and that no thread
+    can hog the system. If a thread runs for too long it is put to the back of the
+    queue so that others can have a go. At the same time, a fairness policy needs
+    to adjust to threads that are doing a lot of work and give them the resources
+    to get the job done. Timeshare scheduling is good because of the way it automatically
+    adjusts to a wide range of workloads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, if you have a real-time program, fairness is not helpful.
+    Instead, you then want a policy that is deterministic, that will give you at least
+    minimal guarantees that your real-time threads will be scheduled at the right
+    time so that they don't miss their deadlines. This means that a real-time thread
+    must preempt timeshare threads. Real-time threads also have a static priority
+    that the scheduler can use to choose between them when there are several of them
+    to run at once. The Linux real-time scheduler implements a fairly standard algorithm
+    which runs the highest priority real-time thread. Most RTOS schedulers are also
+    written in this way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both types of thread can coexist. Those requiring deterministic scheduling are
+    scheduled first and the time remaining is divided between the timeshare threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Timeshare policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Timeshare policies are designed for fairness. From Linux 2.6.23 onwards, the
+    scheduler used has been the **Completely Fair Scheduler** (**CFS**). It does not
+    use timeslices in the normal sense of the word. Instead, it calculates a running
+    tally of the length of time a thread would be entitled to run if it had its fair
+    share of CPU time, and balances that with the actual amount of time it has run.
+    If it exceeds its entitlement, and there are other timeshare threads waiting to
+    run, the scheduler will suspend the thread and run a waiting thread instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The timeshare policies are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SCHED_NORMAL` (also known as `SCHED_OTHER`): This is the default policy. The
+    vast majority of Linux threads use this policy.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCHED_BATCH`: This is similar to `SCHED_NORMAL` except threads are scheduled
+    with a larger granularity; that is they run for longer but have to wait longer
+    until scheduled again. The intention is to reduce the number of context switches
+    for background processing (batch jobs) and so reduce the amount of CPU cache churn.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCHED_IDLE`: These threads are run only when there are no threads of any other
+    policy ready to run. It is the lowest possible priority.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There are two pairs of functions to get and set the policy and priority of
+    a thread. The first pair takes a PID as a parameter and affects the main thread
+    in a process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second pair operates on `pthread_t` and so can change the parameters of
+    the other threads in a process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Niceness
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Some timeshare threads are more important than others. You can indicate this
+    with the `nice` value which multiplies a thread's CPU entitlement by a scaling
+    factor. The name comes from the function call, `nice(2)`, which has been part
+    of Unix since the early days. A thread becomes `nice` by reducing its load on
+    the system, or moves in the opposite direction by increasing it. The range of
+    values is from 19, which is really nice, to -20 which is really not nice. The
+    default value is 0, which is averagely nice or so-so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `nice` value can be changed for `SCHED_NORMAL` and `SCHED_BATCH` threads.
+    To reduce niceness, which increases the CPU load, you need the capability `CAP_SYS_NICE`,
+    which is available to the root user.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Almost all the documentation for functions and commands that change the `nice`
+    value (`nice(2)` and the `nice` and `renice` commands) talks in terms of processes.
+    However, it really relates to threads. As mentioned in the preceding section,
+    you can use a TID in place of a PID to change the `nice` value of an individual
+    thread. One other discrepancy in the standard descriptions of `nice`: the `nice`
+    value is referred to as the priority of a thread (or sometimes, mistakenly, a
+    process). I believe this is misleading and confuses the concept with real-time
+    priority which is a completely different thing.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Real-time policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Real-time policies are intended for determinism. The real-time scheduler will
+    always run the highest priority real-time thread that is ready to run. Real-time
+    threads always preempt timeshare threads. In essence, by selecting a real-time
+    policy over a timeshare policy, you are saying that you have inside knowledge
+    of the expected scheduling of this thread and wish to override the scheduler's
+    built-in assumptions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are two real-time policies:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SCHED_FIFO`: This is a run to completion algorithm, which means that, once
+    the thread starts to run, it will continue until it is preempted by a higher priority
+    real-time thread or blocks in a system call or terminates (completes).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCHED_RR`: This is a round robin algorithm which will cycle between threads
+    of the same priority if they exceed their time slice which, by default, is 100
+    ms. Since Linux 3.9, it has been possible to control the `timeslice` value through
+    `/proc/sys/kernel/sched_rr_timeslice_ms`. Apart from this, it behaves in the same
+    way as `SCHED_FIFO`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each real-time thread has a priority in the range 1 to 99, with 99 being the
+    highest.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To give a thread a real-time policy, you need `CAP_SYS_NICE` which, by default,
+    is given only to the root user.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One problem with real-time scheduling, both in Linux and elsewhere, is that
+    of a thread that becomes compute bound, often because a bug has caused it to loop
+    indefinitely, which prevents real-time threads of lower priority from running
+    as well as all the timeshare threads. The system become erratic and may lock up
+    completely. There are a couple of ways to guard against this possibility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, since Linux 2.6.25, the scheduler has, by default, reserved 5% of CPU
+    time for non real-time threads, so that even a runaway real-time thread cannot
+    completely halt the system. It is configured via two kernel controls:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`/proc/sys/kernel/sched_rt_period_us`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/proc/sys/kernel/sched_rt_runtime_us`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: They have default values of 1,000,000 (1 second) and 950,000 (950 ms) respectively,
+    which means that out of every second, 50ms is reserved for non real-time processing.
+    If you want real-time threads to be able to take 100% then set `sched_rt_runtime_us`
+    to `-1`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The second option is to use a watchdog, either hardware or software, to monitor
+    the execution of key threads and to take action when they begin to miss deadlines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing a policy
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In practice, timeshare policies satisfy the majority of computing workloads.
+    Threads that are I/O bound spend a lot of time blocked and so always have some
+    spare entitlement in hand. When they unblock they will be scheduled almost immediately.
+    Meanwhile, CPU-bound threads will naturally take up any CPU cycles left over.
+    Positive nice values can be applied to the less important threads and negative
+    values to the important ones.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Of course, this is only average behavior, there are no guarantees that this
+    will always be the case. If more deterministic behavior is needed, then real-time
+    policies will be required. The things that mark out a thread as being real-time
+    are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It has a deadline by which it must generate an output
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Missing the deadline would compromise the effectiveness of the system
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is event-driven
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is not compute bound
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Examples of real-time tasks include the classic robot arm servo controller,
+    multimedia processing, and communication processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing a real-time priority
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Choosing real-time priorities that work for all expected workloads is a tricky
+    business and a good reason for avoiding real-time policies in the first place.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The most widely used procedure for choosing priorities is known as **Rate Monotonic
+    Analysis** (**RMA**), after the 1973 paper by Liu and Layland. It applies to real-time
+    systems with periodic threads, which is a very important class. Each thread has
+    a period, and a utilization, which is the proportion of the period it will be
+    executing. The goal is to balance the load so that all threads can complete their
+    execution phase before the next period. RMA states that this can be achieved if:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The highest priorities are given to the threads with the shortest periods
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The total utilization is less than 69%
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The total utilization is the sum of all of the individual utilizations. It also
+    makes the assumption that the interaction between threads or the time spent blocked
+    on mutexes and the like, is negligible.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following resources have further information about the topics introduced
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*The Art of Unix Programming*, by *Eric Steven Raymond*, *Addison Wesley*;
+    (23 Sept. 2003) ISBN 978-0131429017'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux System Programming, 2nd edition*, by *Robert Love*, *O''Reilly Media*;
+    (8 Jun. 2013) ISBN-10: 1449339530'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux Kernel Development*, *3rd edition by Robert Love*, *Addison-Wesley Professional*;
+    (July 2, 2010) ISBN-10: 0672329468'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*The Linux Programming Interface*, by *Michael Kerrisk*, *No Starch Press*;
+    (October 2010) ISBN 978-1-59327-220-3'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*UNIX Network Programming: v. 2: Interprocess Communications, 2nd Edition*,
+    by *W. Richard Stevens*, *Prentice Hall*; (25 Aug. 1998) ISBN-10: 0132974290'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Programming with POSIX Threads*, by *Butenhof*, *David R*, *Addison-Wesley*,
+    *Professional*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Scheduling Algorithm for multiprogramming in a Hard-Real-Time Environment*,
+    by *C. L. Liu* and *James W. Layland*, *Journal of ACM*, 1973, vol 20, no 1, pp.
+    46-61'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The long Unix heritage that is built into Linux and the accompanying C libraries
+    provides almost everything you need to write stable and resilient embedded applications.
+    The issue is that, for every job, there are at least two ways to achieve the end
+    you desire.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, I have focused on two aspects of system design: the partitioning
+    into separate processes, each with one or more threads to get the job done, and
+    the scheduling of those threads. I hope that I have shed some light on this, and
+    given you the basis for further study into all of them.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, I will examine another important aspect of system design,
+    memory management.
+  prefs: []
+  type: TYPE_NORMAL

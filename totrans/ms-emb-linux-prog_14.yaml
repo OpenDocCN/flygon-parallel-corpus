@@ -1,0 +1,1005 @@
+- en: Chapter 14. Real-time Programming
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Much of the interaction between a computer system and the real world happens
+    in real-time and so this is an important topic for developers of embedded systems.
+    I have touched on real-time programming in several places so far: in [Chapter
+    10](ch10.html "Chapter 10. Learning About Processes and Threads"), *Learning About
+    Processes and Threads*, I looked at scheduling policies and priority inversion,
+    and in [Chapter 11](ch11.html "Chapter 11. Managing Memory"), *Managing Memory*,
+    I described the problems with page faults and the need for memory locking. Now,
+    it is time to bring these topics together and look at real-time programming in
+    some depth.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, I will begin with a discussion about the characteristics of
+    real-time systems and then consider the implications for system design, both at
+    the application and kernel levels. I will describe the real-time kernel patch,
+    `PREEMPT_RT`, and show how to get it and apply it to a mainline kernel. The last
+    sections will describe how to characterize system latencies using two tools: `cyclictest`
+    and `Ftrace`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are other ways to achieve real-time behavior on an embedded Linux device,
+    for instance, using a dedicated micro-controller or a separate real-time kernel
+    alongside the Linux kernel in the way that Xenomai and RTAI do. I am not going
+    to discuss these here because the focus of this book is on using Linux as the
+    core for embedded systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is real-time?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The nature of real-time programming is one of the subjects that software engineers
+    love to discuss at length, often giving a range of contradictory definitions.
+    I will begin by setting out what I think is important about real-time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A task is a real-time task if it has to complete before a certain point in time,
+    known as the deadline. The distinction between real-time and non real-time tasks
+    is shown by considering what happens when you play an audio stream on your computer
+    while compiling the Linux kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first is a real-time task because there is a constant stream of data arriving
+    at the audio driver and blocks of audio samples have to be written to the audio
+    interface at the playback rate. Meanwhile, the compilation is not real-time because
+    there is no deadline. You simply want it to complete as soon as possible; whether
+    it takes 10 seconds or 10 minutes does not affect the quality of the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The other important thing to consider is the consequence of missing the deadline,
+    which can range from mild annoyance through to system failure and death. Here
+    are some examples:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Playing an audio stream**: There is a deadline in the order of tens of milliseconds.
+    If the audio buffer under-runs you will hear a click, which is annoying, but you
+    will get over it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Moving and clicking a mouse**: The deadline is also in the order of tens
+    of milliseconds. If it is missed, the mouse moves erratically and button clicks
+    will be lost. If the problem persists, the system will become unusable.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Printing a piece of paper**: The deadlines for the paper feed are in the
+    millisecond range, which, if missed, may cause the printer to jam and somebody
+    will have to go and fix it. Occasional jams are acceptable but nobody is going
+    to buy a printer that keeps on jamming.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Printing sell-by dates on bottles on a production line**: If one bottle is
+    not printed the whole production line has to be halted, the bottle removed and
+    the line restarted, which is expensive.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Baking a cake**: There is a deadline of 30 minutes or so. If you miss it
+    by a few minutes, the cake might be ruined. If you miss it by a large amount,
+    the house will burn down.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**A power surge detection system**: If the system detects a surge, a circuit
+    breaker has to be triggered within 2 milliseconds. Failing to do so causes damage
+    to the equipment and may injure or kill personnel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In other words, there are many consequences to missed deadlines. We often talk
+    about these different categories:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**soft real-time**: The deadline is desirable but is sometimes missed without
+    the system being considered a failure. First two examples are like this.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**hard real-time**: Here, missing a deadline has a serious effect. We can further
+    subdivide hard real-time into mission-critical systems in which there is a cost
+    to missing the deadline, such as the fourth example, and safety critical-systems
+    in which there is a danger to life and limb, such as the last two examples. I
+    put in the banking example to show that not all hard real-time systems have deadlines
+    measured in microseconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Software written for safety-critical systems has to conform to various standards
+    that seek to ensure that it is capable of performing reliably. It is very difficult
+    for a complex operating system such as Linux to meet those requirements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When it comes to mission-critical systems, it is possible, and common, for Linux
+    to be used for a wide range of control systems. The requirements of the software
+    depend on the combination of the deadline and the confidence level, which can
+    usually be determined through extensive testing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Therefore, to say that a system is real-time, you have to measure its response
+    times under the maximum anticipated load, and show that it meets the deadline
+    for an agreed proportion of the time. As a rule of thumb, a well configured Linux
+    system using a mainline kernel is good for soft real-time tasks with deadlines
+    down to tens of milliseconds and a kernel with the `PREEMPT_RT` patch is good
+    for soft and hard real-time mission-critical systems with deadlines down to several
+    hundreds of microseconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The key to creating a real-time system is to reduce the variability in response
+    times so that you have greater confidence that they will not be missed; in other
+    words, you need to make the system more deterministic. Often, this is done at
+    the expense of performance. For example, caches make systems run faster by making
+    the average time to access an item of data shorter, but the maximum time is longer
+    in the case of a cache miss. Caches make a system faster but less deterministic,
+    which is the opposite of what we want.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: It is a myth of real-time computing that it is fast. This is not so, the more
+    deterministic a system is, the lower the maximum throughput.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The remainder of this chapter is concerned with identifying the causes of latency
+    and the things you can do to reduce it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Identifying the sources of non-determinism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Fundamentally, real-time programming is about making sure that the threads
+    controlling the output in real-time are scheduled when needed and so can complete
+    the job before the deadline. Anything that prevents this is a problem. Here are
+    some problem areas:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Scheduling**: Real-time threads must be scheduled before others so they must
+    have a real-time policy, `SCHED_FIFO`, or `SCHED_RR`. Additionally they should
+    have priorities assigned in descending order starting with the one with the shortest
+    deadline, according to the theory of Rate Monotonic Analysis that I described
+    in [Chapter 10](ch10.html "Chapter 10. Learning About Processes and Threads"),
+    *Learning About Processes and Threads*.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Scheduling latency**: The kernel must be able to reschedule as soon as an
+    event such as an interrupt or timer occurs, and not be subject to unbounded delays.
+    Reducing scheduling latency is a key topic later on in this chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Priority inversion**: This is a consequence of priority-based scheduling,
+    which leads to unbounded delays when a high priority thread is blocked on a mutex
+    held by a low priority thread, as I described in [Chapter 10](ch10.html "Chapter 10. Learning
+    About Processes and Threads"), *Learning About Processes and Threads*. User space
+    has priority inheritance and priority ceiling mutexes; in kernel space we have
+    rt-mutexes which implement priority inheritance and which I will talk about in
+    the section on the real-time kernel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Accurate timers**: If you want to manage deadlines in the region of low milliseconds
+    or microseconds, you need timers that match. High resolution timers are crucial
+    and are a configuration option on almost all kernels.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Page faults**: A page fault while executing a critical section of code will
+    upset all timing estimates. You can avoid them by locking memory, as I describe
+    later on.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Interrupts**: They occur at unpredictable times and can result in unexpected
+    processing overhead if there is a sudden flood of them. There are two ways to
+    avoid this. One is to run interrupts as kernel threads, and the other, on multi-core
+    devices, is to shield one or more CPUs from interrupt handling. I will discuss
+    both possibilities later.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Processor caches**: Provide a buffer between the CPU and the main memory
+    and, like all caches, are a source of non-determinism, especially on multi-core
+    devices. Unfortunately, this is beyond the scope of this book but, refer to the
+    references at the end of the chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Memory bus contention**: When peripherals access memory directly through
+    a DMA channel they use up a slice of memory bus bandwidth, which slows down access
+    from the CPU core (or cores) and so contributes to non-deterministic execution
+    of the program. However, this is a hardware issue and is also beyond the scope
+    of this book.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I will expand on the important problems and see what can be done about them
+    in the next sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One item missing from the list is power management. The needs of real-time and
+    power management pull in opposite directions. Power management often leads to
+    high latencies when switching between sleep states, since setting up power regulators
+    and waking up processors all takes time, as does changing the core clock frequency
+    because the clocks take time to settle. But, surely you wouldn't expect a device
+    to respond immediately to an interrupt from suspend state? I know I can't get
+    going in the morning until after at least one cup of coffee.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding scheduling latency
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Real-time threads need to be scheduled as soon as they have something to do.
+    However, even if there are no other threads of the same or higher priority, there
+    is always a delay from the point at which the wake up event occurs – an interrupt
+    or system timer – to the time that the thread starts to run. This is called scheduling
+    latency. It can be broken down into several components, as shown in the following
+    diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Understanding scheduling latency](img/B03982_14_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Firstly, there is the hardware interrupt latency from the point at which an
+    interrupt is asserted until the **ISR** (**interrupt service routine**) begins
+    to run. A small part of this is the delay in the interrupt hardware itself but
+    the biggest problem is interrupts disabled in the software. Minimizing this *IRQ
+    off time* is important.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next is interrupt latency, which is the length of time until the ISR has
+    serviced the interrupt and woken up any threads waiting on this event. It is mostly
+    dependent on the way the ISR was written. Normally it should take only a short
+    time, measured in micro-seconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The final delay is the preemption latency, which is the time from the point
+    that the kernel is notified that a thread is ready to run to that at which the
+    scheduler actually runs the thread. It is determined by whether the kernel can
+    be preempted or not. If it is running code in a critical section then the reschedule
+    will have to wait. The length of the delay is dependent on the configuration of
+    kernel preemption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel preemption
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The preemption latency occurs because it is not always safe or desirable to
+    preempt the current thread of execution and call the scheduler. Mainline Linux
+    has three settings for preemption, selected via the **Kernel Features** | **Preemption
+    Model** menu:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_PREEMPT_NONE`: no preemption'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_PREEMPT_VOLUNTARY`: enables additional checks for requests for preemption'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_PREEMPT`: allows the kernel to be preempted'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With preemption set to `none`, kernel code will continue without rescheduling
+    until it either returns via a `syscall` back to user space, where preemption is
+    always allowed, or it encounters a sleeping wait which stops the current thread.
+    Since it reduces the number of transitions between the kernel and user space and
+    may reduce the total number of context switches, this option results in the highest
+    throughput at the expense of large preemption latencies. It is the default for
+    servers and some desktop kernels where throughput is more important than responsiveness.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The second option enables more explicit preemption points where the scheduler
+    is called if the `need_resched` flag is set, which reduces the worst case preemption
+    latencies at the expense of slightly lower throughput. Some distributions set
+    this option on desktops.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The third option makes the kernel preemptible, meaning that an interrupt can
+    result in an immediate reschedule so long as the kernel is not executing in an
+    atomic context, which I will describe in the following section. This reduces worst
+    case preemption latencies and, therefore, overall scheduling latencies, to something
+    in the order of a few milliseconds on typical embedded hardware. This is often
+    described as a soft real-time option and most embedded kernels are configured
+    in this way. Of course, there is a small reduction in overall throughput but that
+    is usually less important than having more deterministic scheduling for embedded
+    devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The real-time Linux kernel (PREEMPT_RT)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There is a long-standing effort to reduce latencies still further which goes
+    by the name of the kernel configuration option for these features, `PREEMPT_RT`.
+    The project was started by Ingo Molnar, Thomas Gleixner, and Steven Rostedt and
+    has had contributions from many more developers over the years. The kernel patches
+    are at [https://www.kernel.org/pub/linux/kernel/projects/rt](https://www.kernel.org/pub/linux/kernel/projects/rt)
+    and there is a wiki, including an FAQ (slightly out of date), at [https://rt.wiki.kernel.org](https://rt.wiki.kernel.org).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Many parts of the project have been incorporated into mainline Linux over the
+    years, including high resolution timers, kernel mutexes, and threaded interrupt
+    handlers. However, the core patches remain outside of the mainline because they
+    are rather intrusive and (some claim) only benefit a small percentage of the total
+    Linux user base. Maybe, one day, the whole patch set will be merged upstream.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The central plan is to reduce the amount of time the kernel spends running
+    in an atomic context, which is where it is not safe to call the scheduler and
+    switch to a different thread. Typical atomic contexts are when the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: is running an interrupt or trap handler
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: is holding a spin lock or in an RCU critical section. Spin lock and RCU are
+    kernel locking primitives, the details of which are not relevant here
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: is between calls to `preempt_disable()` and `preempt_enable()`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: hardware interrupts are disabled
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The changes that are part of `PREEMPT_RT` fall into two main areas: one is
+    to reduce the impact of interrupt handlers by turning them into kernel threads
+    and the other is to make locks preemptible so that a thread can sleep while holding
+    one. It is obvious that there is a large overhead in these changes, which makes
+    average case interrupt handling slower but much more deterministic, which is what
+    we are striving for.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threaded interrupt handlers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Not all interrupts are triggers for the real-time tasks but all interrupts
+    steal cycles from the real-time task. Threaded interrupt handlers allow a priority
+    to be associated with the interrupt and for it to be scheduled at an appropriate
+    time as shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Threaded interrupt handlers](img/B03982_14_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'If the interrupt handler code is run as a kernel thread there is no reason
+    why it cannot be preempted by a user space thread of higher priority, and so the
+    interrupt handler does not contribute towards scheduling latency of the user space
+    thread. Threaded interrupt handlers have been a feature of mainline Linux since
+    2.6.30\. You can request that an individual interrupt handler is threaded by registering
+    it with `request_threaded_irq()` in place of the normal `request_irq()`. You can
+    make threaded IRQs the default by configuring the kernel with `CONFIG_IRQ_FORCED_THREADING=y`
+    which makes all handlers into threads unless they have explicitly prevented this
+    by setting the `IRQF_NO_THREAD` flag. When you apply the `PREEMPT_RT` patches,
+    interrupts are, by default, configured as threads in this way. Here is an example
+    of what you might see:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this case, a BeagleBone running `linux-yocto-rt`, only the `gp_timer` interrupt
+    was not threaded. It is normal that the timer interrupt handler be run in-line.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Note that the interrupt threads have all been given the default policy `SCHED_FIFO`
+    and a priority of `50`. It doesn't make sense to leave them with the defaults,
+    however; now is your chance to assign priorities according to the importance of
+    the interrupts compared to real-time user space threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is a suggested order of descending thread priorities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The POSIX timers thread, `posixcputmr`, should always have the highest priority.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardware interrupts associated with the highest priority real-time thread.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The highest priority real-time thread.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardware interrupts for the progressively lower priority real-time threads followed
+    by the thread itself.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardware interrupts for non-real-time interfaces.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The soft IRQ daemon, `ksoftirqd`, which on RT kernels is responsible for running
+    delayed interrupt routines and, prior to Linux 3.6, was responsible for running
+    the network stack, the block I/O layer, and other things. You may need to experiment
+    with different priority levels to get a balance.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'You can change the priorities using the `chrt` command as part of the boot
+    script, using a command like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `pgrep` command is part of the `procps` package.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preemptible kernel locks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Making the majority of kernel locks preemptible is the most intrusive change
+    that `PREEMPT_RT` makes and this code remains outside of the mainline kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The problem occurs with spinlocks, which are used for much of the kernel locking.
+    A spinlock is a busy-wait mutex which does not require a context switch in the
+    contended case and so is very efficient as long as the lock is held for a short
+    time. Ideally, they should be locked for less than the time it would take to reschedule
+    twice. The following diagram shows threads running on two different CPUs contending
+    the same spinlock. **CPU0** gets it first, forcing **CPU1** to spin, waiting until
+    it is unlocked:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Preemptible kernel locks](img/B03982_14_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The thread that holds the spinlock cannot be preempted since doing so may make
+    the new thread enter the same code and deadlock when it tries to lock the same
+    spinlock. Consequently, in mainline Linux, locking a spinlock disables kernel
+    preemption, creating an atomic context. This means that a low priority thread
+    that holds a spinlock can prevent a high priority thread from being scheduled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The solution adopted by `PREEMPT_RT` is to replace almost all spinlocks with
+    rt-mutexes. A mutex is slower than a spinlock but it is fully preemptible. Not
+    only that, but rt-mutexes implement priority inheritance and so are not susceptible
+    to priority inversion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting the PREEMPT_RT patches
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The RT developers do not create patch sets for every kernel version because
+    of the amount of effort involved. On average, they create patches for every other
+    kernel. The most recent kernels that are supported at the time of writing are
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 4.1-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 4.0-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 3.18-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 3.14-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 3.12-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 3.10-rt
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The patches are available at [https://www.kernel.org/pub/linux/kernel/projects/rt](https://www.kernel.org/pub/linux/kernel/projects/rt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you are using the Yocto Project, there is an `rt` version of the kernel
+    already. Otherwise, it is possible that the place you got your kernel from already
+    has the `PREEMPT_RT` patch applied. Otherwise, you will have to apply the patch
+    yourself. Firstly, make sure that the `PREEMPT_RT` patch version and your kernel
+    version match exactly, otherwise you will not be able to apply the patches cleanly.
+    Then you apply it in the normal way, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: You will then be able to configure the kernel with `CONFIG_PREEMPT_RT_FULL`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a problem in the last paragraph. The RT patch will only apply if you
+    are using a compatible mainline kernel. You are probably not because that is the
+    nature of embedded Linux kernels and so you will have to spend some time looking
+    at failed patches and fixing them, and then analyzing the board support for your
+    target and adding any real-time support that is missing. These details are, once
+    again, outside the scope of this book. If you are not sure what to do, you should
+    inquire of the developers of the kernel you are using and on kernel developer's
+    forums.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Yocto Project and PREEMPT_RT
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The Yocto Project supplies two standard kernel recipes: `linux-yocto` and `linux-yoco-rt`,
+    the latter having the real-time patches already applied. Assuming that your target
+    is supported by these kernels, then you just need to select `linux-yocto-rt` as
+    your preferred kernel and declare that your machine is compatible, for example,
+    by adding lines similar to these to your `conf/local.conf`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: High resolution timers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Timer resolution is important if you have precise timing requirements which
+    is typical for real-time applications. The default timer in Linux is a clock that
+    runs at a configurable rate, typically 100 Hz for embedded systems and 250 Hz
+    for servers and desktops. The interval between two timer ticks is known as a **jiffy**
+    and, in the examples given above, is 10 milliseconds on an embedded SoC and four
+    milliseconds on a server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Linux gained more accurate timers from the real-time kernel project in version
+    2.6.18 and now they are available on all platforms, providing that there is a
+    high resolution timer source and device driver for it – which is almost always
+    the case. You need to configure the kernel with `CONFIG_HIGH_RES_TIMERS=y`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With this enabled, all the kernel and user space clocks will be accurate down
+    to the granularity of the underlying hardware. Finding the actual clock granularity
+    is difficult. The obvious answer is the value provided by `clock_getres(2)` but
+    that always claims a resolution of one nanosecond. The `cyclictest` tool that
+    I will describe later has an option to analyze the times reported by the clock
+    to guess the resolution:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The two methods give rather different numbers, for which I have no good explanation
+    but, since both are below one microsecond, I am happy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Avoiding page faults in a real-time application
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A page fault occurs when an application reads or writes memory that is not committed
+    to physical memory. It is impossible (or very hard) to predict when a page fault
+    will happen so they are another source of non-determinism in computers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Fortunately, there is a function that allows you to commit all memory for a
+    process and lock it down so that it cannot cause a page fault. It is `mlockall(2)`.
+    These are its two flags:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`MCL_CURRENT`: locks all pages currently mapped'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`MCL_FUTURE`: locks pages that are mapped in later'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You usually call `mlockall(2)` during the start up of the application with both
+    flags set to lock all current and future memory mappings.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Note that `MCL_FUTURE` is not magic in that there will still be non-deterministic
+    delay when allocating or freeing heap memory using `malloc()/free()` or `mmap()`.
+    Such operations are best done at start up and not in the main control loops.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Memory allocated on the stack is trickier because it is done automatically
+    and if you call a function that makes the stack deeper than before, you will encounter
+    more memory management delays. A simple fix is to grow the stack to a size larger
+    than you think you will ever need at start up. The code would look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `stack_grow()` function allocates a large variable on the stack and then
+    zeroes it to force those pages of memory to be committed to this process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interrupt shielding
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Using threaded interrupt handlers helps mitigate interrupt overhead by running
+    some threads at a higher priority than interrupt handlers that do not impact the
+    real-time tasks. If you are using a multi-core processor, you can take a different
+    approach and shield one or more cores from processing interrupts completely, allowing
+    them to be dedicated to real-time tasks instead. This works either with a normal
+    Linux kernel or a `PREEMPT_RT` kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Achieving this is a question of pinning the real-time threads to one CPU and
+    the interrupt handlers to a different one. You can set the CPU affinity off a
+    thread or process using the command line tool `taskset`, or you can use the `sched_setaffinity(2)`
+    and `pthread_setaffinity_np(3)` functions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To set the affinity of an interrupt, first note that there is a subdirectory
+    for each interrupt number in `/proc/irq/<IRQ number>`. The control files for the
+    interrupt are in there, including a CPU mask in `smp_affinity`. Write a bitmask
+    to that file with a bit set for each CPU that is allowed to handle that IRQ.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring scheduling latencies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'All the configuration and tuning you may do will be pointless if you cannot
+    show that your device meets the deadlines. You will need your own benchmarks for
+    the final testing but I will describe here two important measurement tools: `cyclictest`
+    and `Ftrace`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: cyclictest
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '`cyclictest` was originally written by Thomas Gleixner and is now available
+    on most platforms in a package named `rt-tests`. If you are using the Yocto Project,
+    you can create a target image that includes `rt-tests` by building the real-time
+    image recipe like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: If you are using Buildroot, you need to add the package, `BR2_PACKAGE_RT_TESTS`
+    in the menu **Target packages** | **Debugging, profiling and benchmark** | **rt-tests**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`cyclictest` measures scheduling latencies by comparing the actual time taken
+    for a sleep to the requested time. If there was no latency they would be the same
+    and the reported latency would be zero. `cyclictest` assumes a timer resolution
+    of less than one microsecond.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It has a large number of command-line options. To start with, you might try
+    running this command as root on the target:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The options selected are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`-l N`: loop N times: the default is unlimited'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-m`: lock memory with mlockall'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-n`: use `clock_nanosleep(2)` instead of `nanosleep(2)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-p N`: use the real-time priority `N`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The result line shows the following, reading from left to right:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`T: 0`: this was thread 0, the only thread in this run. You can set the number
+    of threads with parameter `-t`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`(320)`: this was PID 320.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`P:99`: the priority was 99.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`I:1000`: the interval between loops was 1,000 microseconds. You can set the
+    interval with parameter `-i N`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`C:100000`: the final loop count for this thread was 100,000.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Min: 9`: the minimum latency was 9 microseconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Act:13`: the actual latency was 13 microseconds. The actual latency is the
+    most recent latency measurement, which only makes sense if you are watching `cyclictest`
+    run.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Avg:15`: the average latency was 15 microseconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Max:134`: the maximum latency was 134 microseconds.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This was obtained on an idle system running an unmodified `linux-yocto` kernel
+    as a quick demonstration of the tool. To be of real use, you would run tests over
+    a 24 hour period or more while running a load representative of the maximum you
+    expect.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Of the numbers produced by `cyclictest`, the maximum latency is the most interesting,
+    but it would be nice to get an idea of the spread of the values. You can get that
+    by adding `-h <N>` to obtain a histogram of samples that are up to `N` microseconds
+    late. Using this technique, I obtained three traces for the same target board
+    running kernels with no preemption, with standard preemption, and with RT preemption
+    while being loaded with Ethernet traffic from a flood ping. The command line was
+    as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is the output generated with no preemption:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![cyclictest](img/B03982_14_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Without preemption, most samples are within 100 microseconds of the deadline,
+    but there are some outliers of up to 500 microseconds, which is pretty much what
+    you would expect.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is the output generated with standard preemption:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![cyclictest](img/B03982_14_05.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: With preemption, the samples are spread out at the lower end but there is nothing
+    beyond 120 microseconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is the output generated with RT preemption:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![cyclictest](img/B03982_14_06.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The RT kernel is a clear winner because everything is tightly bunched around
+    the 20 microsecond mark and there is nothing later than 35 microseconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`cyclictest`, then, is a standard metric for scheduling latencies. However,
+    it cannot help you identify and resolve specific problems with kernel latency.
+    To do that, you need `Ftrace`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Ftrace
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The kernel function tracer has tracers to help track down kernel latencies—that
+    is what it was originally written for, after all. These tracers capture the trace
+    for the worst case latency detected during a run, showing the functions that caused
+    the delay. The tracers of interest, together with the kernel configuration parameters,
+    are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`irqsoff`: `CONFIG_IRQSOFF_TRACER` traces code that disables interrupts, recording
+    the worst case'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`preemptoff`: `CONFIG_PREEMPT_TRACER` is similar to `irqsoff`, but traces the
+    longest time that kernel preemeption is disabled (only available on preemptible
+    kernels)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`preemptirqsoff`: it combines the previous two traces to record the largest
+    time either `irqs` and/or preemption is disabled'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`wakeup`: traces and records the maximum latency that it takes for the highest
+    priority task to get scheduled after it has been woken up'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`wakeup_rt`: the same as wake up but only for real-time threads with the `SCHED_FIFO`,
+    `SCHED_RR`, or `SCHED_DEADLINE` policies'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`wakeup_dl`: the same but only for deadline-scheduled threads with the `SCHED_DEADLINE`
+    policy'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Be aware that running `Ftrace` adds a lot of latency, in the order of tens of
+    milliseconds, every time it captures a new maximum which `Ftrace` itself can ignore.
+    However, it skews the results of user-space tracers such as `cyclictest`. In other
+    words, ignore the results of `cyclictest` if you run it while capturing traces.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Selecting the tracer is the same as for the function tracer we looked at in
+    [Chapter 13](ch13.html "Chapter 13. Profiling and Tracing"), *Profiling and Tracing*.
+    Here is an example of capturing a trace for the maximum period with preemption
+    disabled for a period of 60 seconds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The resulting trace, heavily edited, looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, you can see that the longest period with kernel preemption disabled while
+    running the trace was 1,160 microseconds. This simple fact is available by reading
+    `/sys/kernel/debug/tracing/tracing_max_latency`, but the trace above goes further
+    and gives you the sequence of kernel function calls that lead up to that measurement.
+    The column marked `delay` shows the point on the trail where each function was
+    called, ending with the call to `trace_preempt_on()` at `1162us`, at which point
+    kernel preemption is once again enabled. With this information, you can look back
+    through the call chain and (hopefully) work out if this is a problem or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other tracers mentioned work in the same way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Combining cyclictest and Ftrace
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: If `cyclictest` reports unexpectedly long latencies you can use the `breaktrace`
+    option to abort the program and trigger `Ftrace` to obtain more information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You invoke breaktrace using `-b<N>` or `--breaktrace=<N>` where `N` is the
+    number of microseconds of latency that will trigger the trace. You select the
+    `Ftrace` tracer using `-T[tracer name]` or one of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`-C`: context switch'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-E`: event'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '-`f`: function'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-w`: wakeup'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`-W`: wakeup-rt'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For example, this will trigger the `Ftrace` function tracer when a latency
+    greater than 100 microseconds is measured:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The following resources have further information about the topics introduced
+    in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Hard Real-Time Computing Systems: Predictable Scheduling Algorithms and Applications*
+    by *Buttazzo*, *Giorgio*, *Springer*, 2011'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Multicore Application Programming* by *Darryl Gove*, *Addison Wesley*, 2011'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The term real-time is meaningless unless you qualify it with a deadline and
+    an acceptable miss rate. When you know that you can determine whether or not Linux
+    is a suitable candidate for the operating system and, if so, begin to tune your
+    system to meet the requirements. Tuning Linux and your application to handle real-time
+    events means making it more deterministic so that it can process data reliably
+    inside deadlines. Determinism usually comes at the price of total throughput so
+    a real-time system is not going to be able to process as much data as a non-real-time
+    system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is not possible to provide mathematical proof that a complex operating system
+    like Linux will always meet a given deadline, so the only approach is through
+    extensive testing using tools such as `cyclictest` and `Ftrace`, and, more importantly,
+    using your own benchmarks for your own application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To improve determinism, you need to consider both the application and the kernel.
+    When writing real-time applications, you should follow the guidelines given in
+    this chapter about scheduling, locking, and memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel has a large impact on the determinism of your system. Thankfully,
+    there has been a lot of work on this over the years. Enabling kernel preemption
+    is a good first step. If you still find that it is missing deadlines more often
+    than you would like, then you might want to consider the `PREEMPT_RT` kernel patches.
+    They can certainly produce low latencies but the fact that they are not in mainline
+    yet means that you may have problems integrating them with the vendor kernel for
+    your particular board. You may instead, or in addition, need to embark on the
+    exercise of finding the cause of the latencies using `Ftrace` and similar tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: That brings me to the end of this dissection of embedded Linux. Being an engineer
+    of embedded systems requires a very wide range of skills, which range from a low
+    level knowledge of hardware, how the system bootstrap works and how the kernel
+    interacts with it, to being an excellent system engineer who is able to configure
+    user applications and tune them to work in an efficient manner. All of this has
+    to be done with hardware that is, almost always, only just capable of the task.
+    There is a quotation that sums this up, *An engineer can do for a dollar what
+    anyone else can do for two*. I hope that you will be able to achieve that with
+    the information I have presented during the course of this book.
+  prefs: []
+  type: TYPE_NORMAL

@@ -530,6 +530,7 @@
   id: totrans-62
   prefs: []
   type: TYPE_NORMAL
+  zh: 首先要注意的是，如果标志的值为1，我们实际上不需要将其替换为1，我们可以让它保持不变。为什么这很重要？交换是一个读-修改-写操作。即使它将旧值更改为相同的值，它也需要独占访问包含标志的缓存行。我们不需要独占访问只是为了读取标志。这在以下情况下很重要：锁定了一个锁，拥有锁的线程没有改变它（它正忙于工作），但所有其他线程都在检查锁，并等待值更改为0。如果它们不尝试写入标志，缓存行就不需要在不同的CPU之间反弹：它们都有内存的相同副本在它们的缓存中，并且这个副本是当前的，不需要将任何数据发送到任何地方。只有当其中一个线程实际更改值时，硬件才需要将内存的新内容发送到所有CPU。这是我们刚刚描述的优化，在代码中完成：
 - en: '[PRE6]'
   id: totrans-63
   prefs: []
@@ -544,6 +545,7 @@
   id: totrans-64
   prefs: []
   type: TYPE_NORMAL
+  zh: 这里的优化是，我们首先读取标志，直到看到0，然后将其与1交换。如果另一个线程首先获得了锁，那么在我们进行检查和交换之间，值可能已经更改为1。另外，请注意，在预先检查标志时，我们根本不关心内存屏障，因为最终的确定性检查总是使用交换及其内存屏障完成。
 - en: Even with this optimization, the lock performs pretty poorly. The reason has
     to do with the way the operating systems tend to prioritize threads. In general,
     a thread that is doing heavy computing will get more CPU time on the assumption
@@ -557,6 +559,7 @@
   id: totrans-65
   prefs: []
   type: TYPE_NORMAL
+  zh: 即使进行了这种优化，锁的性能仍然相当差。原因在于操作系统倾向于优先考虑线程的方式。一般来说，进行大量计算的线程将获得更多的CPU时间，因为假设它正在做一些有用的事情。不幸的是，在我们的情况下，最大量计算的线程是在等待标志改变时不断尝试获取锁。这可能导致一种不良情况，即一个线程试图获取锁并且已经分配了CPU给它，而另一个线程想要释放锁，但却没有被调度执行一段时间。解决方法是让等待的线程在多次尝试后放弃CPU，以便其他线程可以运行，并且希望完成它的工作并释放锁。
 - en: 'There are several ways for a thread to release the control on the CPU; most
     are done by a system function call. There isn''t a universal best way to do so.
     Experimentally, on Linux, a call to sleep for a very short time (1 nanosecond)
@@ -568,6 +571,7 @@
   id: totrans-66
   prefs: []
   type: TYPE_NORMAL
+  zh: 线程释放CPU的方式有几种，大多数是通过系统函数调用完成的。没有一种通用的最佳方法。在Linux上，通过调用`nanosleep()`似乎能够产生最佳结果，通常比调用`sched_yield()`更好，后者是另一个系统函数，用于让出CPU访问权。所有系统调用与硬件指令相比都很昂贵，因此不要经常调用它们。最佳平衡是当我们尝试多次获取锁，然后将CPU让给另一个线程，然后再次尝试：
 - en: '[PRE7]'
   id: totrans-67
   prefs: []
@@ -579,35 +583,42 @@
   id: totrans-68
   prefs: []
   type: TYPE_NORMAL
+  zh: 在释放CPU之前获取锁的最佳尝试次数取决于硬件和线程数量，但通常，8到16之间的值效果很好。
 - en: 'Now we are ready for the second round of benchmarks, and here is the result:'
   id: totrans-69
   prefs: []
   type: TYPE_NORMAL
+  zh: 现在我们准备进行第二轮基准测试，以下是结果：
 - en: '![Figure 6.2 – Performance of a shared count increment: spinlock-based, lock-free
     (compare-and-swap, or CAS), and wait-free (atomic)'
   id: totrans-70
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.2 - 共享计数增量的性能：基于自旋锁、无锁（比较和交换，或CAS）和无等待（原子）的性能比较'
 - en: '](img/Figure_6.2_B16229.jpg)'
   id: totrans-71
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.2_B16229.jpg)'
 - en: 'Figure 6.2 – Performance of a shared count increment: spinlock-based, lock-free
     (compare-and-swap, or CAS), and wait-free (atomic)'
   id: totrans-72
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.2 - 共享计数增量的性能：基于自旋锁、无锁（比较和交换，或CAS）和无等待（原子）的性能比较
 - en: 'The spinlock has done very well: it is soundly outperforming the compare-and-swap
     implementation and gives the wait-free operation tough competition.'
   id: totrans-73
   prefs: []
   type: TYPE_NORMAL
+  zh: 自旋锁表现非常出色：它明显优于比较和交换实现，并给无等待操作带来了激烈的竞争。
 - en: 'These results leave us with two questions: first, why don''t all locks use
     spinlocks if they are so much faster? Second, why do we even need the atomic operations
     if the spinlock is so good (other than for implementing the lock, of course)?'
   id: totrans-74
   prefs: []
   type: TYPE_NORMAL
+  zh: 这些结果给我们留下了两个问题：首先，如果自旋锁如此快，为什么不所有的锁都使用自旋锁？其次，如果自旋锁如此出色，为什么我们甚至需要原子操作（除了用于实现锁之外）？
 - en: 'The answer to the first question boils down to the title of this section: different
     locks for different problems. The downside of the spinlock is that the waiting
     thread continuously uses the CPU or is "busy waiting." On the other hand, the
@@ -1115,22 +1126,26 @@
   id: totrans-122
   prefs: []
   type: TYPE_NORMAL
+  zh: 指针自旋锁的一个明显优势是，只要它提供了访问受保护对象的唯一方式，就不可能意外地创建竞争条件并在没有锁的情况下访问共享数据。第二个优势是，这个锁往往比常规自旋锁稍微更快。自旋锁是否也优于原子操作取决于硬件。同样的基准测试在不同处理器上产生非常不同的结果：
 - en: '![Figure 6.3 – Performance of a shared count increment: regular spinlock, pointer
     spinlock, lock-free (compare-and-swap, or CAS), and wait-free (atomic) for different
     hardware systems (a) and (b)'
   id: totrans-123
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.3 - 共享计数增量的性能：常规自旋锁、指针自旋锁、无锁（比较和交换，或CAS）、无等待（原子）对不同硬件系统（a）和（b）的影响'
 - en: '](img/Figure_6.3_B16229.jpg)'
   id: totrans-124
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.3_B16229.jpg)'
 - en: 'Figure 6.3 – Performance of a shared count increment: regular spinlock, pointer
     spinlock, lock-free (compare-and-swap, or CAS), and wait-free (atomic) for different
     hardware systems (a) and (b)'
   id: totrans-125
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.3 - 共享计数增量的性能：常规自旋锁、指针自旋锁、无锁（比较和交换，或CAS）、无等待（原子）对不同硬件系统（a）和（b）的影响
 - en: As a rule, the more recent processors handle locks and busy waiting better,
     and it is more likely that the spinlock delivers better performance on the latest
     hardware (in *Figure 6.3*, system *b* uses Intel X86 CPUs that are one generation
@@ -1138,6 +1153,7 @@
   id: totrans-126
   prefs: []
   type: TYPE_NORMAL
+  zh: 一般来说，较新的处理器更好地处理锁和忙等待，而且旋转锁更有可能在最新的硬件上提供更好的性能（在*图6.3*中，系统*b*使用的是Intel X86处理器，比系统*a*的处理器晚一代）。
 - en: 'The average time it takes to execute an operation (or its inverse, the throughput)
     is the metric that we are mainly concerned with in most HPC systems. However,
     this is not the only possible metric used to gauge the performance of concurrent
@@ -1149,20 +1165,24 @@
   id: totrans-127
   prefs: []
   type: TYPE_NORMAL
+  zh: 执行操作所需的平均时间（或其倒数，吞吐量）是我们在大多数HPC系统中主要关注的度量标准。然而，这并不是衡量并发程序性能的唯一可能度量标准。例如，如果程序在移动设备上运行，功耗可能更为重要。所有线程使用的总CPU时间是平均功耗的一个合理代理。我们用来测量计数器增量的平均实际时间的相同基准测试也可以用来测量CPU时间：
 - en: '![Figure 6.4 – Average CPU time used by different implementations of the thread-safe
     counter'
   id: totrans-128
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.4 - 不同线程安全计数器实现的平均CPU使用时间'
 - en: '](img/Figure_6.4_B16229.jpg)'
   id: totrans-129
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.4_B16229.jpg)'
 - en: Figure 6.4 – Average CPU time used by different implementations of the thread-safe
     counter
   id: totrans-130
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.4 - 不同线程安全计数器实现的平均CPU使用时间
 - en: The bad news here is that no matter the implementation, the cost of accessing
     the shared data by multiple threads at once increases exponentially with the number
     of threads, at least when we have many threads (note that the *y* axis scale in
@@ -1174,6 +1194,7 @@
   id: totrans-131
   prefs: []
   type: TYPE_NORMAL
+  zh: 坏消息是，无论实现方式如何，多个线程同时访问共享数据的成本都会随着线程数量的增加呈指数级增长，至少当我们有很多线程时是这样（请注意*图6.4*中的*y*轴刻度是对数刻度）。然而，效率在不同实现之间差异很大，至少对于最有效的实现来说，指数增长实际上直到至少八个线程才会真正开始。请注意，结果将再次因硬件系统而异，因此选择必须考虑目标平台，并且只能在测量完成后进行。
 - en: Whatever the chosen implementation, a thread-safe accumulator or a counter should
     not expose it but encapsulate it in a class. One reason is to provide the clients
     of the class with a stable interface while retaining the freedom to optimize the
@@ -1181,6 +1202,7 @@
   id: totrans-132
   prefs: []
   type: TYPE_NORMAL
+  zh: 无论选择哪种实现方式，线程安全的累加器或计数器都不应该暴露出来，而是应该封装在一个类中。一个原因是为了为类的客户提供稳定的接口，同时保留优化实现的自由。
 - en: 'The second reason is more subtle, and it has to do with the exact guarantees
     the counter provides. So far, we have focused on the counter value itself, making
     sure that it is modified and accessed by all threads without any races. Whether
@@ -1209,6 +1231,7 @@
   id: totrans-133
   prefs: []
   type: TYPE_NORMAL
+  zh: 第二个原因更微妙，它与计数器提供的确切保证有关。到目前为止，我们已经专注于计数器的值本身，确保它被所有线程修改和访问而没有任何竞争。是否足够取决于我们如何使用计数器。如果我们只是想计算一些事件，而且没有其他东西依赖于计数器的值，那么我们只关心值本身是否正确。另一方面，如果我们要计算的是，比如说，数组中元素的数量，那么我们就涉及到数据依赖性。假设我们有一个大的预分配数组（或者一个可以在不干扰已有元素的情况下增长的容器），所有线程都在计算要插入到这个数组中的新元素。计数器计算已计算并插入数组中的元素的数量，并且可以被其他线程使用。换句话说，如果一个线程从计数器中读取值`N`，它必须确保数组的前`N`个元素是安全可读的（这意味着没有其他线程再修改它们）。但是数组本身既不是原子的，也没有受到锁的保护。当然，我们可以通过锁来保护对整个数组的访问，但这可能会降低程序的性能：如果数组中已经有很多元素，但只有一个线程可以读取它们，那么程序可能就像单线程一样。另一方面，我们知道任何常量、不可变的数据都可以在多个线程中安全地读取，而不需要任何锁。我们只需要知道不可变数据和可变数据之间的边界在哪里，这正是计数器应该提供的。这里的关键问题是内存可见性：我们需要保证数组的前`N`个元素的任何更改在计数器的值从`N-1`变为`N`之前对所有线程都是可见的。
 - en: 'We studied memory visibility in the previous chapter when we discussed the
     memory model. At the time, it might have appeared to be a largely theoretical
     matter, but not anymore. From the last chapter, we know that the way we control
@@ -1230,6 +1253,7 @@
   id: totrans-134
   prefs: []
   type: TYPE_NORMAL
+  zh: 我们在上一章中研究了内存可见性，当时它可能看起来是一个主要是理论性的问题，但现在不是了。从上一章我们知道，我们控制可见性的方式是通过限制内存顺序或使用内存屏障（谈论同一件事的两种不同方式）。多线程程序中计数和索引之间的关键区别在于索引提供了额外的保证：如果将索引从`N-1`增加到`N`的线程在增加索引之前已经完成了数组元素`N`的初始化，那么读取索引并得到值`N`（或更大）的任何其他线程都保证能够在数组中看到至少`N`个完全初始化和安全可读的元素（当然假设没有其他线程写入这些元素）。这是一个非平凡的保证，不要轻易忽视它：多个线程在访问内存中的同一位置（数组元素`N`）*而没有任何锁*，并且其中一个线程*写入*这个位置，然而，访问是安全的，没有数据竞争。如果我们不能使用共享索引来安排这个保证，我们将不得不锁定对数组的所有访问，只有一个线程能够每次读取它。相反，我们可以使用这个原子索引类：
 - en: '[PRE9]'
   id: totrans-135
   prefs: []
@@ -1240,6 +1264,7 @@
   id: totrans-136
   prefs: []
   type: TYPE_NORMAL
+  zh: 计数和索引之间唯一的区别在于内存可见性的保证；计数没有提供：
 - en: '[PRE10]'
   id: totrans-137
   prefs: []
@@ -1260,6 +1285,8 @@
   id: totrans-138
   prefs: []
   type: TYPE_NORMAL
+  zh: 当然，每个类的线程安全性和内存可见性保证都应该有文档记录。两者之间是否存在性能差异取决于硬件。在X86 CPU上，没有差异，因为原子递增和原子读取的硬件指令具有“类似索引”的内存屏障，无论我们是否请求。在ARM
+    CPU上，放松（或无屏障）内存操作明显更快。但是，无论性能如何，清晰和意图都很重要，不应被忘记：如果程序员使用明确提供内存顺序保证的索引类，但没有使用它进行任何索引，每个读者都会想知道发生了什么，代码中的这些保证被使用在了哪个微妙而隐藏的地方。通过使用具有正确一组文档保证的接口，您向读者表明编写此代码时的意图。
 - en: 'Let us now return to what may be the main "hidden" accomplishment in this section.
     We learned about thread-safe counters, but along the way, we came up with an algorithm
     to seemingly violate the first rule of writing multi-threaded code: any time two
@@ -1272,11 +1299,13 @@
   id: totrans-139
   prefs: []
   type: TYPE_NORMAL
+  zh: 现在让我们回到本节可能是主要的“隐藏”成就。我们学习了关于线程安全计数器，但在这个过程中，我们提出了一个似乎违反了编写多线程代码的第一规则的算法：任何时候两个或更多线程访问同一内存位置，并且至少有一个线程在写入，所有访问都必须被锁定（或原子化）。我们没有锁定共享数组，我们允许其元素中的任意数据（所以它可能不是原子的），但我们却得以逃脱！我们用来避免数据竞争的方法，事实证明是几乎每个专为并发设计的数据结构的基石，我们现在将花时间更好地理解和概括它。
 - en: Publishing protocol
   id: totrans-140
   prefs:
   - PREF_H2
   type: TYPE_NORMAL
+  zh: 发布协议
 - en: 'The general problem we are trying to solve is a very common one in data structure
     design and, by extension, the development of concurrent programs: one thread is
     creating new data, and the rest of the program must be able to see this data when
@@ -1285,6 +1314,7 @@
   id: totrans-141
   prefs: []
   type: TYPE_NORMAL
+  zh: 我们试图解决的一般问题在数据结构设计中非常常见，通过扩展，也是并发程序的开发：一个线程正在创建新数据，而程序的其余部分必须在数据准备好时能够看到这些数据，但在此之前不能看到。前一个线程通常被称为写入线程或生产者线程。所有其他线程都是读取或消费者线程。
 - en: 'The most obvious solution is to use a lock and follow the rule of avoiding
     the data races to the letter. If multiple threads (check) must access the same
     memory location (check) and at least one thread is writing at this location (exactly
@@ -1307,11 +1337,14 @@
   id: totrans-142
   prefs: []
   type: TYPE_NORMAL
+  zh: 最明显的解决方案是使用锁，并严格遵循避免数据竞争的规则。如果多个线程（检查）必须访问同一内存位置（检查），并且至少有一个线程在该位置写入（在我们的情况下确切地是一个线程
+    - 检查），那么所有线程在访问该内存位置之前都必须获取锁，无论是读取还是写入。这种解决方案的缺点是性能：在生产者完成并且不再有写入发生之后，所有消费者线程仍然互相阻止并发地读取数据。现在，只读访问根本不需要任何锁定，但问题是，我们需要在程序中有一个保证的点，使得所有写入在此点之前发生，所有读取在此点之后发生。然后我们可以说所有消费者线程在只读环境中操作，不需要任何锁定。挑战在于保证读取和写入之间的边界：请记住，除非我们进行某种同步，否则内存可见性是不被保证的：仅仅因为写入者已经完成了对内存的修改，并不意味着读取者看到了该内存的最终状态。锁包括适当的内存屏障，正如我们之前所见；它们界定了临界区，并确保在临界区之后执行的任何操作都会看到在临界区之前或期间发生的所有对内存的更改。但现在我们希望在没有锁定的情况下获得相同的保证。
 - en: 'The lock-free solution to this problem relies on a very specific protocol for
     passing information between the producer and the consumer threads:'
   id: totrans-143
   prefs: []
   type: TYPE_NORMAL
+  zh: 这个无锁解决方案依赖于生产者和消费者线程之间传递信息的一个非常具体的协议：
 - en: The producer thread prepares the data in a memory that is not accessible to
     other threads. It could be the memory allocated by the producer threads, or it
     could be pre-allocated memory, but the important point is that the producer is
@@ -1325,6 +1358,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 生产者线程在其他线程无法访问的内存中准备数据。这可能是生产者线程分配的内存，也可能是预先分配的内存，但重要的是生产者是唯一拥有对这个内存的有效引用的线程，并且这个有效引用不与其他线程共享（其他线程可能有访问这个内存的方法，但这将是程序中的一个错误，类似于超出数组边界索引）。由于只有一个线程访问新数据，因此不需要同步。就其他线程而言，这些数据根本不存在。
 - en: 'All consumer threads must use a single shared pointer for any access to the
     data, which we call the root pointer, and this pointer is initially null. It remains
     null while the producer thread is constructing the data. Again, from the point
@@ -1338,6 +1372,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 所有消费者线程必须使用一个共享指针来访问数据，我们称之为根指针，这个指针最初为空。在生产者线程构造数据时，它保持为空。同样，从消费者线程的角度来看，这个时候没有数据。更一般地说，这个“指针”不需要是实际的指针：只要它能够访问内存位置并且可以设置为预定的无效值，任何类型的句柄或引用都可以使用。例如，如果所有新对象都是在预先分配的数组中创建的，那么“指针”实际上可以是数组的索引，无效值可以是大于或等于数组大小的任何值。
 - en: 'The key to the protocol is that the only way for the consumer to access the
     data is through the root pointer, and this pointer remains null until the producer
     is ready to reveal, or publish, the data. The act of publishing the data is very
@@ -1348,6 +1383,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 协议的关键在于消费者访问数据的唯一方式是通过根指针，而且在生产者准备揭示或发布数据之前，这个指针始终为空。发布数据的行为非常简单：生产者必须原子地将数据的正确内存位置存储在根指针中，并且这个变化必须伴随着释放内存屏障。
 - en: The consumer thread can, at any time, query the root pointer, again atomically.
     If the query returns null, then there is no data (as far as the consumer is concerned),
     and the consumer thread should wait or, ideally, do some other work. If the query
@@ -1359,6 +1395,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 消费者线程可以随时原子地查询根指针。如果查询返回空值，那么就没有数据（就消费者而言），消费者线程应该等待，或者最好做一些其他工作。如果查询返回非空值，那么数据已准备好，生产者将不再更改它。查询必须使用获取内存屏障进行，这与生产者端的释放屏障结合使用，可以保证当观察到指针值的变化时，新数据是可见的。
 - en: This process is sometimes called the **publishing protocol** because it allows
     the producer thread to publish information for other threads to consume in a way
     that guarantees no data races. As we said, the publishing protocol can be implemented
@@ -1368,6 +1405,7 @@
   id: totrans-148
   prefs: []
   type: TYPE_NORMAL
+  zh: 这个过程有时被称为**发布协议**，因为它允许生产者线程发布信息供其他线程消费，以一种保证没有数据竞争的方式。正如我们所说，发布协议可以使用任何允许访问内存的句柄来实现，只要这个句柄可以被原子地改变。指针是最常见的句柄，当然，其次是数组索引。
 - en: 'The data that is being published can be simple or complex; it doesn''t matter.
     It does not even have to be a single object or a single memory location: the object
     that the root pointer points to can itself contain pointers to more data. The
@@ -1375,18 +1413,21 @@
   id: totrans-149
   prefs: []
   type: TYPE_NORMAL
+  zh: 被发布的数据可以是简单的或复杂的；这并不重要。它甚至不必是单个对象或单个内存位置：根指针指向的对象本身可以包含指向更多数据的指针。发布协议的关键要素如下：
 - en: All consumers access a particular set of data through one root pointer. The
     only way to gain access to the data is to read a non-null value of the root pointer.
   id: totrans-150
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 所有消费者通过一个根指针访问特定的数据集。获得访问数据的唯一方法是读取根指针的非空值。
 - en: 'The producer can prepare the data any way it wants, but the root pointer remains
     null: the producer has its own reference to the data that is local to this thread.'
   id: totrans-151
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 生产者可以以任何方式准备数据，但根指针始终为空：生产者有自己的对数据的引用，这是本地线程的。
 - en: When the producer wants to publish the data, it sets the root pointer to the
     correct address atomically and with a release barrier. After the data is published,
     the producer cannot change it (neither can anyone else).
@@ -1394,6 +1435,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 当生产者想要发布数据时，它会原子地使用释放屏障将根指针设置为正确的地址。数据发布后，生产者不能再更改它（其他人也不能）。
 - en: The consumer threads must read the root pointer atomically and with an acquire
     barrier. If they read a non-null value, they can read the data accessible through
     the root pointer.
@@ -1401,6 +1443,7 @@
   prefs:
   - PREF_UL
   type: TYPE_NORMAL
+  zh: 消费者线程必须原子地并且使用获取屏障读取根指针。如果他们读取到非空值，他们可以读取通过根指针访问的数据。
 - en: The atomic reads and writes used to implement the publishing protocol should
     not be, of course, scattered throughout the code. We should implement a publishing
     pointer class to encapsulate this functionality. In the next section, we will
@@ -1408,11 +1451,13 @@
   id: totrans-154
   prefs: []
   type: TYPE_NORMAL
+  zh: 用于实现发布协议的原子读写当然不应该散布在整个代码中。我们应该实现一个发布指针类来封装这个功能。在下一节中，我们将看到这样一个类的简单版本。
 - en: Smart pointers for concurrent programming
   id: totrans-155
   prefs:
   - PREF_H2
   type: TYPE_NORMAL
+  zh: 用于并发编程的智能指针
 - en: The challenge of concurrent (thread-safe) data structures is how to add, remove,
     and change the data in a way that maintains certain thread safety guarantees.
     The publishing protocol, which gives us a way to release new data to all threads,
@@ -1422,16 +1467,19 @@
   id: totrans-156
   prefs: []
   type: TYPE_NORMAL
+  zh: 并发（线程安全）数据结构的挑战在于如何以一种保持特定线程安全保证的方式添加、删除和更改数据。发布协议为我们提供了一种向所有线程发布新数据的方法，通常是向任何此类数据结构添加新数据的第一步。因此，毫无疑问，我们将学习的第一个类是封装了这个协议的指针。
 - en: Publishing pointer
   id: totrans-157
   prefs:
   - PREF_H3
   type: TYPE_NORMAL
+  zh: 发布指针
 - en: 'Here is a basic publishing pointer that also includes the functionality of
     a unique, or owning, pointer (so we can call it a thread-safe unique pointer):'
   id: totrans-158
   prefs: []
   type: TYPE_NORMAL
+  zh: 这是一个基本的发布指针，还包括唯一或拥有指针的功能（所以我们可以称之为线程安全的唯一指针）：
 - en: '[PRE11]'
   id: totrans-159
   prefs: []
@@ -1446,6 +1494,7 @@
   id: totrans-160
   prefs: []
   type: TYPE_NORMAL
+  zh: 当然，这是一个非常简单的设计；一个完整的实现应该支持自定义删除器、移动构造函数和赋值运算符，以及可能还有一些类似于`std::unique_ptr`的其他功能。顺便说一句，标准并不保证访问存储在`std::unique_ptr`对象中的指针值是原子的，或者使用了必要的内存屏障，因此标准唯一指针不能用于实现发布协议。
 - en: 'By now, it should be clear to the reader what our thread-safe unique pointer
     offers: the key functions are `publish()` and `get()`, and they implement the
     publishing protocol. Note that the `publish()` method does not delete the old
@@ -1458,6 +1507,7 @@
   id: totrans-161
   prefs: []
   type: TYPE_NORMAL
+  zh: 现在，读者应该清楚我们的线程安全唯一指针提供了什么：关键函数是`publish()`和`get()`，它们实现了发布协议。请注意，`publish()`方法不会删除旧数据；假定生产者线程只调用一次`publish()`，而且只在空指针上调用。我们可以为此添加一个断言，在调试构建中这样做可能是个好主意，但我们也关心性能。说到性能，基准测试显示，我们的发布指针的单线程解引用所花费的时间与原始指针或`std::unique_ptr`的时间相同。基准测试并不复杂：
 - en: '[PRE12]'
   id: totrans-162
   prefs: []
@@ -1468,43 +1518,52 @@
   id: totrans-163
   prefs: []
   type: TYPE_NORMAL
+  zh: 运行这个基准测试可以让我们了解我们的无锁发布指针的解引用速度有多快：
 - en: '![Figure 6.5 – The performance of the publishing pointer (consumer threads)'
   id: totrans-164
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.5 - 发布指针的性能（消费者线程）'
 - en: '](img/Figure_6.5_B16229.jpg)'
   id: totrans-165
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.5_B16229.jpg)'
 - en: Figure 6.5 – The performance of the publishing pointer (consumer threads)
   id: totrans-166
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.5 - 发布指针的性能（消费者线程）
 - en: 'The result should be compared with dereferencing a raw pointer, which we can
     also do on multiple threads:'
   id: totrans-167
   prefs: []
   type: TYPE_NORMAL
+  zh: 应该将结果与解引用原始指针进行比较，我们也可以在多个线程上执行此操作：
 - en: '![Figure 6.6 – The performance of the raw pointer, for comparison with Figure
     6.5'
   id: totrans-168
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.6 - 原始指针的性能，用于与图6.5进行比较'
 - en: '](img/Figure_6.6_B16229.jpg)'
   id: totrans-169
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.6_B16229.jpg)'
 - en: Figure 6.6 – The performance of the raw pointer, for comparison with Figure
     6.5
   id: totrans-170
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.6 - 原始指针的性能，用于与图6.5进行比较
 - en: 'The performance numbers are very close. We can also compare the speed of publishing,
     but, usually, the consumer side is more important: each object is published only
     once but then accessed many times.'
   id: totrans-171
   prefs: []
   type: TYPE_NORMAL
+  zh: 性能数字非常接近。我们也可以比较发布的速度，但通常来说，消费者端更重要：每个对象只发布一次，但会被访问多次。
 - en: It is equally important to understand what the publishing pointer does not do.
     First of all, there is no thread safety in the construction of the pointer. We
     have assumed that both the producer and the consumer threads share access to the
@@ -1527,6 +1586,7 @@
   id: totrans-172
   prefs: []
   type: TYPE_NORMAL
+  zh: 同样重要的是要理解发布指针不做的事情。首先，在指针的构造中没有线程安全性。我们假设生产者和消费者线程共享对已构造的指针的访问权，该指针初始化为null。谁构造并初始化了指针？通常，在任何数据结构中，都有一个根指针，通过它可以访问整个数据结构；它是由构造初始数据结构的任何线程初始化的。然后有一些指针，它们作为某个数据元素的根，并且它们本身包含在另一个数据元素中。现在，想象一个简单的单链表，其中每个列表元素的“下一个”指针是下一个元素的根，列表的头是整个列表的根。生产列表元素的线程必须在其他事情之间将“下一个”指针初始化为null。然后，另一个生产者可以添加一个新元素并发布它。请注意，这与一般规则不同，即一旦发布的数据就是不可变的。然而，这是可以的，因为对线程安全的唯一指针的所有更改都是原子的。无论如何，关键是在构造指针时没有线程可以访问它（这是一个非常常见的限制，大多数构造都不是线程安全的，甚至它们的线程安全性的问题都是不合适的，因为对象直到构造出来才存在，所以不能给出任何保证）。
 - en: 'The next thing our pointer does not do is this: it does not offer any synchronization
     for multiple producer threads. If two threads attempt to publish their new data
     elements through the same pointer, the results are undefined, and there is a data
@@ -1536,6 +1596,7 @@
   id: totrans-173
   prefs: []
   type: TYPE_NORMAL
+  zh: 我们的指针接下来没有做的事情是：它不为多个生产者线程提供任何同步。如果两个线程尝试通过相同的指针发布它们的新数据元素，结果是未定义的，并且存在数据竞争（一些消费者线程将看到一组数据，而其他线程将看到不同的数据）。如果有多个生产者线程在特定数据结构上操作，它们必须使用另一种同步机制。
 - en: Finally, while our pointer implements a thread-safe publishing protocol, it
     does nothing to safely "un-publish" and delete the data. It is an owning pointer,
     so when it is deleted, so is the data it points to. However, any consumer thread
@@ -1550,16 +1611,19 @@
   id: totrans-174
   prefs: []
   type: TYPE_NORMAL
+  zh: 最后，虽然我们的指针实现了线程安全的发布协议，但它并没有安全地“取消发布”和删除数据。它是一个拥有指针，所以当它被删除时，它指向的数据也会被删除。然而，任何消费者线程都可以使用它之前获取的值来访问数据，即使指针已被删除。数据所有权和生命周期的问题必须以其他方式处理。理想情况下，我们的程序中会有一个点，整个数据结构或其中的一部分被认为不再需要；没有消费者线程应该尝试访问这些数据，甚至保留任何指向它的指针。在那时，根指针和通过它可访问的任何内容都可以安全地删除。安排执行中的这种点是完全不同的事情；通常由整体算法控制。
 - en: Sometimes we want a pointer that manages both the creation and the deletion
     of the data in a thread-safe way. In this case, we need a thread-safe shared pointer.
   id: totrans-175
   prefs: []
   type: TYPE_NORMAL
+  zh: 有时我们需要一个指针以线程安全的方式管理数据的创建和删除。在这种情况下，我们需要一个线程安全的共享指针。
 - en: Atomic shared pointer
   id: totrans-176
   prefs:
   - PREF_H3
   type: TYPE_NORMAL
+  zh: 原子共享指针
 - en: 'If we cannot guarantee that there is a known point in the program where the
     data can be safely deleted, we have to keep track of how many consumer threads
     hold valid pointers to the data. If we want to delete this data, we have to wait
@@ -1571,6 +1635,7 @@
   id: totrans-177
   prefs: []
   type: TYPE_NORMAL
+  zh: 如果我们不能保证程序中有一个已知的点可以安全地删除数据，我们必须跟踪有多少消费者线程持有数据的有效指针。如果我们想删除这些数据，我们必须等到整个程序中只有一个指向它的指针；然后，才能安全地删除数据和指针本身（或者至少将其重置为null）。这是共享指针的典型工作：它对同一对象的指针在程序中还有多少进行引用计数；数据由最后一个这样的指针删除。
 - en: 'When talking about thread-safe shared pointers, it is vitally important to
     understand precisely what guarantees are required from the pointer. The C++ standard
     shared pointer, `std::shared_ptr`, is often referred to as thread-safe. Specifically,
@@ -1589,6 +1654,7 @@
   id: totrans-178
   prefs: []
   type: TYPE_NORMAL
+  zh: 谈论线程安全的共享指针时，准确理解指针需要什么保证是非常重要的。C++标准共享指针`std::shared_ptr`经常被称为线程安全。具体来说，它提供了以下保证：如果多个线程操作指向同一对象的不同共享指针，那么即使两个线程同时导致计数器发生变化，对引用计数器的操作也是线程安全的。例如，如果一个线程正在复制其共享指针，而另一个线程正在删除其共享指针，并且在这些操作开始之前引用计数为`N`，那么计数器将增加到`N+1`，然后返回到`N`（或者先减少，然后增加，取决于实际的执行顺序），最终将具有相同的值`N`。中间值可以是`N+1`或`N-1`，但没有数据竞争，行为是明确定义的，包括最终状态。这一保证意味着对引用计数器的操作是原子的；实际上，引用计数器是一个原子整数，并且实现使用`fetch_add()`来原子地增加或减少它。
 - en: 'This guarantee applies as long as no two threads share access to the same shared
     pointer. How to get each thread its own shared pointer is a separate issue: since
     all shared pointers pointing to the same object must be created from the very
@@ -1612,6 +1678,7 @@
   id: totrans-179
   prefs: []
   type: TYPE_NORMAL
+  zh: 只要没有两个线程共享对同一个共享指针的访问，此保证就适用。如何为每个线程获取其自己的共享指针是一个单独的问题：因为指向同一对象的所有共享指针必须从第一个这样的指针开始创建，这些指针必须曾经在某个时间点从一个线程传递到另一个线程。为简单起见，让我们假设一下，做共享指针的复制的代码受到互斥锁的保护。如果两个线程访问同一个共享指针，那么一切都不确定。例如，如果一个线程正在尝试复制共享指针，而另一个线程同时正在重置它，结果是未定义的。特别是，标准共享指针不能用于实现发布协议。然而，一旦共享指针的副本已经分发给所有线程（可能在锁定状态下），共享所有权就得到了维护，并且对象的删除是以线程安全的方式处理的。一旦指向对象的最后一个共享指针被删除，对象就会被删除。请注意，由于我们同意每个特定的共享指针永远不会被多个线程处理，这是完全安全的。如果在程序执行过程中，当只有一个共享指针拥有我们的对象时，那么也只有一个线程可以访问这个对象。其他线程无法复制这个指针（我们不让两个线程共享同一个指针对象），也没有其他方法获得指向同一对象的指针，因此删除将有效地以单线程方式进行。
 - en: 'This is all well and good, but what if we cannot guarantee that two threads
     won''t try to access the same shared pointer? The first example of such access
     is our publishing protocol: the consumer threads are reading the value of the
@@ -1623,6 +1690,7 @@
   id: totrans-180
   prefs: []
   type: TYPE_NORMAL
+  zh: 这一切都很好，但如果我们不能保证两个线程不会尝试访问同一个共享指针怎么办？这种访问的第一个例子是我们的发布协议：消费者线程正在读取指针的值，而生产者线程可能正在更改它。我们需要共享指针本身的操作是原子的。在C++20中，我们可以做到这一点：它让我们编写`std::atomic<std::shared_ptr<T>>`。请注意，早期的提案中提到了一个新类`std::atomic_shared_ptr<T>`。最终，这不是选择的路径。
 - en: 'If you do not have a C++20-compliant compiler and the corresponding standard
     library or cannot use C++20 in your code, you can still do atomic operations on
     `std::shared_ptr`, but you must do so explicitly. In order to publish the object
@@ -1631,6 +1699,7 @@
   id: totrans-181
   prefs: []
   type: TYPE_NORMAL
+  zh: 如果您没有符合C++20标准的编译器和相应的标准库，或者无法在您的代码中使用C++20，您仍然可以在`std::shared_ptr`上执行原子操作，但必须明确这样做。为了使用在所有线程之间共享的指针`p_`发布对象，生产者线程必须这样做：
 - en: '[PRE13]'
   id: totrans-182
   prefs: []
@@ -1640,6 +1709,7 @@
   id: totrans-183
   prefs: []
   type: TYPE_NORMAL
+  zh: 另一方面，为了获取指针，消费者线程必须这样做：
 - en: '[PRE14]'
   id: totrans-184
   prefs: []
@@ -1652,6 +1722,7 @@
   id: totrans-185
   prefs: []
   type: TYPE_NORMAL
+  zh: 与C++20原子共享指针相比，这种方法的主要缺点是没有保护意外的非原子访问。程序员必须记住始终使用原子函数来操作共享指针。
 - en: 'It should be noted that, while convenient, `std::shared_ptr` is not a particularly
     efficient pointer, and the atomic accesses make it even slower. We can compare
     the speed of publishing an object using the thread-safe publishing pointer from
@@ -1659,20 +1730,24 @@
   id: totrans-186
   prefs: []
   type: TYPE_NORMAL
+  zh: 值得注意的是，虽然方便，`std::shared_ptr`并不是特别高效的指针，而原子访问使其变得更慢。我们可以比较使用上一节中的线程安全发布指针与显式原子访问的共享指针发布对象的速度：
 - en: '![Figure 6.7 – The performance of the atomic shared publishing pointer (consumer
     threads)'
   id: totrans-187
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.7 - 原子共享发布指针的性能（消费者线程）'
 - en: '](img/Figure_6.7_B16229.jpg)'
   id: totrans-188
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.7_B16229.jpg)'
 - en: Figure 6.7 – The performance of the atomic shared publishing pointer (consumer
     threads)
   id: totrans-189
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.7 - 原子共享发布指针的性能（消费者线程）
 - en: 'Again, the numbers should be compared with those from *Figure 6.5*: the publishing
     pointer is 60 times faster on one thread, and the advantage increases with the
     number of threads. Of course, the whole point of the shared pointer is that it
@@ -1682,6 +1757,7 @@
   id: totrans-190
   prefs: []
   type: TYPE_NORMAL
+  zh: 同样，这些数字应该与*图6.5*中的数字进行比较：在一个线程上，发布指针比共享指针快60倍，随着线程数量的增加，优势也会增加。当然，共享指针的整个目的是提供共享资源所有权，因此自然需要更多时间来完成更多的工作。比较的重点是显示这种共享所有权的成本：如果可以避免，程序将更加高效。
 - en: 'Even if you need shared ownership (and there are some concurrent data structures
     that are really hard to design without it), usually, you can do much better if
     you design your own reference-counted pointer with limited functionality and optimal
@@ -1694,6 +1770,7 @@
   id: totrans-191
   prefs: []
   type: TYPE_NORMAL
+  zh: 即使需要共享所有权（有一些并发数据结构确实很难在没有共享所有权的情况下设计），通常情况下，如果设计自己的具有有限功能和最佳实现的引用计数指针，通常可以做得更好。一种非常常见的方法是使用侵入式引用计数。**侵入式共享指针**将其引用计数存储在其指向的对象中。当为特定对象设计时，例如我们特定数据结构中的列表节点，对象是以共享所有权为目的设计的，并包含一个引用计数器。否则，我们可以为几乎任何类型使用包装类，并用引用计数器增强它：
 - en: '[PRE15]'
   id: totrans-192
   prefs: []
@@ -1704,6 +1781,7 @@
   id: totrans-193
   prefs: []
   type: TYPE_NORMAL
+  zh: 在减少引用计数时，重要的是要知道何时达到0（或在减少之前为1）：共享指针必须删除对象。
 - en: The implementation of even the simplest atomic shared pointer is quite lengthy;
     a very rudimentary example can be found in the sample code for this chapter. Again,
     this example contains only the bare minimum necessary for the pointer to correctly
@@ -1714,6 +1792,7 @@
   id: totrans-194
   prefs: []
   type: TYPE_NORMAL
+  zh: 即使是最简单的原子共享指针的实现也相当冗长；本章的示例代码中可以找到一个非常基本的示例。再次强调，该示例仅包含使指针能够正确执行发布对象和多个线程同时访问同一指针等多项任务所必需的最低限度。该示例的目的是使实现这种指针的基本要素更容易理解（即使如此，代码也有几页长）。
 - en: 'In addition to using an intrusive reference counter, an application-specific
     shared pointer can forgo other features of `std::shared_ptr`. For example, many
     applications do not require a weak pointer, but there is an overhead for supporting
@@ -1722,20 +1801,24 @@
   id: totrans-195
   prefs: []
   type: TYPE_NORMAL
+  zh: 除了使用侵入式引用计数外，特定于应用程序的共享指针可以放弃`std::shared_ptr`的其他功能。例如，许多应用程序不需要弱指针，但即使从未使用过，支持它也会带来开销。一个最简化的引用计数指针可以比标准指针高出几倍效率：
 - en: '![Figure 6.8 – The performance of a custom atomic shared publishing pointer
     (consumer threads)'
   id: totrans-196
   prefs: []
   type: TYPE_NORMAL
+  zh: '![图6.8 - 自定义原子共享发布指针的性能（消费者线程）'
 - en: '](img/Figure_6.8_B16229.jpg)'
   id: totrans-197
   prefs: []
   type: TYPE_NORMAL
+  zh: '](img/Figure_6.8_B16229.jpg)'
 - en: Figure 6.8 – The performance of a custom atomic shared publishing pointer (consumer
     threads)
   id: totrans-198
   prefs: []
   type: TYPE_NORMAL
+  zh: 图6.8 - 自定义原子共享发布指针的性能（消费者线程）
 - en: It is similarly more efficient for assignment and reassignment of the pointer,
     atomic exchange of two pointers, and other atomic operations on the pointer. Even
     this shared pointer is still much less efficient than a unique pointer, so again,
@@ -1744,17 +1827,20 @@
   id: totrans-199
   prefs: []
   type: TYPE_NORMAL
+  zh: 对于指针的赋值和重新赋值、两个指针的原子交换以及指针的其他原子操作，这样做同样更有效。即使这种共享指针仍然比唯一指针效率低得多，所以如果可以明确管理数据所有权而不使用引用计数，那么请这样做。
 - en: 'We now have the two key building blocks of almost any data structure: we can
     add new data and publish it (reveal it to other threads), and we can track the
     ownership, even across threads (although it comes at a price).'
   id: totrans-200
   prefs: []
   type: TYPE_NORMAL
+  zh: 现在我们几乎可以构建任何数据结构的两个关键构件：我们可以添加新数据并发布它（向其他线程公开），甚至可以跨线程跟踪所有权（尽管这是有代价的）。
 - en: Summary
   id: totrans-201
   prefs:
   - PREF_H1
   type: TYPE_NORMAL
+  zh: 总结
 - en: 'In this chapter, we have learned about the performance of the basic building
     blocks of any concurrent program. All accesses to the shared data must be protected
     or synchronized, but there is a wide range of options when it comes to implementing
@@ -1764,6 +1850,7 @@
   id: totrans-202
   prefs: []
   type: TYPE_NORMAL
+  zh: 在本章中，我们已经了解了任何并发程序的基本构建块的性能。所有对共享数据的访问都必须受到保护或同步，但在实现这种同步时有很多选择。虽然互斥锁是最常用和最简单的选择，但我们还学习了其他几种性能更好的选择：自旋锁及其变体，以及无锁同步。
 - en: The key to an efficient concurrent program is to make as much data as possible
     local to one thread and minimize the operations on the shared data. The requirements
     specific to each problem usually dictate that such operations cannot be eliminated
@@ -1772,6 +1859,7 @@
   id: totrans-203
   prefs: []
   type: TYPE_NORMAL
+  zh: 高效并发程序的关键是尽可能将数据局部化到一个线程，并最小化对共享数据的操作。每个问题特定的要求通常决定了这些操作不能完全被消除，因此本章重点是使并发数据访问更加高效。
 - en: We studied how to count or accumulate results across multiple threads, again
     with and without locks. Understanding the data dependency issues led us to the
     discovery of the publishing protocol and its implementation in several thread-safe
@@ -1779,6 +1867,7 @@
   id: totrans-204
   prefs: []
   type: TYPE_NORMAL
+  zh: 我们学习了如何在多个线程之间计数或累积结果，有锁和无锁的情况下。了解数据依赖性问题使我们发现了发布协议及其在几种线程安全的智能指针中的实现，适用于不同的应用程序。
 - en: We are now well prepared to take our study to the next level and put several
     of these building blocks together in the form of more complex thread-safe data
     structures. In the next chapter, you will learn how to use these techniques to
@@ -1786,34 +1875,41 @@
   id: totrans-205
   prefs: []
   type: TYPE_NORMAL
+  zh: 我们现在已经准备好将我们的研究提升到下一个水平，并将其中几个构建块组合成更复杂的线程安全数据结构。在下一章中，您将学习如何使用这些技术来设计并发程序的实用数据结构。
 - en: Questions
   id: totrans-206
   prefs:
   - PREF_H1
   type: TYPE_NORMAL
+  zh: 问题
 - en: What are the defining properties of lock-based, lock-free, and wait-free programs?
   id: totrans-207
   prefs:
   - PREF_OL
   type: TYPE_NORMAL
+  zh: 锁定型、无锁型和无等待型程序的定义特性是什么？
 - en: If an algorithm is wait-free, does it mean that it will scale perfectly?
   id: totrans-208
   prefs:
   - PREF_OL
   type: TYPE_NORMAL
+  zh: 如果算法是无等待的，这是否意味着它将完美扩展？
 - en: What are the drawbacks of the locks that prompt us to look for alternatives?
   id: totrans-209
   prefs:
   - PREF_OL
   type: TYPE_NORMAL
+  zh: 锁定的缺点是什么，促使我们寻找替代方案？
 - en: What is the difference between a shared counter and a shared index into an array
     or another container?
   id: totrans-210
   prefs:
   - PREF_OL
   type: TYPE_NORMAL
+  zh: 共享计数器和数组或其他容器中的共享索引之间有什么区别？
 - en: What is the key advantage of the publishing protocol?
   id: totrans-211
   prefs:
   - PREF_OL
   type: TYPE_NORMAL
+  zh: 发布协议的主要优势是什么？

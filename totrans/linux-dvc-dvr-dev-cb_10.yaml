@@ -1,0 +1,370 @@
+- en: 'Additional Information: Managing Interrupts and Concurrency'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Recalling what we did in [Chapter 3](https://cdp.packtpub.com/linux_device_driver_development_cookbook/wp-admin/post.php?post=28&action=edit#post_26), *Working
+    with Char Drivers,* when we talked about the `read()` system call and how we can
+    implement it for our char driver (see `chapter_4/chrdev/chrdev.c` file on  GitHub),
+    we noticed that our implementation was tricky because data was always available:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding example, the data inside `chrdev->buf` is always there, but
+    in a real peripheral, this is very often not true; we must usually wait for new
+    data and then the current process should be suspended (that is, *put to sleep*).
+    That is why our `chrdev_read()` should be something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Please note that this example is deliberately not complete, due to the fact
+    that a real (and complete) `read()` system call implementation will be presented
+    in [Chapter 7](3a9fe19d-0ba6-4959-bc71-493d9f499cc4.xhtml), *Advanced Char Driver
+    Operations*. In this chapter, we simply introduce mechanisms and not how we can
+    use them in a device driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By using the  `wait_for_event()` function, we are asking the kernel to test
+    whether there is some available data and, if so, to permit process execution,
+    otherwise, the current process will be put to sleep and then woken up again once
+    the condition, `chrdev->available > 0` is true.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Peripherals usually use interrupts to notify the CPU that some new data is available
+    (or that some important activity must be done with them), and then it's quite
+    obvious that it's there, inside the interrupt handler, where we, as device driver
+    developers, have to inform the kernel that the sleeping process, waiting for that
+    data, should be awakened. In the following sections, we'll see, by using very
+    simple examples, which mechanisms are available in the kernel and how they can
+    be used to suspend a process, and we'll also see when we can do it safely! In
+    fact, if we ask the scheduler to revoke the CPU to the current process to give
+    it to another process within an interrupt handler, we're simply trying to carry
+    out a nonsense operation. When we are in an interrupt context, we are not executing
+    process code, so what process can we revoke the CPU? Simply speaking, the executing
+    process can *go to sleep* when the CPU is in the process context, while, when
+    we are in interrupt context we can't because no process is currently, officially,
+    holding the CPU!
+  prefs: []
+  type: TYPE_NORMAL
+- en: This last concept is very important and it must be well understood by device
+    driver developers; in fact, if we try to go to sleep when the CPU is in the interrupt
+    context, then a severe exception will be generated and, most probably, the complete
+    system will hang.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another important concept to be really clear about is **atomic operations.**
+    A device driver is not a normal program with a regular beginning and end; instead,
+    a device driver is a collection of methods and asynchronous interrupt handlers
+    that can run simultaneously. That's why we'll most probably have to protect our
+    data from race conditions that may corrupt them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For instance, if we use a buffer to save just the received data from a peripheral,
+    we must be sure that the data is correctly queued so that the reading process
+    can read valid data and no information is lost. Then, in these cases, we should
+    use some mutual exclusion mechanisms that Linux offers to us to do our job. However,
+    we must pay attention to what we do since some of these mechanisms can be safely
+    used in both processes or interrupt contexts, while others can't; some of them
+    can be used only in the process context and they can damage our system if we use
+    them in the interrupt context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Moreover, we should take into account that modern CPUs have more than one core,
+    so using the trick to disable a CPU's interrupts to get atomic code doesn't work
+    at all, and a specific mutual exclusion mechanism must be used instead. In Linux,
+    this mechanism is called **spinlocks** and it can be used in both the interrupt
+    or process context, but for very short periods of time, since they are implemented
+    using a busy-waiting approach. This means that, in order to perform an atomic
+    operation, while one core is operating in the critical section of the code belonging
+    to such an atomic operation, all the other cores in the CPU are kept out of the
+    same critical section, making them wait by actively spinning in a tight loop,
+    which, in turn, signifies that you are effectively throwing away the CPU's cycles,
+    which are doing nothing useful.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next sections, we're going to see, in detail, all these aspects and we'll
+    try to explain their usage with very simple examples; in [Chapter 7](https://cdp.packtpub.com/linux_device_driver_development_cookbook/wp-admin/post.php?post=28&action=edit#post_30), *Advanced
+    Char Driver Operations*, we'll see how we can use these mechanisms in a device
+    driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deferring work
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A long time ago, there were the **bottom halves**, that is, a hardware event
+    was split into two halves: the top half (the hardware interrupt handler) and the
+    bottom half (the software interrupt handler). This is because an interrupt handler
+    must execute as quickly as possible to be ready to serve the next incoming interrupts,
+    so, for instance, the CPU cannot stay for a long time in the interrupt handler''s
+    body waiting for the slow peripheral sending or receiving of its data. That''s
+    why we used bottom halves; interrupts were split into two parts: the top one,
+    the real hardware interrupt handler, which executes quickly and with disabled
+    interrupts that simply acknowledges the peripheral and then starts a bottom half,
+    executed with enabled interrupts, which can safely complete the sending/receiving
+    job by taking its time.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, bottom halves were very limiting, so kernel developers introduced **tasklets** in
+    Linux 2.4 series. Tasklets allowed the dynamic creation of deferrable functions
+    in a very simple manner; they were executed in the software interrupt context
+    and were suitable for fast execution as they couldn't sleep. However, if we need
+    to sleep, we must use another mechanism. In the Linux 2.6 series, **workqueues** were
+    introduced as a replacement for a similar construct called taskqueue, which was
+    already present in the Linux 2.4 series; they allow kernel functions to be activated
+    (or deferred) for later execution as tasklets do, but in comparison tasklets (which
+    are executed within software interrupts), they are executed in special kernel
+    threads called **worker threads**. This implies that both can be used to defer
+    jobs, but workqueue handlers can sleep. This handler, of course, has higher latency
+    but, in comparison, workqueues include a richer API for work deferral.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are two other important concepts to talk about before ending this recipe: the shared
+    work queue and the `container_of()` macro.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The shared work queue
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The preceding example in the recipe can be simplified by using the **shared
+    work queue**. This is a special work queue defined by the kernel itself that can
+    be used by device drivers (and other kernel entities) if they *promise* not to
+    monopolize the queue for long periods of time (that is no long periods of sleep
+    and no long-running tasks), if they accept the fact that their handlers may take
+    longer to get their fair share of CPU. If both conditions are met, we can avoid
+    creating a custom work queue with `create_singlethread_workqueue()` and we can
+    schedule work by simply using `schedule_work()` and `schedule_delayed_work()`
+    as follows. Here are the handlers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, the modifications for the initialization and removal:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding patch can be found in the GitHub repository in the `add_workqueue_2_to_irqtest_module.patch` file and
+    it can be applied as usual with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**`$ patch -p1 < add_workqueue_2_to_irqtest_module.patch`**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The container_of() macro
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As a final note, we should utilize some words to explain a bit about the  `container_of()` macro.
+    This macro is defined in `linux/include/linux/kernel.h` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `container_of()`  function takes three arguments: a pointer `ptr`, the `type` of
+    the container, and the name of the `member` the pointer refers to within the container.
+    By using this information, the macro can expand to a new address pointing to the
+    containing structure, which accommodates the respective member.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, in our example, in `irqtest_work_handler()`, we can get a `struct irqtest_data` pointer
+    to tell `container_of()` which is the address of its member named `work`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For further information regarding `container_of()` function, the internet is
+    your friend; however, a good starting point is in kernel sources within the  `linux/Documentation/driver-model/design-patterns.txt` file, which describes
+    a few common design patterns found in device drivers using this macro.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It could be interesting to take a look at **Notifier Chains**, simply called **notifiers**,
+    which are a general mechanism provided by the kernel and designed to provide a way
+    for kernel elements to express interest in being informed about the occurrence
+    of general **asynchronous** **events**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notifiers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The basic building block of the notifiers'' mechanism is the `struct notifier_block` defined
+    in the `linux/include/linux/notifier.h` header file, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The structure contains the pointer `notifier_call` to the function to be called
+    when the event occurs. The parameters passed to the notifier function when it's
+    called, include an `nb` pointer to the notifier block itself, an event `action` code, which
+    depends on the particular used chain, and a  `data` pointer to an unspecified
+    private data type, which can be used in a similar manner as tasklets or waitqueues.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `next` field is managed by notifier internals, while the `priority` field defines
+    the priority of the function pointed by `notifier_call` within the notifier chain. First
+    the functions having higher priority are executed.  In reality, priority is left
+    by nearly all registrations out of the notifier block definition, which means
+    it gets 0 as the default value and execution order ends up depending only on the
+    registration order (that is a semi-random order).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Device driver developers shouldn''t need to create their own notifiers, and
+    very often it happens that they need to use an existing one. Linux defines several
+    notifiers, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Netdevice notifier (see `linux/include/linux/netdevice.h`)—reports networking
+    device's events
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Backlight notifier (see `linux/include/linux/backlight.h`)—reports LCD backlight
+    events
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Suspend notifier (see `linux/include/linux/suspend.h`)—reports power to suspend
+    and resume related events
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Reboot notifier (see `linux/include/linux/reboot.h`)—reports rebooting requests
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Power supply notifier (see `linux/include/linux/power_supply.h`)—reports power
+    supply activities
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Each notifier has a register function that can be used to ask the system to
+    be informed whenever a particular event happens. For example, the following code
+    is reported as a useful example to request networking device and rebooting events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: All code presented here is in the `notifier.c` file from GitHub repository regarding
+    this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Both the `register_netdevice_notifier()` and `register_reboot_notifier()` functions
+    work on two struct notifier_block defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notifier functions are defined like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By using `container_of()`, as usual, we can get a pointer to our data structure, `struct
+    notifier_data`; then, once our job is done, we have to return a well-fixed value
+    defined in the `linux/include/linux/notifier.h` header:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Their meanings are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`NOTIFY_DONE`: Not interested in this notification.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`NOTIFY_OK`: Notification was correctly processed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`NOTIFY_BAD`: Something went wrong with this notification, so stop calling
+    callback functions for this event!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`NOTIFY_STOP_MASK` can be used to encapsulate (negative) `errno` values as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `errno` value can then be retrieved with `notifier_to_errno()`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To test our simple example, we have to compile the `notifier.c` kernel module and
+    then move the `notifier.ko` module to the ESPRESSObin, where it can be inserted
+    into the kernel as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Just after insertion, some events are already notified; however, to generate
+    new events, we can try, for instance, to disable or enable a network device using
+    the following `ip` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Code `0xd` corresponds to the `NETDEV_PRE_UP` event as defined in `linux/include/linux/netdevice.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we reboot the system, we should see the following message within the kernel
+    messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Kernel timers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A **kernel timer** is an easy way to ask the kernel to execute a specific function
+    after a well-defined amount of time. Linux implements two different types of kernel
+    timers: old but still valid kernel timers defined in the `linux/include/linux/timer.h` header
+    file and new **high-resolution** kernel timers defined in the `linux/include/linux/hrtimer.h `header
+    file. Even if they are implemented differently, both mechanisms work in a very
+    similar manner: we have to declare a structure holding timer''s data, which can
+    be initialized by proper functions, and then the timer can be started using the
+    proper function. Once expired, the timer calls a handler to execute the desired
+    actions and, eventually, we have the possibility of stopping or restarting the
+    timer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Legacy kernel timers are only supported at a resolution of 1 jiffy. The length
+    of a jiffy is dependent on the value of the defined `HZ` in the Linux kernel (see
+    the `linux/include/asm-generic/param.h `file); usually, it's 1 millisecond on
+    PCs and some other platforms, while it's set to 10 milliseconds on most embedded
+    platforms. Having a resolution of 1 millisecond resolved most problems for device
+    drivers developers in the past, but nowadays, most peripherals need higher resolution
+    to be correctly managed. This is why higher resolution timers come into play,
+    allowing the system to wake up and process data quickly at more accurate time
+    intervals. Currently, kernel timers have been obsoleted by high-resolution timers
+    (even if they are still used around the kernel sources), which have the target
+    to implement the POSIX 1003.1b Section 14 (Clocks and Timers) API in Linux, that
+    is, timers with accuracy better than 1 jiffy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that we just saw that, to delay a job, we can also use delayed workqueues.
+  prefs: []
+  type: TYPE_NORMAL

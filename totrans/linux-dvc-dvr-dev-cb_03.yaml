@@ -1,0 +1,797 @@
+- en: Working with Char Drivers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A device driver is special code (running in kernel space) that interfaces a
+    physical device to the system and exports it to the user space processes using
+    a well-defined API, that is, by implementing some **system calls** on a **special
+    file**. This is due to the fact that, in a Unix-like OS, **everything is a file**
+    and physical devices are represented as special files (usually placed in the `/dev`
+    directory), each one connected to a particular device (so, for instance, the keyboard
+    can be a file named `/dev/input0`, a serial port can be a file named `/dev/ttyS1`,
+    and a real-time clock can be `/dev/rtc2`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: We can expect that network devices belong to a particular set of devices not
+    respecting this rule because we have no `/dev/eth0` file for the `eth0` interface. This
+    is true, since network devices are the only devices class that doesn't respect
+    this rule because network-related applications don't care about individual network
+    interfaces; they work at a higher level by referring sockets instead. That's why
+    Linux doesn't provide direct access to network devices, as for other devices classes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Looking at the next diagram, we see that the kernel space is used to abstract
+    hardware to user space, so that every process uses the same interface to get access
+    to peripherals, and this interface is composed by a set of system calls:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/86240942-ff71-4d42-a1de-dfc3717df2ae.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: The diagram also shows that it is possible to get access to peripherals not
+    only by using device drivers but also by using another interface such as **sysfs**
+    or by implementing a user space driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since our peripherals are just (special) files, our drivers should implement
+    the system calls we need to manipulate these files and especially the ones useful
+    to exchange data. For example, we need `open()` and `close()` system calls to
+    start and stop the communication with the peripheral and `read()` and `write()`
+    system calls to exchange data with it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The main difference between a normal C function and a system call is just the
+    fact that the latter is mainly executed into the kernel, while a function executes
+    into the user space only. For example, `printf()` is a function, while `write()`
+    is a system call. The latter (except for the prologue and epilogue part of a C
+    function) executes in the kernel space, while the former executes predominantly
+    in the user space even if, at the and, it calls `write()` to actually write its
+    data to the output stream (this is because all input/output data flows must pass through the
+    kernel anyway).
+  prefs: []
+  type: TYPE_NORMAL
+- en: For more information check this book out:[ https://prod.packtpub.com/hardware-and-creative/gnulinux-rapid-embedded-programming](https://prod.packtpub.com/hardware-and-creative/gnulinux-rapid-embedded-programming)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Well, this chapter will show us how to implement at least the `open()`, `close()`,
+    `read()`, and `write()` system calls in order to introduce device drivers programming
+    and the first steps into char drivers development.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now it''s time to write our first device driver! In this chapter, we will start
+    with a very simple character (or char) driver in order to cover the following
+    recipes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the simplest char driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Exchanging data with a char driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the ''Everything Is a File" abstraction
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Throughout this chapter, we'll need whatever we used in [Chapter 1](2739e129-3c1a-4c98-ba9a-9c17ae4c09db.xhtml), *Installing
+    the Development System*, and [Chapter 2](c044f5b1-bd3a-4ac7-bc14-421acd9448ed.xhtml), *A
+    Peek Inside the Kernel*, so please refer to them for cross-compilation, kernel
+    modules loading and management, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For more information on this chapter please read the *Appendix*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The code and other files used in this chapter can be downloaded from GitHub
+    at [https://github.com/giometti/linux_device_driver_development_cookbook/tree/master/chapter_03](https://github.com/giometti/linux_device_driver_development_cookbook/tree/master/chapter_03).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the simplest char driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the Linux kernel, three major device types exist—char device, block device,
+    and net device. And of course, we have three major device driver types; that is,
+    char, block, and net drivers. In this chapter, we're taking a look at a char (or
+    character) device, which is a kind of peripheral that can be accessed as a stream
+    of bytes, such as a serial port, audio device, and so on. However, in this recipe,
+    we're going to present a really basic char driver, which simply registers itself
+    and does nothing more than this. Even if it may seem useless, we will discover
+    that this step really introduces plenty of new concepts!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Actually, it could be possible to exchange data between peripherals and user
+    space without a char, block, or net driver but by simply using some mechanism
+    offered by the **sysfs**, but this is a special case and it is generally used
+    only for very simple devices that have to exchange simple data types.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting ready
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To realize our first char driver, we need the module presented in the previous
+    chapter. This is because using kernel modules is the simplest method we have to
+    inject code into kernel space. Of course, we can decide to compile our driver
+    as built in to the kernel but, in this manner, we have to fully recompile the
+    kernel and reboot our system each time we have to modify the code (it's a possibility
+    but definitely not the best!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just a note before carrying on: to provide a clearer explanation regarding
+    how a char driver works and to present a really simple example, I decided to use
+    the legacy way to register a char driver into the kernel. There''s nothing to
+    be concerned about, since this mode of operation is perfectly legal and still
+    supported and, in any case, in the *Using a device tree to describe a character
+    driver* recipe, in [Chapter 4](5f22a69e-e8b7-402e-8e67-72938d00c914.xhtml), *Using
+    the Device Tre**e*, I''m going to present the currently advised way of registering
+    char drivers.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to do it...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s look into the `chrdev_legacy.c` file from GitHub sources. We have our
+    very first driver, so let''s start and examine it in detail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First of all, let''s take a look at the beginning of the file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'At the end of `chrdev_legacy.c`, check the following code where the module''s
+    `init()` function is defined as below:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And the module''s `exit()` function looks like the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the `major` number is the driver reference into the kernel from the user
+    space, the **file operations** structure (referenced by `chrdev_fops`) represents
+    the only allowed system calls that we can execute on our driver, and they are
+    defined as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Methods are then basically implemented as follows. Here are the `read()` and
+    `write()` methods:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'While here are the `open()` and `release()` (aka the `close()`) methods:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To compile the code, we can do it the usual way on the host machine, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, to test our driver, we can load it in our target system (again we can
+    use the `scp` command to load the module file into the ESPRESSObin):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: OK. The driver has been loaded and our major number is `239`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a final note, let me suggest you take a look into the `/proc/devices` file on
+    the ESPRESSObin. This special file is generated on the fly when someone reads
+    it and it holds all character (and block) drivers registered into the system;
+    that''s why we should find something as follows if we filter it with the `grep` command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Of course, your major number can be a different number! There's nothing strange
+    about that; just rewrite the next commands according to the number you get.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To effectively execute some system calls on our driver, we can use the program
+    stored in the `chrdev_test.c` file (still from GitHub sources); the beginning
+    of its `main()` function looks like the following:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: First of all, we need to open the file device and then get a file descriptor;
+    this can be done by using the `open()` system call.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Then, the `main()` function continues, as follow by writing data in the device:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And the by reading just written data from it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: After the device opens, our program performs `write()` followed by a `read()` system
+    call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We should notice that I call `read()` and `write()` system calls inside a `for()` loop;
+    the reason behind this implementation will be clearer in the following recipe, *Exchanging
+    data with a char driver,* where we're going to see how these system calls actually
+    work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, `main()` can close the file device and then exit:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this manner, we can test the system calls we implemented earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How it works...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In *step 1*, As you can see, it's very similar to the kernel module we presented
+    in the previous chapter, even if there are some new `include` files. However,
+    the most important new entry is the `major` variable and, in order to understand
+    what it is useful for, we should directly go to the end of the file, where we
+    find the real char driver registration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In step 2, Again, we have the `module_init()` and `module_exit()` functions
+    and macros such as `MODULE_LICENSE()` (see [Chapter 2](c044f5b1-bd3a-4ac7-bc14-421acd9448ed.xhtml),
+    *A Peek Inside the Kernel*, the Working with kernel modules recipe); however,
+    what is really important here is what the `chrdev_init()` and `chrdev_exit()`
+    functions effectively do. In fact, `chrdev_init()` calls the `register_chrdev()`
+    function, which, in turn, is the one that registers a new char driver into the
+    system, labeling it as `chrdev` and using the provided `chrdev_fops` as file operations,
+    while storing the return value into the major variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We should take into account this fact because, in case no errors were returned, `major` is
+    the main reference of our new driver in the system! In fact, the kernel distinguishes
+    one char driver from another by just using its **major number** (that's why we
+    save it and then we use it in the `chrdev_exit()` function as a parameter of `unregister_chrdev()`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In *step 3*, Each field then points to a well-defined function, which, in turn,
+    implements the system call body. The only non-function field here is `owner`,
+    which is just used to point to the module's owner and it's not related to the
+    driver but to the kernel modules management system only.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In *step 4*, Through the means of the preceding code our char driver implements
+    four system calls by using four methods: `open()`, `close()` (called as `release()`), `read()`,
+    and `write()`, which are a very minimal (and simple) system calls set we can define
+    into a char driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that, at this time, all methods simply do nothing! When we issue a  `read()` system
+    call on our driver, the `chrdev_read()` method is properly called inside our driver
+    in kernel space (see the next section in order to understand how to exchange data
+    with the user space).
+  prefs: []
+  type: TYPE_NORMAL
+- en: I use both **function** and **method** names interchangeably because all of
+    these functions can be seen as methods in object programming, where the same function
+    names specialize into different steps according to the object they are applied
+    to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With drivers it is the same: for example, they all have a `read()` method,
+    but this method''s behavior changes according to the object (or peripheral) it
+    is applied to.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In *step 6*, Again, the `loading out-of-tree module taints kernel` message is
+    just a warning and can be safely ignored; please note, however, that the module
+    filename is `chrdev_legacy.ko` while the driver's name is just `chrdev`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's more...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We can verify how our new driver works, so let''s compile the program stored
+    in the `chrdev_test.c` file we saw earlier. To do so, we can use the next command
+    on the ESPRESSObin:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: If not yet installed, both the `make` and `gcc` commands can be easily installed
+    into your ESPRESSObin, just using the usual `apt` command `apt install make gcc`
+    (after the ESPRESSObin has been connected to the internet!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now we can try it by executing it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Yes! Which is the filename we have to use? We always said that our devices
+    are files in a Unix OS, but which file? Well, to generate this file—that is, the
+    file which represents our driver—we must use the `mknod` command, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: For further information regarding the `mknod` command, you can take a look at
+    its man pages by using the command line `man mknod`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Usually `mknod` created files are located in the `/dev` directory; however,
+    they can be created wherever we wish and this is just an example to show how the
+    mechanism works.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding command creates a file named `chrdev` in the current directory,
+    which is a special file of the type **character** (or **unbuffered**),  having
+    as a major number `239` (which is, of course, the major number of our driver as
+    seen in *step 1*) and as a minor number `0`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At this time, we still haven't introduced minor numbers however, you should
+    consider them as just a simple extra parameter that the kernel simply passes to
+    the driver without changing it. It's the driver itself that knows how to manage
+    the minor number.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In fact, if we examine it by using the `ls` command, we see the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the initial character, `c`, points out that this `chrdev` file is not
+    a usual file (which is represented by a `-` character) but it's a character device
+    file instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: OK. Now that we have our file *connected* to our driver, let's try our testing
+    program on it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We get the following output on the Terminal:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'However, on the serial console (or via `dmesg`), we get the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: This is exactly what we expected! As stated in *step 4* here we can verify that
+    all system calls  `open()`, `close()` (called as `release()`), `read()`, and `write()`,
+    we defined in the driver, are effectively executed by the call of the corresponding
+    method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that, if you execute the `chrdev_test` program directly on the serial console,
+    all of the preceding messages will overlap each other and you may not easily recognize
+    them! So, let me suggest you use a SSH connection to execute the test.
+  prefs: []
+  type: TYPE_NORMAL
+- en: See also
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: For further information regarding how to register character devices by using
+    legacy functions, a good starting point are some old (but still existing) pages
+    of *The Linux Kernel Module Programming Guide* at [https://www.tldp.org/LDP/lkmpg/2.6/html/x569.html](https://www.tldp.org/LDP/lkmpg/2.6/html/x569.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Exchanging data with a char driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this recipe we'll see how to read and write data to and from a driver according
+    to `read()` and `write()` system calls behaviors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting ready
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To modify our first char driver in order to allow it to exchange data between
+    user space we can still work on the module used in the previous recipe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to do it...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In order to exchange data with our new driver, we need to modify the `read()`
+    and `write()` methods according to what we said earlier, and we have to add a
+    data buffer where exchanged data can be stored:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, let''s modify our file, `chrdev_legacy.c`, as follows, in order to include
+    the `linux/uaccess.h` file and to define our internal buffer:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, the `chrdev_read()` method should be modified, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All of the preceding modifications and the next ones in this section can be
+    easily applied by using the `modify_read_write_to_chrdev_legacy.patch` patch file
+    from GitHub sources, issuing the following command line in the same directory
+    where the `chrdev_legacy.c` file is located:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$ patch -p3 < modify_read_write_to_chrdev_legacy.patch`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can repeat this for the `chrdev_write()` method:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: How it works...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In *step 2*, with the preceding modifications to our `chrdev_read()` method,
+    now we will copy the supplied data from the user space by using the `copy_to_user()` function
+    in the driver's internal buffer while moving the `ppos` pointer accordingly and
+    then returning how much data has been read (or error).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that `copy_from/to_user()` functions return zero on success or non-zero
+    to indicate the number of bytes that weren't transferred, so, here, we should
+    account for this situation (even if rare) and properly update `count`, subtracting
+    the number of bytes not transferred (if any), in order to correctly update `ppos` and
+    return a correct count value to user space. However, to keep the example as simple
+    as possible, we simply prefer return an error condition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note also that, in case `*ppos + count` points beyond the buffer end, `count` is
+    recomputed accordingly and the function will return a value representing the number
+    of transferred bytes, which is smaller than the original `count` value provided
+    in input (which represented the size of the provided destination user buffer and
+    so the maximum length of data allowed for transfer).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In *step 3*, we can consider the same note as before regarding the `copy_to_user()`
+    return value. However, additionally on `copy_from_user()`, if some data could
+    not be copied, this function will pad the copied data to the requested size using
+    zero bytes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we can see, this function is very similar to the preceding one, even if it
+    implements the opposite data flow.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's more...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'After the modifications are in place and the new driver version has been recompiled
+    and correctly loaded into ESPRESSObin''s kernel, we can again execute our testing
+    program, `chrdev_test`. We should get the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'From the serial console, we should see something as similar to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'OK. We got exactly what we expected! In fact, from kernel messages, we can
+    see the calling of `chrdev_open()` and then what happens when `chrdev_write()`
+    and `chrdev_read()` are called: 11 bytes are transferred and the `ppos` pointer
+    is moved as we expected. Then, `chrdev_release()` is called and the file definitely
+    closed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now a question: what happens if we call the preceding command again?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Well, we should expect exactly the same output; in fact, each time the file
+    is opened, `ppos` is re-positioned at the file beginning (that is, to 0) and we
+    continue reading and writing at the same positions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is the output of this second execution:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Additionally, the following are the related kernel messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we wish to read the data just written data, we can modify the `chrdev_test`
+    program in such a way it will close and then reopen the file after calling `write()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Note that all of these modifications are stored in the `modify_close_open_to_chrdev_test.patch`
+    patch file from GitHub sources and it can be applied by using the following command
+    where the `chrdev_test.c` file is located:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$ patch -p2 < modify_close_open_to_chrdev_test.patch`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, if we try to execute `chrdev_test` again, we should get the following
+    output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Perfect! Now, we read exactly what we wrote and, from the kernel space, we
+    get the following messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, we can see perfectly what happens to `ppos`, and how the `chrdev_read()`
+    and `chrdev_write()` methods work in order to exchange data with the user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: See also
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: For further information regarding `read()` and `write()` system calls, the reader
+    can start reading the related man pages, which can be obtained with the usual
+    commands: `man 2 read` and `man 2 write`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that, this time, we have to specify section 2 of the man pages (system-calls);
+    otherwise, we will get information straight from section 1 (executable programs).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Alternatively, regarding the `copy_from_user()` and `copy_to_user()` functions,
+    the reader can take a look at *The Linux Kernel API* at [https://www.kernel.org/doc/htmldocs/kernel-api/API---copy-from-user.html](https://www.kernel.org/doc/htmldocs/kernel-api/API---copy-from-user.html)
+    and [https://www.kernel.org/doc/htmldocs/kernel-api/API---copy-to-user.html](https://www.kernel.org/doc/htmldocs/kernel-api/API---copy-to-user.html).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the “Everything Is a File” abstraction
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When we introduced device drivers we said that they lay under the Unix file
+    abstraction; that is, in a Unix-like OS, everything is a file. Now, it's time
+    to verify it, so let's see what happens if we try to execute some file-related
+    utility programs against our new driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thanks to our latest modifications to the `chrdev_legacy.c` file, our driver
+    simulates a file 300 bytes long (see the `chrdev_buf[BUF_LEN]` buffer where `BUF_LEN` is
+    set to `300`), where we're able to execute `read()` and `write()` system calls
+    on it, just as we do on a *normal* file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, we may still have some doubts, so let''s consider standard `cat` or `dd` commands,
+    as we know they are utilities useful to manipulate files content. For example,
+    in the man pages of the `cat` command, we can read the following definition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And, for `dd`, we have the following definition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: We don't see any reference to device drivers, only to files, so if our driver
+    works like a file, we should be able to use these commands on it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Getting ready
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To check how the “Everything Is a File” abstraction we can still use our new
+    character driver which can be managed as it was a regular file. So let's be sure
+    that the driver is correctly loaded in the kernel and move to the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How to do it...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s see how to do it by following these steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First of all, we can try to clear the driver''s buffer by writing into it all
+    `0` characters with the following command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, we can read just written data by using the `cat` command, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Perfect! As we can see, we erased the driver's internal buffer, as expected.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reader should notice that we use the `tr` command in order to translate
+    data bytes 0 to the printable character 0; otherwise, we'll see garbage (or most
+    probably nothing).
+  prefs: []
+  type: TYPE_NORMAL
+- en: See the `tr` man page with `man tr` for further information about its usage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we can try to move a normal file data into our char device; for instance,
+    if we consider the `/etc/passwd` file, we should see something as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This file is larger than 300 bytes but we can still try to move it into our
+    char driver with the next command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We get an error message, as expected, due to the fact our file cannot hold
+    more than 300 bytes. However, the really interesting things to see are in the
+    kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Even if we get an error, from the preceding kernel messages, we see that some
+    data has been actually written in our char driver, so we can try to find a specific
+    line in it with the next command line using the `grep` command:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: For further information about `grep`, just see its man page with `man grep`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Since the line referring to the root user is one of the first lines in `/etc/passwd`,
+    it has definitely been copied into the char driver, and then we get it as expected.
+    For completeness, below are reported the relative kernel messages where we can
+    see all system calls that `grep` does on our driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: How it works...
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With the preceding `dd` command, we generate three blocks that are 100 bytes
+    long and that we pass to the `write()` system calls; in fact, if we take a look
+    at kernel messages, we explicitly see what happens:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: At first calling, after `open()`, `ppos` is set to `0`, and then it's moved
+    to 100 after the data has been written. Then, on the next calls, `ppos` is increased
+    by 100 bytes until it reaches 300.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In *step 2*, it''s really interesting to see what happened in the kernel space
+    when we issue the `cat` command, so let''s see the kernel messages related to
+    it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we can see, `cat` asks for 131,072 bytes but, since our buffer is shorter, only
+    300 bytes are returned; then, `cat` executes again `read()` asking for 131,072
+    bytes but now `ppos` points to the end of file, so 0 is returned just to signal
+    the end-of-file condition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When we try to write too much data into our device file, we obviously get an
+    error message, but the really interesting things to see are in the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: First, the `write()` call asks to write 1,285 bytes (which is the real size
+    of `/etc/passwd`) but only 300 bytes are actually written (due to the limited
+    buffer size). Then, the second `write()` call asks to write 985 bytes (*1,285-300*
+    bytes) but now `ppos` points to 300, which means that the buffer is full and then
+    0 (bytes written) is returned, which has been interpreted as a No space left on
+    device error condition by the write command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In *step 4*, the kernel messages relative to the preceding `grep` command are
+    reported as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: We can easily see that the `grep` command first opens our device file by using
+    the `open()` system call, then it keeps reading data with `read()` until our driver
+    returns end-of-file (which is addressed by 0), and finally it executes the `close()`
+    system call to release our driver.
+  prefs: []
+  type: TYPE_NORMAL

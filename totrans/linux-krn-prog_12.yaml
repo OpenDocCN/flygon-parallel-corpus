@@ -1,0 +1,1328 @@
+- en: The CPU Scheduler - Part 1
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter and the next, you will dive into the details regarding a key
+    OS topic – that is, CPU scheduling on the Linux OS. I will try and keep the learning
+    more hands-on, by asking (and answering) typical questions and performing common
+    tasks related to scheduling. Understanding how scheduling works at the level of
+    the OS is not only important from a kernel (and driver) developer viewpoint, but
+    it will also automatically make you a better system architect (even for user space
+    applications).
+  prefs: []
+  type: TYPE_NORMAL
+- en: We shall begin by covering essential background material; this will include
+    the **Kernel Schedulable Entity** (**KSE**) on Linux, as well as the POSIX scheduling
+    policies that Linux implements. We will then move on to using tools – `perf` and
+    others – to visualize the flow of control as the OS runs tasks on CPUs and switches
+    between them. This is useful to know when profiling apps as well! After that,
+    we will dive deeper into the details of how exactly CPU scheduling works on Linux,
+    covering modular scheduling classes, **Completely Fair Scheduling** (**CFS**),
+    the running of the core schedule function, and so on. Along the way, we will also
+    cover how you can programmatically (and dynamically) query and set the scheduling
+    policy and priority of any thread on the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following areas:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 1 – essential background
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Visualizing the flow
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 2
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Threads – which scheduling policy and priority
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now, let's get started with this interesting topic!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I assume that you have gone through [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml), *Kernel
+    Workspace Setup*, and have appropriately prepared a guest **Virtual Machine**
+    (**VM**) running Ubuntu 18.04 LTS (or a later stable release) and installed all
+    the required packages. If not, I highly recommend you do this first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the most out of this book, I strongly recommend you first set up the
+    workspace environment, including cloning this book's GitHub repository for the
+    code and working on it in a hands-on fashion. The repository can be found here: [https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 1 – essential background
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's take a quick look at the essential background information we require to
+    understand CPU scheduling on Linux.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that in this book, we do not intend to cover material that competent system
+    programmers on Linux should already be well aware of; this includes basics such
+    as process (or thread) states, the state machine and transitions on it, and more
+    information on what real time is, the POSIX scheduling policies, and so on. This
+    (and more) has been covered in some detail in my earlier book: *Hands-On System
+    Programming with Linux*, published by Packt in October 2018.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is the KSE on Linux?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As you learned in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel
+    Internals Essentials – Processes and Threads*, in the *Organizing processes, threads,
+    and their stacks – user and kernel space* section, every process – in fact, every
+    thread alive on the system – is bestowed with a task structure (`struct task_struct`)
+    and both a user-mode as well as a kernel-mode stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here, the key question to ask is: when scheduling is performed, *what object
+    does it act upon*, in other words, what is the **Kernel Schedulable Entity**,
+    the **KSE**? On Linux, **the KSE is a thread**, not a process (of course, every
+    process contains a minimum of one thread). Thus, the thread is the granularity
+    level at which scheduling is performed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An example will help explain this: if we have a hypothetical situation where
+    we have one CPU core and 10 user space processes, consisting of three threads
+    each, plus five kernel threads, then we have a total of (10 x 3) + 5, which equals
+    35 threads. Each of them, except for the five kernel threads, has a user and kernel
+    stack and a task structure (the kernel threads only have kernel stacks and task
+    structures; all of this has been thoroughly explained in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml),
+    *Kernel Internals Essentials – Processes and Threads*, in the *Organizing processes,
+    threads, and their stacks – user and kernel space* section). Now, if all these
+    35 threads are runnable, they then  compete for the single processor (though it''s
+    unlikely that they''re all runnable simultaneously, but let''s just consider it
+    for the sake of discussion), then we now have 35 *threads* in competition for
+    the CPU resource, not 10 processes and five kernel threads.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we understand that the KSE is a thread, we will (almost) always refer
+    to the thread in the context of scheduling. Now that this is understood, let's
+    move on to the scheduling policies Linux implements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The POSIX scheduling policies
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: It's important to realize that the Linux kernel does not have just one algorithm
+    that implements CPU scheduling; the fact is, the POSIX standard specifies a minimal
+    three scheduling policies (algorithms, in effect) that a POSIX-compliant OS must
+    adhere to. Linux goes above and beyond, implementing these three as well as more,
+    with a powerful design called scheduling classes (more on this in the *Understanding
+    modular scheduling classes* section later in this chapter).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, information on the POSIX scheduling policies on Linux (and more) is covered
+    in more detail in my earlier book, *Hands-On System Programming with Linux*, published
+    by Packt in October 2018.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For now, let''s just briefly summarize the POSIX scheduling policies and what
+    effect they have in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Scheduling policy** | **Key points** | **Priority scale** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_OTHER` or `SCHED_NORMAL` | Always the default; threads with this policy
+    are non-real-time; internally implemented as a **Completely Fair Scheduling**
+    (**CFS**) class (seen later in the *A word on CFS and the vruntime value* section).The
+    motivation behind this schedule policy is fairness and overall throughput. | Real-time priority
+    is `0`; the non-real-time priority is called the nice value: it ranges from -20
+    to +19 (a lower number implies superior priority) with a base of 0 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_RR` | The motivation behind this schedule policy is a (soft) real-time
+    policy that''s moderately aggressive. Has a finite timeslice (typically defaulting
+    to 100 ms).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A `SCHED_RR` thread will yield the processor IFF (if and only if):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- It blocks on I/O (goes to sleep).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- It stops or dies.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- A higher-priority real-time thread becomes runnable (which will preempt this
+    one).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- Its timeslice expires. | (Soft) real-time: 1 to 99 (a higher number'
+  prefs: []
+  type: TYPE_NORMAL
+- en: implies superior priority) |
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| `SCHED_FIFO` | The motivation behind this schedule policy is a (soft) real-time
+    policy that''s (by comparison, very) aggressive. A `SCHED_FIFO` thread will yield
+    the processor IFF:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- It blocks on I/O (goes to sleep).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- It stops or dies.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '- A higher-priority real-time thread becomes runnable (which will preempt this
+    one).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It has, in effect, infinite timeslice. |  (same as `SCHED_RR`) |
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| `SCHED_BATCH` | The motivation behind this schedule policy is a scheduling
+    policy that''s suitable for non-interactive batch jobs, less preemption. |  Nice
+    value range (-20 to +19) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `SCHED_IDLE` | Special case: typically the PID `0` kernel thread (traditionally
+    called the `swapper`; in reality, it''s the per CPU idle thread) uses this policy.
+    It''s always guaranteed to be the lowest-priority thread on the system and only
+    runs when no other thread wants the CPU. | The lowest priority of all (think of
+    it as being below the nice value +19) |'
+  prefs: []
+  type: TYPE_TB
+- en: It's important to note that when we say real-time in the preceding table, we
+    really mean *soft* (or at best, *firm*) real time and *not* hard real time as
+    in an **Real-Time Operating System** (**RTOS**). Linux is a **GPOS**, a **general-purpose
+    OS**, not an RTOS. Having said that, you can convert vanilla Linux into a true
+    hard real-time RTOS by applying an external patch series (called the RTL, supported
+    by the Linux Foundation); you'll learn how to do precisely this in the following
+    chapter in the *Converting mainline Linux into an RTOS* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice that a `SCHED_FIFO` thread in effect has infinite timeslice and runs
+    until it wishes or one of the preceding mentioned conditions comes true. At this
+    point, it's important to understand that we're only concerned with thread (KSE)
+    scheduling here; on an OS such as Linux, the reality is that hardware (and software) *interrupts *are
+    always superior and will always preempt even (kernel or user space) `SCHED_FIFO`
+    threads! Do refer back to Figure 6.1 to see this. Also, we will cover hardware
+    interrupts in detail in Chapter 14, *Handling Hardware Interrupts*. For our discussion
+    here, we will ignore interrupts for the time being.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The priority scaling is simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Non-real-time threads (`SCHED_OTHER`) have a real-time priority of `0`; this
+    ensures that they cannot even compete with real-time threads. They use an (old
+    UNIX-style) priority value called the **nice value**, which ranges from -20 to
+    +19 (-20 being the highest priority and +19 the worst).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The way it's implemented on modern Linux, each nice level corresponds to an
+    approximate 10% change (or delta, plus or minus) in CPU bandwidth, which is a
+    significant amount.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Real-time threads (`SCHED_FIFO / SCHED_RR`) have a real-time priority scale
+    from 1 to 99, 1 being the least and 99 being the highest priority. Think of it
+    this way: on a non-preemptible Linux system with one CPU, a `SCHED_FIFO` priority
+    99 thread spinning in an unbreakable infinite loop will effectively hang the machine!
+    (Of course, even this will be preempted by interrupts – both hard and soft; see
+    Figure 6.1.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The scheduling policy and priorities (both the static nice value and real-time
+    priority) are members of the task structure, of course. The scheduling class that
+    a thread belongs to is exclusive: a thread can only belong to one scheduling policy
+    at a given point in time (worry not, we''ll cover scheduling classes in some detail
+    later in the *CPU scheduling internals – part 2* section).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, you should realize that on a modern Linux kernel, there are other scheduling
+    classes (stop-schedule and deadline) that are in fact superior (in priority) to
+    the FIFO/RR ones we mentioned earlier. Now that you have an idea of the basics,
+    let''s move on to something pretty interesting: how we can actually *visualize*
+    the flow of control. Read on!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualizing the flow
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Multicore systems have led to processes and threads executing concurrently on
+    different processors. This is useful for gaining higher throughput and thus performance,
+    but also causes synchronization headaches with shared writable data. So, for example,
+    on a hardware platform with, say, four processor cores, we can expect processes
+    (and threads) to execute in parallel on them. This is nothing new; is there a
+    way, though, to actually see which processes or threads are executing on which
+    CPU core – that is, a way to visualize a processor timeline? It turns out there
+    are indeed a few ways to do so. In the following sections, we will look at one
+    interesting way with `perf`, followed later by others (with LTTng, Trace Compass,
+    and Ftrace).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using perf to visualize the flow
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Linux, with its vast arsenal of developer and **Quality Assurance** (**QA**)
+    tools, has a really powerful one in `perf(1)`. In a nutshell, the `perf` toolset
+    is the modern way to perform CPU profiling on a Linux box. (Besides a few tips,
+    we do not cover `perf` in detail in this book.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Akin to the venerable `top(1)` utility, to get a thousand-foot view of what's
+    eating the CPU (in a lot more detail than `top(1)`), the **`perf(1)`** set of
+    utilities is excellent. Do note, though, that, quite unusually for an app, `perf`
+    is tightly coupled with the kernel that it runs upon. It's important that you
+    install the `linux-tools-$(uname -r)` package first. Also, the distribution package
+    will not be available for the custom 5.4 kernel we have built; so, when using
+    `perf`, I suggest you boot your guest VM with one of the standard (or distro)
+    kernels, install the `linux-tools-$(uname -r)` package, and then try using `perf`.
+    (Of course, you can always manually build perf from within the kernel source tree,
+    under the `tools/perf/` folder.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With `perf` installed and running, do try out these `perf` commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: '(By the way, `comm` implies the name of the command/process, `**dso**` is an abbreviation for **dynamic
+    shared object**). Using an `alias` makes it easier; try this one (in one line)
+    for even more verbose details (the call stack can be expanded too!):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `man` page on `perf(1)` provides the details; use the `man perf-<foo>` notation
+    – for example, `man perf-top` – to get help with `perf top`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One way to use `perf` is to obtain an idea of what task is running on what
+    CPU; this is done via the `timechart` sub-command in `perf`. You can record events
+    using `perf`, both system-wide as well as for a specific process. To record events
+    system-wide, run the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Terminate the recording session with a signal (`^C`). This will generate a
+    binary data file named `perf.data` by default. It can now be examined with the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: This command generates a **Scalable Vector Graphics** (**SVG**) file! It can
+    be viewed with vector drawing utilities (such as Inkscape, or via the `display`
+    command in ImageMagick) or simply within a web browser. It can be quite fascinating
+    to study the time chart; I urge you to try it out. Do note, though, that the vector
+    images can be quite large and therefore take a while to open.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A system-wide sampling run on a native Linux x86_64 laptop running Ubuntu 18.10
+    is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: It is possible to configure `perf` to work with non-root access. Here, we don't;
+    we just run `perf` as root via `sudo(8)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A screenshot of the SVG file generated by `perf` is seen in the following screenshot.
+    To view the SVG file, you can simply drag and drop it into your web browser:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/20bb069c-c381-4463-92d8-477e983b6122.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 10.1 – (Partial) screenshot showing the SVG file generated by sudo perf
+    timechart
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, as one example, you can see that the `EMT-0` thread
+    is busy and takes maximum CPU cycles (the phrase CPU 3 is unfortunately unclear;
+    look closely in the purple bar below CPU 2). This makes sense; it's the thread
+    representing the **Virtual CPU** (**VCPU**) of VirtualBox where we are running
+    Fedora 29 (**EMT** stands for **emulator thread**)!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can zoom in and out of this SVG file, studying the scheduling and CPU events
+    that are recorded by default by `perf`. The following figure, a partial screenshot
+    when zoomed in 400% to the CPU 1 region of the preceding screenshot, shows `htop` running
+    on CPU #1 (the purple band literally shows the slice when it executed):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/effe3bb9-475a-46e0-8746-2d2aedd84371.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 10.2 – Partial screenshot of perf timechart's SVG file, when zoomed in
+    400% to the CPU 1 region
+  prefs: []
+  type: TYPE_NORMAL
+- en: What else? By using the `-I` option switch to `perf timechart record`, you can
+    request only system-wide disk I/O (and network, apparently) events be recorded.
+    This could be especially useful as, often, the real performance bottlenecks are
+    caused by I/O activity (and not the CPU; I/O is usually the culprit!). The `man`
+    page on `perf-timechart(1)` details further useful options; for example, `--callchain`
+    to perform stack backtrace recording. As another example, the `--highlight <name>` option
+    switch will highlight all tasks with the name `<name>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can convert `perf`'s binary `perf.data` record file into the popular **Common
+    Trace Format** (**CTF**) file format, using `perf data convert -- all --to-ctf`,
+    where the last argument is the directory where the CTF file(s) get stored. Why
+    is this useful? CTF is the native data format used by powerful GUI visualizers
+    and analyzer tools such as Trace Compass (seen later in [Chapter 11](d6e5ebd3-1f04-40e8-a240-2607c58b1299.xhtml),
+    *The CPU Scheduler – Part 2*, under the *Visualization with LTTng and Trace Compass*
+    section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, there is a catch, as mentioned in the Trace Compass Perf Profiling
+    user guide ([https://archive.eclipse.org/tracecompass.incubator/doc/org.eclipse.tracecompass.incubator.perf.profiling.doc.user/User-Guide.html](https://archive.eclipse.org/tracecompass.incubator/doc/org.eclipse.tracecompass.incubator.perf.profiling.doc.user/User-Guide.html)):
+    "*Not all Linux distributions have the ctf conversion builtin. One needs to compile
+    perf (thus linux) with environment variables LIBBABELTRACE=1 and LIBBABELTRACE_DIR=/path/to/libbabeltrace
+    to enable that support*."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unfortunately, as of the time of writing, this is the case with Ubuntu.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualizing the flow via alternate (CLI) approaches
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are, of course, alternate ways to visualize what''s running on each processor;
+    we mention a couple here and have saved one other interesting one (LTTng) for
+    [Chapter 11](d6e5ebd3-1f04-40e8-a240-2607c58b1299.xhtml), *The CPU Scheduler –
+    Part 2*, under the *Visualization with LTTng and Trace Compass* section):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With `perf(1)`, again, run the `sudo perf sched record` command; this records
+    activity. Stop by terminating it with the `^C` signal, followed by `sudo perf
+    sched map` to see a (CLI) map of execution on the processor(s).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Some simple Bash scripting can show what''s executing on a given core (a simple
+    wrapper over `ps(1)`). In the following snippet, we show sample Bash functions;
+    for example, the following `c0()` function shows what is currently executing on
+    CPU core `#0`, while `c1()` does the same for core `#1`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'While on the broad topic of `perf`, Brendan Gregg has a very useful series
+    of scripts that perform a lot of the hard work required when monitoring production
+    Linux systems using `perf`; do take a look at them here: [https://github.com/brendangregg/perf-tools](https://github.com/brendangregg/perf-tools) (some
+    distributions include them as a package called `perf-tools[-unstable]`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do give these alternatives (including the `perf-tools[-unstable] package`) a
+    try!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 2
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This section delves into kernel CPU scheduling internals in some detail, the
+    emphasis being on the core aspect of the modern design, modular scheduler classes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding modular scheduling classes
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Ingo Molnar, a key kernel developer, (along with others) redesigned the internal
+    structure of the kernel scheduler, introducing a new approach called **scheduling
+    classes** (this was back in October 2007 with the release of the 2.6.23 kernel).
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a side note, the word *class* here isn't a coincidence; many Linux kernel
+    features are intrinsically, and quite naturally, designed with an **object-oriented**
+    nature. The C language, of course, does not allow us to express this directly
+    in code (hence the preponderance of structures with both data and function pointer
+    members, emulating a class). Nevertheless, the design is very often object-oriented
+    (as you shall again see with the driver model in the *Linux Kernel Programming
+    Part 2* book). Please see the *Further reading* section of this chapter for more
+    details on this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A layer of abstraction was introduced under the core scheduling code, the `schedule()`
+    function. This layer under `schedule()` is generically called the scheduling classes
+    and is modular in design. Note that the word *modular* here implies that scheduler
+    classes can be added or removed from the inline kernel code; it has nothing to
+    do with the **Loadable Kernel Module** (**LKM**) framework.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The basic idea is this: when the core scheduler code (encapsulated by the `schedule()`
+    function) is invoked, understanding that there are various available scheduling
+    classes under it, it iterates over each of the classes in a predefined priority
+    order, asking each if it has a thread (or process) that requires scheduling onto
+    a processor (how exactly, we shall soon see).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As of the 5.4 Linux kernel, these are the scheduler classes within the kernel,
+    listed in priority order, with the highest priority first:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: There we have it, the five scheduler classes – stop-schedule, deadline, (soft)
+    real time, fair, and idle – in priority order, highest to lowest. The data structures
+    that abstracts these scheduling classes, `struct sched_class`, are strung together
+    on a singly linked list, which the core scheduling code iterates over. (You will
+    come to what the `sched_class` structure is later; ignore it for now).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every thread is associated with it's own unique task structure (`task_struct`);
+    within the task structure, the `policy` member specifies the scheduling policy
+    that the thread adheres to (typically one of `SCHED_FIFO`, `SCHED_RR`, or `SCHED_OTHER`).
+    It's exclusive - a thread can only adhere to one scheduling policy at any given
+    point in time (it can be changed though). Similarly, another member of the task
+    structure, `struct sched_class`, holds the modular scheduling class that the thread
+    belongs to (which is also exclusive). Both the scheduling policy and priority
+    are dynamic and can be queried and set programmatically (or via utilities; you
+    will soon see this).
+  prefs: []
+  type: TYPE_NORMAL
+- en: So knowing this, you will now realize that all threads that adhere to either the `SCHED_FIFO` or `SCHED_RR` scheduling
+    policy, map to the `rt_sched_class` (for their `sched_class` within the task structure),
+    all threads that are `SCHED_OTHER` (or `SCHED_NORMAL`) map to the `fair_sched_class`,
+    and the idle thread (`swapper/n`, where `n` is the CPU number starting from `0`)
+    always maps to `idle_sched_class` scheduling class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When the kernel needs to schedule, this is the essential call sequence:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The actual iteration over the preceding scheduling classes occurs here; see
+    the (partial) code of `pick_next_task()`, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding `for_each_class()` macro sets up a `for` loop to iterate over
+    all scheduling classes. Its implementation is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can see from the preceding implementation that the code results in each
+    class, from `sched_class_highest` to `NULL` (implying the end of the linked list
+    they're on), being asked, via the `pick_next_task()` "method", who to schedule
+    next. Now, the scheduling class code determines whether it has any candidates
+    that want to execute. How? That's simple actually; it merely looks up its **runqueue**
+    data structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, this is a key point: *the kernel maintains one runqueue for every processor
+    core and for every scheduling class*! So, if we have a system with, say, eight
+    CPU cores, then we will have *8 cores * 5 sched classes  = 40 runqueues*! Runqueues
+    are in fact implemented as per-CPU variables, an interesting lock-free technique (exception:
+    on **Uniprocessor** (**UP**) systems, the `stop-sched` class does not exist):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/abb1b8ad-48fa-4554-80ac-1c6e13d443ae.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 10.3 – There is a runqueue per CPU core per scheduling class
+  prefs: []
+  type: TYPE_NORMAL
+- en: Please note that in the preceding diagram, the way I show the runqueues makes
+    them perhaps appear as arrays. That isn't the intention at all, it's merely a
+    conceptual diagram. The actual runqueue data structure used depends on the scheduling
+    class (the class code implements the runqueue after all). It could be an array
+    of linked lists (as with the real-time class), a tree - a **red-black (rb) tree**
+    -as with the fair class), and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help better understand the scheduler class model, we will devise an example:
+    let''s say, on an **Symmetric Multi Processor** (**SMP**) or multicore) system,
+    we have 100 threads alive (in both user and kernel space). Among them, we have
+    a few competing for the CPUs; that is, they are in the ready-to-run (run) state,
+    implying they are runnable and thus enqueued on runqueue data structures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thread S1: Scheduler class, `stop-sched` (**SS**)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Threads D1 and D2: Scheduler class, **Deadline** (**DL**)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Threads RT1 and RT2: Scheduler class, **Real Time** (**RT**)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Threads F1, F2, and F3: Scheduler class, CFS (or fair)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Thread I1: Scheduler class, idle.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Imagine that, to begin with, thread F2 is on a processor core, happily executing
+    code. At some point, the kernel wishes to context switch to some other task on
+    that CPU (what triggers this? You shall soon see). On the scheduling code path,
+    the kernel code ultimately ends up in the `kernel/sched/core.c:void schedule(void)` kernel
+    routine (again, code-level details follow later). What''s important to understand
+    for now is that the `pick_next_task()` routine, invoked by `schedule()`, iterates
+    over the linked list of scheduler classes, asking each whether it has a candidate
+    to run. It''s code path (conceptually, of course) looks something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Core scheduler code (`schedule()`): "*H**ey, SS, do you have any threads that
+    want to run?*"'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'SS class code: Iterates over its runqueue and does find a runnable thread;
+    it thus replies: "*Yes, I do, it''s thread S**1.*"'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Core scheduler code (`schedule()`): "*Okay, let''s context switch to S1.*"'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'And the job is done. But what if there is no runnable thread S1 on the SS runqueue
+    for that processor (or it has gone to sleep, or is stopped, or it''s on another
+    CPU''s runqueue). Then, SS will say "*no*" and the next most important scheduling
+    class, DL, will be asked. If it has potential candidate threads that want to run
+    (D1 and D2, in our example), its class code will identify which of D1 or D2 should
+    run, and the kernel scheduler will faithfully context switch to it. This process
+    continues for the RT and fair (CFS) scheduling classes. (A picture''s worth a
+    thousand words, right: see Figure 10.4).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In all likelihood (on your typical moderately loaded Linux system), there will
+    be no SS, DL, or RT candidate threads that want to run on the CPU in question,
+    and there often will be at least one fair (CFS) thread that will want to run;
+    hence, it will be picked and context-switched to. If there''s none that wants
+    to run (no SS/DL/RT/CFS class thread wants to run), it implies that the system
+    is presently idle (lazy chap). Now, the idle class is asked whether it wants to
+    run: it always says yes! This makes sense: after all, it is the CPU idle thread''s
+    job to run on the processor when no one else needs to. Hence, in such a case,
+    the kernel switches context to the idle thread (typically labelled `swapper/n`,
+    where `n` is the CPU number that it''s executing upon (starting from `0`)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, note that the `swapper/n` (CPU idle) kernel thread does not show up in
+    the `ps(1)` listing, though it''s always present (recall the code we demonstrated
+    in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals
+    Essentials – Processes and Threads*, here: `ch6/foreach/thrd_showall/thrd_showall.c`.
+    There, we wrote a `disp_idle_thread()` routine to show some details of the CPU
+    idle thread as even the kernel''s `do_each_thread() { ... } while_each_thread()`
+    loop that we employed there does not show the idle thread).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram neatly sums up the way the core scheduling code invokes
+    the scheduling classes in priority order, context switching to the ultimately
+    selected next thread:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/566496e5-f85b-4568-897a-ed2ca202fdf4.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 10.4 – Iterating over every scheduling class to pick the task that will
+    run next
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the following chapter, you shall learn, among other things, how to visualize
+    kernel flow via some powerful tools. There, precisely this work of iterating over
+    modular scheduler classes is actually seen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Asking the scheduling class
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'How exactly does the core scheduler code (`pick_next_task()`) ask the scheduling
+    classes whether they have any threads that want to run? We have already seen this,
+    but I feel it''s worthwhile repeating the following code fragment for clarity
+    (called mostly from `__schedule()` and also from the thread migration code path):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice the object orientation in action: the `class->pick_next_task()` code,
+    for all practical purposes, is invoking a method, `pick_next_task()`, of the scheduling
+    class, `class`! The return value, conveniently, is the pointer to the task structure
+    of the picked task, which the code now context switches to.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding paragraph implies, of course, that there is a `class` structure,
+    embodying what we really mean by the scheduling class. Indeed, this is the case:
+    it contains all possible operations, as well as useful hooks, that you might require
+    in a scheduling class. It''s (surprisingly) called the `sched_class` structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: (There are many more members to this structure than we've shown here; do look
+    it up in the code). As should be obvious by now, each scheduling class instantiates
+    this structure, appropriately populating it with methods (function pointers, of
+    course). The core scheduling code, iterating over the linked list of scheduling
+    classes (as well as elsewhere in the kernel), invokes - as long as it's not `NULL`-
+    the methods and hook functions as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As an example, let''s consider how the fair scheduling class (CFS) implements
+    its scheduling class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So now you see it: the code used by the fair sched class to pick the next task
+    to run (when asked by the core scheduler), is the function `pick_next_task_fair()`.
+    FYI, the `task_tick` and `task_fork` members are good examples of scheduling class
+    hooks; these functions will be invoked by the scheduler core on every timer tick
+    (that is, each timer interrupt, which fires – in theory, at least – `CONFIG_HZ`
+    times a second) and when a thread belonging to this scheduling class forks, respectively.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An interesting in-depth Linux kernel project, perhaps: create your own scheduling
+    class with its particular methods and hooks, implementing its internal scheduling
+    algorithm(s). Link all the bits and pieces as required (into the scheduling classes-linked
+    list, inserted at the desired priority, and so on) and test! Now you can see why
+    they''re called modular scheduling classes.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Great – now that you understand the architecture behind how the modern modular
+    CPU scheduler works, let's take a brief look at the algorithm behind CFS, perhaps
+    the most used scheduling class on generic Linux.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A word on CFS and the vruntime value
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Since version 2.6.23, CFS has been the de facto kernel CPU scheduling code for
+    regular threads; the majority of threads are `SCHED_OTHER`, which is driven by
+    CFS. The driver *behind CFS is fairness and overall throughput*. In a nutshell,
+    within its implementation, the kernel keeps track of the actual CPU runtime (at
+    nanosecond granularity) of every runnable CFS (`SCHED_OTHER`) thread; the thread
+    with the smallest runtime is the thread that most deserves to run and will be
+    awarded the processor on the next scheduling switch. Conversely, threads that
+    continually hammer on the processor will accumulate a large amount of runtime
+    and will thus be penalized (it's quite karmic, really)!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Without delving into too many details regarding the internals of the CFS implementation,
+    embedded within the task structure is another data structure, `struct sched_entity`,
+    which contains within it an unsigned 64-bit value called `vruntime`. This is,
+    at a simplistic level, the monotonic counter that keeps track of the amount of
+    time, in nanoseconds, that the thread has accumulated (run) on the processor.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In practice, here, a lot of code-level tweaks, checks, and balances are required.
+    For example, often, the kernel will reset the `vruntime` value to `0`, triggering
+    another scheduling epoch. Also, there are various tunables under `/proc/sys/kernel/sched_*`,
+    to help better fine-tune the CPU scheduler behavior.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How CFS picks the next task to run is encapsulated in the `kernel/sched/fair.c:pick_next_task_fair()` function.
+    In theory, the way CFS works is simplicity itself: enqueue all runnable tasks
+    (for that CPU) onto the runqueue, which is an rb-tree (a type of self-balancing
+    binary search tree), in such a manner that the task that has spent the least amount
+    of time on the processor is the leftmost leaf node on the tree, with succeeding
+    nodes to the right representing the next task to run, then the one after that.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In effect, scanning the tree from left to right gives a timeline of future task
+    execution. How is this assured? By using the aforementioned `vruntime` value as
+    the key via which tasks are enqueued onto the rb-tree!
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the kernel needs to schedule, and it asks CFS, the CFS class code - we've
+    already mentioned it, the `pick_next_task_fair()` function - *simply picks the
+    leftmost leaf node on the tree*, returning the pointer to the task structure embedded
+    there; it's, by definition, the task with the lowest `vruntime` value, effectively,
+    the one that has run the least! (Traversing a tree is a *O(log n)* time-complexity
+    algorithm, but due to some code optimization and a clever caching of the leftmost
+    leaf node in effect render it into a very desirable *O(1)* algorithm!) Of course,
+    the actual code is a lot more complex than is let on here; it requires several
+    checks and balances. We won't delve into the gory details here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We refer those of you that are interested in learning more on CFS to the kernel
+    documentation on the topic, at [https://www.kernel.org/doc/Documentation/scheduler/sched-design-CFS.txt](https://www.kernel.org/doc/%20Documentation/scheduler/sched-design-CFS.txt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, the kernel contains several tunables under `/proc/sys/kernel/sched_*`
+    that have a direct impact on scheduling. Notes on these and how to use them can
+    be found on the *Tuning the Task Scheduler* page ([https://documentation.suse.com/sles/12-SP4/html/SLES-all/cha-tuning-taskscheduler.html](https://documentation.suse.com/sles/12-SP4/html/SLES-all/cha-tuning-taskscheduler.html)),
+    and an excellent real-world use case can be found in the article at [https://www.scylladb.com/2016/06/10/read-latency-and-scylla-jmx-process/](https://www.scylladb.com/2016/06/10/read-latency-and-scylla-jmx-process/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now let's move onto learning how to query the scheduling policy and priority
+    of any given thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threads – which scheduling policy and priority
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section, you'll learn how to query the scheduling policy and priority
+    of any given thread on the system. (But what about programmatically querying and
+    setting the same? We defer that discussion to the following chapter, in the *Querying
+    and setting a thread’s scheduling policy and priority* section.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: We learned that, on Linux, the thread is the KSE; it's what actually gets scheduled
+    and runs on the processor. Also, Linux has several choices for the scheduling
+    policy (or algorithm) to use. The policy, as well as the priority to allocate
+    to a given task (process or thread), is assigned on a per-thread basis, with the
+    default always being the `SCHED_OTHER` policy with real-time priority `0`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a given Linux system, we can always see all processes alive (via a simple
+    `ps -A`), or, with GNU `ps`, even every thread alive (`ps -LA`). This does not
+    tell us, though, what scheduling policy and priority these tasks are running under;
+    how do we query that?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This turns out to be pretty simple: on the shell, the `chrt(1)` utility is
+    admirably suited to query and set a given process'' scheduling policy and/or priority.
+    Issuing `chrt` with the `-p` option switch and providing the PID as a parameter
+    has it display both the scheduling policy as well as the real-time priority of
+    the task in question; for example, let''s query this for the `init` process (or
+    systemd) PID `1`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: As usual, the `man` page on `chrt(1)` provides all the option switches and their
+    usage; do take a peek at it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following (partial) screenshot, we show a run of a simple Bash script
+    (`ch10/query_task_sched.sh`, a wrapper over `chrt`, essentially) that queries
+    and displays the scheduling policy and real-time priority of all the alive threads
+    (at the point they''re run):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/be65cbf3-e0cf-4dd8-a670-caca37a35397.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 10.5 – (Partial) screenshot of our ch10/query_task_sched.sh Bash script
+    in action
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few things to notice:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our script, by using GNU `ps(1)`, with `ps -LA`, we''re able to capture
+    all the threads that are alive on the system; their PID and TID are displayed.
+    As you learned in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel
+    Internals Essentials – Processes and Threads*, the PID is the user space equivalent
+    of the kernel TGID and the TID is the user space equivalent of the kernel PID.
+    We can thus conclude the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the PID and TID match, it - the thread seen in that row (the third column
+    has its name) - is the main thread of the process.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the PID and TID match and the PID shows up only once, it's a single-threaded
+    process.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If we have the same PID multiple times (leftmost column) with varying TIDs (second
+    column), those are the child (or worker) threads of the process. Our script shows
+    this by indenting the TID number a bit to the right.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Notice how the vast majority of threads on a typical Linux box (even embedded)
+    will tend to be non real-time (the `SCHED_OTHER` policy). On a typical desktop,
+    server, or even embedded Linux, the majority of threads will be `SCHED_OTHER`
+    (the default policy), with a few real-time threads (FIFO/RR). **Deadline** (**DL**)
+    and **Stop-Sched** (**SS**) threads are very rare indeed.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Do notice the following observations regarding the real-time threads that showed
+    up in the preceding output:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Our script highlights any real-time threads (one with policy: `SCHED_FIFO` or
+    `SCHED_RR`) by displaying an asterisk on the extreme right.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Moreover, any real-time threads with a real-time priority of 99 (the maximum
+    possible value) will have three asterisks on the extreme right (these tend to
+    be specialized kernel threads).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `SCHED_RESET_ON_FORK` flag, when Boolean ORed with the scheduling policy,
+    has the effect of disallowing any children (via `fork(2)`) to inherit a privileged
+    scheduling policy (a security measure).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Changing the scheduling policy and/or priority of a thread can be performed
+    with `chrt(1)`; however, you should realize that this is a sensitive operation
+    requiring root privileges (or, nowadays, the preferred mechanism should be the
+    capabilities model, the `CAP_SYS_NICE` capability being the capability bit in
+    question).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We will leave it to you to examine the code of the script (`ch10/query_task_sched.sh`).
+    Also, be aware (beware!) that performance and shell scripting do not really go
+    together (so don't expect much in terms of performance here). Think about it,
+    every external command issued within a shell script (and we have several here,
+    such as `awk`, `grep`, and `cut`) involves a fork-exec-wait semantic and context
+    switching. Also, these are all executing within a loop.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `tuna(8)` program can be used to both query and set various attributes;
+    this includes process-/thread-level scheduling policy/priority and a CPU affinity
+    mask, as well as IRQ affinity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might ask, will the (few) threads with the `SCHED_FIFO` policy and a real-time
+    priority of `99` always hog the system''s processors? No, not really; the reality
+    is that these threads are asleep most of the time. When the kernel does require
+    them to perform some work, it wakes them up. Now, precisely due to their real-time
+    policy and priority, it''s pretty much guaranteed that they will get a CPU and
+    execute for as long as is required (going back to sleep once the work is done).
+    The key point: when they require the processor, they will get it (somewhat akin
+    to an RTOS, but without the iron-clad guarantees and determinism that an RTOS
+    delivers).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How exactly does the `chrt(1)` utility query (and set) the real-time scheduling
+    policy/priority? Ah, that should be obvious: as they reside within the task structure
+    in kernel **Virtual Address Space** (**VAS**), the `chrt` process must issue a
+    system call. There are several system call variations that perform these tasks:
+    the one used by `chrt(1)` is the `sched_getattr(2)` to query, and the `sched_setattr(2)` system
+    call is to set the scheduling policy and priority. (Be sure to look up the `man`
+    page on `sched(7)` for details on these and more scheduler-related system calls.)
+    A quick `strace(1)` on `chrt` will indeed verify this!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that you have the practical knowledge to query (and even set) a thread's
+    scheduling policy/priority, it's time to dig a bit deeper. In the following section,
+    we delve further into the internal workings of Linux's CPU scheduler. We figure
+    out who runs the code of the scheduler and when it runs. Curious? Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning about the CPU scheduling internals – part 3
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the preceding sections, you learned that the core kernel scheduling code
+    is anchored within the `void schedule(void)` function, and that the modular scheduler
+    classes are iterated over, ending up with a thread picked to be context-switched
+    to. All of this is fine; a key question now is: who and when, exactly, is the `schedule()`
+    code path run?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Who runs the scheduler code?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A subtle yet key misconception regarding how scheduling works is unfortunately
+    held by many: we imagine that some kind of kernel thread (or some such entity)
+    called the "scheduler" is present, that periodically runs and schedules tasks.
+    This is just plain wrong; in a monolithic OS such as Linux, scheduling is carried
+    out by the process contexts themselves, the regular threads that run on the CPU!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In fact, the scheduling code is always run by the process context that is currently
+    executing the code of the kernel, in other words, by **`current`.**
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This may also be an appropriate time to remind you of what we shall call one
+    of the *golden rules* of the Linux kernel: *scheduling code must never ever run
+    in any kind of atomic or interrupt context*. In other words, interrupt context
+    code must be guaranteed to be non-blocking; this is why you cannot call `kmalloc()`
+    with the `GFP_KERNEL` flag in an interrupt context – it might block! But with
+    the `GFP_ATOMIC` flag, it''s all right as that instructs the kernel memory management
+    code to never block. Also, kernel preemption is disabled while the schedule code
+    runs; this makes sense.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When does the scheduler run?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The job of the OS scheduler is to arbitrate access to the processor (CPU) resource,
+    sharing it between competing entities (threads) that want to use it. But what
+    if the system is busy, with many threads continually competing for and acquiring
+    the processor? More correctly, what we''re really getting at is: in order to ensure
+    fair sharing of the CPU resource between tasks, you must ensure that the policeman
+    in the picture, the scheduler itself, runs periodically on the processor. Sounds
+    good, but how exactly can you ensure that?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s a (seemingly) logical way to go about it: invoke the scheduler when
+    the timer interrupt fires; that is, it gets a chance to run `CONFIG_HZ` times
+    a second (which is often set to the value 250)! Hang on, though, we learned a
+    golden rule in [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml), *Kernel
+    Memory Allocation for Module Authors – Part 1*, in the *Never sleep in interrupt
+    or atomic contexts* section: you cannot invoke the scheduler in any kind of atomic
+    or interrupt context; thus invoking it within the timer interrupt code path is 
+    certainly disqualified. So, what does the OS do?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The way it's actually done is that both the timer interrupt context, and the
+    process context code paths, are used to make scheduling work. We will briefly
+    describe the details in the following section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The timer interrupt part
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Within the timer interrupt (in the code of `kernel/sched/core.c:scheduler_tick()`,
+    wherein interrupts are disabled), the kernel performs the meta work necessary
+    to keep scheduling running smoothly; this involves the constant updating of the
+    per CPU runqueues as appropriate, load balancing work, and so on. Please be aware
+    that the actual `schedule()` function is *never called here*. At best, the scheduling
+    class hook function (for the process context `current` that was interrupted), `sched_class:task_tick()`, if
+    non-null, is invoked. For example, for any thread belonging to the fair (CFS)
+    class, the update of the `vruntime` member (the virtual runtime, the (priority-biased)
+    time spent on the processor by the task) is done here in `task_tick_fair()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: More technically, all this work described in the preceding paragraph occurs
+    within the timer interrupt soft IRQ, `TIMER_SOFTIRQ`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, a key point, it''s the scheduling code that decides: do we need to preempt
+    `current`? Within this timer interrupt code path, if the kernel detects that the
+    current task has exceeded its time quantum or must, for any reason, be preempted
+    (perhaps there is another runnable thread now on the runqueue with higher priority
+    than it), the code sets a "global" flag called `need_resched`. (The reason we
+    put the word global within quotes is that it''s not really a kernel-wide global;
+    it''s actually simply a bit within `current` instance''s `thread_info->flags` bitmask
+    named `TIF_NEED_RESCHED`. Why? It''s actually faster to access the bit that way!)
+    It''s worth emphasizing that, in the typical (likely) case, there will be no need
+    to preempt `current`, thus the `thread_info.flags:TIF_NEED_RESCHED` bit will remain
+    clear. If set, scheduler activation will occur soon; but when exactly? Do read
+    on...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The process context part
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Once the just-described timer interrupt portion of the scheduling housekeeping
+    work is done (and, of course, these things are done very quickly indeed), control
+    is handed back to the process context (the thread, `current`) that was rudely
+    interrupted. It will now be running what we think of as the exit path from the
+    interrupt. Here, it checks whether the `TIF_NEED_RESCHED` bit is set – the `need_resched()` helper
+    routine performs this task. If it returns `True`, this indicates the immediate
+    need for a reschedule to occur: the kernel calls `schedule()`! Here, it''s fine
+    to do so, as we are now running in process context. (Always keep in mind: all
+    this code we''re talking about here is being run by `current`, the process context
+    in question.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Of course, now the key question becomes where exactly is the code that will
+    recognize whether the `TIF_NEED_RESCHED` bit has been set (by the previously described
+    timer interrupt part)? Ah, this becomes the crux of it: the kernel arranges for
+    several **scheduling opportunity points** to be present within the kernel code
+    base. Two scheduling opportunity points are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Return from the system call code path.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Return from the interrupt code path.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'So, think about it: every time any thread running in user space issues a system
+    call, that thread is (context) switched to kernel mode and now runs code within
+    the kernel, with kernel privilege. Of course, system calls are finite in length;
+    when done, there is a well-known return path that they will follow in order to
+    switch back to user mode and continue execution there. On this return path, a
+    scheduling opportunity point is introduced: a check is made to see whether the `TIF_NEED_RESCHED` bit
+    within its `thread_info` structure is set. If yes, the scheduler is activated.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'FYI, the code to do this is arch-dependent; on x86 it''s here: `arch/x86/entry/common.c:exit_to_usermode_loop()`.
+    Within it, the section relevant to us here is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Similarly, after handling an (any) hardware interrupt (and any associated soft
+    IRQ handlers that needed to be run), after the switch back to process context
+    within the kernel (an artifact within the kernel – `irq_exit()`), but before restoring
+    context to the task that was interrupted, the kernel checks the `TIF_NEED_RESCHED` bit:
+    if it is set, `schedule()` is invoked.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s summarize the preceding discussion on the setting and recognition of
+    the `TIF_NEED_RESCHED` bit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The timer interrupt (soft IRQ) sets the `thread_info:flags TIF_NEED_RESCHED`
+    bit in the following cases:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If preemption is required by the logic within the scheduling class's `scheduler_tick()`
+    hook function; for example, on CFS, if the current task's `vruntime` value exceeds
+    that of another runnable thread by a given threshold (typically 2.25 ms; the relevant
+    tunable is `/proc/sys/kernel/sched_min_granularity_ns`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If a higher-priority thread becomes runnable (on the same CPU and thus runqueue;
+    via `try_to_wake_up()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In process context, this is what occurs: on both the interrupt return and system
+    call return path, check the value of `TIF_NEED_RESCHED`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If it's set (`1`), call `schedule()`; otherwise, continue processing.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an aside, these scheduling opportunity points – the return from a hardware
+    interrupt or a system call – also serve as signal recognition points. If a signal
+    is pending on `current`, it is serviced before restoring context or returning
+    to user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preemptible kernel
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s take a hypothetical situation: you''re running on a system with one
+    CPU. An analog clock app is running on the GUI along with a C program, `a.out`,
+    whose one line of code is (groan) `while(1);`. So, what do you think: will the
+    CPU hogger *while 1* process indefinitely hog the CPU, thus causing the GUI clock
+    app to stop ticking (will its second hand stop moving altogether)?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A little thought (and experimentation) will reveal that, indeed, the GUI clock
+    app keeps ticking in spite of the naughty CPU hogger app! Actually, this is really
+    the whole point of having an OS-level scheduler: it can, and does, preempt the
+    CPU-hogging user space process. (We briefly discussed the CFS algorithm previously;
+    CFS will cause the aggressive CPU hogger process to accumulate a huge `vruntime` value
+    and thus move more to the right on its rb-tree runqueue, thus penalizing itself!)
+    All modern OSes support this type of preemption – it''s called **user-mode preemption**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But now, consider this: what if you write a kernel module that performs the
+    same `while(1)` infinite loop on a single processor system? This could be a problem:
+    the system will now simply hang. How will the OS preempt itself (as we understand
+    that kernel modules run in kernel mode at kernel privilege)? Well, guess what:
+    for many years now, Linux has provided a build-time configuration option to make
+    the kernel preemptible, `CONFIG_PREEMPT`. (Actually, this is merely evolution
+    toward the long-term goal of cutting down latencies and improving the kernel and
+    scheduler response. A large body of this work came from earlier, and some ongoing,
+    efforts: the **Low Latency** (**LowLat**) patches, (the old) RTLinux work, and
+    so on. We will cover more on real-time (RTOS) Linux - RTL - in the following chapter.)
+    Once this `CONFIG_PREEMPT` kernel config option is turned on and the kernel is
+    built and booted into, we''re now running on a preemptible kernel – where the
+    OS has the ability to preempt itself.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To check out this option, within `make menuconfig`, navigate to General Setup
+    | Preemption Model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are essentially three available kernel config options as far as preemption
+    goes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Preemption type** | **Characteristics** | **Appropriate for** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `CONFIG_PREEMPT_NONE` | Traditional model, geared toward high overall throughput.
+    | Server/enterprise-class and compute-intensive systems |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `CONFIG_PREEMPT_VOLUNTARY` | Preemptible kernel (desktop); more explicit
+    preemption opportunity points within the OS; leads to lower latencies, better
+    app response. Typically the default for distros. | Workstations/desktops, laptops
+    running Linux for the desktop |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `CONFIG_PREEMPT` | LowLat kernel; (almost) the entire kernel is preemptible;
+    implies involuntary preemption of even kernel code paths is now possible; yields
+    even lower latencies (tens of us to low hundreds us range on average) at the cost
+    of slightly lower throughput and slight runtime overhead. | Fast multimedia systems
+    (desktops, laptops, even modern embedded products: smartphones, tablets, and so
+    on) |'
+  prefs: []
+  type: TYPE_TB
+- en: The `kernel/Kconfig.preempt` kbuild configuration file contains the relevant
+    menu entries for the preemptible kernel options. (As you will see in the following
+    chapter, when building Linux as an RTOS, a fourth choice for kernel preemption
+    appears.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: CPU scheduler entry points
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The detailed comments present in (just before) the core kernel scheduling function `kernel/sched/core.c:__schedule()` are
+    well worth reading through; they specify all the possible entry points to the
+    kernel CPU scheduler. We have simply reproduced them here directly from the 5.4
+    kernel code base, so do take a look. Keep in mind: the following code is being
+    run in process context by the process (thread, really) that''s going to kick itself
+    off the CPU by ultimately context-switching to some other thread! And this thread
+    is who? Why, it''s `current`, of course!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `__schedule()` function has (among others) two local variables, pointer
+    to struct `task_struct` named `prev` and `next`. The pointer named `prev` is set
+    to `rq->curr`, which is nothing but `current`! The pointer named `next` will be
+    set to the task that''s going to be context-switched to, that''s going to run
+    next! So, you see: `current` runs the scheduler code, performing the work and
+    then kicking itself off the processor by context-switching to `next`! Here''s
+    the large comment we mentioned:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The preceding code is a large comment detailing how exactly the kernel CPU
+    core scheduling code – `__schedule()` – can be invoked. Small relevant snippets
+    of `__schedule()` itself can be seen in the following code, reiterating the points
+    we have been discussing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: A quick word on the actual context switch follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The context switch
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'To finish this discussion, a quick word on the (scheduler) context switch.
+    The job of the context switch (in the context of the CPU scheduler) is quite obvious:
+    before simply switching to the next task, the OS must save the state of the previous,
+    that is, the currently executing, task; in other words, the state of `current`.
+    You will recall from [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml),
+    *Kernel Internals Essentials – Processes and Threads*, that the task structure
+    holds an inline structure to store/retrieve the thread''s hardware context; it''s
+    the member `struct thread_struct thread` (on the x86, it''s always the very last
+    member of the task struct). In Linux, an inline function, `kernel/sched/core.c:context_switch()`,
+    performs the job, switching from the `prev` task (that is, from `current`) to
+    the `next` task, the winner of this scheduling round or preemption. This switch
+    is essentially performed in two (arch-specific) stages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The memory (MM) switch**: Switch an arch-specific CPU register to point to
+    the memory descriptor structure (`struct mm_struct`) of `next`. On the x86[_64],
+    this register is called `CR3` (**Control Register 3**); on ARM, it''s called the
+    `TTBR0` (**Translation Table Base Register `0`**) register.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The actual CPU switch**: Switch from `prev` to `next` by saving the stack
+    and CPU register state of `prev` and restoring the stack and CPU register state
+    of `next` onto the processor; this is done within the `switch_to()` macro.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A detailed implementation of the context switch is not something we shall cover
+    here; do check out the *Further reading *section for more resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned about several areas and facets of the versatile
+    Linux kernel's CPU scheduler. Firstly, you saw how the actual KSE is a thread
+    and not a process, followed by gaining an appreciation of the available scheduling
+    policies that the OS implements. Next, you understood that to support multiple
+    CPUs in a superbly scalable fashion, the kernel powerfully mirrors this with a
+    design that employs one runqueue per CPU core per scheduling class. How to query
+    any given thread's scheduling policy and priority, and deeper details on the internal
+    implementation of the CPU scheduler, were then covered. We focused on how the
+    modern scheduler leverages the modular scheduling classes design, who exactly
+    runs the actual scheduler code and when, and ended with a brief note on the context
+    switch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next chapter has you continue on this journey, gaining more insight and
+    details on the workings of the kernel-level CPU scheduler. I suggest you first
+    fully digest this chapter's content, work on the questions given, and then move
+    on to the next chapter. Great going!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

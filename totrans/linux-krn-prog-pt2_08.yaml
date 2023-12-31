@@ -1,0 +1,2358 @@
+- en: Kernel Synchronization - Part 1
+  prefs: []
+  type: TYPE_NORMAL
+- en: As any developer familiar with programming in a multithreaded environment (or
+    even a single-threaded one where multiple processes work on shared memory, or
+    where interrupts are a possibility) is well aware, there is a need for **synchronization**
+    whenever two or more threads (code paths in general) may race; that is, their
+    outcome cannot be predicted. Pure code itself is never an issue as its permissions
+    are read/execute (`r-x`); reading and executing code simultaneously on multiple CPU
+    cores is not only perfectly fine and safe, but it's encouraged (it results in
+    better throughput and is why multithreading is a good idea). However, the moment
+    you're working on shared writeable data is the moment you need to start being
+    very careful!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The discussions around concurrency and its control – synchronization – are varied,
+    especially in the context of a complex piece of software such as a Linux kernel
+    (its subsystems and related regions, such as device drivers), which is what we're
+    dealing with in this book. Thus, for convenience, we will split this large topic
+    into two chapters, this one and the next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Critical sections, exclusive execution, and atomicity
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Concurrency concerns within the Linux kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mutex or spinlock? Which to use when
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the mutex lock
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the spinlock
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Locking and interrupts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's get started!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Critical sections, exclusive execution, and atomicity
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Imagine you''re writing software for a multicore system (well, nowadays, it''s
+    typical that you will work on multicore systems, even on most embedded projects).
+    As we mentioned in the introduction, running multiple code paths in parallel is
+    not only safe, it''s desirable (why spend those dollars otherwise, right?). On
+    the other hand, concurrent (parallel and simultaneous) code paths within which
+    **shared writeable data** (also known as **shared state**) **is accessed** in
+    any manner is where you are required to guarantee that, at any given point in
+    time, only one thread can work on that data at a time! This is really key; why?
+    Think about it: if you allow multiple concurrent code paths to work in parallel
+    on shared writeable data, you''re literally asking for trouble: **data corruption**
+    (a "race") can occur as a result.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is a critical section?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A code path that can execute in parallel and that works on (reads and/or writes)
+    shared writeable data (shared state) is called a critical section. They require
+    protection from parallelism. Identifying and protecting critical sections from
+    simultaneous execution is an implicit requirement for correct software that you
+    – the designer/architect/developer – must handle.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A critical section is a piece of code that must run either exclusively; that
+    is, alone (serialized), or atomically; that is, indivisibly, to completion, without
+    interruption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By exclusively, we're implying that at any given point in time, one thread is
+    running the code of the critical section; this is obviously required for data
+    safety reasons.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This notion also brings up the important concept of *atomicity*: a single atomic
+    operation is one that is indivisible. On any modern processor, two operations
+    are considered to always be **atomic**; that is, they cannot be interrupted and
+    will run to completion:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The execution of a single machine language instruction.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Reads or writes to an aligned primitive data type that is within the processor's
+    word size (typically 32 or 64 bits); for example, reading or writing a 64-bit integer
+    on a 64-bit system is guaranteed to be atomic. Threads reading that variable will
+    never see an in-between, torn, or dirty result; they will either see the old or
+    the new value.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: So, if you have some lines of code that work upon shared (global or static)
+    writeable data, it cannot – in the absence of any explicit synchronization mechanism
+    – be guaranteed to run exclusively. Note that at times, running the critical section's
+    code *atomically, *as well as exclusively, is required, but not all the time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the code of the critical section is running in a safe-to-sleep process
+    context (such as typical file operations on a driver via a user app (open, read,
+    write, ioctl, mmap, and so on), or the execution path of a kernel thread or workqueue),
+    it might well be acceptable to not have the critical section being truly atomic.
+    However, when its code is running in a non-blocking atomic context (such as a
+    hardirq, tasklet, or softirq), *it must run atomically as well as exclusively*
+    (we shall cover these points in more detail in the *Mutex or spinlock? Which to
+    use when* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A conceptual example will help clarify things. Let''s say that three threads
+    (from user space app(s)) attempt to open and read from your driver more or less
+    simultaneously on a multicore system. Without any intervention, they may well
+    end up running the critical section''s code in parallel, thus working on the shared
+    writable data in parallel, thus very likely corrupting it! For now, let''s look
+    at a conceptual diagram to see how non-exclusive execution within a critical section''s
+    code path is wrong (we won''t even talk about atomicity here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/4daabc10-0ddf-4879-96c2-49eeb6aa96e3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.1 – A conceptual diagram showing how a critical section code path is
+    violated by having >1 thread running within it simultaneously
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As shown in the preceding diagram, in your device driver, within its (say)
+    read method, you''re having it run some code in order to perform its job (reading
+    some data from the hardware). Let''s take a more in-depth look at this diagram *in
+    terms of data accesses being made* at different points in time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'From time `t0` to `t1`: None or only local variable data is accessed. This
+    is concurrent-safe, with no protection required, and can run in parallel (since
+    each thread has its own private stack).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'From time `t1` to `t2`: Global/static shared writeable data is accessed. This
+    is *not *concurrent-safe; it''s **a critical section** and thus must be **protected**
+    from concurrent access. It should only contain code that runs exclusively (alone,
+    exactly one thread at a time, serialized) and, perhaps, atomically.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'From time `t2` to `t3`: None or only local variable data is accessed. This
+    is concurrent-safe, with no protection required, and can run in parallel (since
+    each thread has its own private stack).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In this book, we assume that you are already aware of the need to synchronize
+    critical sections; we will not discuss this particular topic any further. Those
+    of you who are interested may refer to my earlier book, *Hands-On System Programming
+    with Linux (Packt, October 2018)*, which covers these points in detail (especially
+    *Chapter 15*, *Multithreading with Pthreads Part II – Synchronization*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, knowing this, we can now restate the notion of a critical section while
+    also mentioning when the situation arises (shown in square brackets and italics
+    in the bullet points). A critical section is code that must run as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**(Always) Exclusively**: Alone (serialized)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**(When in an atomic context) Atomically**: Indivisibly, to completion, without
+    interruption'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the next section, we'll look at a classic scenario – the increment of a global
+    integer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A classic case – the global i ++
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Think of this classic example: a global `i` integer is being incremented within
+    a concurrent code path, one within which multiple threads of execution can simultaneously
+    execute. A naive understanding of computer hardware and software will lead you
+    to believe that this operation is obviously atomic. However, the reality is that
+    modern hardware and software (the compiler and OS) are much more sophisticated
+    than you may imagine, thus causing all kinds of invisible (to the app developer)
+    performance-driven optimizations.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We won''t attempt to delve into too much detail here, but the reality is that
+    modern processors are extremely complex: among the many technologies they employ
+    toward better performance, a few are superscalar and super-pipelined execution
+    in order to execute multiple independent instructions and several parts of various
+    instructions in parallel (respectively), performing on-the-fly instruction and/or
+    memory reordering, caching memory in complex hierarchical on-CPU caches, false
+    sharing, and so on! We will delve into some of these details in [Chapter 7](14cf1232-dfd5-428a-9c0b-30bcd84651b9.xhtml),
+    *Kernel Synchronization – Part 2*, in the *Cache effects – false sharing* and
+    *Memory barriers* sections.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The paper *What every systems programmer should know about concurrency* by *Matt
+    Kline, April 2020*, ([https://assets.bitbashing.io/papers/concurrency-primer.pdf](https://assets.bitbashing.io/papers/concurrency-primer.pdf))
+    is superb and a must-read on this subject; do read it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'All of this makes for a situation that''s more complex than it appears to be
+    at first glance. Let''s continue with the classic `i ++`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Is this increment safe by itself? The short answer is no, you must protect
+    it. Why? It''s a critical section – we''re accessing shared writeable data for
+    a read and/or write operation. The longer answer is that it really depends on
+    whether the increment operation is truly atomic (indivisible); if it is, then
+    `i ++` poses no danger in the presence of parallelism – if not, it does! So, how
+    do we know whether `i ++` is truly atomic or not? Two things determine this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The processor's **Instruction Set Architecture** (**ISA**), which determines
+    (among several things related to the processor at a low level) the machine instructions
+    that execute at runtime.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The compiler.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the ISA has the facility to employ a single machine instruction to perform
+    an integer increment, *and* the compiler has the intelligence to use it, *then *it's
+    truly atomic – it's safe and doesn't require locking. Otherwise, it's not safe
+    and requires locking!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Try this out**: Navigate your browser to this wonderful compiler explorer
+    website: [https://godbolt.org/](https://godbolt.org/). Select C as the programming
+    language and then, in the left pane, declare the global `i` integer and increment
+    within a function. Compile in the right pane with an appropriate compiler and
+    compiler options. You''ll see the actual machine code generated for the C high-level `i
+    ++;` statement. If it''s indeed a single machine instruction, then it will be
+    safe; if not, you will require locking. By and large, you will find that you can''t
+    really tell: in effect, you *cannot *afford to assume things – you will have to
+    assume it''s unsafe by default and protect it! This can be seen in the following
+    screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/a6f1659c-346b-40c8-b5e0-f0e4033381ef.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.2 – Even with the latest stable gcc version but no optimization, the
+    x86_64 gcc produces multiple instructions for the i ++
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding screenshot clearly shows this: the yellow background regions
+    in the left- and right-hand panes is the C source and the corresponding assembly
+    generated by the compiler, respectively (based on the x86_64 ISA and the compiler''s
+    optimization level). By default, with no optimization, `i ++` becomes three machine
+    instructions. This is exactly what we expect: it corresponds to the *fetch* (memory
+    to register), the *increment*, and the *store* (register to memory)! Now, this
+    is *not *atomic; it''s entirely possible that, after one of the machine instructions
+    executes, the control unit interferes and switches the instruction stream to a
+    different point. This could even result in another process or thread being context
+    switched in!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The good news is that with a quick `-O2` in the `Compiler options...` window,
+    `i ++` becomes just one machine instruction – truly atomic! However, we can't
+    predict these things in advance; one day, your code may execute on a fairly low-end
+    ARM (RISC) system, increasing the chance that multiple machine instructions are
+    required for `i ++`. (Worry not – we shall cover an optimized locking technology
+    specifically for integers in the *Using the atomic integer operators* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Modern languages provide native atomic operators; for C/C++, it's fairly recent
+    (from 2011); the ISO C++11 and the ISO C11 standards provide ready-made and built-in
+    atomic variables for this. A little googling will quickly reveal them to you.
+    Modern glibc also makes use of them. As an example, if you've worked with signaling
+    in user space, you will know to use the `volatile sig_atomic_t` data type to safely access
+    and/or update an atomic integer within signal handlers. What about the kernel?
+    In the next chapter, you'll learn about the Linux kernel's solution to this key
+    issue. We'll cover this in the *Using the atomic integer operators* and *Using
+    the atomic bit operators* sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Linux kernel is, of course, a concurrent environment: multiple threads
+    of execution run in parallel on multiple CPU cores. Not only that, but even on uni-processor
+    (UP/single CPU) systems, the presence of hardware interrupts, traps, faults, exceptions,
+    and software signals can cause data integrity issues. Needless to say, protecting
+    against concurrency at required points in the code path is easier said than done;
+    identifying and protecting critical sections using technologies such as locking
+    – as well as other synchronization primitives and technologies – is absolutely
+    essential, which is why this is the core subject matter of this chapter and the
+    next.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Concepts – the lock
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We require synchronization because of the fact that, without any intervention,
+    threads can concurrently execute critical sections where shared writeable data
+    (shared state)is being worked upon. To defeat concurrency, we need to get rid
+    of parallelism, and we need to *serialize *code that's within the critical section
+    – the place where the shared data is being worked upon (for reading and/or writing).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To force a code path to become serialized, a common technique is to use a **lock**.
+    Essentially, a lock works by guaranteeing that precisely one thread of execution
+    can "take" or own the lock at any given point in time. Thus, using a lock to protect
+    a critical section in your code will give you what we''re after – running the
+    critical section''s code exclusively (and perhaps atomically; more on this to
+    come):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/5ccf6307-e970-4b7f-bcaa-566fb4acfb80.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.3 – A conceptual diagram showing how a critical section code path is
+    honored, given exclusivity, by using a lock
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding diagram shows one way to fix the situation mentioned previously:
+    using a lock to protect the critical section! How does the lock (and unlock) work,
+    conceptually?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The basic premise of a lock is that whenever there is contention for it – that
+    is, when multiple competing threads (say, `n` threads) attempt to acquire the
+    lock (the `LOCK` operation) – exactly one thread will succeed. This is called
+    the "winner" or the "owner" of the lock. It sees the *lock* API as a non-blocking
+    call and thus continues to run happily – and exclusively – while executing the
+    code of the critical section (the critical section is effectively the code between
+    the *lock* and the *unlock* operations!). What happens to the `n-1` "loser" threads?
+    They (perhaps) see the lock API as a blocking call; they, to all practical effect,
+    wait. Wait upon what? The *unlock* operation, of course, which is performed by
+    the owner of the lock (the "winner" thread)! Once unlocked, the remaining `n-1`
+    threads now compete for the next "winner" slot; of course, exactly one of them
+    will "win" and proceed forward; in the interim, the `n-2` losers will now wait
+    upon the (new) winner's *unlock*; this repeats until all `n` threads (finally
+    and sequentially) acquire the lock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, locking works of course, but – and this should be quite intuitive – it results
+    in (pretty steep!) **overhead, as it defeats parallelism and serializes** the
+    execution flow! To help you visualize this situation, think of a funnel, with
+    the narrow stem being the critical section where only one thread can fit at a
+    time. All other threads get choked; locking creates bottlenecks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/4f476235-4b35-4d76-8d49-694b0095c1be.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.4 – A lock creates a bottleneck, analogous to a physical funnel
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another oft-mentioned physical analog is a highway with several lanes merging
+    into one very busy – and choked with traffic – lane (a poorly designed toll booth,
+    perhaps). Again, parallelism – cars (threads) driving in parallel with other cars
+    in different lanes (CPUs) – is lost, and serialized behavior is required – cars
+    are forced to queue one behind the other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, it is imperative that we, as software architects, try and design our products/projects
+    so that locking is minimally required. While completely eliminating global variables
+    is not practically possible in most real-world projects, optimizing and minimizing
+    their usage is required. We shall cover more regarding this, including some very
+    interesting lockless programming techniques, later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another really key point is that a newbie programmer might naively assume that
+    performing reads on a shared writeable data object is perfectly safe and thus
+    requires no explicit protection (with the exception of an aligned primitive data
+    type that is within the size of the processor's bus); this is untrue. This situation
+    can lead to what's called **dirty or torn reads**, a situation where possibly
+    stale data can be read as another writer thread is simultaneously writing while
+    you are – incorrectly, without locking – reading the very same data item.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since we're on the topic of atomicity, as we just learned, on a typical modern
+    microprocessor, the only things guaranteed to be atomic are a single machine language
+    instruction or a read/write to an aligned primitive data type within the processor
+    bus's width. So, how can we mark a few lines of "C" code so that they're truly
+    atomic? In user space, this isn't even possible (we can come close, but cannot
+    guarantee atomicity).
+  prefs: []
+  type: TYPE_NORMAL
+- en: How do you "come close" to atomicity in user space apps? You can always construct
+    a user thread to employ a `SCHED_FIFO` policy and a real-time priority of `99`.
+    This way, when it wants to run, pretty much nothing besides hardware interrupts/exceptions
+    can preempt it. (The old audio subsystem implementation heavily relied on this.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: In kernel space, we can write code that's truly atomic. How, exactly? The short
+    answer is that we can use spinlocks! We'll learn about spinlocks in more detail
+    shortly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A summary of key points
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s summarize some key points regarding critical sections. It''s really
+    important to go over these carefully, keep these handy, and ensure you use them
+    in practice:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **critical section** is a code path that can execute in parallel and that
+    works upon (reads and/or writes) shared writeable data (also known as "shared
+    state").
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Because it works on shared writable data, the critical section requires protection
+    from the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Parallelism (that is, it must run alone/serialized/in a mutually exclusive fashion)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When running in an atomic (interrupt) non-blocking context – atomically: indivisibly,
+    to completion, without interruption. Once protected, you can safely access your
+    shared state until you "unlock".
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Every critical section in the code base must be identified and protected:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Identifying critical sections is critical! Carefully review your code and make
+    sure you don't miss them.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Protecting them can be achieved via various technologies; one very common technique
+    is *locking* (there's also lock-free programming, which we'll look at in the next
+    chapter).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A common mistake is only protecting critical sections that *write* to global writeable
+    data; you must also protect critical sections that *read* global writeable data;
+    otherwise, you risk a **torn or dirty read! **To help make this key point clear,
+    visualize an unsigned 64-bit data item being read and written on a 32-bit system;
+    in such a case, the operation can't be atomic (two load/store operations are required).
+    Thus, what if, while you're reading the value of the data item in one thread,
+    it's being simultaneously written to by another thread!? The writer thread takes
+    a "lock" of some sort but because you thought reading is safe, the lock isn't
+    taken by the reader thread; due to an unfortunate timing coincidence, you can
+    end up performing a partial/torn/dirty read! We will learn how to overcome these
+    issues by using various techniques in the coming sections and the next chapter.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Another deadly mistake is not using the same lock to protect a given data item.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Failing to protect critical sections leads to a **data race**, a situation where
+    the outcome – the actual value of the data being read/written – is "racy", which
+    means it varies, depending on runtime circumstances and timing. This is known
+    as a bug. (A bug that, once in "the field", is extremely difficult to see, reproduce,
+    determine its root cause, and fix. We will cover some very powerful stuff to help
+    you with this in the next chapter, in the *Lock debugging within the kernel *section;
+    be sure to read it!)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Exceptions**: You are safe (implicitly, without explicit protection) in the
+    following situations:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When you are working on local variables. They're allocated on the private stack
+    of the thread (or, in the interrupt context, on the local IRQ stack) and are thus,
+    by definition, safe.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When you are working on shared writeable data in code that cannot possibly run
+    in another context; that is, it's serialized by nature. In our context, the *init *and *cleanup *methods
+    of an LKM qualify (they run exactly once, serially, on `insmod` and `rmmod` only).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When you are working on shared data that is truly constant and read-only (don't
+    let C's `const` keyword fool you, though!).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Locking is inherently complex; you must carefully think, design, and implement
+    this to avoid *deadlocks. *We'll cover this in more detail in the *Locking guidelines
+    and deadlocks* section.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Concurrency concerns within the Linux kernel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Recognizing critical sections within a piece of kernel code is of critical
+    importance; how can you protect it if you can''t even see it? The following are
+    a few guidelines to help you, as a budding kernel/driver developer, recognize
+    where concurrency concerns – and thus critical sections – may arise:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The presence of **Symmetric Multi-Processor** (**SMP**) systems (`CONFIG_SMP`)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The presence of a preemptible kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Blocking I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardware interrupts (on either SMP or UP systems)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These are critical points to understand, and we will discuss each in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Multicore SMP systems and data races
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The first point is pretty obvious; take a look at the pseudocode shown in the
+    following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/79357d73-c814-478c-b463-1951621f15e2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.5 – Pseudocode – a critical section within a (fictional) driver's read
+    method; it's wrong as there's no locking
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's a similar situation to what we showed in *Figures 6.1* and 6*.3*; it's
+    just that here, we're showing the concurrency in terms of pseudocode. Clearly, from
+    time `t2` to time `t3`, the driver is working on some global shared writeable
+    data, thus making this a critical section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, visualize a system with, say, four CPU cores (an SMP system); two user
+    space processes, P1 (running on, say, CPU 0) and P2 (running on, say, CPU 2),
+    can concurrently open the device file and simultaneously issue a `read(2)` system
+    call. Now, both processes will be concurrently executing the driver read "method",
+    thus simultaneously working on shared writeable data! This (the code between `t2`
+    and `t3`) is a critical section, and since we are in violation of the fundamental
+    exclusivity rule – critical sections must be executed by only a single thread
+    at any point in time – we can very well end up corrupting the data, the application,
+    or worse.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In other words, this is now a **data race**; depending on delicate timing coincidences,
+    we may or may not generate an error (a bug). This very uncertainty – the delicate
+    timing coincidence – is what makes finding and fixing errors like this extremely difficult
+    (it can escape your testing effort).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This aphorism is all too unfortunately true: *Testing can detect the presence
+    of errors, not their absence. *Adding to this, you''re worse off if your testing
+    fails to catch races (and bugs), allowing them free rein in the field.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might feel that since your product is a small embedded system running on one
+    CPU core (UP), this discussion regarding controlling concurrency (often, via locking)
+    does not apply to you. We beg to differ: pretty much all modern products, if they
+    haven''t already, will move to multicore (in their next-generation phases, perhaps).
+    More importantly, even UP systems have concurrency concerns, as we shall explore.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preemptible kernels, blocking I/O, and data races
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Imagine you're running your kernel module or driver on a Linux kernel that's
+    been configured to be preemptible (that is, `CONFIG_PREEMPT` is on; we covered
+    this topic in the companion guide *Linux Kernel Programming,* *Chapter 10*, *The
+    CPU Scheduler – Part 1*). Consider that a process, P1, is running the driver's
+    read method code in the process context, working on the global array. Now, while
+    it's within the critical section (between time `t2` and `t3`), what if the kernel *preempts*
+    process P1 and context switches to another process, P2, which is just waiting
+    to execute this very code path? It's dangerous, and again, a data race. This could
+    well happen on even a UP system!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another scenario that''s somewhat similar (and again, could occur on either
+    a single core (UP) or multicore system): process P1 is running through the critical
+    section of the driver method (between time `t2` and `t3;` again, see *Figure 6.5*).
+    This time, what if, within the critical section, it hits a blocking call?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **blocking call** is a function that causes the calling process context to
+    be put to sleep, waiting upon an event; when that event occurs, the kernel will
+    "wake up" the task, and it will resume execution from where it left off. This
+    is also known as blocking on I/O and is very common; many APIs (including several
+    user space library and system calls, as well as several kernel APIs, are blocking
+    by nature). In such a case, process P1 is effectively context switches off the
+    CPU and goes to sleep, which means that the code of `schedule()` runs and enqueues
+    it onto a wait queue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the interim, before P1 gets switched back, what if another process, P2, is
+    scheduled to run? What if that process is also running this particular code path?
+    Think about it – by the time P1 is back, the shared data could have changed "underneath
+    it", causing all kinds of errors; again, a data race, a bug!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hardware interrupts and data races
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Finally, envision this scenario: process P1 is, again, innocently running the
+    driver''s read method code; it enters the critical section (between time `t2`
+    and `t3`; again, see *Figure 6.5*). It makes some progress but then, alas, a hardware
+    interrupt triggers (on the same CPU)! On the Linux OS, hardware (peripheral) interrupts
+    have the highest priority; they preempt any code (including kernel code) by default.
+    Thus, process (or thread) P1 will be at least temporarily shelved, thus losing
+    the processor; the interrupt handling code will preempt it and run.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Well, you might be wondering, so what? Indeed, this is a completely commonplace
+    occurrence! Hardware interrupts fire very frequently on modern systems, effectively
+    (and literally) interrupting all kinds of task contexts (do a quick `vmstat 3` on
+    your shell; the column under `system` labeled `in` shows the number of hardware
+    interrupts that fired on your system in the last 1 second!). The key question
+    to ask is this: is the interrupt handling code (either the hardirq top half or
+    the so-called tasklet or softirq bottom half, whichever occurred), *sharing and
+    working upon the same shared writable data of the process context that it just
+    interrupted?*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If this is true, then, *Houston, we have a problem* – a data race! If not, then
+    your interrupted code is not a critical section with respect to the interrupt
+    code path, and that's fine. The fact is that the majority of device drivers do
+    handle interrupt(s); thus, it is the driver author's (your!) responsibility to
+    ensure that no global or static data – in effect, no critical sections – are shared between
+    the process context and interrupt code paths. If they are (which does happen),
+    you must somehow protect that data from data races and possible corruption.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These scenarios might leave you feeling that protecting against these concurrency
+    concerns is a really tall order; how exactly can you accomplish data safety in the
+    face of critical sections existing, along with various possible concurrency concerns? Interestingly,
+    the actual APIs are not hard to learn to use; again, we emphasize that **recognizing critical
+    sections** is the key thing to do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, the basics regarding how a lock (conceptually) works, locking guidelines
+    (very important; we'll recap on them shortly), and the types of and how to prevent
+    deadlocks, are all dealt with in my earlier book, *Hands-On System Programming
+    with Linux (Packt, Oct 2018)*. This books covers these points in detail in *Chapter
+    15*, *Multithreading with Pthreads Part II – Synchronization*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Without further ado, let's dive into the primary synchronization technology
+    that will serve to protect our critical sections – locking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locking guidelines and deadlocks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Locking, by its very nature, is a complex beast; it tends to give rise to complex
+    interlocking scenarios. Not understanding it well enough can lead to both performance
+    headaches and bugs – deadlocks, circular dependencies, interrupt-unsafe locking,
+    and more. The following locking guidelines are key to ensuring correctly written
+    code when using locking:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Locking granularity**: The ''distance'' between the lock and the unlock (in
+    effect, the length of the critical section) should not be coarse (too long a critical section)
+    it should be ''fine enough''; what does this mean? The points below explain this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You need to be careful here. When you're working on large projects, keeping
+    too few locks is a problem, as is keeping too many! Too few locks can lead to
+    performance issues (as the same locks are repeatedly used and thus tend to be
+    highly contended).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Having a lot of locks is actually good for performance, but not good for complexity
+    control. This also leads to another key point to understand: with many locks in
+    the code base, you should be very clear on which lock protects which shared data
+    object. It''s completely meaningless if you use, say, `lockA` to protect `mystructX`,
+    but in a code path far away (perhaps an interrupt handler) you forget this and
+    try and use some other lock, `lockB`, for protection when working on the same
+    structure! Right now, these things might sound obvious, but (as experienced developers
+    know), under sufficient pressure, even the obvious isn''t always obvious!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Try and balance things out. In large projects, using one lock to protect one
+    global (shared) data structure is typical. (*Naming* the lock variable well can
+    become a big problem in itself! This is why we place the lock that protects a
+    data structure within it as a member.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Lock ordering** is critical; **locks must be taken in the same order throughout**,
+    and their order should be documented and followed by all the developers working
+    on the project (annotating locks is useful too; more on this in the section on
+    *lockdep* in the next chapter). Incorrect lock ordering often leads to deadlocks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Avoid recursive locking as much as possible.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Take care to prevent starvation; verify that a lock, once taken, is indeed released "quickly
+    enough".
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Simplicity is key**: Try to avoid complexity or over-design, especially with
+    regard to complex scenarios involving locks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'On the topic of locking, the (dangerous) issue of deadlocks arises. A **deadlock**
+    is the inability to make any progress; in other words, the app and/or kernel component(s)
+    appear to hang indefinitely. While we don''t intend to delve into the gory details
+    of deadlocks here, I will quickly mention some of the more common types of deadlock
+    scenarios that can occur:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Simple case, single lock, process context:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We attempt to acquire the same lock twice; this results in a **self-deadlock**.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Simple case, multiple (two or more) locks, process context – an example:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On CPU `0`, thread A acquires lock A and then wants lock B.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Concurrently, on CPU `1`, thread B acquires lock B and then wants lock A.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The result is a deadlock, often called the **AB-BA** **deadlock**.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It can be extended; for example, the AB-BC-CA **circular dependency** (A-B-C lock
+    chain) results in a deadlock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Complex case, single lock, and process and interrupt contexts:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lock A takes in an interrupt context.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What if an interrupt occurs (on another core) and the handler attempts to take
+    lock A? Deadlock is the result! Thus, locks acquired in the interrupt context
+    must always be used with interrupts disabled. (How? We will look at this in more
+    detail when we cover spinlocks.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: More complex cases, multiple locks, and process and interrupt (hardirq and softirq) contexts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In simpler cases, always following the *lock ordering guideline* is sufficient:
+    always obtain and release locks in a well-documented order (we will provide an
+    example of this in kernel code in the *Using the mutex lock* section). However,
+    this can get very complex; complex deadlock scenarios can trip up even experienced
+    developers. Luckily for us, ***lockdep*** – the Linux kernel''s runtime lock dependency
+    validator – can catch every single deadlock case! (Don''t worry – we shall get
+    there: we''ll cover lockdep in detail in the next chapter). When we cover spinlocks
+    (the *Using the spinlock* section), we''ll come across process and/or interrupt
+    context scenarios similar to the ones mentioned previously; the type of spinlock
+    to use is made clear there.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With regard to deadlocks, a pretty detailed presentation on lockdep was given
+    by Steve Rostedt at a Linux Plumber's Conference (back in 2011); the relevant
+    slides are informative and explore both simple and complex deadlock scenarios,
+    as well as how lockdep can detect them ([https://blog.linuxplumbersconf.org/2011/ocw/sessions/153](https://blog.linuxplumbersconf.org/2011/ocw/sessions/153)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, the reality is that not just deadlock, but even **livelock** situations,
+    can be just as deadly! Livelock is essentially a situation similar to deadlock;
+    it's just that the state of the participating task is running and not waiting. An
+    example, an interrupt "storm" can cause a livelock; modern network drivers mitigate
+    this effect by switching off interrupts (under interrupt load) and resorting to
+    a polling technique called **New API; Switching Interrupts** (**NAPI**) (switching interrupts
+    back on when appropriate; well, it's more complex than that, but we leave it at
+    that here).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For those of you who''ve been living under a rock, you will know that the Linux
+    kernel has two primary types of locks: the mutex lock and the spinlock. Actually,
+    there are several more types, including other synchronization (and "lockless"
+    programming) technology, all of which will be covered in the course of this chapter
+    and the next.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex or spinlock? Which to use when
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The exact semantics of learning to use the mutex lock and the spinlock are quite simple
+    (with appropriate abstraction within the kernel API set, making it even easier
+    for the typical driver developer or module author). The critical question in this
+    situation is a conceptual one: what really is the difference between the two locks?
+    More to the point, under which circumstances should you use which lock? You will
+    learn the answers to these questions in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Taking our previous driver read method''s pseudocode (*Figure 6.5*) as a base
+    example, let''s say that three threads – **tA**, **tB**, and **tC** – are running
+    in parallel (on an SMP system) through this code. We shall solve this concurrency
+    issue, while avoiding any data races, by taking or acquiring a lock prior to the
+    start of the critical section (time **t2**), and release the lock (unlock) just
+    after the end of the critical section code path (time **t3**). Let''s take a look
+    at the pseudocode once more, this time with locking to ensure it''s correct:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/a0db53d6-0c64-4377-90a2-bdb95a2fab16.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.6 – Pseudocode – a critical section within a (fictional) driver's read
+    method; correct, with locking
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When the three threads attempt to simultaneously acquire the lock, the system
+    guarantees that only exactly one of them will get it. Let''s say that **tB** (thread
+    B) gets the lock: it''s now the "winner" or "owner" thread. This means that threads
+    **tA** and **tC** are the "losers"; what do they do? They wait upon the unlock!
+    The moment the "winner" (**tB**) completes the critical section and unlocks the
+    lock, the battle resumes between the previous losers; one of them will be the
+    next winner and the process repeats.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The key difference between the two lock types – the mutex and the spinlock –
+    is based on how the losers wait upon the unlock. With the mutex lock, the loser
+    threads are put to sleep; that is, they wait by sleeping. The moment the winner
+    performs the unlock, the kernel awakens the losers (all of them) and they run,
+    again competing for the lock. (In fact, mutexes and semaphores are sometimes referred
+    to as sleeplocks.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With the **spinlock**, however, there is no question of sleeping; the losers
+    wait by spinning upon the lock until it is unlocked. Conceptually, this looks
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that this is *only conceptual*. Think about it a moment – this is actually
+    polling. However, as a good programmer, you will understand, that polling is usually
+    considered a bad idea. Why, then, does the spinlock work this way? Well, it doesn't;
+    it has only been presented in this manner for conceptual purposes. As you will
+    soon understand, spinlocks only really have meaning on multicore (SMP) systems.
+    On such systems, while the winner thread is away and running the critical section
+    code, the losers wait by spinning on other CPU cores! In reality, at the implementation
+    level, the code that's used to implement the modern spinlock is highly optimized (and
+    arch-specific) and does not work by trivially "spinning" (for example, many spinlock implementations
+    for ARM use the **wait for event** (**WFE**) machine language instruction, which
+    has the CPU optimally wait in a low power state; see the *Further reading *section
+    for several resources on the internal implementation of spinlocks).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determining which lock to use – in theory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'How the spinlock is implemented is really not our concern here; the fact that
+    the spinlock has a lower overhead than the mutex lock is of interest to us. How
+    so? It''s simple, really: for the mutex lock to work, the loser thread has to
+    go to sleep. To do so, internally, the `schedule()` function gets called, which
+    means the loser sees the mutex lock API as a blocking call! A call to the scheduler
+    will ultimately result in the processer being context-switched off. Conversely,
+    when the owner thread unlocks the lock, the loser thread(s) must be woken up;
+    again, it will be context-switched back onto the processor. Thus, the minimal
+    "cost" of the mutex lock/unlock operation is the time it takes to perform two
+    context switches on the given machine. (See the *Information Box* in the next
+    section.) By relooking at the preceding screenshot once more, we can determine
+    a few things, including the time spent in the critical section (the "locked" code
+    path); that is, `t_locked = t3 - t2`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s say that `t_ctxsw` represents the time to context switch. As we''ve
+    learned, the minimal cost of the mutex lock/unlock operation is `2 * t_ctxsw`.
+    Now, let''s say that the following expression is true:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: In other words, what if the time spent within the critical section is less than
+    the time taken for two context switches? In this case, using the mutex lock is
+    just wrong as this is far too much overhead; more time is being spent performing
+    metawork than actual work – a phenomenon known as **thrashing**. It's this precise
+    use case – the presence of very short critical sections – that's often the case
+    on modern OSes such as Linux. So, in conclusion, for short non-blocking critical
+    sections, using a spinlock is (far) superior to using a mutex lock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determining which lock to use – in practice
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'So, operating under the `t_locked < 2 * t_ctxsw` "rule" might be great in theory,
+    but hang on: are you really expected to precisely measure the context switch time
+    and the time spent in the critical section of each and every case where one (critical
+    section) exists? No, of course not – that''s pretty unrealistic and pedantic.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Practically speaking, think about it this way: the mutex lock works by having
+    the loser threads sleep upon the unlock; the spinlock does not (the losers "spin").
+    Let''s recall one of our golden rules of the Linux kernel: a kernel cannot sleep
+    (call `schedule()`) in any kind of atomic context. Thus, we can never use the
+    mutex lock in an interrupt context, or indeed in any context where it isn''t safe
+    to sleep; using the spinlock, however, would be fine. (Remember, a blocking API
+    is one that puts the calling context to sleep by calling `schedule()`.) Let''s
+    summarize this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Is the critical section running in an atomic (interrupt) context, or, in
+    a process context, where it cannot sleep?** Use the spinlock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Is the critical section running in a process context and sleep in the critical
+    section is necessary?** Use the mutex lock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Of course, using the spinlock is considered lower overhead than using the mutex;
+    thus, you can even use the spinlock in the process context (such as our fictional
+    driver's read method), as long as the critical section does not block (sleep).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**[1]** The time taken for a context switch is varied; it largely depends on the
+    hardware and the OS quality. Recent (September 2018) measurements show that context
+    switching time is in the region of 1.2 to 1.5 **us** (**microseconds**) on a pinned-down
+    CPU, and around 2.2 us without pinning ([https://eli.thegreenplace.net/2018/measuring-context-switching-and-memory-overheads-for-linux-threads/](https://eli.thegreenplace.net/2018/measuring-context-switching-and-memory-overheads-for-linux-threads/)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both hardware and the Linux OS have improved tremendously, and because of that,
+    so has the average context switching time. An old (December 1998) Linux Journal
+    article determined that on an x86 class system, the average context switch time
+    was 19 us (microseconds), and that the worst-case time was 30 us.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This brings up the question, how do we know if the code is currently running
+    in a process or interrupt context? Easy: our `PRINT_CTX()` macro (within our `convenient.h`
+    header) shows us this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that you understand which one – mutex or spinlock – to use and when, let's
+    get into the actual usage. We'll begin with how to use the mutex lock!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the mutex lock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Mutexes are also called sleepable or blocking mutual exclusion locks. As you
+    have learned, they are used in the process context if the critical section can
+    sleep (block). They must not be used within any kind of atomic or interrupt context
+    (top halves, bottom halves such as tasklets or softirqs, and so on), kernel timers,
+    or even the process context where blocking is not allowed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Initializing the mutex lock
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A mutex lock "object" is represented in the kernel as a `struct mutex` data
+    structure. Consider the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: To use a mutex lock, it *must* be explicitly initialized to the unlocked state. Initialization
+    can be performed statically (declare and initialize the object) with the `DEFINE_MUTEX()` macro,
+    or dynamically via the `mutex_init()` function (this is actually a macro wrapper
+    over the `__mutex_init()` function).
+  prefs: []
+  type: TYPE_NORMAL
+- en: For example, to declare and initialize a mutex object called `mymtx`, we can
+    use `DEFINE_MUTEX(mymtx);`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can also do this dynamically. Why dynamically? Often, the mutex lock is
+    a member of the (global) data structure that it protects (clever!). For example,
+    let''s say we have the following global context structure in our driver code (note
+    that this code is fictional):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, in your driver''s (or LKM''s) `init` method, do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Keeping the lock variable as a member of the (parent) data structure it protects
+    is a common (and clever) pattern that's used within Linux; this approach has the
+    added benefit of avoiding namespace pollution and is unambiguous about which mutex
+    protects which shared data item (a bigger problem than it might appear to be at
+    first, especially in enormous projects such as the Linux kernel!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keep the lock protecting a global or shared data structure as a member within
+    that data structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Correctly using the mutex lock
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Typically, you can find very insightful comments within the kernel source tree.
+    Here''s a great one that neatly summarizes the rules you must follow to correctly
+    use a mutex lock; please read this carefully:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As a kernel developer, you must understand the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A critical section causes the code path *to be serialized, defeating parallelism*.
+    Due to this, it's imperative that you keep the critical section as short as possible.
+    A corollary to this is **lock data, not code**.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Attempting to reacquire an already acquired (locked) mutex lock – which is effectively recursive locking
+    – is *not* supported and will lead to a self-deadlock.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Lock ordering**: This is a very important rule of thumb for preventing dangerous
+    deadlock situations. In the presence of multiple threads and multiple locks, it
+    is critical that *the order in which locks are taken is documented and strictly
+    followed by all the developers working on the project.* The actual lock ordering
+    itself isn''t sacrosanct, but the fact that once it''s been decided on it must
+    be followed, is. While browsing through the kernel source tree, you will come
+    across many places where the kernel developers ensure this is done, and they (usually)
+    write a comment regarding this for other developers to see and follow. Here''s
+    a sample comment from the slab allocator code (`mm/slub.c`):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that we understand how mutexes work from a conceptual standpoint (and we
+    understand their initialization), let's learn how to make use of the lock/unlock
+    APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex lock and unlock APIs and their usage
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The actual locking and unlocking APIs for the mutex lock are as follows. The
+    following code shows how to lock and unlock a mutex, respectively:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: (Ignore `__sched` here; it's just a compiler attribute that has this function
+    disappear in the `WCHAN` output, which shows up in procfs and with certain option
+    switches to `ps(1)` (such as `-l`)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Again, the comments within the source code in `kernel/locking/mutex.c` are
+    very detailed and descriptive; I encourage you to take a look at this file in
+    more detail. We''ve only shown some of its code here, which has been taken directly
+    from the 5.4 Linux kernel source tree:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`might_sleep()` is a macro with an interesting debug property; it catches code
+    that''s supposed to execute in an atomic context but doesn''t! So, think about
+    it: `might_sleep()`, which is the first line of code in `mutex_lock()`, implies
+    that this code path should not be executed by anything that''s in an atomic context
+    since it might sleep. This means that you should only use the mutex in the process
+    context when it''s safe to sleep!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**A quick and important reminder**: The Linux kernel can be configured with
+    a large number of debug options; in this context, the `CONFIG_DEBUG_MUTEXES` config
+    option will help you catch possible mutex-related bugs, including deadlocks. Similarly,
+    under the Kernel Hackingmenu, you will find a large number of debug-related kernel
+    config options. We discussed this in the companion guide *Linux Kernel Programming
+    -* *Chapter 5*, *Writing Your First Kernel Module – LKMs Part 2*. There are several
+    very useful kernel configs with regard to lock debugging; we shall cover these
+    in the next chapter, in the *Lock debugging within the kernel* section.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex lock – via [un]interruptible sleep?
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As usual, there's more to the mutex than what we've seen so far. You already
+    know that a Linux process (or thread) cycles through various states of a state
+    machine. On Linux, sleeping has two discrete states – an interruptible sleep and
+    an uninterruptible sleep. A process (or thread) in an interruptible sleep is sensitive,
+    which means it will respond to user space signals, whereas a task in an uninterruptible sleep
+    is not sensitive to user signals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a human-interactive application with an underlying driver, as a general
+    rule of thumb, you should typically put a process into an interruptible sleep
+    (while it''s blocking upon the lock), thus leaving it up to the end user as to whether
+    to abort the application by pressing *Ctrl* + *C* (or some such mechanism involving signals).
+    There is a design rule that''s often followed on Unix-like systems: **provide
+    mechanism, not policy**. Having said this, on non-interactive code paths, it''s
+    often the case that you must wait on the lock to wait indefinitely, with the semantic
+    that a signal that''s been delivered to the task should not abort the blocking
+    wait. On Linux, the uninterruptible case turns out to be the most common one.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, here''s the thing: the `mutex_lock()` API always puts the calling task
+    into an uninterruptible sleep. If this is not what you want, use the `mutex_lock_interruptible()`
+    API to put the calling task into an interruptible sleep. There is one difference
+    syntax-wise; the latter returns an integer value of `0` on success and `-EINTR`
+    (remember the `0`/`-E` return convention) on failure (due to signal interruption).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general, using `mutex_lock()` is faster than using `mutex_lock_interruptible()`; use
+    it when the critical section is short (thus pretty much guaranteeing that the
+    lock is held for a short while, which is a very desirable characteristic).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The 5.4.0 kernel contains over 18,500 and just over 800 instances of calling
+    the `mutex_lock()` and `mutex_lock_interruptible()` APIs, respectively; you can
+    check this out via the powerful `cscope(1)` utility on the kernel source tree.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In theory, the kernel provides a `mutex_destroy()` API as well. This is the
+    opposite of `mutex_init()`; its job is to mark the mutex as being unusable. It
+    must only be invoked once the mutex is in the unlocked state, and once invoked,
+    the mutex cannot be used. This is a bit theoretical because, on regular systems,
+    it just reduces to an empty function; only on a kernel with `CONFIG_DEBUG_MUTEXES`
+    enabled does it become actual (simple) code. Thus, we should use this pattern
+    when working with the mutex, as shown in the following pseudocode:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that you have learned how to use the mutex lock APIs, let's put this knowledge
+    to use. In the next section, we will build on top of one of our earlier (poorly
+    written – no protection!) "misc" drivers by employing the mutex object to lock
+    critical sections as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex locking – an example driver
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We have created a simple device driver code example in *Chapter 1* - *Writing
+    a Simple misc Character Device Driver*; that is, `ch1/miscdrv_rdwr`. There, we
+    wrote a simple `misc` class character device driver and used a user space utility
+    program (`ch12/miscdrv_rdwr/rdwr_drv_secret.c`) to read and write a (so-called)
+    secret from and to the device driver's memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, what we glaringly (egregiously is the right word here!) failed to
+    do in that code is protect shared (global) writeable data! This will cost us dearly
+    in the real world. I urge you to take some time to think about this: it isn''t
+    viable that two (or three or more) user mode processes open the device file of
+    this driver, and then concurrently issue various I/O reads and writes. Here, the
+    global shared writable data (in this particular case, two global integers and
+    the driver context data structure) could easily get corrupted.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, let''s learn from and correct our mistakes by making a copy of this driver
+    (we will now call it `ch12/1_miscdrv_rdwr_mutexlock/1_miscdrv_rdwr_mutexlock.c`)
+    and rewriting some portions of it. The key point is that we must use mutex locks
+    to protect all critical sections. Instead of displaying the code here (it''s in
+    this book''s GitHub repository at [https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming),
+    after all, please do `git clone` it!), let''s do something interesting: let''s
+    look at a "diff" (the differences – the delta generated by `diff(1)`) between
+    the older unprotected version and the newer protected code version. The output
+    here has been truncated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, we can see that in the newer safe version of the driver, we have declared
+    and initialized a mutex variable called `lock1`; we shall use it to protect the
+    (just for demonstration purposes) two global integers, `ga` and `gb`, within our
+    driver. Next, importantly, we declared a mutex lock named `lock` within the "driver
+    context" data structure; that is, `drv_ctx`. This will be used to protect any
+    and all access to members of that data structure. It is initialized within the `init` code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This detailed comment clearly explains why we don''t need to lock/unlock around
+    `strscpy()`. Again, this should be obvious, but local variables are implicitly
+    private to each process context (as they reside in that process or thread''s kernel
+    mode stack) and therefore require no protection (each thread/process has a separate
+    *instance* of the variable, so no one steps on anyone''s toes!). Before we forget,
+    the *cleanup* code path (which is invoked via the `rmmod(8)` process context),
+    must destroy the mutexes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, let''s look at the diff of the driver''s open method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is where we manipulated the global integers, *making this a critical section*;
+    unlike the previous version of this program, here, we *do protect this critical section*
+    with the `lock1` mutex. So, there it is: the critical section here is the code `ga++;
+    gb--;`: the code between the (mutex) lock and unlock operations.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But (there''s always a but, isn''t there?), all is not well! Take a look at
+    the `printk` function (`dev_info()`) following the `mutex_unlock()` line of code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Does this look okay to you? No, look carefully: we are *reading* the value
+    of the global integers, `ga` and `gb`. Recall the fundamentals: in the presence
+    of concurrency (which is certainly a possibility here in this driver''s *open*
+    method), *even reading shared writeable data without the lock is potentially unsafe*.
+    If this doesn''t make sense to you, please think: what if, while one thread is
+    reading the integers, another is simultaneously updating (writing) them; what
+    then? This kind of situation is called a **dirty read** (or a **torn read)**;
+    we might end up reading stale data and must be protected against. (The fact is
+    that this isn''t really a great example of a dirty read as, on most processors,
+    reading and writing single integer items does tend to be an atomic operation.
+    However, we must not assume such things – we must simply do our job and protect
+    it.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In fact, there''s another similar bug-in-waiting: we have read data from the
+    open file structure (the `filp` pointer) without bothering to protect it (indeed,
+    the open file structure has a lock; we''re supposed to use it! We shall do so
+    later).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The precise semantics of how and when things such as *dirty reads* occur does
+    tend to be very arch (machine)-dependent; nevertheless, our job as module or driver
+    authors is clear: we must ensure that we protect all critical sections. This includes
+    reads upon shared writable data.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For now, we shall just flag these as potential errors (bugs). We will take
+    care of this in the *Using the atomic integer operators* section, in a more performance-friendly
+    manner. Looking at the diff of the driver''s read method reveals something interesting
+    (ignore the line numbers shown here; they might change):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ad26b085-7d4a-4090-96b8-44aef98664ce.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.7 – The diff of the driver's read() method; see the usage of the mutex
+    lock in the newer version
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have now used the driver context structure's mutex lock to protect the critical
+    sections. The same goes for both the *write* and *close* (release) methods of
+    the device driver (generate the patch for yourself and take a look).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the user mode app remains unchanged, which means for us to test the
+    new safer version, we must continue using the user mode app at `ch12/miscdrv_rdwr/rdwr_drv_secret.c`. Running
+    and testing code such as this driver code on a debug kernel, which contains various locking
+    errors and deadlock detection capabilities, is crucial (we'll return to these
+    "debug" capabilities in the next chapter, in the *Lock debugging within the kernel* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding code, we took the mutex lock just before the `copy_to_user()`
+    routine; that's fine. However, we only release it after `dev_info()`. Why not
+    release it before this `printk`, thus shortening the critical section?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A closer look at `dev_info()` reveals why it''s *within* the critical section.
+    We are printing the values of three variables here: the number of bytes read by `secret_len` and
+    the number of bytes that are "transmitted" and "received" by `ctx->tx` and `ctx->rx`,
+    respectively. `secret_len` is a local variable and does not require protection,
+    but the other two variables are within the global driver context structure and
+    thus do require protection, even from (possibly dirty) reads.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mutex lock – a few remaining points
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, we will cover a few additional points regarding mutexes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mutex lock API variants
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: First, let's take a look at a few variants of the mutex lock API; besides the
+    interruptible variant (described in the *Mutex lock – via [un]interruptible sleep?* section),
+    we have the *trylock, killable*, and *io* variants.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mutex trylock variant
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'What if you would like to implement a **busy-wait** semantic; that is, test
+    for the availability of the (mutex) lock and, if available (meaning it''s currently
+    unlocked), acquire/lock it and continue with the critical section code path? If
+    this is not available (it''s currently in the locked state), do not wait for the
+    lock; instead, perform some other work and retry. In effect, this is a non-blocking
+    mutex lock variant and is called the trylock; the following flowchart shows how
+    it works:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/421daaad-97a1-4acc-8cfc-e4d33751eb84.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.8 – The "busy wait" semantic, a non-blocking trylock operation
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The API for this trylock variant of the mutex lock is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This API''s return value signifies what transpired at runtime:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A return value of `1` indicates that the lock has been successfully acquired.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A return value of `0` indicates that the lock is currently contended (locked).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Though it might sound tempting to, do *not* attempt to use the `mutex_trylock()`
+    API to figure out if a mutex lock is in a locked or unlocked state; this is inherently
+    "racy". Next, note that using this trylock variant in a highly contended lock
+    path may well reduce your chances of acquiring the lock. The trylock variant has
+    been traditionally used in deadlock prevention code that might need to back out
+    of a certain lock order sequence and be retried via another sequence (ordering).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, with respect to the trylock variant, even though the literature uses the
+    term *try and acquire the mutex atomically*, it does not work in an atomic or
+    interrupt context – it *only* works in the process context (as with any type of
+    mutex lock). As usual, the lock must be released by `mutex_unlock()` being invoked
+    by the owner context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I suggest that you try working on the trylock mutex variant as an exercise.
+    See the *Questions *section at the end of this chapter for an assignment!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mutex interruptible and killable variants
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'As you have already learned, the `mutex_lock_interruptible()` API is used when
+    the driver (or module) is willing to acknowledge any (user space) signal interrupting
+    it (and returns `-ERESTARTSYS` to tell the kernel VFS layer to perform signal
+    handling; the user space system call will fail with `errno` set to `EINTR`). An
+    example can be found in the module handling code in the kernel, within the `delete_module(2)`
+    system call (which `rmmod(8)` invokes):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice how the API returns `-EINTR` on failure. (The `SYSCALL_DEFINEn()` macro
+    becomes a system call signature; `n` signifies the number of parameters this particular
+    system call accepts. Also, notice the capability check – unless you are running
+    as root or have the `CAP_SYS_MODULE` capability (or module loading is completely
+    disabled), the system call just returns a failure (`-EPERM`).)
+  prefs: []
+  type: TYPE_NORMAL
+- en: If, however, your driver is only willing to be interrupted by fatal signals
+    (those that *will kill* the user space context), then use the `mutex_lock_killable()`
+    API (the signature is identical to that of the interruptible variant).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mutex io variant
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: The `mutex_lock_io()` API is identical in syntax to the `mutex_lock()` API;
+    the only difference is that the kernel thinks that the wait time of the loser
+    thread(s) is the same as waiting for I/O (the code comment in `kernel/locking/mutex.c:mutex_lock_io()`
+    clearly documents this; take a look). This can matter accounting-wise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find fairly exotic APIs such as `mutex_lock[_interruptible]_nested()`
+    within the kernel, with the emphasis here being on the `nested` suffix. However,
+    note that the Linux kernel does not prefer developers to use nested (or recursive)
+    locking (as we mentioned in the *Correctly using the mutex lock* section). Also, these
+    APIs only get compiled in the presence of the `CONFIG_DEBUG_LOCK_ALLOC` config
+    option; in effect, the nested APIs were added to support the kernel lock validator
+    mechanism. They should only be used in special circumstances (where a nesting
+    level must be incorporated between instances of the same lock type).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the next section, we will answer a typical FAQ: what''s the difference between
+    the mutex and semaphore objects? Does Linux even have a semaphore object? Read
+    on to find out!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The semaphore and the mutex
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The Linux kernel does provide a semaphore object, along with the usual operations
+    you can perform on a (binary) semaphore:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A semaphore lock acquire via the `down[_interruptible]()` (and variations) APIs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A semaphore unlock via the `up()` API.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In general, the semaphore is an older implementation, so it's advised that you
+    use the mutex lock in place of it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An FAQ worth looking at, though, is this: *what is the difference between a
+    mutex and a semaphore?* They appear to be conceptually similar, but are actually
+    quite different:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A semaphore is a more generalized form of a mutex; a mutex lock can be acquired
+    (and subsequently released or unlocked) exactly once, while a semaphore can be
+    acquired (and subsequently released) multiple times.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A mutex is used to protect a critical section from simultaneous access, while
+    a semaphore should be used as a mechanism to signal another waiting task that
+    a certain milestone has been reached (typically, a producer task posts a signal
+    via the semaphore object, which a consumer task is waiting to receive, in order
+    to continue with further work).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A mutex has the notion of ownership of the lock and only the owner context can perform
+    the unlock; there is no ownership for a binary semaphore.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Priority inversion and the RT-mutex
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: A word of caution when using any kind of locking is that you should carefully
+    design and code to prevent the dreaded *deadlock* scenarios that could arise (more
+    on this in the next chapter in the *The lock validator lockdep – catch locking
+    issues early* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Aside from deadlocks, there is another risky scenario that arises when using
+    the mutex: that of priority inversion (again, we will not delve into the details
+    in this book). Suffice it to say that the unbounded **priority inversion** case
+    can be a deadly one; the end result is that the product''s high(est) priority
+    thread is kept off the CPU for too long.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As I covered in some detail in my earlier book, *Hands-on System Programming
+    with Linux, *it's precisely this priority inversion issue that struck NASA's Mars
+    Pathfinder robot, on the Martian surface no less, back in July 1997! See the *Further
+    reading* section of this chapter for interesting resources about this, something
+    that every software developer should be aware of!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The userspace Pthreads mutex implementation certainly has **priority inheritance**
+    (**PI**) semantics available. But what about within the Linux kernel? For this,
+    Ingo Molnar provided the PI-futex-based RT-mutex (a real-time mutex; in effect,
+    a mutex extended to have PI capabilities. `futex(2)` is a sophisticated system
+    call that provides a fast userspace mutex). These become available when the `CONFIG_RT_MUTEXES` config
+    option is enabled. Quite similar to the "regular" mutex semantics, RT-mutex APIs
+    are provided to initialize, (un)lock, and destroy the RT-mutex object. (This code
+    has been merged into the mainline kernel from Ingo Molnar's `-rt` tree). As far
+    as actual usage is concerned, the RT-mutex is used for internally implementing
+    the PI futex (the `futex(2)` system call itself internally implements the userspace
+    Pthreads mutex). Besides this, the kernel locking self-test code and the I2C subsystem
+    uses the RT-mutex directly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, for a typical module (or driver) author, these APIs are not going to be
+    used very frequently. The kernel does provide some documentation on the internal
+    design of the RT-mutex at [https://www.kernel.org/doc/Documentation/locking/rt-mutex-design.rst](https://www.kernel.org/doc/Documentation/locking/rt-mutex-design.rst) (covering
+    priority inversion, priority inheritance, and more).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Internal design
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A word on the reality of the internal implementation of the mutex lock deep
+    within the kernel fabric: Linux tries to implement a *fast path* approach when
+    possible.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **fast path** is the most optimized high-performance type of code path; for example,
+    one with no locks and no blocking. The intent is to have code follow this fast
+    path as far as possible. Only when it really isn't possible does the kernel fall
+    back to a (possible) "mid path", and then a "slow path", approach; it still works
+    but is slow(er).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This fast path is taken in the absence of contention for the lock (that is,
+    the lock is in an unlocked state to begin with). So, the lock is locked with no
+    fuss, pretty much immediately. If, however, the mutex is already locked, then
+    the kernel typically uses a mid path optimistic spinning implementation, making
+    it more of a hybrid (mutex/spinlock) lock type. If even this isn't possible, the
+    "slow path" is followed – the process context attempting to get the lock may well
+    enter the sleep state. If you're interested in its internal implementation, more
+    details can be found within the official kernel documentation: [https://www.kernel.org/doc/Documentation/locking/mutex-design.rst](https://www.kernel.org/doc/Documentation/locking/mutex-design.rst).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*LDV (Linux Driver Verification) project:* in the companion guide *Linux Kernel
+    Programming -* *Chapter 1*, *Kernel Workspace Setup*, in the section *The LDV
+    – Linux Driver Verification – project*, we mentioned that this project has useful
+    "rules" with respect to various programming aspects of Linux modules (drivers,
+    mostly) as well as the core kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With regard to our current topic, here''s one of the rules: *Locking a mutex
+    twice or unlocking without prior locking* ([http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0032](http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0032)).
+    It mentions the kind of things you cannot do with the mutex lock (we have already
+    covered this in the *Correctly using the mutex lock* section). The interesting
+    thing here: you can see an actual example of a bug – a mutex lock double-acquire
+    attempt, leading to (self) deadlock – in a kernel driver (as well as the subsequent
+    fix).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you've understood how to use the mutex lock, let's move on and look
+    at the other very common lock within the kernel – the spinlock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the spinlock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the *Mutex or spinlock? Which to use when* section, you learned when to
+    use the spinlock instead of the mutex lock and vice versa. For convenience, we
+    have reproduced the key statements we provided previously here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Is the critical section running in an atomic (interrupt) context or in a
+    process context where it cannot sleep?** Use the spinlock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Is the critical section running in a process context and sleep in the critical section
+    is necessary?** Use the mutex lock.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In this section, we shall consider that you've now decided to use the spinlock.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Spinlock – simple usage
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: For all the spinlock APIs, you must include the relevant header file; that is, `include
+    <linux/spinlock.h>`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Similar to the mutex lock, you *must* declare and initialize the spinlock to
+    the unlocked state before use. The spinlock is an "object" that''s declared via
+    the `typedef` data type named `spinlock_t` (internally, it''s a structure defined
+    in `include/linux/spinlock_types.h`). It can be initialized dynamically via the
+    `spin_lock_init()` macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Alternatively, this can be performed statically (declared and initialized) with `DEFINE_SPINLOCK(lock);`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As with the mutex, declaring a spinlock within the (global/static) data structure
+    is meant to protect against concurrent access, and is typically a very good idea.
+    As we mentioned earlier, this very idea is made use of within the kernel often;
+    as an example, the data structure representing an open file on the Linux kernel
+    is called `struct file`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Check it out: for the `file` structure, the spinlock variable named `f_lock` is
+    the spinlock that protects the `f_ep_links` and `f_flags` members of the `file`
+    data structure (it also has a mutex lock to protect another member; that is, the
+    file''s current seek position – `f_pos`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How do you actually lock and unlock the spinlock? There are quite a few variations
+    on the API that are exposed by the kernel to us module/driver authors; the simplest
+    form of the spin(un)lock APIs are as folows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that there is no spinlock equivalent of the `mutex_destroy()` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's see the spinlock APIs in action!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Spinlock – an example driver
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Similar to what we did with our mutex locking sample driver (the *Mutex locking
+    – an example driver* section), to illustrate the simple usage of a spinlock, we
+    shall make a copy of our earlier `ch12/1_miscdrv_rdwr_mutexlock` driver as a starting template
+    and then place it in a new kernel driver; that is, `ch12/2_miscdrv_rdwr_spinlock`.
+    Again, here, we''ll only show small parts of the diff (the differences, the delta
+    generated by `diff(1)`) between that program and this one (we won''t show every
+    line of the diff, only the relevant portions):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: This time, to protect the members of our `drv_ctx` global data structure, we
+    have both the original mutex lock and a new spinlock. This is quite common; the
+    mutex lock protects member usage in a critical section where blocking can occur,
+    while the spinlock is used to protect members in critical sections where blocking
+    (sleeping – recall that it might sleep) cannot occur.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Of course, we must ensure that we initialize all the locks so that they''re
+    in the unlocked state. We can do this in the driver''s `init` code (continuing
+    with the patch output):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the driver''s `open` method, we replace the mutex lock with the spinlock
+    to protect the increments and decrements of the global integers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, within the driver''s `read` method, we use the spinlock instead of the
+    mutex to protect some critical sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'However, that''s not all! Continuing with the driver''s `read` method, carefully
+    take a look at the following code and comment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: When protecting data where the critical section has possibly blocking APIs – such
+    as in `copy_to_user()` – we *must* only use a mutex lock! (Due to lack of space,
+    we haven't displayed more of the code diff here; we expect you to read through the
+    spinlock sample driver code and try it out for yourself.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Test – sleep in an atomic context
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You have already learned that the one thing we should *not do is sleep (block)
+    in any kind of atomic or interrupt context*. Let's put this to the test. As always,
+    the empirical approach – where you test things for yourself rather than relying
+    on other's experiences – is key!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How exactly can we test this? Easy: we shall use a simple integer module parameter, `buggy`, that,
+    when set to `1` (the default value being `0`), executes a code path within our
+    spinlock''s critical section that violates this rule. We shall invoke the `schedule_timeout()`
+    API (which, as you learned in [Chapter 5](c7d2d826-9d8a-439f-b843-06fa72db36b9.xhtml), *Working
+    with Kernel Timers, Threads, and Workqueues*, in the *Understanding how to use
+    the *sleep() blocking APIs* section) internally invokes `schedule()`; it''s how
+    we go to sleep in the kernel space). Here''s the relevant code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, for the interesting part: let''s test this (buggy) code path in two kernels:
+    first, in our custom 5.4 "debug" kernel (the kernel where we have enabled several
+    kernel debug configuration options (mostly from the `Kernel Hacking` menu in `make
+    menuconfig`), as explained in the companion guide *Linux Kernel Programming -* *Chapter
+    5*, *Writing Your First Kernel Module – LKMs Part 2*), and second, on a generic
+    distro (we usually run on Ubuntu) 5.4 kernel without any relevant kernel debug
+    options enabled.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing on a 5.4 debug kernel
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'First of all, ensure you''ve built the custom 5.4 kernel and that all the required
+    kernel debug config options enabled (again, look back to the companion guide *Linux
+    Kernel Programming -* *Chapter 5*, *Writing Your First Kernel Module – LKMs Part
+    2*, the *Configuring a debug kernel* section if you need to). Then, boot off your
+    debug kernel (here, it''s named `5.4.0-llkd-dbg`). Now, build the driver (in `ch12/2_miscdrv_rdwr_spinlock/`)
+    against this debug kernel (the usual `make` within the driver''s directory should
+    do this; you might find that, on the debug kernel, the build is noticeably slower!):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, we're running our custom 5.4.0 "debug" kernel on our x86_64
+    Ubuntu 20.04 guest VM.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How do you know whether you're running on a **virtual machine** (**VM**) or
+    on the "bare metal" (native) system? `virt-what(1)` is a useful little script
+    that shows this (you can install it on Ubuntu with `sudo apt install virt-what`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To run our test case, insert the driver into the kernel and set the `buggy` module
+    parameter to `1`. Invoking the driver''s `read` method (via our user space app;
+    that is, `ch12/miscdrv_rdwr/rdwr_test_secret`) isn''t an issue, as shown here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we issue a `write(2)` to the driver via the user mode app; this time,
+    our buggy code path gets executed. As you saw, we issued a `schedule_timeout()`
+    within a spinlock critical section (that is, between the lock and unlock). The
+    debug kernel detects this as a bug and spawns (impressively large) debug diagnostics
+    into the kernel log (note that bugs like this can quite possibly hang your system,
+    so test this on a VM first):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/3c6f7129-6f1c-4a04-9f5c-df29e28b0420.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.9 – Kernel diagnostics being triggered by the "scheduling in atomic
+    context" bug we've deliberately hit here
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The preceding screenshot shows part of what transpired (follow along while
+    viewing the driver code in `ch12/2_miscdrv_rdwr_spinlock/2_miscdrv_rdwr_spinlock.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we have our user mode app''s process context (`rdwr_test_secre`; notice
+    how the name is truncated to the first 16 characters, including the `NULL` byte),
+    which enters the driver''s write method; that is, `write_miscdrv_rdwr()`. This
+    can be seen in the output of our useful `PRINT_CTX()` macro (we''ve reproduced
+    this line here):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: It copies in the new 'secret' from the user space writer process and writes
+    it, for 24 bytes.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: It then "takes" the spinlock, enters the critical section, and copies this data
+    to the `oursecret` member of our driver's context structure.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: After this, `if (1 == buggy) {` evaluates to true.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Then, it calls `schedule_timeout()`, which is a blocking API (as it internally
+    calls `schedule()`), triggering the bug, which is helpfully highlighted in red:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: The kernel now dumps a good deal of the diagnostic output. Among the first things
+    to be dumped is the **call stack**.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The call stack or stack backtrace (or "call trace") of the kernel mode stack
+    of the process – here, it's our user space app, `rdwr_drv_secret`, which is running
+    our (buggy) driver's code in the process context – can be clearly seen in *Figure
+    6.9*. Each line after the `Call Trace:` header is essentially a call frame on
+    the kernel stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a tip, ignore the stack frames that begin with the `?` symbol; they are
+    literally questionable call frames, in all likelihood "leftovers" from previous
+    stack usage in the same memory region. It''s worth taking a small memory-related
+    diversion here: this is how stack allocation really works; stack memory isn''t
+    allocated and freed on a per-call frame basis as that would be frightfully expensive.
+    Only when a stack memory page is exhausted is a new one automatically *faulted
+    in*! (Recall our discussions in the companion guide *Linux Kernel Programming
+    -* *Chapter 9*, *Kernel Memory Allocation for Module Authors – Part 2*, in the *A
+    brief note on memory allocations and demand paging* section.) So, the reality
+    is that, as code calls and returns from functions, the same stack memory page(s)
+    tend to keep getting reused.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Not only that, but for performance reasons, the memory isn't wiped each time,
+    leading to leftovers from previous frames often appearing. (They can literally
+    "spoil" the picture. However, fortunately, the modern stack call frame tracing
+    algorithms are usually able to do a superb job in figuring out the correct stack
+    trace.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Following the stack trace bottom-up (*always read it bottom-up*), we can see
+    that, as expected, our user space `write(2)` system call (it often shows up as
+    (something like) `SyS_write` or, on the x86, as `__x64_sys_write`, though not
+    visible in *Figure 6.9*) invokes the kernel''s VFS layer code (you can see `vfs_write()` here,
+    which calls `__vfs_write()`), which further invokes our driver''s write method;
+    that is, `write_miscdrv_rdwr()`! This code, as we well know, invokes the buggy
+    code path where we call `schedule_timeout()`, which, in turn, invokes `schedule()`
+    (and `__schedule()`), causing the whole **`BUG: scheduling while atomic`** bug
+    to trigger.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The format of the `scheduling while atomic` code path is retrieved from the
+    following line of code, which can be found in `kernel/sched/core.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Interesting! Here, you can see that it printed the following string:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: After `atomic:`, it prints the process name – the PID – and then invokes the
+    `preempt_count()` inline function, which prints the *preempt depth*; the preempt
+    depth is a counter that's incremented every time a lock is taken and decremented
+    on every unlock. So, if it's positive, this implies that the code is within a
+    critical or atomic section; here, it shows as the value `2`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that this bug gets neatly served up during this test run precisely because the `CONFIG_DEBUG_ATOMIC_SLEEP` debug
+    kernel config option is turned on. It''s on because we''re running a custom "debug
+    kernel" (kernel version 5.4.0)! The config option details (you can interactively
+    find and set this option in `make menuconfig`, under the `Kernel Hacking` menu) are
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: Testing on a 5.4 non-debug distro kernel
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As a contrasting test, we will now perform the very same thing on our Ubuntu
+    20.04 LTS VM, which we'll boot via its default generic 'distro' 5.4 Linux kernel
+    that is typically *not configured as a 'debug' kernel* (here, the `CONFIG_DEBUG_ATOMIC_SLEEP`
+    kernel config option hasn't been set).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we insert our (buggy) driver. Then, when we run our `rdwr_drv_secret`
+    process in order to write the new secret to the driver, the buggy code path gets
+    executed. However, this time, the kernel *does not crash, nor does it report any
+    issues at all* (looking at the `dmesg(1)` output validates this):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: We know that our write method has a deadly bug, yet it doesn't seem to fail
+    in any manner! This is really bad; it's this kind of thing that can erroneously
+    lead you to conclude that your code is just fine when there's actually a nasty
+    bug silently lying in wait to pounce one fine day!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help us investigate what exactly is going on under the hood, let''s run
+    our test app (the `rdwr_drv_secret` process) once more, but this time via the
+    powerful `trace-cmd(1)` tool (a very useful wrapper over the Ftrace kernel infrastructure;
+    the following is its truncated output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Linux kernel''s **Ftrace** infrastructure is the kernel''s primary tracing infrastructure;
+    it provides a detailed trace of pretty much every function that''s been executed
+    in the kernel space. Here, we are leveraging Ftrace via a convenient frontend:
+    the `trace-cmd(1)` utility. These are indeed very powerful and useful debug tools;
+    we''ve mentioned several others in the companion guide *Linux Kernel Programming
+    -* *Chapter 1*, *Kernel Workspace Setup*, but unfortunately, the details are beyond
+    the scope of this book. Check out the man pages to learn more.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The output can be seen in the following screenshot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/63b163f7-5ce7-45f1-907e-b10a06909ef3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.10 – A partial screenshot of the trace-cmd(1) report output
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you can see, the `write(2)` system call from our user mode app becomes, as
+    expected, `vfs_write()`, which itself (after security checks) invokes `__vfs_write()`,
+    which, in turn, invokes our driver's write method – the `write_miscdrv_rdwr()`
+    function!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the (large) Ftrace output stream, we can see that the `schedule_timeout()` function
+    has indeed been invoked:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/1cd0401a-b6a2-43e1-998d-10994995cdd6.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.11 – A partial screenshot of the trace-cmd(1) report output, showing
+    the (buggy!) calls to schedule_timeout() and schedule() within an atomic context
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few lines of output after `schedule_timeout()`, we can clearly see `schedule()` being
+    invoked! So, there we have it: our driver has (deliberately, of course) performed
+    something buggy – calling `schedule()` in an atomic context. But again, the key
+    point here is that on this Ubuntu system, we are *not* running a "debug" kernel,
+    which is why we have the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: This is why the bug isn't being reported! This proves the usefulness of running
+    test cases – and indeed performing kernel development – on a "debug" kernel, a
+    kernel with many debug features enabled. (As an exercise, if you haven't done
+    so already, prepare a "debug" kernel and run this test case on it.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Linux Driver Verification (LDV) project**: In the companion guide *Linux
+    Kernel Programming -* *Chapter 1*, *Kernel Workspace Setup*, in the section *The
+    LDV – Linux Driver Verification – project*, we mentioned that this project has
+    useful "rules" with respect to various programming aspects of Linux modules (drivers,
+    mostly) as well as the core kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With regard to our current topic, here''s one of the rules: *Usage of spin
+    lock and unlock functions* ([http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0039](http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0039)).
+    It mentions key points with regard to the correct usage of spinlocks; interestingly,
+    here, it shows an actual bug instance in a driver where a spinlock was attempted
+    to be released twice – a clear violation of the locking rules, leading to an unstable
+    system.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Locking and interrupts
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far, we have learned how to use the mutex lock and, for the spinlock, the
+    basic `spin_[un]lock()` APIs. A few other API variations on the spinlock exist,
+    and we shall examine the more common ones here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To understand exactly why you may need other APIs for spinlocks, let''s go
+    over a scenario: as a driver author, you find that the device you''re working
+    on asserts a hardware interrupt; accordingly, you write the interrupt handler
+    for it. Now, while implementing a `read` method for your driver, you find that
+    you have a non-blocking critical section within it. This is easy to deal with:
+    as you have learned, you should use a spinlock to protect it. Great! But what
+    if, while in the `read` method''s critical section, the device''s hardware interrupt
+    fires? As you''re aware, *hardware interrupts preempt anything and everything*;
+    thus, control will go to the interrupt handler code preempting the driver''s `read`
+    method.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The key question here: is this an issue? That answer depends both on what your
+    interrupt handler and your `read` method were doing and how they were implemented.
+    Let''s visualize a few scenarios:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The interrupt handler (ideally) uses only local variables, so even if the `read` method
+    were in a critical section, it really doesn't matter; the interrupt handling will
+    complete very quickly and control will be handed back to whatever was interrupted
+    (again, there's more to it than this; as you know, any existing bottom-half, such
+    as a tasklet or softirq, may also need to execute). In other words, as such, there
+    is really no race in this case.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The interrupt handler is working on (global) shared writeable data but *not* on
+    the data items that your read method is using. Thus, again, there is no conflict and
+    no race with the read code. What you should realize, of course, is that the interrupt
+    code *does have a critical section and that it must be protected* (perhaps with
+    another spinlock).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The interrupt handler is working on the same global shared writeable data that your
+    `read` method is using. In this case, we can see that the potential for a race
+    definitely exists, so we need locking!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's focus on the third case. Obviously, we should use a spinlock to protect
+    the critical section within the interrupt handling code (recall that using a mutex
+    is disallowed when we're in any kind of interrupt context). Also, *unless we use
+    the very same spinlock* in both the `read` method and the interrupt handler's
+    code path, they will not be protected at all! (Be careful when working with locks;
+    take the time to think through your design and code in detail.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s try and make this a bit more hands-on (with pseudocode for now): let''s
+    say we have a global (shared) data structure named `gCtx`; we''re operating on
+    it in both the `read` method as well as the interrupt handler (hardirq handler)
+    within our driver. Since it''s shared, it''s a critical section and therefore
+    requires protection; since we are running in an atomic (interrupt) context, we
+    *can''t use a mutex*, so we must use a spinlock instead (here, the spinlock variable
+    is called `slock`). The following pseudocode shows some timestamps (`t1, t2, ...`)
+    for this situation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following pseudocode is for the device driver''s interrupt handler:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This can be summed up with the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/3d9d5f60-bb83-44a5-a694-2a05f28df4f8.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.12 – Timeline – the driver's read method and hardirq handler run sequentially
+    when working on global data; there's no issues here
+  prefs: []
+  type: TYPE_NORMAL
+- en: Luckily, everything has gone well – "luckily" because the hardware interrupt
+    fired *after *the `read` function's critical section completed. Surely we can't
+    count on luck as the exclusive safety stamp of our product! The hardware interrupt
+    is asynchronous; what if it fired at a less opportune time (for us) – say, while
+    the `read` method's critical section is running between time t1 and t2? Well,
+    isn't the spinlock going to do its job and protect our data?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, the interrupt handler''s code will attempt to acquire the same
+    spinlock (`&slock`). Wait a minute – it cannot "get" it as it''s currently locked!
+    In this situation, it "spins", in effect waiting on the unlock. But how can it
+    be unlocked? It cannot, and there we have it: a **(self) deadlock**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Interestingly, the spinlock is more intuitive and makes sense on an SMP (multicore)
+    system. Let''s assume that the `read` method is running on CPU core 1; the interrupt
+    can be delivered on another CPU core, say core 2\. The interrupt code path will
+    "spin" on the lock on CPU core 2, while the `read` method, on core 1, completes
+    the critical section and then unlocks the spinlock, thus unblocking the interrupt
+    handler. But what about on **UP** (**uniprocessor**, with only one CPU core)?
+    How will it work then? Ah, so here''s the solution to this conundrum: when "racing"
+    with interrupts, *regardless of uniprocessor or SMP, simply use the* `_irq` *variant*
+    *of the spinlock API*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `spin_lock_irq()` API internally disables interrupts on the processor core that
+    it's running on; that is, the local core. So, by using this API in our `read`
+    method, interrupts will be disabled on the local core, thus making any possible
+    "race" impossible via interrupts. (If the interrupt does fire on another CPU core,
+    the spinlock technology will simply work as advertised, as discussed previously!)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `spin_lock_irq()` implementation is pretty nested (as with most of the spinlock
+    functionality), yet fast; down the line, it ends up invoking the `local_irq_disable()`
+    and `preempt_disable()` macros, disabling both interrupts and kernel preemption
+    on the local processor core that it's running on. (Disabling hardware interrupts
+    has the (desirable) side effect of disabling kernel preemption as well.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`spin_lock_irq()` pairs off with the corresponding `spin_unlock_irq()` API.
+    So, the correct usage of the spinlock for this scenario (as opposed to what we
+    saw previously) is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Before patting ourselves solidly on the back and taking the rest of the day
+    off, let''s consider another scenario. This time, on a more complex product (or
+    project), it''s quite possible that, among the several developers working on the
+    code base, one has deliberately set the interrupt mask to a certain value, thus blocking
+    some interrupts while allowing others. For the sake of our example, let''s say
+    that this has occurred earlier, at some point in time `t0`. Now, as we described
+    previously, another developer (you!) comes along, and in order to protect a critical
+    section within the driver''s read method, uses the `spin_lock_irq()` API. Sounds
+    correct, yes? Yes, but this API has the power *to turn off (mask) all hardware
+    interrupts* (and kernel preemption, which we''ll ignore for now) on the local
+    CPU core. It does so by manipulating, at a low level, the (very arch-specific)
+    hardware interrupt mask register. Let''s say that setting a bit corresponding
+    to an interrupt to `1` enables that interrupt, while clearing the bit (to `0`)
+    disables or masks it. Due to this, we may end up with the following scenario:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'time `t0`: The interrupt mask is set to some value, say, `0x8e (10001110b)`,
+    enabling some and disabling some interrupts. This is important to the project
+    (here, for simplicity, we''re assuming there''s an 8-bit mask register)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*[... time elapses ... ].*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'time `t1`: Just before entering the driver `read` method''s critical section,
+    call'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`spin_lock_irq(&slock);`. This API will have the internal effect of clearing
+    all the bits in the interrupt mask registered to `0`, thus disabling all interrupts
+    (as we *think* we desire).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: time `t2`: Now, hardware interrupts cannot fire on this CPU core, so we go ahead
+    and complete the critical section. Once we're done, we call `spin_unlock_irq(&slock);`.
+    This API will have the internal effect of setting all the bits in the interrupt
+    mask register to `1`, reenabling all interrupts.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: However, the interrupt mask register has now been wrongly "restored" to a value
+    of `0xff (11111111b)`, *not the value* `0x8e` as the original developer wants,
+    requires, and assumes! This can (and probably will) break something in the project.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The solution is quite straightforward: don''t assume anything, **simply save
+    and restore the interrupt mask**. This can be achieved with the following API
+    pair:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The first parameter to both the lock and unlock functions is the spinlock variable
+    to use. The second parameter, `flags`, *must be a local variable* of the `unsigned
+    long` type. This will be used to save and restore the interrupt mask:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: To be pedantic, `spin_lock_irqsave()` is not an API, but a macro; we've shown
+    it as an API for readability. Also, although the return value of this macro is
+    not void, it's an internal detail (the `flags` parameter variable is updated here).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What about if a tasklet or a softirq (a bottom-half interrupt mechanism) has
+    a critical section that "races" with your process-context code paths? In such
+    situations, using the `spin_lock_bh()` routine is likely what''s required since
+    it can disable bottom halves on the local processor and then take the spinlock,
+    thus safeguarding the critical section (similar to the way that `spin_lock_irq[save]()`
+    protects the critical section in the process context by disabling hardware interrupts
+    on the local core):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Of course, *overhead* does matter in highly performance-sensitive code paths
+    (the network stack being a great example). Thus, using the simplest form of spinlocks
+    will help with more complex variants. Having said that, though, there are certainly
+    going to be occasions that demand the use of the stronger forms of the spinlock
+    API. For example, on the 5.4.0 Linux kernel, this is an approximation of the number
+    of usage instances of different forms of the spinlock APIs we have seen: `spin_lock()`:
+    over 9,400 usage instances; `spin_lock_irq()`: over 3,600 usage instances; `spin_lock_irqsave()`:
+    over 15,000 usage instances; and `spin_lock_bh()`: over 3,700 usage instances.
+    (We don''t draw any major inference from this; it''s just that we wish to point
+    out that using the stronger form of spinlock APIs is quite widespread in the Linux
+    kernel).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, let''s provide a very brief note on the internal implementation of
+    the spinlock: in terms of under-the-hood internals, the implementation tends to
+    be very arch-specific code, often comprised of atomic machine language instructions
+    that execute very fast on the microprocessor. On the popular x86[_64] architecture,
+    for example, the spinlock ultimately boils down to an *atomic test-and-set* machine
+    instruction on a member of the spinlock structure (typically implemented via the
+    `cmpxchg` machine language instruction). On ARM machines, as we mentioned earlier,
+    it''s often the `wfe` (Wait For Event, as well as the **SetEvent** (**SEV**))
+    machine instruction at the heart of the implementation. (You will find resources
+    regarding its internal implementation in the *Further reading *section). Regardless,
+    as a kernel or driver author, you should only use the exposed APIs (and macros)
+    when using spinlocks.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using spinlocks – a quick summary
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let''s quickly summarize spinlocks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Simplest, lowest overhead**: Use the non-irq spinlock primitives, `spin_lock()`/`spin_unlock()`,
+    when protecting critical sections in the process context (there''s either no interrupts
+    to deal with or there are interrupts, but we do not race with them at all; in
+    effect, use this when interrupts don''t come into play or don''t matter).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Medium overhead**: Use the irq-disabling (as well as kernel preemption disabling) versions,
+    `spin_lock_irq() / spin_unlock_irq()`, when interrupts are in play and do matter
+    (the process and interrupt contexts can "race"; that is, they share global data).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Strongest (relatively), high overhead**: This is the safest way to use a
+    spinlock. It does the same as the medium overhead, except it performs a save-and-restore
+    on the interrupt mask via the `spin_lock_irqsave()` / `spin_unlock_irqrestore()` pair,
+    so as to guarantee that the previous interrupt mask settings aren''t inadvertently
+    overwritten, which could happen with the previous case.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As we saw earlier, the spinlock – in the sense of "spinning" on the processor
+    it's running on when awaiting the lock – is impossible on UP (how can you spin
+    on the one CPU that's available while another thread runs simultaneously on the
+    very same CPU?). Indeed, on UP systems, the only real effect of the spinlock APIs
+    is that it can disable hardware interrupts and kernel preemption on the processor!
+    On SMP (multicore) systems, however, the spinning logic actually comes into play,
+    and thus the locking semantics work as expected. But hang on – this should not
+    stress you, budding kernel/driver developer; in fact, the whole point is that
+    you should simply use the spinlock APIs as described and you will never have to
+    worry about UP versus SMP; the details of what is done and what isn't are all
+    hidden by the internal implementation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though this book is based on the 5.4 LTS kernel, a new feature was added to
+    the 5.8 kernel from the **Real-Time Linux** (**RTL**, previously called PREEMPT_RT)
+    project, which deserves a quick mention here: "**local locks**". While the main
+    use case for local locks is for (hard) real-time kernels, they help with non-real-time
+    kernels too, mainly for lock debugging via static analysis, as well as runtime
+    debugging via lockdep (we cover lockdep in the next chapter). Here''s the LWN
+    article on the subject: [https://lwn.net/Articles/828477/](https://lwn.net/Articles/828477/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this, we complete the section on spinlocks, an extremely common and key
+    lock used in the Linux kernel by virtually all its subsystems, including drivers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Congratulations on completing this chapter!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding concurrency and its related concerns is absolutely critical for
+    any software professional. In this chapter, you learned key concepts regarding
+    critical sections, the need for exclusive execution within them, and what atomicity
+    means. You then learned *why *we need to be concerned with concurrency while writing
+    code for the Linux OS. After that, we delved into the actual locking technologies –
+    mutex locks and spinlocks – in detail. You also learned what lock you should use
+    and when. Finally, learning how to handle concurrency concerns when hardware interrupts
+    (and their possible bottom halves) are in play was covered.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But we aren't done yet! There are many more concepts and technologies we need
+    to learn about, which is just what we will do in the next, and final, chapter
+    of this book. I suggest that you digest the content of this chapter well first
+    by browsing through it, as well as the resources in the *Further reading *section
+    and the exercises provided, before diving into the last chapter!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

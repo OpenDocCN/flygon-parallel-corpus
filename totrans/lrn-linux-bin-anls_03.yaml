@@ -1,0 +1,838 @@
+- en: Chapter 3. Linux Process Tracing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the last chapter, we covered the internals of the `ELF` format and explained
+    its internal workings. In Linux and other Unix-flavored OSes that use `ELF`, the
+    `ptrace` system call goes hand in glove with analyzing, debugging, reverse engineering,
+    and modifying programs that use the `ELF` format. The `ptrace` system call is
+    used to attach to a process and access the entire range of code, data, stack,
+    heap, and registers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since an `ELF` program is completely mapped in a process address space, you
+    can attach to the process and parse or modify the `ELF` image very similarly to
+    how you would do this with the actual `ELF` file on disk. The primary difference
+    is that we use `ptrace` to access the program instead of using the `open/mmap/read/write`
+    calls that would be used for the `ELF` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With `ptrace`, we can have full control over a program's execution flow, which
+    means that we can do some very interesting things, ranging from memory virus infection
+    and virus analysis/detection to userland memory rootkits, advanced debugging tasks,
+    hotpatching, and reverse engineering. Since we have entire chapters in this book
+    dedicated to some of these tasks, we will not cover each of these in depth just
+    yet. Instead, I will provide a primer for you to learn about some of the basic
+    functionality of `ptrace` and how it is used by hackers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The importance of ptrace
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In Linux, the `ptrace(2)` system call is the userland means of accessing a process
+    address space. This means that someone can attach to a process that they own and
+    modify, analyze, reverse, and debug it. Well-known debugging and analysis applications
+    such as `gdb`, `strace`, and `ltrace` are `ptrace` assisted applications. The
+    `ptrace` command is very useful for both reverse engineers and malware authors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It gives a programmer the ability to attach to a process and modify the memory,
+    which can include injecting code and modifying important data structures such
+    as the **Global Offset Table** (**GOT**) for shared library redirection. In this
+    section, we will cover the most commonly used features of `ptrace`, demonstrate
+    memory infection from the attacker's side, and process analysis by writing a program
+    to reconstruct a process image back into an executable. If you have never used
+    `ptrace`, then you will see that you have been missing out on a lot of fun!
+  prefs: []
+  type: TYPE_NORMAL
+- en: ptrace requests
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `ptrace` system call has a `libc` wrapper like any other system call, so
+    you may include `ptrace.h` and simply call `ptrace` while passing it a request
+    and a process ID. The following details are not a replacement for the main pages
+    of `ptrace(2)`, although some descriptions were borrowed from the main pages.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s the synopsis:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: ptrace request types
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Here is a list of requests that are most commonly used when using `ptrace`
+    to interact with a process image:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Request | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_ATTACH` | Attach to the process specified in `pid`, making it a tracee
+    of the calling process. The tracee is sent a `SIGSTOP` signal, but will not necessarily
+    have stopped by the completion of this call. Use `waitpid(2)` to wait for the
+    tracee to stop. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_TRACEME` | Indicates that this process is to be traced by its parent.
+    A process probably shouldn''t make this request if its parent isn''t expecting
+    to trace it. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_PEEKTEXT PTRACE_PEEKDATA PTRACE_PEEKUSER` | These requests allow
+    the tracing process to read from a virtual memory address within the traced process
+    image; for instance, we can read the entire text or data segment into a buffer
+    for analysis.Note that there is no difference in implementation between the `PEEKTEXT`,
+    `PEEKDATA`, and `PEEKUSER` requests. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_POKTEXT PTRACE_POKEDATA PTRACE_POKEUSER` | These requests allow the
+    tracing process to modify any location within the traced process image. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_GETREGS` | This request allows the tracing process to get a copy
+    of the traced process''s registers. Each thread context has its own register set,
+    of course. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_SETREGS` | This request allows the tracing process to set new register
+    values for the traced process, for example, modifying the value of the instruction
+    pointer to point to the shellcode. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_CONT` | This request tells the stopped traced process to resume execution.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_DETACH` | This request resumes the traced process as well but also
+    detaches. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_SYSCALL` | This request resumes the traced process but arranges for
+    it to stop at the entrance/exit of the next syscall. This allows us to inspect
+    the arguments for the syscall and even modify them. This `ptrace` request is heavily
+    used in the code for a program called `strace`, which is shipped with most Linux
+    distributions. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_SINGLESTEP` | This resumes the process but stops it after the next
+    instruction. Single stepping allows a debugger to stop after every instruction
+    that is executed. This allows a user to inspect the values of the registers and
+    the state of the process after each instruction. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_GETSIGINFO` | This retrieves information about the signal that caused
+    the stop. It retrieves a copy of the `siginfo_t` structure, which we can analyze
+    or modify (with `PTRACE_SETSIGINFO`) to send back to the tracee. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_SETSIGINFO` | Sets the signal information. Copies a `siginfo_t` structure
+    from the address data in the tracer to the tracee. This will affect only signals
+    that would normally be delivered to the tracee and would be caught by the tracer.
+    It may be difficult to tell these normal signals from synthetic signals generated
+    by `ptrace()` itself (`addr` is ignored). |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PTRACE_SETOPTIONS` | Sets the `ptrace` options from data (`addr` is ignored).
+    Data is interpreted as a bitmask of options. These are specified by flags in the
+    following section (check out the main pages of `ptrace(2)` for a listing). |'
+  prefs: []
+  type: TYPE_TB
+- en: The term *tracer* refers to the process that is doing the tracing (the one that
+    is invoking `ptrace`), and the term *tracee* or *the traced* means the program
+    that is being traced by the tracer (with `ptrace`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The default behavior overrides any mmap or mprotect permissions. This means
+    that a user can write to the text segment with `ptrace` (even though it is read-only).
+    This is not true if the kernel is pax or grsec and patched with mprotect restrictions,
+    which enforce segment permissions so that they apply to `ptrace` as well; this
+    is a security feature.
+  prefs: []
+  type: TYPE_NORMAL
+- en: My paper on *ELF runtime infection* at [http://vxheavens.com/lib/vrn00.html](http://vxheavens.com/lib/vrn00.html)
+    discusses some methods to bypass these restrictions for code injection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The process register state and flags
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `user_regs_struct` structure for `x86_64` contains the general-purpose
+    registers, segmentation registers, stack pointer, instruction pointer, CPU flags,
+    and TLS registers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the 32-bit Linux kernel, `%gs` was used as the **thread-local-storage** (**TLS**)
+    pointer, although since `x86_64`, the `%fs` register has been used for this purpose.
+    Using the registers from `user_regs_struct` and with read/write access to a process's
+    memory using `ptrace`, we can have complete control over it. As an exercise, let's
+    write a simple debugger that allows us to set a breakpoint at a certain function
+    in a program. When the program runs, it will stop at the breakpoint and print
+    the register values and the function arguments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A simple ptrace-based debugger
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s look at a code example that makes use of `ptrace` to create a debugger
+    program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the tracer program
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To compile the preceding source code, use this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Keep in mind that `tracer.c` locates the symbol table by finding and referencing
+    the `SHT_SYMTAB` type section header, so it will not work on executables that
+    have been stripped of the `SHT_SYMTAB` symbol table (although they may have `SHT_DYNSYM`).
+    This actually makes sense, because usually we are debugging programs that are
+    still in their development phase, so they usually do have a complete symbol table.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other limitation is that it doesn't allow you to pass arguments to the program
+    you are executing and tracing. So, it wouldn't do well in a real debugging situation,
+    where you may need to pass switches or command-line options to your program that
+    is being debugged.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an example of the `./tracer` program that we designed, let's try it on a
+    very simple program that calls a function called `print_string(char *)` twice,
+    and passes to it the `Hello 1` string on the first round and `Hello 2` on the
+    second.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of using the `./tracer` code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, a breakpoint was set on `print_string`, and each time the function
+    was called, our `./tracer` program caught the trap, printed the register values,
+    and then continued executing after we hit a character. The `./tracer` program
+    is a good example of how a debugger such as `gdb` works. Although it is much simpler,
+    it demonstrates process tracing, breakpoints, and symbol lookup.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This program works great if you want to execute a program and trace it all at
+    once. But what about tracing a process that is already running? In such a case,
+    we would want to attach to the process image with `PTRACE_ATTACH`. This request
+    sends a `SIGSTOP` to the process we are attaching to, so we use `wait` or `waitpid`
+    to wait for the process to stop.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A simple ptrace debugger with process attach capabilities
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let''s look at a code example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Using `./tracer` (version 2), we can now attach to an already running process,
+    then set a breakpoint on the desired function, and trace the execution. Here is
+    an example of tracing a program that prints the `Hello 1` string 20 times in a
+    loop with `print_string(char *s);`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, we have accomplished the coding of simple debugging software that can both
+    execute a program and trace it, or attach to an existing process and trace it.
+    This demonstrates the most common type of use cases for ptrace, and most other
+    programs you write that use ptrace will be variations of the techniques in the
+    *tracer.c* code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Advanced function-tracing software
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In 2013, I designed a tool that traces function calls. It is quite similar
+    to `strace` and `ltrace`, but instead of tracing `syscalls` or library calls,
+    it traces every function call made from the executable. This tool was covered
+    in [Chapter 2](part0019_split_000.html#I3QM1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 2. The ELF Binary Format"), *The ELF Binary Format*, but it is quite
+    relevant to the topic of `ptrace`. This is because it is completely dependent
+    on `ptrace` and performs some pretty wicked dynamic analysis using control flow
+    monitoring. The source code can be found on GitHub:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/leviathansecurity/ftrace](https://github.com/leviathansecurity/ftrace)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ptrace and forensic analysis
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `ptrace()` command is the system call that is most commonly used for memory
+    analysis of a userland. In fact, if you are designing forensics software that
+    runs in userland, the only way it can access other processes memory is through
+    the `ptrace` system call, or by reading the `proc` filesystem (unless, of course,
+    the program has some type of explicit shared memory IPC setup).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: One may attach to a process and then `open/lseek/read/write /proc/<pid>/mem`
+    as an alternative to `ptrace` read/write semantics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In 2011, I was awarded a contract by the DARPA CFT (Cyber Fast Track) program
+    to design something called *Linux VMA Monitor*. The purpose of this software is
+    to detect a wide range of known and unknown process memory infections, such as
+    rootkits and memory-resident viruses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It essentially performs automated intelligent memory forensic analysis on every
+    single process address space using special heuristics that understands `ELF` execution.
+    It can spot anomalies or parasites, such as hijacked functions and generic code
+    infections. The software can either analyze live memory and work as a host intrusion
+    detection system, or take snapshots of the process memory and perform an analysis
+    on them. This software can also detect and disinfect `ELF` binaries that are infected
+    with viruses on disk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `ptrace` system call is used heavily in the software and demonstrates a
+    lot of interesting code around the `ELF` binary and `ELF` runtime infections.
+    I have not released the source code as I intend to provide a more production-ready
+    version prior to the release. Throughout this text, we will cover almost all the
+    infection types that *Linux VMA Monitor* can detect/disinfect, and we will discuss
+    and demonstrate the heuristics used to identify these infections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For well over a decade, hackers have been hiding complex malware within process
+    memory to remain stealthy. This may be a combination of shared library injection
+    and GOT poisoning, or any other set of techniques. The chances of a system administrator
+    finding these are very slim, especially since there is not a lot of software publicly
+    available for detecting many of these attacks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I have released several tools, including but not limited to AVU and ECFS, both
+    of which can be found on GitHub and my website at [http://bitlackeys.org/](http://bitlackeys.org/).
+    Whatever other software is in existence for such things is highly specialized
+    and privately used, or it simply may not exist at all. Meanwhile, a good forensics
+    analyst can use a debugger or write custom software to detect such malware, and
+    it is important to know what you are looking for and why. Since this chapter is
+    all about ptrace, I wanted to emphasize how it is interrelated with forensic analysis.
+    And it is, and especially for those who are interested in designing specialized
+    software for the purpose of identifying threats in memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Towards the end of the chapter, we will see how to write a program to detect
+    function trampolines in running software.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What to look for in the memory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: An `ELF` executable is nearly the same in the memory as it is on the disk, with
+    the exception of changes to the data segment variables, global offset table, function
+    pointers, and uninitialized variables (the `.bss` section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This means that many of the virus or rootkit techniques that are used in `ELF`
+    binaries can also be applied to processes (runtime code), and therefore they are
+    better for an attacker to remain hidden. We will cover all of these common infection
+    vectors in depth throughout the book, but here is a list of some techniques that
+    have been used to implement infectious code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Infection technique | Intended results | Residency type |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| GOT infection | Hijacking shared library functions | Process memory or executable
+    file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Procedure linkage table** (**PLT**) infection | Hijacking shared library
+    functions | Process memory or executable file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| The `.ctors`/`.dtors` function pointer modification | Altering the control
+    flow to malicious code | Process memory or executable file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Function trampolines | Hijacking any function | Process memory or executable
+    file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Shared library injection | Inserting malicious code | Process memory or executable
+    file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Relocatable code injection | Inserting malicious code | Process memory or
+    executable file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Direct modification to the text segment | Inserting malicious code | Process
+    memory or executable file |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Process possession (injecting an entire program into the address space) |
+    Running a totally different executable program hidden within an existing process
+    | Process memory |'
+  prefs: []
+  type: TYPE_TB
+- en: Using a combination of `ELF` format parsing, `/proc/<pid>/maps`, and `ptrace`,
+    one can create a set of heuristics to detect every one of the preceding techniques,
+    and create a counter method to disinfect the process from the so-called parasite
+    code. We will delve into all of these techniques throughout the book, primarily
+    in [Chapter 4](part0040_split_000.html#164MG1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 4. ELF Virus Technology – Linux/Unix Viruses"), *ELF Virus Technology
+    – Linux/Unix Viruses* and [Chapter 6](part0060_split_000.html#1P71O2-1d4163ae11644cc2802846625b2dc985
+    "Chapter 6. ELF Binary Forensics in Linux"), *ELF Binary Forensics in Linux*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process image reconstruction – from the memory to the executable
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One neat exercise to test our abilities with both the `ELF` format and `ptrace`
+    is to design software that can reconstruct a process image back into a working
+    executable. This is especially useful for the type of forensic work where we find
+    a suspicious program running on the system. **Extended core file snapshot** (**ECFS**)
+    technology is capable of this and extends the functionality into an innovative
+    forensics and debugging format that is backward compatible with the traditional
+    Linux core files' format. This is available at [https://github.com/elfmaster/ecfs](https://github.com/elfmaster/ecfs)
+    and is further documented in [Chapter 8](part0074_split_000.html#26I9K1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 8. ECFS – Extended Core File Snapshot Technology"), *ECFS – Extended
+    Core File Snapshot Technology*, in this book. Quenya also has this feature and
+    is available for download at [http://www.bitlackeys.org/projects/quenya_32bit.tgz](http://www.bitlackeys.org/projects/quenya_32bit.tgz).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Challenges for process-executable reconstruction
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In order to reconstruct a process back into an executable we must first consider
+    the challenges involved, as there are a myriad things to consider. There is one
+    particular type of variables over which we have no control, and these are the
+    global variables in the initialized data. They will have possibly changed at runtime
+    to variables dictated by the code, and we will have no way of knowing what they
+    are supposed to be initialized to before runtime. We may not even be able to find
+    this out by static code analysis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are the goals for executable reconstruction:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Take a process ID as an argument and reconstruct that process image back into
+    its executable file state
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We should construct a minimal set of section headers so that the program can
+    be analyzed by tools such as `objdump` and `gdb` with better accuracy
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Challenges for executable reconstruction
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Full executable reconstruction is possible, but it comes with some challenges,
+    especially when reconstructing a dynamically linked executable. Here, we will
+    go over what the primary challenges are and what the general solution is for each
+    one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PLT/GOT integrity
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The global offset table will be filled in with the resolved values of the corresponding
+    shared library functions. This was, of course, done by the dynamic linker, and
+    so we must replace these addresses with the original PLT stub addresses. We do
+    this so that when the shared library functions are called for the first time,
+    they trigger the dynamic linker properly through the PLT instruction that pushes
+    the GOT offset onto the stack. Refer to the *ELF and dynamic linking* section
+    of [Chapter 2](part0019_split_000.html#I3QM1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 2. The ELF Binary Format"), *The ELF Binary Format*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram demonstrates how GOT entries must be restored:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![PLT/GOT integrity](img/00004.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Adding a section header table
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Remember that a program's section header table is not loaded into the memory
+    at runtime. This is because it is not needed. When reconstructing a process image
+    back into an executable, it would be desirable (although not necessary) to add
+    a section header table. It is perfectly possible to add every section header entry
+    that was on the original executable, but a good `ELF` hacker can generate at least
+    the basics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So try to create a section header for the following sections: `.interp`, `.note`,
+    `.text`, `.dynamic`, `.got.plt`, `.data`, `.bss`, `.shstrtab`, `.dynsym`, and
+    `.dynstr`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If the executable that you are reconstructing is statically linked, then you
+    won't have the `.dynamic`, `.got.plt`, `.dynsym`, or `.dynstr` sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The algorithm for the process
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let''s look at executable reconstruction:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Locate the base address of the executable (text segment). This can be done
+    by parsing `/proc/<pid>/maps`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Use the `PTRACE_PEEKTEXT` request with `ptrace` to read in the entire text segment.
+    You can see in a line from the preceding maps output that the address range for
+    the text segment (marked `r-xp`) is `0x400000` to `0x401000`, which is 4096 bytes.
+    So, this is how large your buffer should be for the text segment. Since we have
+    not covered how to use `PTRACE_PEEKTEXT` to read more than a long-sized word at
+    a time, I have written a function called `pid_read()` that demonstrates a good
+    way to do this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Parse the `ELF` file header (for example, `Elf64_Ehdr`) to locate the program
+    header table:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then parse the program header table to find the data segment:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Read the data segment into a buffer, and locate the dynamic segment within
+    it and then the GOT. Use `d_tag` from the dynamic segment to locate the GOT:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We discussed the dynamic segment and its tag values in the *Dynamic linking*
+    section of [Chapter 2](part0019_split_000.html#I3QM1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 2. The ELF Binary Format"), *The ELF Binary Format*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once the GOT has been located, it must be restored to its state prior to runtime.
+    The part that matters the most is restoring the original PLT stub addresses in
+    each GOT entry so that lazy linking works at program runtime. See the *ELF dynamic
+    linking* section of [Chapter 2](part0019_split_000.html#I3QM1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 2. The ELF Binary Format"), *The ELF Binary Format*:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The GOT entry that is reserved for `puts()` should be patched to point back
+    to the PLT stub code that pushes the GOT offset onto the stack for that entry.
+    The address for this, `0x4003e6`, is given in the preceding command. The method
+    for determining the GOT-to-PLT entry relationship is left as an exercise for the
+    reader.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Optionally reconstruct a section header table. Then write the text and data
+    segment (and the section header table) to the disk.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Process reconstruction with Quenya on a 32-bit test environment
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A 32-bit `ELF` executable named `dumpme` simply prints the `You can Dump my
+    segments!` string and then pauses, giving us time to reconstruct it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, the following code demonstrates Quenya reconstructing a process image
+    into an executable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, we are demonstrating that the output executable runs correctly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Quenya has created a minimal section header table for the executable as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are seven section headers, starting at the offset `0x1118`, as shown
+    here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Process reconstruction with Quenya on a 32-bit test environment](img/00005.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The source code for process reconstruction in Quenya is located primarily in
+    `rebuild.c`, and Quenya may be downloaded from my site at [http://www.bitlackeys.org/](http://www.bitlackeys.org/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code injection with ptrace
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: So far we have examined some interesting use cases for `ptrace`, including process
+    analysis and process image reconstruction. Another common use of `ptrace` is for
+    introducing new code into a running process and executing it. This is commonly
+    done by attackers to modify a running program so that it does something else,
+    such as load a malicious shared library into the process address space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In Linux, the default `ptrace()` behavior is such that it allows you to write
+    `Using PTRACE_POKETEXT` to segments that are not writable, such as the text segment.
+    This is because it is expected that debuggers will need to insert breakpoints
+    into the code. This works out great for hackers who want to insert code into memory
+    and execute it. To demonstrate this, we have written `code_inject.c`. This attaches
+    to a process and injects a shellcode that will create an anonymous memory mapping
+    large enough to hold our payload executable, `payload.c`, which is then injected
+    into the new memory and executed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As mentioned earlier in this chapter, Linux kernels that are patched with `PaX`
+    will not allow `ptrace()` to write to segments that are not writable. This is
+    for further enforcement of memory protection restrictions. In the paper *ELF runtime
+    infection via GOT poisoning*, I have discussed methods of bypassing these restrictions
+    by manipulating the `vsyscall` table with `ptrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s look at a code example where we inject a shellcode into a running
+    process that loads a foreign executable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here''s the source code for `payload.c`. It is compiled without `libc` linking
+    and with position-independent code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Simple examples aren't always so trivial
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Although the source code for our code injection doesn't appear really trivial,
+    the `code_inject.c` source code is a slightly dampened-down version of a real
+    memory infector. I say this because it is limited to injecting position-independent
+    code, and it loads the text and data segments of the payload executable into the
+    same memory region back to back.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the payload program were to reference any variables in the data segment,
+    they would not work, so in a real scenario, there would have to be proper page
+    alignment between the two segments. In our case, the payload program is very basic
+    and simply writes a string to the terminal's standard output. Also in a real scenario,
+    the attacker generally wants to save the original instruction pointer and registers
+    and then resume execution at that point after the shellcode has been run. In our
+    case, we just let the shellcode print a string and then exit the entire program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Most hackers inject shared libraries or relocatable code into a process address
+    space. The idea of injecting complex executables into a process address space
+    is a technique that I've not seen before, other than with my own experimentation
+    and implementations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A good example of injecting complex programs into a process address space can
+    be found in the `elfdemon` source code, which allows a user to inject a full dynamically
+    linked executable of the `ET_EXEC` type into an existing process without overwriting
+    the host program. This task has many challenges and can be found in an experimental
+    project of mine at the following link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://www.bitlackeys.org/projects/elfdemon.tgz](http://www.bitlackeys.org/projects/elfdemon.tgz)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Demonstrating the code_inject tool
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we can see, our program injects and executes a shellcode that creates an
+    executable memory mapping, where the payload program is then injected and executed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Run the host program (the one that you want to infect):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Run `code_inject` and tell it to inject the program named payload into the
+    process for the host:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: You may have noticed that there appears to be no traditional shellcode (byte
+    code) in `code_inject.c`. That's because the `uint64_t injection_code(void *)`
+    function is our shellcode. Since it is already compiled into machine instructions,
+    we just calculated its length and passed its address to `pid_write()` in order
+    to inject it into the process. This, in my opinion, is a more elegant way of doing
+    things than the more common method of including an array of byte code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A ptrace anti-debugging trick
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `ptrace` command can be used as an anti-debugging technique. Often when
+    a hacker doesn't want their program to be easily debugged, they include certain
+    anti-debugging techniques. One popular way in Linux is to use `ptrace` with the
+    `PTRACE_TRACEME` request so that it traces the process of itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Remember that a process can only have one tracer at a time, so if a process
+    is already being traced and a debugger tries to attach using `ptrace`, it says
+    `Operation not permitted`. `PTRACE_TRACEME` can also be used to check whether
+    your program is already being debugged. You can use the code in the following
+    section to check this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Is your program being traced?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code works because it should only fail if the program is already
+    being traced. So, if `ptrace` returns an error value (less than `0`) with `PTRACE_TRACEME`,
+    you can be certain that a debugger is present and then exit the program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If a debugger is not present, then `PTRACE_TRACEME` will succeed, and now that
+    the program is tracing itself, any attempts by a debugger to trace the program
+    will fail. So, it is a nice anti-debugging measure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As shown in [Chapter 1](part0015_split_000.html#E9OE2-1d4163ae11644cc2802846625b2dc985
+    "Chapter 1. The Linux Environment and Its Tools"), *The Linux Environment and
+    Its Tools*, the `LD_PRELOAD` environment variable may be used to bypass this anti-debug
+    measure by tricking the program into loading a fake `ptrace` command that does
+    nothing but return `0`, and will therefore not have any effect against debuggers.
+    On the contrary, if a program uses the `ptrace` anti-debugging trick without using
+    the `libc ptrace` wrapper—and instead creates its own wrapper—then the `LD_PRELOAD`
+    trick will not work. This is because the program is not relying on any library
+    for access to `ptrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is an alternative way to use `ptrace` by writing your own wrapper for
+    it. We will be using the `x86_64 ptrace` wrapper in this example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned about the importance of the `ptrace` system call
+    and how it can be used in conjunction with viruses and memory infections. On the
+    flip side, it is a powerful tool for security researchers, reverse engineering,
+    and advanced hot patching techniques.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `ptrace` system call will be used periodically throughout the rest of this
+    book. Let this chapter serve only as a primer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will cover the exciting world of Linux ELF virus infection
+    and the engineering practices behind virus creation.
+  prefs: []
+  type: TYPE_NORMAL

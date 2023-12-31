@@ -1,0 +1,2572 @@
+- en: Kernel Memory Allocation for Module Authors - Part 1
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the previous two chapters, one on kernel internal aspects and architecture
+    and the other on the essentials of memory management internals, we covered key
+    aspects that serve as required background information for this and the following
+    chapter. In this and the next chapter, we will get down to the actual allocation
+    and freeing of kernel memory by various means. We will demonstrate this via kernel
+    modules that you can test and tweak, elaborate on the whys and hows of it, and
+    provide many real-world tips and tricks to enable a kernel or driver developer
+    like you to gain maximum efficiency when working with memory within your kernel
+    module.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we will cover the kernel's two primary memory allocators –
+    the **Page Allocator** (**PA**) (aka **Buddy System Allocator** (**BSA**)) and
+    the slab allocator. We will delve into the nitty-gritty of working with their
+    APIs within kernel modules. Actually, we will go well beyond simply seeing how
+    to use the APIs, clearly demonstrating why all is not optimal in all cases, and
+    how to overcome these situations. [Chapter 9](dbb888a2-8145-4132-938c-1313a707b2f2.xhtml),
+    *Kernel Memory Allocation for Module Authors – Part 2*, will continue our coverage
+    of the kernel memory allocators, delving into a few more advanced areas.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing kernel memory allocators
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel page allocator (or BSA)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel slab allocator
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Size limitations of the kmalloc API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Slab allocator - a few additional details
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Caveats when using the slab allocator
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I assume that you have gone through [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),
+    *Kernel Workspace Setup*, and have appropriately prepared a guest **Virtual Machine**
+    (**VM**) running Ubuntu 18.04 LTS (or a later stable release) and installed all
+    the required packages. If not, I highly recommend you do this first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the most out of this book, I strongly recommend you first set up the
+    workspace
+  prefs: []
+  type: TYPE_NORMAL
+- en: environment, including cloning this book's GitHub repository ([https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming)) for
+    the code, and work on it in a hands-on fashion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Refer to *Hands-On System Programming with Linux*, Kaiwan N Billimoria, Packt
+    ([https://www.packtpub.com/networking-and-servers/hands-system-programming-linux](https://www.packtpub.com/networking-and-servers/hands-system-programming-linux))
+    as a prerequisite to this chapter (essential reading, really):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Chapter 1*, *Linux System Architecture*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Chapter 2*, *Virtual Memory*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introducing kernel memory allocators
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The Linux kernel, like any other OS, requires a sturdy algorithm and implementation
+    to perform a really key task – the allocation and subsequent deallocation of memory
+    or page frames (RAM). The primary (de)allocator engine in the Linux OS is referred
+    to as the PA, or the BSA. Internally, it uses a so-called buddy system algorithm
+    to efficiently organize and parcel out free chunks of system RAM. We will find
+    more on the algorithm in the *Understanding and using the kernel page allocator
+    (or BSA)* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter and in this book, when we use the notation *(de)allocate*,
+    please read it as both words: *allocate* and *deallocate*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, being imperfect, the page allocator is not the only or always the
+    best way to obtain and subsequently release system memory. Other technologies
+    exist within the Linux kernel to do so. High on the list of them is the kernel's **slab
+    allocator** or **slab cache** system (we use the word *slab* here as the generic
+    name for this type of allocator as it originated with this name; in practice,
+    though, the internal implementation of the modern slab allocator used by the Linux
+    kernel is called SLUB (the unqueued slab allocator); more on this later).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Think of it this way: the slab allocator solves some issues and optimizes performance
+    with the page allocator. What issues exactly? We shall soon see. For now, though,
+    it''s really important to understand that the only way in which to actually (de)allocate
+    physical memory is via the page allocator. The page allocator is the primary engine
+    for memory (de)allocation on the Linux OS!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To avoid confusion and repetition, we will from now on refer to this primary
+    allocation engine as the page allocator. *Y*ou will understand that it's also
+    known as the BSA (derived from the name of the algorithm that drives it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thus, the slab allocator is layered upon (or above) the page allocator. Various
+    core kernel subsystems, as well as non-core code within the kernel, such as device
+    drivers, can allocate (and deallocate) memory either directly via the page allocator
+    or indirectly via the slab allocator; the following diagram illustrates this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/5ac7cdd2-8784-4148-a456-149595e71aed.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.1 – Linux's page allocator engine with the slab allocator layered above
+    it
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few things to be clear about at the outset:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The entire Linux kernel and all of its core components and subsystems (excluding
+    the memory management subsystem itself) ultimately use the page allocator (or
+    BSA) for memory (de)allocation. This includes non-core stuff, such as kernel modules
+    and device drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The preceding systems reside completely in kernel (virtual) address space and
+    are not directly accessible from user space.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The page frames (RAM) from where the page allocator gets memory is within the
+    kernel lowmem region, or the direct-mapped RAM region of the kernel segment (we
+    covered the kernel segment in detail in the previous chapter)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The slab allocator is ultimately a user of the page allocator, and thus gets
+    its memory from there itself (which again implies from the kernel lowmem region)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: User space dynamic memory allocation with the familiar `malloc` family of APIs
+    does not directly map to the preceding layers (that is, calling `malloc(3)` in
+    user space does *not *directly result in a call to the page or slab allocator).
+    It does so indirectly. How exactly? You will learn how; patience! (This key coverage
+    is found in two sections of the next chapter, in fact, involving demand paging; look
+    out for it as you cover that chapter!)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Also, to be clear, Linux kernel memory is non-swappable. It can never be swapped
+    out to disk; this was decided in the early Linux days to keep performance high.
+    User space memory pages are always swappable by default; this can be changed by
+    the system programmer via the `mlock()`/`mlockall()` system calls.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now, fasten your seatbelts! With this basic understanding of the page allocator
+    and slab allocator, let's begin the journey on learning (the basics on) how the
+    Linux kernel's memory allocators work and, more importantly, how to work well
+    with them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel page allocator (or BSA)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this section, you will learn about two aspects of the Linux kernel''s primary
+    (de)allocator engine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, we will cover the fundamentals of the algorithm behind this software
+    (called the buddy system).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Then, we will cover the actual and practical usage of the APIs it exposes to
+    the kernel or driver developer.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding the basics of the algorithm behind the page allocator is important.
+    You will then be able to understand the pros and cons of it, and thus, when and
+    which APIs to use in which situation. Let's begin with its inner workings. Again,
+    remember that the scope of this book with regard to the internal memory management
+    details is limited. We will cover it to a depth deemed sufficient and no more.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fundamental workings of the page allocator
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We will break up this discussion into a few relevant parts. Let's begin with
+    how the kernel's page allocator tracks free physical page frames via its freelist data
+    structures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Freelist organization
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The key to the page allocator (buddy system) algorithm is its primary internal
+    metadata structure. It's called the buddy system freelist and consists of an array
+    of pointers to (the oh-so-common!) doubly linked circular lists. The index of
+    this array of pointers is called the order of the list – it's the power to which
+    to raise 2 to. The array length is from `0` to `MAX_ORDER-1`. The value of `MAX_ORDER`
+    is arch-dependent. On the x86 and ARM, it's 11, whereas on a large-ish system
+    such as the Itanium, it's 17\. Thus, on the x86 and ARM, the order ranges from
+    2⁰ to 2^(10) ; that is, from 1 to 1,024\. What does that mean? Do read on...
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each doubly linked circular list points to free physical contiguous page frames
+    of size *2^(order)*. Thus (assuming a 4 KB page size), we end up with lists of
+    the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 2⁰ = 1 page = 4 KB chunks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 2¹ = 2 pages = 8 KB chunks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 2² = 4 pages = 16 KB chunks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 2³ = 8 pages = 32 KB chunks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 2^(10) = 1024 pages = 1024*4 KB = 4 MB chunks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following diagram is a simplified conceptual illustration of (a single
+    instance of) the page allocator freelist:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/72c111f2-5fee-43ad-91e8-e1ee9d18eabf.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.2 – Buddy system/page allocator freelist on a system with 4 KB page
+    size and MAX_ORDER of 11
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding figure, each memory "chunk" is represented by a square box (to
+    keep it simple, we use the same size in our diagram). Internally, of course, these
+    aren't the actual memory pages; rather, the boxes represent metadata structures
+    (struct page) that point to physical memory frames. On the right side of the figure,
+    we show the size of each physically contiguous free memory chunk that could be
+    enqueued on the list to the left.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel gives us a convenient (summarized) view into the current state of
+    the page allocator via the `proc` filesystem (on our Ubuntu guest VM with 1 GB
+    RAM):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/12346cfe-59e4-438a-bea4-dced0a622b0e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.3 – Annotated screenshot of sample /proc/buddyinfo output
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our guest VM is a pseudo-NUMA box with one node (`Node 0`) and two zones (`DMA`
+    and `DMA32`). The numbers following `zone XXX` are the number of free (physically
+    contiguous!) page frames in order 0, order 1, order 2, right up to `MAX_ORDER-1` (here,
+    *11 – 1 = 10*). So, let''s take a couple of examples from the preceding output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are 35 single-page free chunks of RAM in the order `0` list for node `0`, zone
+    DMA.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In node `0`, zone DMA32, order `3`, the number shown in *Figure 8.3* here is 678;
+    now, take *2^(order) = 2^(3 )**= 8* *page frames = 32 KB* (assuming a page size
+    of 4 KB); this implies that there are 678 32 KB physically contiguous free chunks
+    of RAM on that list.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is important to note that **each chunk is guaranteed to be physically contiguous
+    RAM in and of itself**. Also, notice that the size of the memory chunks on a given
+    order is always double that of the previous order (and half that of the next one).
+    This is, of course, as they're all powers of 2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that `MAX_ORDER` can (and does) vary with the architecture. On regular
+    x86 and ARM systems, it's `11`, yielding a largest chunk size of 4 MB of physically
+    contiguous RAM on order 10 of the freelists. On high-end enterprise server class
+    systems running the Itanium (IA-64) processor, `MAX_ORDER` can be as high as `17` (implying
+    a largest chunk size on order (17-1), thus of *2^(16) = 65,536 pages = 512 MB
+    chunks* of physically contiguous RAM on order 16 of the freelists, for a 4 KB
+    page size). The IA-64 MMU supports up to eight page sizes ranging from a mere
+    4 KB right up to 256 MB. As another example, with a page size of 16 MB, the order
+    16 list could potentially have physically contiguous RAM chunks of size *65,536
+    * 16 MB = 1 TB* each!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another key point: the kernel keeps **multiple BSA freelists – one for every node:zone that
+    is present on the system!** This lends a natural way to allocate memory on a NUMA
+    system.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram shows how the kernel instantiates multiple freelists
+    – *one per node:zone present on the system* (diagram credit: *Professional Linux
+    Kernel Architecture*, Mauerer, Wrox Press, Oct 2008):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/998a8480-eae3-4f0e-bb2b-4ecd15a07d4b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.4 – Page allocator (BSA) "freelists," one per node:zone on the system;
+    diagram credit: Professional Linux Kernel Architecture, Mauerer, Wrox Press, Oct
+    2008
+  prefs: []
+  type: TYPE_NORMAL
+- en: Furthermore, as can be seen in Figure 8.5, when the kernel is called upon to
+    allocate RAM via the page allocator, it picks the optimal freelist to allocate
+    memory from – the one associated with the node upon which the thread asking the
+    request is running (recall the NUMA architecture from the previous chapter). If
+    this node is out of memory or cannot allocate it for whatever reason, the kernel
+    then uses a fallback list to figure out which freelist to attempt to allocate
+    memory from. (In reality, the real picture is even more complex; we provide a
+    few more details in the *Page allocator internals – a few more details* section.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's now understand (in a conceptual way) how all of this actually works.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The workings of the page allocator
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The actual (de)allocation strategy can be explained by using a simple example.
+    Let''s say a device driver requests 128 KB of memory. To fulfill this request,
+    the (simplified and conceptual) page allocator algorithm will do this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The algorithm expresses the amount to be allocated (128 KB here) in pages. Thus,
+    here, it's (assuming a page size of 4 KB) *128/4 = 32 pages*.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Next, it determines to what power 2 must be raised to get 32\. That's *log**[2]**32*,
+    which is 5 (as 2⁵ is 32).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Now, it checks the list on order 5 of the appropriate *node:zone *page allocator
+    freelist. If a memory chunk is available (it will be of size *2**⁵ **pages = 128
+    KB*), dequeue it from the list, update the list, and allocate it to the requester.
+    Job done! Return to caller.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Why do we say *of the appropriate node:zone **page allocator freelist*? Does
+    that mean there''s more than one of them? Yes, indeed! We repeat: the reality
+    is that there will be several freelist data structures, one each per *node:zone *on
+    the system. (Also see more details in the section *Page allocator internals –
+    a few more details*.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If no memory chunk is available on the order 5 list (that is, if it's null),
+    then it checks the list on the next order; that is, the order 6-linked list (if
+    it's not empty, it will have *2⁶** pages = 256 KB* memory chunks enqueued on it,
+    each chunk being double the size of what we want).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'If the order 6 list is non-null, then it will take (dequeue) a chunk of memory
+    from it (which will be 256 KB in size, double of what''s required), and do the
+    following:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Update the list to reflect the fact that one chunk is now removed.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cut the chunk in half, thus obtaining two 128 KB halves or **buddies**! (Please
+    see the following information box.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Migrate (enqueue) one half (of size 128 KB) to the order 5 list.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Allocate the other half (of size 128 KB) to the requester.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Job done! Return to caller.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the order 6 list is also empty, then it repeats the preceding process with
+    the order 7 list, and so on, until it succeeds.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If all the remaining higher-order lists are empty (null), it will fail the request.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: We can cut or slice a memory chunk in half because every chunk on the list is
+    guaranteed to be physically contiguous memory. Once cut, we have two halves; each
+    is called a **buddy block**, hence the name of this algorithm. Pedantically, it's
+    called the binary buddy system as we use power-of-2-sized memory chunks. A buddy
+    block is defined as a block that is of the same size and physically adjacent to
+    another.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will understand that the preceding description is conceptual. The actual
+    code implementation is certainly more complex and optimized. By the way, the code
+    – the *heart of the zoned buddy allocator*,as its comment mentions, is here: `mm/page_alloc.c:__alloc_pages_nodemask()`.
+    Being beyond the scope of this book, we won't attempt to delve into the code-level
+    details of the allocator.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working through a few scenarios
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Now that we have the basics of the algorithm, let''s consider a few scenarios:
+    first, a simple straightforward case, and after that, a couple of more complex
+    cases.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The simplest case**'
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Let's say that a kernel-space device driver (or some core code) requests 128
+    KB and receives a memory chunk from the order 5 list of one of the freelist data
+    structures. At some later point in time, it will necessarily free the memory chunk
+    by employing one of the page allocator free APIs. Now, this API's algorithm calculates
+    – via its order – that the just-freed chunk belongs on the order 5 list; thus,
+    it enqueues it there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**A more complex case**'
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Now, let's say that, unlike the previous simple case, when the device driver
+    requests 128 KB, the order 5 list is null; thus, as per the page allocator algorithm,
+    we go to the list on the next order, 6, and check it. Let's say it's non-null;
+    the algorithm now dequeues a 256 KB chunk and splits (or cuts) it in half. Now,
+    one half (of size 128 KB) goes to the requester, and the remaining half (again,
+    of size 128 KB) is enqueued on to the order 5 list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The really interesting property of the buddy system is what happens when the
+    requester (the device driver), at some later point in time, frees the memory chunk.
+    As expected, the algorithm calculates (via its order) that the just-freed chunk
+    belongs on the order 5 list. But before blindly enqueuing it there, **it looks
+    for its buddy block**, and in this case, it (possibly) finds it! It now merges
+    the two buddy blocks into a single larger block (of size 256 KB) and places (enqueues)
+    the merged block on the *order 6 *list. This is fantastic – it has actually helped defragment
+    memory!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The downfall case**'
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Let's make it interesting now by not using a convenient rounded power-of-2 size
+    as the requirement. This time, let's say that the device driver requests a memory
+    chunk of size 132 KB. What will the buddy system allocator do? As, of course,
+    it cannot allocate less memory than requested, it allocates more – you guessed
+    it (see *Figure 8.2*), the next available memory chunk is on order 7, of size
+    256 KB. But the consumer (the driver) is only going to see and use the first 132
+    KB of the 256 KB chunk allocated to it. The remaining (124 KB) is wasted (think
+    about it, that's close to 50% wastage!).This is called **internal fragmentation
+    (or wastage)** and is the critical failing of the binary buddy system!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You will learn, though, that there is indeed a mitigation to this: a patch
+    was contributed to deal with similar scenarios (via the `alloc_pages_exact() /
+    free_pages_exact()` APIs). We will cover the APIs to use the page allocator shortly.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page allocator internals – a few more details
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In this book, we do not intend to delve into code-level detail on the internals
+    of the page allocator. Having said that, here''s the thing: in terms of data structures,
+    the `zone` structure contains an array of `free_area` structures. This makes sense;
+    as you''ve learned, there can be (and usually are) multiple page allocator freelists
+    on the system, one per node:zone:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `free_area` structure is the implementation of the doubly-linked circular
+    lists (of free memory page frames within that node:zone) along with the number
+    of page frames that are currently free:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Why is it an array of linked lists and not just one list? Without delving into
+    the details, we''ll mention that, in reality, the kernel layout for the buddy
+    system freelists is more complex than let on until now: from the 2.6.24 kernel,
+    each freelist we have seen is actually further broken up into multiple freelists
+    to cater to different *page migration types*. This was required to deal with complications
+    when trying to keep memory defragmented.Besides that, as mentioned earlier, these
+    freelists exist per *node:zone* on the system. So, for example, on an actual NUMA
+    system with 4 nodes and 3 zones per node, there will be 12 (4 x 3) freelists.
+    Not just that, each freelist is actually further broken down into 6 freelists,
+    one per migration type. Thus, on such a system, a total of *6 x 12 = 72* freelist
+    data structures would exist system-wide!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are interested, dig into the details and check out the output of `/proc/buddyinfo` – a
+    nice summary view of the state of the buddy system freelists (as Figure 8.3 shows).
+    Next, for a more detailed and realistic view (of the type mentioned previously,
+    showing *all *the freelists), look up `/proc/pagetypeinfo` (requires root access)
+    – it shows all the freelists (broken up into page migration types as well).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The design of the page allocator (buddy system) algorithm is one of the best-fit class.
+    It confers the major benefit of actually helping to defragment physical memory
+    as the system runs. Briefly, its pros and cons are as follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The pros of the page allocator (buddy system) algorithm are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Helps defragment memory (external fragmentation is prevented)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Guarantees the allocation of a physically contiguous memory chunk
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Guarantees CPU cache line-aligned memory blocks
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Fast (well, fast enough; the algorithmic time complexity is *O(log n)*)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On the other hand, by far the biggest downside is that internal fragmentation
+    or wastage can be much too high.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Okay, great! We have covered a good deal of background material on the internal
+    workings of the page or buddy system allocator. Time to get hands on: let''s now
+    dive into actually understanding and using the page allocator APIs to allocate
+    and free memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning how to use the page allocator APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The Linux kernel provides (exposes to the core and modules) a set of APIs to
+    allocate and deallocate memory (RAM) via the page allocator. These are often referred
+    to as the low-level (de)allocator routines. The following table summarizes the
+    page allocation APIs; you''ll notice that all the APIs or macros that have two
+    parameters, the first parameter is called the *GFP flags or bitmask*; we shall
+    explain it in detail shortly, please ignore it for now. The second parameters
+    is the `order`- the order of the freelist, that is, the amount of memory to allocate
+    is 2^(order) page frames. All prototypes can be found in `include/linux/gfp.h`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **API or macro name** | **Comments** | **API signature or macro** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `__get_free_page()` | Allocates exactly one page frame. The allocated memory
+    will have random content; it''s a wrapper around the `__get_free_pages()` API.
+    The return value is a pointer to the just-allocated memory''s kernel logical address.
+    | `#define __get_free_page(gfp_mask)  \ __get_free_pages((gfp_mask), 0)`​ |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `__get_free_pages()` | Allocates *2^(order)* physically contiguous page frames.
+    Allocated memory will have random content; the return value is a pointer to the
+    just-allocated memory''s kernel logical address. | `unsigned long __get_free_pages(gfp_t
+    gfp_mask, unsigned int order);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `get_zeroed_page()` | Allocates exactly one page frame; its contents are
+    set to ASCII zero (`NULL`; that is, it''s zeroed out); the return value is a pointer
+    to the just-allocated memory''s kernel logical address. | `unsigned long get_zeroed_page(gfp_t
+    gfp_mask);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `alloc_page()` | Allocates exactly one page frame. The allocated memory will
+    have random content; a wrapper over the `alloc_pages()` API; the return value
+    is a pointer to the just-allocated memory''s `page` metadata structure; can convert
+    it into a kernel logical address via the `page_address()` function. | `#define
+    alloc_page(gfp_mask)  \ alloc_pages(gfp_mask, 0)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `alloc_pages()` | Allocates *2^(order)* physically contiguous page frames.
+    The allocated memory will have random content; the return value is a pointer to
+    the start of the just-allocated memory''s `page` metadata structure; can convert
+    it into a kernel logical address via the `page_address()` function. | `struct
+    page * alloc_pages(gfp_t gfp_mask, unsigned int order);` |'
+  prefs: []
+  type: TYPE_TB
+- en: Table 8.1 – Low-level (BSA/page) allocator – popular exported allocation APIs
+  prefs: []
+  type: TYPE_NORMAL
+- en: All the preceding APIs are exported (via the `EXPORT_SYMBOL()` macro), and hence
+    available to kernel module and device driver developers. Worry not, you will soon
+    see a kernel module that demonstrates using them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Linux kernel considers it worthwhile to maintain a (small) metadata structure
+    to track every single page frame of RAM. It''s called the `page` structure. The
+    point here is, be careful: unlike the usual semantics of returning a pointer (a
+    virtual address) to the start of the newly allocated memory chunk, notice how
+    both the `alloc_page()` and `alloc_pages()` APIs mentioned previously return a
+    pointer to the start of the newly allocated memory''s page structure, not the
+    memory chunk itself (as the other APIs do). You must obtain the actual pointer
+    to the start of the newly allocated memory by invoking the `page_address()` API
+    on the page structure address that is returned. Example code in the *Writing a
+    kernel module to demo using the page allocator APIs* sectionwill illustrate the
+    usage of all of the preceding APIs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before we can make use of the page allocator APIs mentioned here, though, it's
+    imperative to understand at least the basics regarding the **Get Free Page** (**GFP**) flags,
+    which are the topic of the section that follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dealing with the GFP flags
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'You will notice that the first parameter to all the previous allocator APIs
+    (or macros) is `gfp_t gfp_mask`. What does this mean? Essentially, these are GFP flags*.*
+    These are flags (there are several of them) used by the kernel''s internal memory
+    management code layers. For all practical purposes, for the typical kernel module
+    (or device driver) developer, just two GFP flags are crucial (as mentioned before,
+    the rest are for internal usage). They are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`GFP_KERNEL`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_ATOMIC`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Deciding which of these to use when performing memory allocation via the page
+    allocator APIs is important; a key rule to always remember is the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*If in process context and it is safe to sleep, use the GFP_KERNEL flag. If
+    it is unsafe to sleep (typically, when in any type of atomic or interrupt context), you must use
+    the GFP_ATOMIC flag.*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Following the preceding rule is critical. Getting this wrong can result in the
+    entire machine freezing, kernel crashes, and/or random bad stuff happening. So,
+    what exactly do the statements *safe/unsafe to sleep* really mean? For this and
+    more, we defer to the *The GFP flags – digging deeper *section that follows. It *is*
+    reallyimportant though, so I definitely recommend you read it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Linux Driver Verification** (**LDV**) project: back in [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),
+    *Kernel Workspace Setup*, in the The LDV - Linux Driver Verification - project section,
+    we mentioned that this project has useful "rules" with respect to various programming
+    aspects of Linux modules (drivers, mostly) as well as the core kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With regard to our current topic, here''s one of the rules, a negative one,
+    implying that you *cannot *do this: *"Using a blocking memory allocation when
+    spinlock is held"* ([http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0043](http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0043)).
+    When holding a spinlock, you''re not allowed to do anything that might block;
+    this includes kernel-space memory allocations. Thus, very important, you must
+    use the `GFP_ATOMIC` flag when performing a memory allocation in any kind of atomic
+    or non-blocking context, like when holding a spinlock (you will learn that this
+    isn''t the case with the mutex lock; you are allowed to perform blocking activities
+    while holding a mutex). Violating this rule leads to instability and even raises
+    the possibility of (an implicit) deadlock. The LDV page mentions a device driver
+    that was violating this very rule and the subsequent fix ([https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=5b0691508aa99d309101a49b4b084dc16b3d7019](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=5b0691508aa99d309101a49b4b084dc16b3d7019)).
+    Take a look: the patch clearly shows (in the context of the `kzalloc()` API, which
+    we shall soon cover) the `GFP_KERNEL` flag being replaced with the `GFP_ATOMIC`
+    flag.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another GFP flag commonly used is `__GFP_ZERO`. Its usage implies to the kernel
+    that you want zeroed-out memory pages. It's often bitwise-ORed with `GFP_KERNEL`
+    or `GFP_ATOMIC` flags in order to return memory initialized to zero.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel developers do take the trouble to document the GFP flags in detail.
+    Take a look in `include/linux/gfp.h`. Within it, there''s a long and detailed
+    comment; it''s headed `DOC: Useful GFP flag combinations`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For now, and so that we get off the ground quickly, just understand that using
+    the Linux kernel's memory allocation APIs with the `GFP_KERNEL` flag is indeed
+    the common case for kernel-internal allocations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Freeing pages with the page allocator
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The flip side of allocating memory is freeing it, of course. Memory leakage
+    in the kernel is definitely not something you''d like to contribute to. For the
+    page allocator APIs shown in *Table 8.1**,* here are the corresponding free APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **API or macro name** | **Comment** | **API signature or macro** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `free_page()` | Free a (single) page that was allocated via the `__get_free_page()`,
+    `get_zeroed_page()`, or `alloc_page()` APIs; it''s a simple wrapper over the `free_pages()`
+    API | `#define free_page(addr) __free_pages((addr), 0)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `free_pages()` | Free multiple pages that were allocated via the `__get_free_pages()` or `alloc_pages()` APIs
+    (it''s actually a wrapper over `__free_pages()`.)  | `void free_pages(unsigned
+    long addr, unsigned int order)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `__free_pages()` | (*Same as the preceding row, plus*) it''s the underlying
+    routine where the work gets done; also, note that the first parameter is a pointer
+    to the `page` metadata structure. | `void __free_pages(struct page *page, unsigned
+    int order)` |'
+  prefs: []
+  type: TYPE_TB
+- en: Table 8.2 – Common free page(s) APIs to use with the page allocator
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can see that the actual underlying API in the preceding functions is `free_pages()`,
+    which itself is just a wrapper over the `mm/page_alloc.c:__free_pages()` code.
+    The first parameter to the `free_pages()` API is the pointer to the start of the
+    memory chunk being freed; this, of course, being the return value from the allocation
+    routine. However, the first parameter to the underlying API, `__free_pages()`,
+    is the pointer to the *page* metadata structure of the start of the memory chunk
+    being freed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generally speaking, unless you really know what you are doing, you're definitely
+    advised to invoke the `foo()` wrapper routine and not its internal `__foo()` routine.
+    One reason to do so is simply correctness (perhaps the wrapper uses some necessary
+    synchronization mechanism - like a lock - prior to invoking the underlying routine).
+    Another reason to do so is validity checking (which helps code remain robust and
+    secure). *O*ften, the `__foo()` routines bypass validity checks in favor of speed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As all experienced C/C++ application developers know, allocating and subsequently
+    freeing memory is a rich source of bugs! This is primarily because C is an unmanaged
+    language, as far as memory is concerned; hence, you can hit all sorts of memory
+    bugs. These include the well-known memory leakage, buffer overflows/underflows
+    for both read/write, double-free, and **Use After Free** (**UAF**) bugs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Unfortunately, it''s no different in kernel space; it''s just that the consequences
+    are (much) worse! Be extra careful! Please do take care to ensure the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Favor routines that initialize the memory allocated to zero.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Think about and use the appropriate GFP flag when performing an allocation
+    – more on this in the *The GFP flags – digging deeper* section, but briefly, note
+    the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When in process context where it's safe to sleep, use `GFP_KERNEL`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When in an atomic context, such as when processing an interrupt, use `GFP_ATOMIC`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When using the page allocator (as we're doing now), try as much as possible
+    to keep the allocation size as rounded power-of-2 pages (again, the rationale
+    behind this and ways to mitigate this – when you don't require so much memory,
+    the typical case – are covered in detail in the coming sections of this chapter).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You only ever attempt to free memory that you allocated earlier; needless to
+    say, don't miss freeing it, and don't double-free it.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Keep the original memory chunk's pointer safe from reuse, manipulation (`ptr
+    ++` or something similar), and corruption, so that you can correctly free it when
+    done.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Check (and recheck!) the parameters passed to APIs. Is a pointer to the previously
+    allocated block required, or to its underlying `page` structure?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Finding it difficult and/or worried about issues in production? Don't forget,
+    you have help! Do learn how to use powerful static analysis tools found within
+    the kernel itself (Coccinelle,  `sparse` and others, such as `cppcheck` or `smatch`).
+    For dynamic analysis, learn how to install and use **KASAN** (the **Kernel Address
+    Sanitizer**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Recall the Makefile template I provided in [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml),
+    *Writing Your First Kernel Module – LKMs Part 2*, in the *A better Makefile template* section.
+    It contains targets that use several of these tools; please do use it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Alright, now that we've covered both the (common) allocation and free APIs of
+    the page allocator, it's time to put this learning to use. Let's write some code!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Writing a kernel module to demo using the page allocator APIs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Let's now get hands on with the low-level page allocator and free APIs that
+    we've learned about so far. In this section, we will show relevant code snippets,
+    followed by an explanation where warranted, from our demo kernel module (`ch8/lowlevel_mem/lowlevel_mem.c`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the primary worker routine, `bsa_alloc()`, of our small LKM, we highlighted
+    (in bold font) the code comments that show what we are trying to achieve. A few
+    points to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we do something very interesting: we use our small kernel "library"
+    function `klib_llkd.c:show_phy_pages()` to literally show you how physical RAM
+    page frames are identity mapped to kernel virtual pages in the kernel lowmem region!
+    (The exact working of the `show_phy_pages()` routine is discussed very shortly):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we allocate one page of memory via the underlying `__get_free_page()`
+    page allocator API (that we saw previously in *Table 8.1*):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice how we emit a `printk` function showing the kernel's logical address. Recall
+    from the previous chapter that this is page allocator memory that lies very much
+    in the direct-mapped RAM or lowmem region of the kernel segment/VAS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, for security, we should consistently, and only, use the `%pK` format specifier
+    when printing kernel addresses so that a hashed value and not the real virtual
+    address shows up in the kernel logs. However, here, in order to show you the actual
+    kernel virtual address, we also use the `%px` format specifier (which, like the
+    `%pK`, is portable as well; for security, please don't use the `%px` format specifier
+    in production!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, notice the detailed comment just after the first `__get_free_page()` API
+    (in the preceding snippet) is issued. It mentions the fact that you don't really
+    have to print an out-of-memory error or warning messages. (Curious? To find out
+    why, visit [https://lkml.org/lkml/2014/6/10/382](https://lkml.org/lkml/2014/6/10/382).)
+    In this example module (as with several earlier ones and more to follow), we code
+    our printk's (or `pr_foo()` macro) instances for portability by using appropriate
+    printk format specifiers (like the `%zd`, `%zu`, `%pK`, `%px`, and `%pa`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s move on to our second memory allocation using the page allocator; see
+    the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet (see the code comments), we have allocated 2³ –
+    that is, 8 – pages of memory via the page allocator's `__get_free_pages()` API
+    (as the default value of our module parameter, `bsa_alloc_order`, is `3`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An aside: notice that we use the `GFP_KERNEL|__GFP_ZERO` GFP flags to ensure
+    that the allocated memory is zeroed out, a best practice. Then again, zeroing
+    out large memory chunks can result in a slight performance hit.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, we ask ourselves the question: is there a way to verify that the memory
+    is really physically contiguous (as promised)? It turns out that yes, we can actually
+    retrieve and print out the physical address of the start of each allocated page
+    frame and retrieve its **Page Frame Number** **(PFN****)** as well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **PFN** is a simple concept: it''s just the index or page number – for
+    example, the PFN of physical address 8192 is 2 (*8192/4096*). As we''ve shown
+    how to (and importantly, when you can) translate kernel virtual addresses to their
+    physical counterparts earlier (and vice versa; this coverage is in [Chapter 7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml),
+    *Memory Management Internals – Essentials*, in the *Direct-mapped RAM and address
+    translation* section), we won''t repeat it here.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To do this work of translating virtual addresses to physical addresses and
+    checking for contiguity, we write a small "library" function, which is kept in
+    a separate C file in the root of this book''s GitHub source tree, `klib_llkd.c`. Our
+    intent is to modify our kernel module''s Makefile to link in the code of this
+    library file as well! (Doing this properly was  covered back in [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml), *Writing
+    Your First Kernel Module – LKMs Part 2*, in the *Performing library emulation
+    via multiple source files* section.) Here''s our invocation of our library routine
+    (just as was done in step 0):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is the code of our library routine (in the `<booksrc>/klib_llkd.c`
+    source file; again, for clarity, we won''t show the entire code here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Study the preceding function. We walk through our given memory range, (virtual)
+    page by (virtual) page, obtaining the physical address and PFN, which we then
+    emit via printk (notice how we use the `%pa` format specifier to port-ably print
+    a *physical address* - it requires it to be passed by reference though). Not only
+    that, if the third parameter, `contiguity_check`*,* is `1`, we check whether the
+    PFNs are just a single digit apart, thus checking that the pages are indeed physically
+    contiguous or not. (By the way, the simple `powerof()` function that we make use
+    of is also within our library code.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hang on, though, a key point: having kernel modules working with physical addresses
+    is *highly discouraged*. Only the kernel''s internal memory management code works
+    directly with physical addresses. There are very few real-world cases of even
+    hardware device drivers using physical memory directly (DMA is one, and using
+    the `*ioremap*` APIs another).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We only do so here to prove a point – that the memory allocated by the page
+    allocator (with a single API call) is physically contiguous. Also, do realize
+    that the `virt_to_phys()`(and friends) APIs that we employ are guaranteed to work
+    *only* on direct-mapped memory (the kernel lowmem region) and nothing else (not
+    the `vmalloc` range, the IO memory ranges, bus memory, DMA buffers, and so on).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s continue with the kernel module code:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: As seen in the preceding snippet, we allocate a single page of memory but ensure
+    it's zeroed out by employing the PA `get_zeroed_page()` API. `pr_info()` shows
+    the hashed and actual KVAs (using the `%pK` or `%px` has the addresses printed
+    in a port-able fashion as well, irrespective of your running on a 32 or 64-bit
+    system.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we allocate one page with the `alloc_page()` API. Careful! It does not
+    return the pointer to the allocated page, but rather the pointer to the metadata
+    structure `page` representing the allocated page; here''s the function signature:
+    `struct page * alloc_page(gfp_mask)`. Thus, we use the `page_address()` helper
+    to convert it into a kernel logical (or virtual) address:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet, we allocate one page of memory via the `alloc_page()`
+    PA API. As explained, we need to convert the page metadata structure returned
+    by it into a KVA (or kernel logical address) via the `page_address()` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, allocate and `init` *2^3 = 8 pages* with the `alloc_pages()` API. The
+    same warning as the preceding code snippet applies here too:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet, we combine `alloc_pages()` wrapped within a `page_address()`
+    API to allocate *2^3 = 8* pages of memory!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interestingly, we use several local `goto` statements in the code (do peek at
+    the code in the repo). Looking carefully at it, you will notice that it actually
+    keeps error handling code paths clean and logical. This is indeed part of the
+    Linux kernel coding style guidelines.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Usage of the (sometimes controversial) `goto` is clearly documented right here: [https://www.kernel.org/doc/html/v5.4/process/coding-style.html#centralized-exiting-of-functions](https://www.kernel.org/doc/html/v5.4/process/coding-style.html#centralized-exiting-of-functions).
+    I urge you to check it out! Once you understand the usage pattern, you'll find
+    that it helps reduce the all-too-typical memory leakage (and similar) cleanup
+    errors!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, in the cleanup method, prior to being removed from kernel memory, we
+    free up all the memory chunks we just allocated in the cleanup code of the kernel
+    module.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'In order to link our library `klib_llkd` code with our `lowlevel_mem`kernel
+    module, the Makefile changes to have the following (recall that we learned about
+    compiling multiple source files into a single kernel module in [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml), *Writing
+    Your First Kernel Module – LKMs Part 2*, in the *Performing library emulation
+    via multiple source files* section):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, in this sample LKM we often used the `%px` printk format specifier so
+    that we can see the actual virtual address and not a hashed value (kernel security
+    feature). It's okay here, but don't do this in production.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Phew! That was quite a bit to cover. Do ensure you understand the code, and
+    then read on to see it in action.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deploying our lowlevel_mem_lkm kernel module
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Okay, time to see our kernel module in action! Let's build and deploy it on
+    both a Raspberry Pi 4 (running the default Raspberry Pi OS) and on an x86_64 VM
+    (running Fedora 31).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the Raspberry Pi 4 Model B (here running Raspberry Pi kernel version 5.4.79-v7l+),
+    we build and then `insmod(8)` our `lowlevel_mem_lkm`kernel module. The following
+    screenshot shows the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/08a93d27-6112-4b32-8314-20969b47d182.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.5 – The lowlevel_mem_lkm kernel module's output on a Raspberry Pi 4
+    Model B
+  prefs: []
+  type: TYPE_NORMAL
+- en: Check it out! In step 0 of the output in Figure 8.6 our `show_phy_pages()` library
+    routine clearly shows that KVA `0xc000 0000` has PA `0x0`, KVA `0xc000 1000` has
+    pa `0x1000`, and so on, for five pages (along with the PFN on the right); you
+    can literally see the 1:1 identity mapping of physical RAM page frames to kernel
+    virtual pages (in the lowmem region of the kernel segment)!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, the initial memory allocation with the `__get_free_page()` API goes through
+    as expected. More interesting is our case 2\. Here, we can clearly see that the physical
+    address and PFN of each allocated page (from 0 to 7, for a total of 8 pages) are
+    consecutive, showing that the memory pages allocated are indeed physically contiguous!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We build and run the same module on an x86_64 VM running Ubuntu 20.04 (running
+    our custom 5.4 ''debug'' kernel). The following screenshot shows the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/90c13860-8203-43b7-a2d7-7926b1256fd8.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.6 – The lowlevel_mem_lkm kernel module's output on a x86_64 VM running
+    Ubuntu 20.04
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This time (refer Figure 8.7), with the `PAGE_OFFSET` value being a 64-bit quantity
+    (the value here is `0xffff 8880 0000 0000`), you can again clearly see the identity
+    mapping of physical RAM frames to kernel virtual addresses (for 5 pages). Let''s
+    take a moment and look carefully at the kernel logical addresses returned by the
+    page allocator APIs. In Figure 8.7, you can see that they are all in the range `0xffff
+    8880 .... ....`. The following snippet is from the kernel source tree at `Documentation/x86/x86_64/mm.txt`,
+    documenting (a part of) the virtual memory layout on the x86_64:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If this all seems new and strange to you, please refer to [Chapter 7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml),
+    *Memory Management Internals – Essentials*, particularly the *Examining the kernel
+    segment *and *Direct-mapped RAM and address translation* sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: It's quite clear, isn't it? The page allocator memory (the buddy system free
+    lists) maps directly onto free physical RAM within the direct-mapped or lowmem region
+    of the kernel VAS. Thus, it obviously returns memory from this region. You can
+    see this region in the preceding documentation output (highlighted in bold font)
+    – the kernel direct-mapped or lowmem region. Again, I emphasize the fact that
+    the specific address range used is very arch-specific. In the preceding code,
+    it's the (maximum possible) range on the x86_64.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Though tempting to claim that you're now done with the page allocator and its
+    APIs, the reality is that this is (as usual) not quite the case. Do read on to
+    see why – it's really important to understand these aspects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The page allocator and internal fragmentation
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Though all looks good and innocent on the surface, I urge you to delve a bit
+    deeper. Just under the surface, a massive (unpleasant!) surprise might await you:
+    the blissfully unaware kernel/driver developer. The APIs we covered previously
+    regarding the page allocator (see *Table 8.1*) have the dubious distinction of
+    being able to internally fragment – in simpler terms, **waste** – very significant
+    portions of kernel memory!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To understand why this is the case, you must understand at least the basics
+    of the page allocator algorithm and its freelist data structures. The section *The
+    fundamental workings of the page allocator* covered this (just in case you haven't
+    read it, please do so).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the *Working through a few scenarios* section, you would have seen that
+    when we make an allocation request of convenient, perfectly rounded power-of-two-size
+    pages, it goes very smoothly. However, when this isn''t the case – let''s say
+    the driver requests 132 KB of memory – then we end up with a major issue: the internal
+    fragmentation or wastage is very high. This is a serious downside and must be
+    addressed. We will see how, in two ways, in fact. Do read on!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The exact page allocator APIs
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Realizing the vast potential for wastage within the default page allocator (or
+    BSA), a developer from Freescale Semiconductor (see the information box) contributed
+    a patch to the kernel page allocator that extends the API, adding a couple of
+    new ones.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the 2.6.27-rc1 series, on 24 July 2008, Timur Tabi submitted a patch to mitigate
+    the page allocator wastage issue. Here's the relevant commit: [https://github.com/torvalds/linux/commit/2be0ffe2b29bd31d3debd0877797892ff2d91f4c](https://github.com/torvalds/linux/commit/2be0ffe2b29bd31d3debd0877797892ff2d91f4c).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using these APIs leads to more efficient allocations for large-ish chunks (multiple
+    pages) of memory **with far less wastage**. The new (well, it *was *new back in
+    2008, at least) pair of APIs to allocate and free memory are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter to the `alloc_pages_exact()` API, `size`, is in bytes, the
+    second is the "usual" GFP flags value discussed earlier (in the *Dealing with
+    the GFP flags* section; `GFP_KERNEL` for the might-sleep process context cases,
+    and `GFP_ATOMIC` for the never-sleep interrupt or atomic context cases).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the memory allocated by this API is still guaranteed to be physically
+    contiguous. Also, the amount that can be allocated at a time (with one function
+    call) is limited by `MAX_ORDER`; in fact, this is true of all the other regular
+    page allocation APIs that we have seen so far. We will discuss a lot more about
+    this aspect in the upcoming section, *Size limitations of the kmalloc API.* There,
+    you'll realize that the discussion is in fact not limited to the slab cache but
+    to the page allocator as well!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `free_pages_exact()` API must only be used to free memory allocated by its
+    counterpart, `alloc_pages_exact()`. Also, note that the first parameter to the "free"
+    routine is of course the value returned by the matching 'alloc' routine (the pointer
+    to the newly allocated memory chunk).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The implementation of `alloc_pages_exact()` is simple and clever: it first
+    allocates the entire memory chunk requested "as usual" via the `__get_free_pages()`
+    API. Then, it loops – from the end of the memory to be used to the amount of actually
+    allocated memory (which is typically far greater) – freeing up those unnecessary
+    memory pages! So, in our example, if you allocate 132 KB via the `alloc_pages_exact()`
+    API, it will actually first internally allocate 256 KB via `__get_free_pages()`,
+    but will then free up memory from 132 KB to 256 KB!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another example of the beauty of open source! A demo of using these APIs can
+    be found here: `ch8/page_exact_loop`; we will leave it to you to try it out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before we began this section, we mentioned that there were two ways in which
+    the wastage issue of the page allocator can be addressed. One is by using the
+    more efficient `alloc_pages_exact()` and `free_pages_exact()` APIs, as we just
+    learned; the other is by using a different layer to allocate memory – the *slab
+    allocator*. We will soon cover it; until then, hang in there. Next, let's cover
+    more, *crucial to understand*, details on the (typical) GFP flags and how you,
+    the kernel module or driver author, are expected to use them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The GFP flags – digging deeper
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: With regard to our discussions on the low-level page allocator APIs, the first
+    parameter to every function is the so-called GFP mask. When discussing the APIs
+    and their usage, we mentioned a *key rule*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If in *process context and it is safe to sleep,* use the `GFP_KERNEL` flag. If
+    it is *unsafe to **sleep* (typically, when in any type of interrupt context or
+    when holding some types of locks), you *must* use the `GFP_ATOMIC` flag.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We elaborate on this in the following sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Never sleep in interrupt or atomic contexts
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: What does the phrase *safe to sleep *actually mean? To answer this, think of blocking
+    calls (APIs):a *blocking call *is one where the calling process (or thread) is
+    put into a sleep state because it is waiting on something, an *event*, and the
+    eventit is waiting on has not occurred yet. Thus, it waits – it "sleeps." When,
+    at some future point in time, the event it is waiting on occurs or arrives, it
+    is woken up by the kernel and proceeds forward.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One example of a user space blocking API includes `sleep(3)`. Here, the event
+    it is waiting on is the elapse of a certain amount of time. Another example is `read(2)` and
+    its variants, where the event being waited on is storage or network data becoming
+    available. With `wait4(2)`, the event being waited on is the death or stoppage/continuing
+    of a child process, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, any function that might possibly block can end up spending some time asleep
+    (while asleep, it's certainly off the CPU run queues, and in a wait queue). Invoking
+    this *possibly blocking* functionality when in kernel mode (which, of course,
+    is the mode we are in when working on kernel modules)is *only allowed when in
+    process context.* **It is a bug to invoke a blocking call of any sort in a context
+    where it is unsafe to sleep, such as an interrupt or atomic context***. *Think
+    of this as a golden rule. This is also known as sleeping in an atomic context
+    – it's wrong, it's buggy, and it must *never *happen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might wonder, *how can I know in advance if my code will ever enter an
+    atomic or interrupt context*? In one way, the kernel helps us out: when configuring
+    the kernel (recall `make menuconfig` from [Chapter 2](e0b89a37-18a3-424d-8983-58c4ac0725f6.xhtml),
+    *Building the 5.x Linux Kernel from Source - Part 1*), under the `Kernel Hacking
+    / Lock Debugging` menu, there is a Boolean tunable called `"Sleep inside atomic
+    section checking"`. Turn it on! (The config option is named `CONFIG_DEBUG_ATOMIC_SLEEP`;
+    you can always grep your kernel config file for it. Again, in [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml),
+    *Writing Your First Kernel Module - LKMs Part 2*, under the Configuring a "debug"
+    kernel section, this is something you should definitely turn on.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another way to think of this situation is howexactly do you put a process or
+    thread to sleep? The short answer is by having it invoke the scheduling code –
+    the `schedule()` function. Thus, by implication of what we have just learned (as
+    a corollary), `schedule()` must only be called from within a context where it's
+    safe to sleep; process context usually is safe, interrupt context never is.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is really important to keep in mind! (We briefly covered what process and
+    interrupt context are in [Chapter 4](1c494ebd-e7ec-4a78-8695-5b97bdc3d6be.xhtml),
+    *Writing Your First Kernel Module – LKMs Part 1*, in the *Process and interrupt
+    contexts* section*, *and how the developer can use the `in_task()` macro to determine
+    whether the code is currently running in a process or interrupt context.) Similarly,
+    you can use the `in_atomic()` macro; if the code is an *atomic context* – where
+    it must typically run to completion without interruption – it returns `True`;
+    otherwise, `False`. You can be in process context but atomic at the same time
+    – for example, when holding certain kinds of locks (spinlocks; we will, of course,
+    cover this in the chapters on *synchronization* later); the converse cannot happen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Besides the GFP flags we're focused upon - the `GFP_KERNEL` and `GFP_ATOMIC` ones
+    - the kernel has several other `[__]GFP_*` flags that are used internally; several
+    for the express purpose of reclaiming memory*.* These include (but are not limited
+    to) `__GFP_IO`, `__GFP_FS`, `__GFP_DIRECT_RECLAIM`, `__GFP_KSWAPD_RECLAIM`, `__GFP_RECLAIM`,
+    `__GFP_NORETRY`, and so on. In this book, we do not intend to delve into these
+    details. I refer you to the detailed comment in `include/linux/gfp.h` that describes
+    them (also see the *Further reading* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Linux Driver Verification** (**LDV**) project: back in [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),* Kernel Workspace
+    Setup*, we mentioned that this project has useful "rules" with respect to various
+    programming aspects of Linux modules (drivers, mostly) as well as the core kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With regard to our current topic, here''s one of the rules, a negative one,
+    implying that you *cannot *do this: *Not disabling IO during memory allocation
+    while holding a USB device lock* ([http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0077](http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0077)).
+    Some quick background: when you specify the `GFP_KERNEL` flag, it implicitly means
+    (among other things) that the kernel can start an IO (Input/Output; reads/writes)
+    operation to reclaim memory. The trouble is, at times this can be problematic
+    and should not be done; to get over this, you''re expected use the `GFP_NOIO`
+    flag as part of the GFP bitmask when allocating kernel memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That''s precisely the case that this LDV ''rule'' is referring to: here, between
+    the `usb_lock_device()` and `usb_unlock_device()` APIs, the `GFP_KERNEL` flag
+    shouldn''t be used and the `GFP_NOIO` flag should be used instead. (You can see
+    several instances of this flag being used in this code: `drivers/usb/core/message.c`).
+    The LDV page mentions the fact that a couple of USB-related code driver code source
+    files were fixed to adhere to this rule.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: All right, now that you're armed with a good amount of detail on the page allocator
+    (it is, after all, the internal "engine" of RAM (de)allocation!), its APIs, and
+    how to use them, let's move on to a very important topic – the motivation(s) behind
+    the slab allocator, its APIs, and how to use them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel slab allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As seen in the first section of this chapter, *Introducing kernel memory allocators,* the *slab
+    allocator* or *slab cache* is layered above the page allocator (or BSA; refer
+    back to *Figure 8.1*). The slab allocator justifies its very existence with two
+    primary ideas or purposes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Object caching**: Here, it serves as a cache of common "objects," and the
+    allocation (and subsequent freeing) of frequently allocated data structures within
+    the Linux kernel, for high performance.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mitigate the high wastage (internal fragmentation) of the page allocator by
+    providing small, conveniently sized caches, typically **fragments of a page**.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's now examine these ideas in a more detailed manner.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The object caching idea
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Okay, we begin with the first of these design ideas – the notion of a cache
+    of common objects. A long time ago, a SunOS developer, Jeff Bonwick, noticed that
+    certain kernel objects – data structures, typically – were allocated and deallocated
+    frequently within the OS. He thus had the idea of *pre-allocating* them in a cache
+    of sorts. This evolved into what we call the *slab cache*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thus, on the Linux OS as well, the kernel (as part of the boot time initialization)
+    pre-allocates a fairly large number of objects into several slab caches. The reason:
+    performance! When core kernel code (or a device driver) requires memory for one
+    of these objects, it directly requests the slab allocator. If cached, the allocation
+    is almost immediate (the converse being true as well at deallocation). You might
+    wonder, *is all this really necessary*? Indeed it is!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A good example of high performance being required is within the critical code
+    paths of the network and block IO subsystems. Precisely for this reason, several
+    network and block IO data structures (the network stack's socket buffer, `sk_buff`,
+    the block layer's `biovec`, and, of course, the core `task_struct` data structures
+    or objects, being a few good examples) are *auto-cached *(*pre-allocated*) by
+    the kernel within the slab caches. Similarly, filesystem metadata structures (such
+    as the `inode` and `dentry` structures, and so on), the memory descriptor (`struct
+    mm_struct`), and several more are *pre-allocated* on slab caches. Can we see these
+    cached objects? Yes, just a bit further down, we will do precisely this (via `/proc/slabinfo`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other reason that the slab (or, more correctly now, the SLUB) allocator
+    has far superior performance is simply that traditional heap-based allocators
+    tend to allocate and deallocate memory often, creating "holes" (fragmentation).
+    Because the slab objects are allocated once (at boot) onto the caches, and freed
+    back there (thus not really "freed" up), performance remains high. Of course,
+    the modern kernel has the intelligence to, in a graceful manner, start freeing
+    up the slab caches when the memory pressure gets too high.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The current state of the slab caches – the object caches, the number of objects
+    in a cache, the number in use, the size of each object, and so on – can be looked
+    up in several ways: a raw view via the `proc` and `sysfs` filesystems, or a more
+    human-readable view via various frontend utilities, such as `slabtop(1)`, `vmstat(8)`,
+    and `slabinfo`. In the following code snippet, on a native x86_64 (with 16 GB
+    of RAM) running Ubuntu 18.04 LTS, we peek at the top 10 lines of output from `/proc/slabinfo`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A few points to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Even reading `/proc/slabinfo` requires root access (hence, we use `sudo(8)`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the preceding output, the leftmost column is the name of the slab cache.
+    It often, but not always, matches the name of the actual data structure within
+    the kernel that it caches.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Then follows, for each cache, information in this format: `<statistics> : <tunables>
+    : <slabdata>`. The meaning of each of the fields shown in the header line is explained
+    in the man page for `slabinfo(5)` (look it up with `man 5 slabinfo`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Incidentally, the `slabinfo` utility is one example of user space C code *within*
+    the kernel source tree under the `tools/` directory (as are several others). It
+    displays a bunch of slab layer statistics (try it with the `-X` switch). To build
+    it, do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A question you might have at this point is, *how much memory in total is the
+    slab cache currently using*? This is easily answered by grepping `/proc/meminfo` for
+    the `Slab:` entry, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As is apparent, significant amounts of memory can be used by the slab caches!
+    This, in fact, is a common feature on Linux that puzzles those new to it: the
+    kernel can and will use RAM for cache purposes, thus greatly improving performance.
+    It is, of course, designed to intelligently throttle down the amount of memory
+    used for caching as the memory pressure increases. On a regular Linux system,
+    a significant percentage of memory can go toward caching (especially the *page
+    cache; *it''s used to cache the content of files as IO is performed upon them).
+    This is fine, *as long as* *memory pressure is low*. The `free(1)` utility clearly
+    shows this (again, on my x86_64 Ubuntu box with 16 GB of RAM, in this example):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `buff/cache` column indicates two caches that the Linux kernel employs –
+    the buffer and page caches. In reality, among the various caches that the kernel
+    employs, the *page cache* is a key one and often accounts for a majority of memory
+    usage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Look up `/proc/meminfo` for fine-granularity detail on system memory usage;
+    the fields displayed are numerous. The man page on `proc(5)` describes them under
+    the `/proc/meminfo` section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you understand the motivation behind the slab allocator (there's more
+    on this too), let's dive into learning how to use the APIs it exposes for both
+    the core kernel as well as module authors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning how to use the slab allocator APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You may have noticed that, so far, we haven't explained the second "design idea"
+    behind the slab allocator (cache), namely, *mitigate the high wastage (internal
+    fragmentation) of the page allocator by providing small, conveniently sized caches,
+    typically, fragments of a page*. We will see what exactly this means in a practical
+    fashion, along with the kernel slab allocator APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocating slab memory
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Though several APIs to perform memory allocation and freeing exist within the
+    slab layer, there are just a couple of really key ones, with the rest falling
+    into a "convenience or helper" functions category (which we will of course mention
+    later). The key slab allocation APIs for the kernel module or device driver author
+    are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Be sure to include the `<linux/slab.h>` header file when using any slab allocator
+    APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `kmalloc()` and `kzalloc()` routines tend to be the **most frequently used
+    APIs for memory allocation** within the kernel. A quick check – we're not aiming
+    to be perfectly precise – with the very useful `cscope(1)` code browsing utility
+    on the 5.4.0 Linux kernel source tree reveals the (approximate) frequency of usage: `kmalloc()` is called
+    around 4,600 times and `kzalloc()` is called over 11,000 times!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Both functions have two parameters: the first parameter to pass is the size of
+    the memory allocation required in bytes, while the second is the type of memory
+    to allocate, specified via the now familiar GFP flags(we already covered this
+    topic in earlier sections, namely, *Dealing with the **GFP flags* and *The GFP
+    flags – digging deeper. *If you''re not familiar with them, I suggest you read
+    those sections first).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To mitigate the risk of **Integer Overflow** (**IoF**) bugs, you should avoid
+    dynamically calculating the size of memory to allocate (the first parameter).
+    The kernel documentation warns us regarding precisely this (link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://www.kernel.org/doc/html/latest/process/deprecated.html#open-coded-arithmetic-in-allocator-arguments](https://www.kernel.org/doc/html/latest/process/deprecated.html#open-coded-arithmetic-in-allocator-arguments)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In general, always avoid using deprecated stuff documented here: *Deprecated
+    Interfaces, Language Features, Attributes, and Conventions* (link: [https://www.kernel.org/doc/html/latest/process/deprecated.html#deprecated-interfaces-language-features-attributes-and-conventions](https://www.kernel.org/doc/html/latest/process/deprecated.html#deprecated-interfaces-language-features-attributes-and-conventions)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Upon successful allocation, the return value is a pointer, the *kernel logical
+    address* (remember, it''s still a virtual address, *not* physical) of the start
+    of the memory chunk (or slab) just allocated. Indeed, you should notice that but
+    for the second parameter, the `kmalloc()` and `kzalloc()` APIs closely resemble
+    their user space counterpart, the all-too-familiar glibc `malloc(3)` (and friends)
+    APIs. Don''t get the wrong idea, though: they''re completely different. `malloc()` returns
+    a user space virtual address and, as mentioned earlier, there is no direct correlation
+    between the user-mode `malloc(3)` and the kernel-mode `k[m|z]alloc()` (so no,
+    a call to `malloc()` does *not *result in an immediate call to `kmalloc()`; more
+    on this later!).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, it's important to understand that the memory returned by these slab allocator
+    APIs **is guaranteed to be physically contiguous***. *Furthermore, and another
+    key benefit, the return address is guaranteed to be on a CPU cacheline boundary;
+    that is, it will be **cacheline-aligned**. Both of these are important performance-enhancing
+    benefits.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every CPU reads and writes data (from and to CPU caches <-> RAM) in an atomic
+    unit called the **CPU cacheline***.* The size of the cacheline varies with the
+    CPU. You can look this up with the `getconf(1)` utility – for example, try doing `getconf
+    -a|grep LINESIZE`. On modern CPUs, the cachelines for instructions and data are
+    often separated out (as are the CPU caches themselves). A typical CPU cacheline
+    size is 64 bytes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The content of a memory chunk immediately after allocation by `kmalloc()` is
+    random (again, like `malloc(3)`). Indeed, the reason why `kzalloc()` is the preferred
+    and recommended API to use is that it *sets to zero* the allocated memory. Some
+    developers argue that the initialization of the memory slab takes some time, thus
+    reducing performance. Our counter argument is that unless the memory allocation
+    code is in an extremely time-critical code path (which, you could reasonably argue,
+    is not good design in the first place, but sometimes can't be helped), you should,
+    as a best practice, *initialize your memory upon allocation*. A whole slew of
+    memory bugs and security side effects can thereby be avoided.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Many parts of the Linux kernel core code certainly use the slab layer for memory.
+    Within these, there *are* timecritical code paths – good examples can be found
+    within the network and block IO subsystems. For maximizing performance, the slab
+    (actually SLUB) layer code has been written to be *lo*ckless (via a lock-free
+    technology called per-CPU variables). See more on the performance challenges and
+    implementation details in the *Further reading *section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Freeing slab memory
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Of course, you must free the allocated slab memory you allocated at some point
+    in the future (thus not leaking memory); the  `kfree()` routine serves this purpose.
+    Analogous to the user space `free(3)` API, `kfree()` takes a single parameter
+    – the pointer to the memory chunk to free. It must be a valid kernel logical (or
+    virtual) address and must have been initialized by, that is, the return value
+    of, one of the slab layer APIs (`k[m|z]alloc()` or one of its helpers). Its API
+    signature is simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Just as with `free(3)`, there is no return value. As mentioned before, take
+    care to ensure that the parameter to `kfree()` is the precise value returned by
+    `k[m|z]alloc()`. Passing an incorrect value will result in memory corruption,
+    ultimately leading to an unstable system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are a few additional points to note.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s assume we have allocated some slab memory with `kzalloc()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Later, after usage, we would like to free it, so we do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: This code – checking that the value of `kptr` is not `NULL` before freeing it
+    – *is unnecessary*; just perform `kfree(kptr);` and it's done.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another example of *incorrect* code (pseudo-code) is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Interesting: here, from the second loop iteration onward, the programmer has *assumed *that
+    the `kptr` pointer variable will be set to `NULL` upon being freed! This is definitely
+    not the case (it would have been quite a nice semantic to have though; also, the
+    same argument applies to the "usual" user space library APIs). Thus, we hit a
+    dangerous bug: on the loop''s second iteration, the `if` condition will likely
+    turn out to be false, thus skipping the allocation. Then, we hit the `kfree()`,
+    which, of course, will now corrupt memory (due to a double-free bug)! (We provide
+    a demo of this very case in the LKM here: `ch8/slab2_buggy`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With regard to *initializing* memory buffers after (or during) allocation, just
+    as we mentioned with regard to allocations, the same holds true for freeing memory.
+    You should realize that the `kfree()` API merely returns the just-freed slab to
+    its corresponding cache, leaving the internal memory content exactly as it was!
+    Thus, just prior to freeing up your memory chunk, a (slightly pedantic) best practice
+    is to *wipe out (overwrite)* the memory content. This is especially true for security
+    reasons (such as in the case of an "info-leak," where a malicious attacker could
+    conceivably scan freed memory for "secrets"). The Linux kernel provides the `kzfree()` API
+    for this express purpose (the signature is identical to that of `kfree()`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Careful!* In order to overwrite "secrets," a simple `memset()` of the target
+    buffer might just not work. Why not? The compiler might well optimize away the
+    code (as the buffer is no longer to be used). David Wheeler, in his excellent
+    work *Secure Programming HOWTO* ([https://dwheeler.com/secure-programs/](https://dwheeler.com/secure-programs/)),
+    mentions this very fact and provides a solution: "One approach that seems to work
+    on all platforms is to write your own implementation of memset with internal "volatilization"
+    of the first argument." (This code is based on a workaround proposed by Michael
+    Howard):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`void *guaranteed_memset(void *v,int c,size_t n)`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`{ volatile char *p=v; while (n--) *p++=c; return v; }`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Then place this definition into an external file to force the function to
+    be external (define the function in a corresponding `.h` file, and `#include`
+    the file in the callers, as is usual). This approach appears to be safe at any
+    optimization level (even if the function gets inlined)."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel's `kzfree()` API should work just fine. Take care when doing similar
+    stuff in user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Data structures – a few design tips
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Using the slab APIs for memory allocation in kernel space is highly recommended.
+    For one, it guarantees both physically contiguous as well as cacheline-aligned
+    memory. This is very good for performance; in addition, let's check out a few
+    quick tips that can yield big returns.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*CPU caching* can provide tremendous performance gains. Thus, especially for
+    time-critical code, take care to design your data structures for best performance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keep the most important (frequently accessed, "hot") members  together and at
+    the top of the structure. To see why, imagine there are five important members
+    (of a total size of say, 56 bytes) in your data structure; keep them all together
+    and at the top of the structure. Say the CPU cacheline size is 64 bytes. Now,
+    when your code accesses *any one* of these five important members (for anything,
+    read/write), *all five members will be fetched into the CPU cache(s) as the CPU's
+    memory read/writes work in an atomic unit of CPU cacheline size; *this optimizes
+    performance (as working on the cache is typically multiple times faster than working
+    on RAM).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Try and align the structure members such that a single member does not "fall
+    off a cacheline." Usually, the compiler helps in this regard, but you can even
+    use compiler attributes to explicitly specify this.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Accessing memory sequentially results in high performance due to effective
+    CPU caching. However, we can''t seriously push the case for making all our data
+    structures arrays! Experienced designers and developers know that using linked
+    lists is extremely common. But doesn''t that actually hurt performance? Well,
+    yes, to some extent. Thus, a suggestion: use linked lists. Keep the "node" of
+    the list as a large data structure (with "hot" members at the top and together).
+    This way, we try and maximize the best of both cases as the large structure is
+    essentially an array. (Think about it, the list of task structures that we saw
+    in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals
+    Essentials – Processes and Threads*, – the *task list – *is a perfect real-world
+    example of a linked list with large data structures as nodes).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The upcoming section deals with a key aspect: we learn exactly which slab caches
+    the kernel uses when allocating (slab) memory via the popular `k[m|z]alloc()`
+    APIs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The actual slab caches in use for kmalloc
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We''ll take a quick deviation – very important, though – before trying out
+    a kernel module using the basic slab APIs. It''s important to understand where
+    exactly the memory allocated by the `k[m|z]alloc()` APIs is coming from. Well,
+    it''s from the slab caches, yes, but which ones exactly? A quick `grep` on the
+    output of `sudo vmstat -m` reveals this for us (the following screenshot is on
+    our x86_64 Ubuntu guest):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ec7fdc35-1bda-4de1-b8fb-fed9b2cce797.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.7 – Screenshot of sudo vmstat -m showing the kmalloc-n slab caches
+  prefs: []
+  type: TYPE_NORMAL
+- en: That's very interesting! The kernel has a slew of dedicated slab caches for
+    generic `kmalloc` memory of varying sizes, *ranging from 8,192 bytes down to a
+    mere 8 bytes!* This tells us something – with the page allocator, if we had requested,
+    say, 12 bytes of memory, it would have ended up giving us a whole page (4 KB)
+    – the wastage is just too much. Here, with the slab allocator, an allocation request
+    for 12 bytes ends up actually allocating just 16 bytes (from the second-to-last
+    cache seen in Figure 8.8)! Fantastic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, note the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Upon `kfree()`, the memory is freed back into the appropriate slab cache.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The precise sizing of the slab caches for `kmalloc` varies with the architecture.
+    On our Raspberry Pi system (an ARM CPU, of course), the generic memory `kmalloc-N` caches
+    ranged from 64 bytes to 8,192 bytes.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The preceding screenshot also reveals a clue. Often, the demand is for small-to-tiny
+    fragments of memory. As an example, in the preceding screenshot the column labelled
+    `Num` represents the *Number of currently active objects*, the maximum number
+    is from the 8- and 16-byte `kmalloc` slab caches (of course, this may not always
+    be the case. Quick tip: use the `slabtop(1)` utility (you''ll need to run it as
+    root): the rows towards the top reveal the current frequently used slab caches.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Linux keeps evolving, of course. As of the 5.0 mainline kernel, there is a
+    newly introduced `kmalloc` cache type, called the reclaimable cache (the naming
+    format is `kmalloc-rcl-N`). Thus, performing a grep as done previously on a 5.x
+    kernel will also reveal these caches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: The new `kmalloc-rcl-N` caches help internally with more efficiencies (to reclaim
+    pages under pressure and as an anti-fragmentation measure). However, a module
+    author like you need not be concerned with these details. (The commit for this
+    work can be viewed here: [https://github.com/torvalds/linux/commit/1291523f2c1d631fea34102fd241fb54a4e8f7a0](https://github.com/torvalds/linux/commit/1291523f2c1d631fea34102fd241fb54a4e8f7a0).)
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vmstat -m` is essentially a wrapper over the kernel''s `/sys/kernel/slab`
+    content (more on this follows). Deep internal details of the slab caches can be
+    seen using utilities such as `slabtop(1)`, as well as the powerful `crash(1)`
+    utility (on a "live" system, the relevant crash command is `kmem -s` (or `kmem
+    -S`)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right! Time to again get hands on with some code to demonstrate the usage of
+    the slab allocator APIs!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Writing a kernel module to use the basic slab APIs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In the following code snippet, take a look at the demo kernel module code (found
+    at `ch8/slab1/`). In the `init` code, we merely perform a couple of slab layer
+    allocations (via the `kmalloc()` and `kzalloc()` APIs), print some information,
+    and free the buffers in the cleanup code path (of course, the full source code
+    is accessible at this book's GitHub repository). Let's look at the relevant parts
+    of the code step by step.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At the start of the `init` code of this kernel module, we initialize a global
+    pointer (`gkptr`) by allocating 1,024 bytes to it (*remember: pointers have no
+    memory!*) via the `kmalloc()` slab allocation API. Notice that, as we''re certainly
+    running in process context here, and it is thus "safe to sleep," we use the `GFP_KERNEL` flag
+    for the second parameter (just in case you want to refer back, the earlier section, *The
+    GFP flags – digging deeper*, has it covered):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code, also notice that we use the `print_hex_dump_bytes()` kernel
+    convenience routine as a convenient way to dump the buffer memory in a human-readable
+    format. Its signature is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Where `prefix_str` is any string you would like to prefix to each line of the
+    hex dump; `prefix_type` is one of `DUMP_PREFIX_OFFSET`, `DUMP_PREFIX_ADDRESS`,
+    or `DUMP_PREFIX_NONE`, `buf` is the source buffer to hex-dump; and `len` is the
+    number of bytes to dump.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Up next is a typical strategy (*a best practice*) followed by many device drivers:
+    they keep all their required or context information in a single data structure,
+    often termed the *driver context* structure. We mimic this by declaring a (silly/sample)
+    data structure called `myctx`, as well as a global pointer to it called `ctx` (the
+    structure and pointer definition is in the preceding code block):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: After the data structure, we then allocate and initialize `ctx` to the size
+    of the `myctx` data structure via the useful `kzalloc()` wrapper API. The subsequent
+    *hexdump* will show that it is indeed initialized to all zeroes (for readability,
+    we will only "dump" the first 32 bytes).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Do notice how we handle the error paths using `goto`; this has already been
+    mentioned a few times earlier in this book, so we won''t repeat ourselves here. Finally,
+    in the cleanup code of the kernel module, we `kfree()` both buffers, preventing
+    any memory leakage:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A screenshot of a sample run on my Raspberry Pi 4 follows. I used our `../../lkm`
+    convenience script to build, load, and do `dmesg`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ca0f2ab4-3db3-48cf-8ae9-d5ff027ddcdf.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.8 – Partial screenshot of our slab1.ko kernel module in action on a
+    Raspberry Pi 4
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now that you have a grip on the basics of using the common slab allocator
+    APIs, `kmalloc(), kzalloc()`, and `kfree()`, let's go further. In the next section,
+    we will dive into a really key concern – the reality of size limitations on the
+    memory you can obtain via the slab (and page) allocators. Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Size limitations of the kmalloc API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One of the key advantages of both the page and slab allocators is that the memory
+    chunk they provide upon allocation is not only virtually contiguous (obviously)
+    but is also guaranteed to be *physically contiguous memory*. Now that is a big
+    deal and will certainly help performance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But (there's always a *but*, isn't there!), precisely because of this guarantee,
+    it becomes impossible to serve up any given large size when performing an allocation.
+    In other words, there is a definite limit to the amount of memory you can obtain
+    from the slab allocator with a single call to our dear `k[m|z]alloc()` APIs. What
+    is the limit? (This is indeed a really frequently asked question.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Firstly, you should understand that, technically, the limit is determined by
+    two factors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One, the system page size (determined by the `PAGE_SIZE` macro)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Two, the number of "orders" (determined by the `MAX_ORDER` macro); that is,
+    the number of lists in the page allocator (or BSA) freelist data structures (see
+    Figure 8.2)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With a standard 4 KB page size and a MAX_ORDER value of 11, the maximum amount
+    of memory that can be allocated with a single `kmalloc()` or `kzalloc()` API call
+    is 4 MB. This is the case on both the x86_64 and ARM architectures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might wonder, *how exactly is this 4 MB limit arrived at*? Think about
+    it: once a slab allocation request exceeds the maximum slab cache size that the
+    kernel provides (often 8 KB), the kernel simply passes the request down to the
+    page allocator. The page allocator''s maximum allocable size is determined by
+    `MAX_ORDER`. With it set to `11`, the maximum allocable buffer size is *2^((MAX_ORDER-1)) =**2^(10)
+    pages = 1024 pages = 1024 * 4K = 4 MB*!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing the limits – memory allocation with a single call
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A really key thing for developers (and everyone else, for that matter) is to
+    **be empirical** in your work! The English word *empirical *means based on what
+    is experienced or seen, rather than on theory. This is a critical rule to always
+    follow – do not simply assume things or take them at face value. Try them out
+    for yourself and see.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s do something quite interesting: write a kernel module that allocates
+    memory from the (generic) slab caches (via the `kmalloc()` API, of course). We
+    will do so in a loop, allocating – and freeing – a (calculated) amount on each
+    loop iteration. The key point here is that we will keep increasing the amount
+    allocated by a given "step" size. The loop terminates when `kmalloc()` fails;
+    this way, we can test just how much memory we can actually allocate with a single
+    call to `kmalloc()`(you''ll realize, of course, that `kzalloc()`, being a simple
+    wrapper over `kmalloc()`, faces precisely the same limits).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following code snippet, we show the relevant code. The `test_maxallocsz()`
+    function is called from the `init` code of the kernel module:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: By the way, notice how our `printk()` function uses the `%zu` format specifier
+    for the `size_t` (essentially an unsigned integer) variable? `%zu` is a portability
+    aid; it makes the variable format correct for both 32- and 64-bit systems!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s build (cross-compile on the host) and insert this kernel module on our
+    Raspberry Pi device running our custom-built 5.4.51-v7+ kernel; almost immediately, upon
+    `insmod(8)`, you will see an error message, `Cannot allocate memory`, printed
+    by the `insmod` process; the following (truncated) screenshot shows this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/5fd4b019-8594-448d-9c41-7f0cb0040383.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.9 – The first insmod(8) of our slab3_maxsize.ko kernel module on a
+    Raspberry Pi 3 running a custom 5.4.51 kernel
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is expected! Think about it, the `init` function of our kernel module code
+    has indeed failed with `ENOMEM` after all. Don't get thrown by this; looking up
+    the kernel log reveals what actually transpired. The fact is that on the very
+    first test run of this kernel module, you will find that at the place where `kmalloc()` fails,
+    the kernel dumps some diagnostic information, including a pretty lengthy kernel
+    stack trace. This is due to it invoking a `WARN()` macro.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, our slab memory allocations worked, up to a point. To clearly see the failure
+    point, simply scroll down in the kernel log (`dmesg`) display. The following screenshot
+    shows this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/df1b5ab9-fc13-4aa8-889f-e1e0294c79ea.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.10 – Partial screenshot showing the lower part of the dmesg output
+    (of our slab3_maxsize.ko kernel module) on a Raspberry Pi 3
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Aha, look at the last line of output (Figure 8.11): the `kmalloc()` fails on
+    an allocation above 4 MB (at 4,200,000 bytes), precisely as expected; until then,
+    it succeeds.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As an interesting aside, notice that we have (quite deliberately) performed
+    the very first allocation in the loop with size `0`; it does not fail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`kmalloc(0, GFP_xxx);` returns the zero pointer; on x86[_64], it''s the value `16` or `0x10` (see `include/linux/slab.h` for
+    details). In effect, it''s an invalid virtual address living in the page `0` `NULL`
+    pointer trap. Accessing it will, of course, lead to a page fault (originating
+    from the MMU).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Similarly, attempting `kfree(NULL);` or `kfree()` of the zero pointer results
+    in `kfree()` becoming a no-op.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Hang on, though – an extremely important point to note: in the *The actual
+    slab caches in use for kmalloc* section, we saw that the slab caches that are
+    used to allocate memory to the caller are the `kmalloc-n` slab caches, where `n` ranges
+    from `64` to `8192` bytes (on the Raspberry Pi, and thus the ARM for this discussion).
+    Also, FYI, you can perform a quick  `sudo vmstat -m | grep -v "\-rcl\-" | grep
+    --color=auto "^kmalloc"` to verify this.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But clearly, in the preceding kernel module code example, we have allocated
+    via `kmalloc()` much larger quantities of memory (right from 0 bytes to 4 MB).
+    The way it really works is that the `kmalloc()` API only uses the `kmalloc-''n''`
+    slab caches for memory allocations less than or equal to 8,192 bytes (if available);
+    any allocation request for larger memory chunks is then passed to the underlying page
+    (or buddy system) allocator! Now, recall what we learned in the previous chapter:
+    the page allocator uses the buddy system freelists (on a per *node:zone* basis) *and *the
+    maximum size of memory chunks enqueued on the freelists are *2^((MAX_ORDER-1)) =
+    2^(10)* *pages*, which, of course, is 4 MB (given a page size of 4 KB and `MAX_ORDER` of `11`).
+    This neatly ties in with our theoretical discussions.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, there we have it: both in theory and in practice, you can now see that (again,
+    given a page size of 4 KB and `MAX_ORDER` of `11`), the maximum size of memory
+    that can be allocated via a single call to `kmalloc()` (or `kzalloc()`) is 4 MB.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Checking via the /proc/buddyinfo pseudo-file
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'It''s really important to realize that although we figured out that 4 MB of
+    RAM is the maximum we can get at one shot, it definitely doesn''t mean that you
+    will always get that much. No, of course not. It completely depends upon the amount
+    of free memory present within the particular freelist at the time of the memory
+    request. Think about it: what if you are running on a Linux system that has been
+    up for several days (or weeks). The likelihood of finding physically contiguous
+    4 MB chunks of free RAM is quite low (again, this depends upon the amount of RAM
+    on the system and its workload).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a rule of thumb, if the preceding experiment did not yield a maximum allocation
+    of what we have deemed to be the maximum size (that is, 4 MB), why not try it
+    on a freshly booted guest system? Now, the chances of having physically contiguous
+    4 MB chunks of free RAM are a lot better. Unsure about this? Let''s get empirical
+    again and look up the content of `/proc/buddyinfo` – both on an in-use and a freshly
+    booted system – to figure out whether the memory chunks are available. In the
+    following code snippet, on our in-use x86_64 Ubuntu guest system with just 1 GB
+    of RAM, we look it up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we learned earlier (in the *Freelist organization* section), the numbers
+    seen in the preceding code block are in the sequence order `0` to `MAX_ORDER-1`
+    (typically, *0* to *11 – 1 = 10*), and they represent the number of *2^(order)*
+    contiguous free page frames in that order.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding output, we can see that we do *not* have free blocks on the
+    order `10` list (that is, the 4 MB chunks; it''s zero). On a freshly booted Linux
+    system, the chances are high that we will. In the following output, on the same
+    system that''s just been rebooted, we see that there are seven chunks of free
+    physically contiguous 4 MB RAM available in node `0`, zone DMA32:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Reiterating this very point, on a Raspberry Pi that has been up for just about
+    a half hour, we have the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, there are 160 4 MB chunks of physically contiguous RAM available (free).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, there's more to explore. In the following section, we cover more
+    on using the slab allocator – the resource-managed API alternative, additional
+    slab helper APIs that are available, and a note on cgroups and memory in modern
+    Linux kernels.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Slab allocator – a few additional details
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A few more key points remain to be explored. First, some information on using
+    the kernel's resource-managed versions of the memory allocator APIs, followed
+    by a few additionally available slab helper routines within the kernel, and then
+    a brief look at cgroups and memory. We definitely recommend you go through these
+    sections as well. Please, do read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the kernel's resource-managed memory allocation APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Especially useful for device drivers, the kernel provides a few managed APIs
+    for memory allocation. These are formally referred to as the device resource-managed
+    or devres APIs (the link to kernel documentation on this is [https://www.kernel.org/doc/Documentation/driver-model/devres.txt](https://www.kernel.org/doc/Documentation/driver-model/devres.txt)).
+    They are all prefixed with `devm_`; though there are several of them, we will
+    focus on only one common use case here – that of using these APIs in place of
+    the usual `k[m|z]alloc()` ones. They are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`void * devm_kmalloc(struct device *dev, size_t size, gfp_t gfp);`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`void * devm_kzalloc(struct device *dev, size_t size, gfp_t gfp);`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The reason why these resource-managed APIs are useful is that there is *no need
+    for the developer to explicitly free the memory allocated by them*. The kernel
+    resource management framework guarantees that it will automatically free the memory
+    buffer upon driver detach, or if a kernel module, when the module is removed (or
+    the device is detached, whichever occurs first). This feature immediately enhances
+    code robustness. Why? Simple, we're all human and make mistakes. Leaking memory
+    (especially on error code paths) is indeed a pretty common bug!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few relevant points regarding the usage of these APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A key point – please do not attempt to blindly replace `k[m|z]alloc()` with
+    the corresponding `devm_k[m|z]alloc()`! These resource-managed allocations are
+    really designed to be used only in the `init` and/or `probe()` methods of a device
+    driver (all drivers that work with the kernel's unified device model will typically
+    supply the `probe()` and `remove()` (or `disconnect()`) methods. We will not delve
+    into these aspects here).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`devm_kzalloc()` is usually preferred as it initializes the buffer as well.
+    Internally (as with `kzalloc()`), it is merely a thin wrapper over the `devm_kmalloc()` API.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second and third parameters are the usual ones, as with the `k[m|z]alloc()` APIs – the
+    number of bytes to allocate and the GFP flags to use. The first parameter, though,
+    is a pointer to `struct device`. Quite obviously, it represents the *device *that
+    your driver is driving.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As the memory allocated by these APIs is auto-freed (on driver detach or module
+    removal), you don't have to do anything. It can, though, be freed via the `devm_kfree()` API.
+    You doing this, however, is usually an indication that the managed APIs are the
+    wrong ones to use...
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Licensing: The managed APIs are exported (and thus available) only to modules
+    licensed under the GPL (in addition to other possible licenses).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Additional slab helper APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There are several helper slab allocator APIs, friends of the `k[m|z]alloc()` API
+    family. These include the `kcalloc()` and `kmalloc_array()` APIs for allocating
+    memory for an array, as well as `krealloc()`, whose behavior is analogous to `realloc(3)`, the
+    familiar user space API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In conjunction with allocating memory for an array of elements, the `array_size()`
+    and `struct_size()` kernel helper routines can be very helpful. In particular,
+    `struct_size()` has been heavily used to prevent (and indeed fix) many integer
+    overflow (and related) bugs when allocating an array of structures, a common task
+    indeed. As a quick example, here''s a small code snippet from `net/bluetooth/mgmt.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: It's worth browsing through the `include/linux/overflow.h` kernel header file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`kzfree()` is like `kfree()` but zeroes out the (possibly larger) memory region
+    being freed. (Why larger? This will be explained in the next section.) Note that
+    this is considered a security measure but might hurt performance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The resource-managed versions of these APIs are also available: `devm_kcalloc()`
+    and `devm_kmalloc_array()`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Control groups and memory
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The Linux kernel supports a very sophisticated resource management system called **cgroups **(**control
+    groups**), which, in a nutshell, are used to hierarchically organize processes
+    and perform resource management (more on cgroups, with an example of cgroups v2
+    CPU controller usage, can be found in [Chapter 11](d6e5ebd3-1f04-40e8-a240-2607c58b1299.xhtml), *The
+    CPU Scheduler - Part 2*, on CPU scheduling).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Among the several resource controllers is one for memory bandwidth. By carefully
+    configuring it, the sysadmin can effectively regulate the distribution of memory
+    on the system. Memory protection is possible, both as (what is called) hard and
+    best-effort protection via certain `memcg` (memory cgroup) pseudo-files (particularly,
+    the `memory.min` and `memory.low` files). In a similar fashion, within a cgroup,
+    the `memory.high` and `memory.max` pseudo-files are the main mechanism to control
+    the memory usage of a cgroup. Of course, as there is a lot more to it than is
+    mentioned here, I refer you to the kernel documentation on the new cgroups (v2)
+    here: [https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right, now that you have learned how to use the slab allocator APIs better,
+    let's dive a bit deeper still. The reality is, there are still a few important
+    caveats regarding the size of the memory chunks allocated by the slab allocator
+    APIs. Do read on to find out what they are!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Caveats when using the slab allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We will split up this discussion into three parts. We will first re-examine
+    some necessary background (which we covered earlier), then actually flesh out
+    the problem with two use cases – the first being very simple, and the second a
+    more real-world case of the issue at hand.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Background details and conclusions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'So far, you have learned some key points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The *page* (or *buddy system*) *allocator* allocates power-of-2 pages to the
+    caller. The power to raise 2 to is called the *order*; it typically ranges from
+    `0` to `10` (on both x86[_64] and ARM).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This is fine, except when it's not. When the amount of memory requested is very
+    small, the *wastage* (or internal fragmentation) can be huge.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Requests for fragments of a page (less than 4,096 bytes) are very common. Thus,
+    the *slab allocator, layered upon the page allocator *(see Figure 8.1) is designed
+    with object caches, as well as small generic memory caches, to efficiently fulfill
+    requests for small amounts of memory.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The page allocator guarantees physically contiguous page and cacheline-aligned
+    memory.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The slab allocator guarantees physically contiguous and cacheline-aligned memory.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'So, fantastic – this leads us to conclude that when the amount of memory required
+    is large-ish and a perfect (or close) power of 2, use the page allocator. When
+    it''s quite small (less than a page), use the slab allocator. Indeed, the kernel
+    source code of `kmalloc()` has a comment that neatly sums up how the `kmalloc()` API
+    should be used (reproduced in bold font as follows):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Sounds great, but there is still a problem! To see it, let''s learn how to
+    use another useful slab API, `ksize()`. Its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: The parameter to `ksize()` is a pointer to an existing slab cache (it must be
+    a valid one). In other words, it's the return address from one of the slab allocator
+    APIs (typically, `k[m|z]alloc()`). The return value is the actual number of bytes
+    allocated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now that you know what `ksize()` is for, let's use it in a more practical
+    fashion, first with a simple use case and then with a better one!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing slab allocation with ksize() – case 1
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To understand what we''re getting at, consider a small example (for readability,
+    we will not show essential validity checks. Also, as this is a tiny code snippet,
+    we haven''t provided it as a kernel module in the book''s code base):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The resulting output on my x86_64 Ubuntu guest system is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, we attempted to allocate 20 bytes with `kzalloc()`, but actually obtained
+    32 bytes (thus incurring a wastage of 12 bytes, or 60%!). This is expected. Recall
+    the `kmalloc-n` slab caches – on x86, there is one for 16 bytes and another for
+    32 bytes (among the many others). So, when we ask for an amount in between the
+    two, we obviously get memory from the higher of the two. (Incidentally, and FYI,
+    on our ARM-based Raspberry Pi system, the smallest slab cache for `kmalloc` is
+    64 bytes, so, of course, we get 64 bytes when we ask for 20 bytes.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the `ksize()` API works only on allocated slab memory; you cannot
+    use it on the return value from any of the page allocator APIs (which we saw in
+    the *Understanding and u**sing the kernel page allocator (or BSA)* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now for the second, and more interesting, use case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing slab allocation with ksize() – case 2
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Okay, now, let''s extend our previous kernel module (`ch8/slab3_maxsize`) to `ch8/slab4_actualsize`.
+    Here, we will perform the same loop, allocating memory with `kmalloc()` and freeing
+    it as before, but this time, we will also document the actual amount of memory
+    allocated to us in each loop iteration by the slab layer, by invoking the `ksize()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The output of this kernel module is indeed interesting to scan! In the following
+    figure, we show a partial screenshot of the output I got on my x86_64 Ubuntu 18.04
+    LTS guest running our custom built 5.4.0 kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/bdf32434-baf3-4fa3-a64f-7327729d0c8a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.11 – Partial screenshot of our slab4_actualsize.ko kernel module in
+    action
+  prefs: []
+  type: TYPE_NORMAL
+- en: The module's printk output can be clearly seen in the preceding screenshot. The
+    remainder of the screen is diagnostic information from the kernel – this is emitted
+    as a kernel-space memory allocation request failed. All this kernel diagnostic
+    information is a  result of the first invocation of the kernel calling the `WARN_ONCE()` macro,
+    as the underlying page allocator code, `mm/page_alloc.c:__alloc_pages_nodemask()` –
+    the "heart" of the buddy system allocator, as it's known -  failed! This should
+    typically never occur, hence the diagnostics (the details on the kernel diagnostics
+    is beyond this book's scope, so we will leave this aside. Having said that, we
+    do examine the kernel stack backtrace to some extent in coming chapters).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interpreting the output from case 2
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Look closely at the preceding screenshot (Figure 8.12; here, we will simply
+    ignore the kernel diagnostics emitted by the `WARN()` macro, which got invoked
+    because a kernel-level memory allocation failed!). The Figure 8.12 output has
+    five columns, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The timestamp from `dmesg(1)`; we ignore it.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`kmalloc(n)`: The number of bytes requested by `kmalloc()` (where `n` is the
+    required amount).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The actual number of bytes allocated by the slab allocator (revealed via `ksize()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The wastage (bytes): The difference between the actual and required bytes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The wastage as a percentage.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As an example, in the second allocation, we requested 200,100 bytes, but actually
+    obtained 262,144 bytes (256 KB). This makes sense, as this is the precise size
+    of one of the page allocator lists on a buddy system freelist (it's *order 6*,
+    as *2⁶ = 64 pages = 64 x 4 = 256 KB*; see *Figure 8.2*). Hence, the delta, or
+    wastage really, is *262,144 - 200,100 = 62,044 bytes*, which, when expressed as
+    a percentage, is 31%.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It''s like this: the closer the requested (or required) size gets to the kernel''s
+    available (or actual) size, the less the wastage will be; the converse is true
+    as well. Let''s look at another example from the preceding output (the snipped
+    output is reproduced as follows for clarity):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'From the preceding output, you can see that when `kmalloc()` requests 1,600,100
+    bytes (around 1.5 MB), it actually gets 2,097,152 bytes (exactly 2 MB), and the
+    wastage is 31%. The wastage then successively *reduces as we get closer to an
+    allocation "boundary" or threshold* (the actual size of the kernel''s slab cache
+    or page allocator memory chunk) as it were: to 16%, then down to  4%. But look:
+    with the next allocation, when we cross that threshold, asking for *just over* 2
+    MB (2,200,100 bytes), we actually get 4 MB, *a wastage of 90%*! Then, the wastage
+    again drops as we move closer to the 4 MB memory size...'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is important! You might think you're being very efficient by mere use of
+    the slab allocator APIs, but in reality, the slab layer invokes the page allocator
+    when the amount of memory requested is above the maximum size that the slab layer
+    can provide (typically, 8 KB, which is often the case in our preceding experiments).
+    Thus, the page allocator, suffering from its usual wastage issues, ends up allocating
+    far more memory than you actually require, or indeed ever use. What a waste!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The moral: *check and recheck your code that allocates memory with the slab
+    APIs*. Run trials on it using `ksize()` to figure out how much memory is actually
+    being allocated, not how much you think is being allocated.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are no shortcuts. Well, there is one: if you require less than a page
+    of memory (a very typical use case), just use the slab APIs. If you require more,
+    the preceding discussion comes into play. Another thing: using the `alloc_pages_exact()
+    / free_pages_exact()` APIs (covered in the *One Solution – the exact page allocator
+    APIs* section) should help reduce wastage as well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Graphing it
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As an interesting aside, we use the well-known `gnuplot(1)` utility to plot
+    a graph from the previously gathered data. Actually, we have to minimally modify
+    the kernel module to only output what we''d like to graph: the required (or requested)
+    amount of memory to allocate (*x* axis), and the percentage of waste that actually
+    occurred at runtime (*y* axis). You can find the code of our slightly modified
+    kernel module in the book''s GitHub repository here: `ch8/slab4_actualsz_wstg_plot` ([https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/ch8/slab4_actualsize](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/ch8/slab4_actualsize)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, we build and insert this kernel module, "massage" the kernel log, saving
+    the data in an appropriate column-wise format as required by `gnuplot` (in a file
+    called `2plotdata.txt`). While we do not intend to delve into the intricacies
+    of using `gnuplot(1)` here (refer to the *Further reading* section for a tutorial
+    link), in the following code snippet, we show the essential commands to generate
+    our graph:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Lo and behold, the plot:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f0680fcb-f728-4941-a8ea-c00a301d1e8b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8.12 – A graph showing the size requested by kmalloc() (x axis) versus
+    the wastage incurred (as a percentage; y axis)
+  prefs: []
+  type: TYPE_NORMAL
+- en: This "saw-tooth"-shaped graph helps visualize what you just learned. The closer
+    a `kmalloc()` (or `kzalloc()`, or indeed *any* page allocator API) allocation
+    request size is to any of the kernel's predefined freelist sizes, the less wastage
+    there is. But the moment this threshold is crossed, the wastage zooms up (spikes)
+    to close to 100% (as seen by the literally vertical lines in the preceding graph).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, with this, we''ve covered a significant amount of stuff. As usual, though,
+    we''re not done: the next section very briefly highlights the actual slab layer
+    implementations (yes, there are several) within the kernel. Let''s check it out!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Slab layer implementations within the kernel
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In closing, we mention the fact that there are at least three different mutually
+    exclusive kernel-level implementations of the slab allocator; only one of them
+    can be in use at runtime. The one to be used at runtime is selected at the time
+    of *configuring* the kernel (you learned this procedure in detail in [Chapter
+    2](e0b89a37-18a3-424d-8983-58c4ac0725f6.xhtml), *Building the 5.x Linux Kernel
+    from Source – Part 1*). The relevant kernel configuration options are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLAB`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLUB`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`CONFIG_SLOB`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The first (`SLAB`) is the early, well-supported (but quite under-optimized)
+    one; the second one (`SLUB`*, the unqueued allocator*) is a major improvement
+    on the first, in terms of memory efficiency, performance, and better diagnostics,
+    and is the one selected by default. The `SLOB` allocator is a drastic simplification
+    and, as per the kernel config help, "does not perform well on large systems."
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned – to a good level of detail – how both the page
+    (or buddy system) as well as the slab allocators work. Recall that the actual
+    "engine" of allocating (and freeing) RAM within the kernel is ultimately the *page
+    (or buddy system) allocator*,the slab allocator being layered on top of it to
+    provide optimization for typical less-than-a-page-in-size allocation requests
+    and to efficiently allocate several well-known kernel data structures ('objects').
+  prefs: []
+  type: TYPE_NORMAL
+- en: You learned how to efficiently use the APIs exposed by both the page and slab
+    allocators, with several demo kernel modules to help show this in a hands-on manner.
+    A good deal of focus was (quite rightly) given to the real issue of the developer
+    issuing a memory request for a certain *N* number of bytes, but you learned that
+    it can be very sub-optimal, with the kernel actually allocating much more (the
+    wastage can climb to very close to 100%)! You now know how to check for and mitigate
+    these cases. Well done!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The following chapter covers more on optimal allocation strategies, as well
+    as some more advanced topics on kernel memory allocation, including the creation
+    of custom slab caches, using the `vmalloc` interfaces, what the *OOM killer *is
+    all about, and more. So, first ensure you've understood the content of this chapter
+    and worked on the kernel modules and assignments (as follows). Then, let's get
+    you on to the next one!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

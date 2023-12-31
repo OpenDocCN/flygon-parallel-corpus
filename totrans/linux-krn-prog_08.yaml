@@ -1,0 +1,1681 @@
+- en: Kernel Internals Essentials - Processes and Threads
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel internals, and especially those concerning memory management, are a vast
+    and complex topic. In this book, we do not intend to delve deep into the gory
+    details of kernel and memory internals. At the same time, I would like to provide
+    sufficient, and definitely requisite,background knowledge for a budding kernel
+    or device driver developer like you to successfully tackle the key topics necessary
+    to understand the kernel architecture in terms of how processes, threads, and
+    their stacks are managed. You'll also be able to correctly and efficiently manage
+    dynamic kernel memory (with the focus on writing kernel or driver code using the
+    **Loadable Kernel Module** (**LKM**) framework). As a side benefit, armed with
+    this knowledge, you will find yourself becoming more proficient at *debugging* both
+    user and kernel space code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I have divided the discussion on essential internals into two chapters, this
+    one and the next. This chapter covers key aspects of the architecture of Linux
+    kernel internals, especially with respect to how processes and threads are managed
+    within the kernel. The following chapter will focus on memory management internals,
+    another critical aspect of understanding and working with the Linux kernel. Of
+    course, the reality is that all of these things do not really get covered in a
+    chapter or two but are spread out across this book (for example, details on the
+    CPU scheduling of processes/threads will be found in later chapters; similarly
+    for memory internals, hardware interrupts, synchronization, and so on).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Briefly, these are the topics covered in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding process and interrupt contexts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding the basics of the process VAS (virtual address space)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Organizing processes, threads, and their stacks – user and kernel space
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and accessing the kernel task structure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Working with the task structure via current
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Iterating over the kernel's task lists
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I assume that you have gone through [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),
+    *Kernel Workspace Setup*, and have appropriately prepared a guest **Virtual Machine**
+    (**VM**) running Ubuntu 18.04 LTS (or a later stable release) and installed all
+    the required packages. If not, I recommend you do this first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the most out of this book, I strongly recommend you first set up the
+    workspace environment, including cloning this book's GitHub repository for the
+    code (found here: [https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming)) and
+    work on it in a hands-on fashion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I do assume that you are familiar with basic virtual memory concepts, the user-mode
+    process **Virtual Address Space** (**VAS**) layout of segments, the stack, and
+    so on. Nevertheless, we do devote a few pages to explaining these basics (in the
+    *Understanding the basics of the process VAS* section that soon follows).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding process and interrupt contexts
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In [Chapter 4](1c494ebd-e7ec-4a78-8695-5b97bdc3d6be.xhtml), *Writing Your First
+    Kernel Module – LKMs, Part 1*, we presented a brief section entitled *Kernel architecture
+    I* (if you haven't read it yet, I suggest you do so before continuing).We will
+    now expand on this discussion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It''s critical to understand that most modern OSes are **monolithic**in design.
+    The word *monolithic* literally means a *single large piece of stone*. We shall
+    defer a little later to how exactly this applies to our favorite OS! For now,
+    we understand *monolithic *as meaning this: when a process or thread issues a
+    system call, it switches to (privileged) kernel mode and executes kernel code,
+    and possibly works on kernel data. Yes, there is no kernel or kernel thread executing
+    code on its behalf; the process (or thread) *itself *executes kernel code. Thus,
+    we say that kernel code executes within the context of a user space process or
+    thread – we call this the **process context***. *Think about it, significant portions
+    of the kernel execute precisely this way, including a large portion of the code
+    of device drivers.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Well, you may ask, now that you understand this, how else – besides process
+    context – can kernel code execute? There is another way: when a hardware interrupt
+    (from a peripheral device – the keyboard, a network card, a disk, and so on) fires,
+    the CPU''s control unit saves the current context and immediately re-vectors the
+    CPU to run the code of the interrupt handler (the **interrupt service routine**—**ISR**).
+    Now this code runs in kernel (privileged) mode too – in effect, this is another,
+    asynchronous, way to switch to kernel mode! The interrupt code path of many device
+    drivers are executed like this; we say that the kernel code being executed in
+    this manner is executing in **interrupt context***.*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, any and every piece of kernel code is entered by and executes in one of
+    two contexts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Process context**: The kernel is entered from a system call or processor *exception *(such
+    as a page fault) and kernel code is executed, kernel data worked upon; it''s synchronous
+    (top down).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Interrupt context**: The is kernel entered from a peripheral chip''s hardware
+    interrupt and kernel code is executed, kernel data worked upon; it''s asynchronous
+    (bottom up).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Figure 6.1* shows the conceptual view: user-mode processes and threads execute
+    in unprivileged user context; the user mode thread can switch to privileged kernel
+    mode by issuing a *system call*. The diagram also shows us that pure *kernel threads *exist
+    as well within Linux; they''re very similar to user-mode threads, with the key
+    difference that they only execute in kernel space; they cannot even *see* the
+    user VAS. A synchronous switch to kernel mode via a system call (or processor
+    exception) has the task now running kernel code in *process context.* (Kernel
+    threads too run kernel code in process context.) Hardware interrupts, though,
+    are a different ball game – they cause execution to asynchronously enter the kernel;
+    the code they execute (typically a device driver''s interrupt handler) runs in
+    the so-called *interrupt context. *'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Figure 6.1* shows more details – interrupt context top and bottom halves, kernel
+    threads and workqueues; we request you to have some patience, we''ll cover all
+    this and much more in later chapters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/d1411ccc-3c39-4cc7-ba13-08780403dcc1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.1 – Conceptual diagram showing unprivileged user-mode execution and
+    privileged kernel-mode execution with both process and interrupt contexts
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further on in the book, we shall show you how exactly you can check *in which
+    context *your kernel code is currently running. Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the basics of the process VAS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A fundamental ''rule'' of virtual memory is this: all potentially addressable
+    memory is in a box; that is, it''s *sandboxed*. We think of this ''box'' as the *process
+    image *or the process VAS. Looking outside the box is disallowed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, we provide only a quick overview of the process user VAS. For details,
+    please refer to the *Further reading* section at the end of this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The user VAS is divided into homogeneous memory regions called *segments *or,
+    more technically, *mappings.* Every Linux process has at least these mappings
+    (or segments):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ccf55662-6096-4433-a89f-a6322988a1ee.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.2 – Process VAS
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s go over a quick breakdown of these segments or mappings:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Text segment***:* This is where the machine code is stored; static (mode:
+    `r-x`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Data segment(s)***:* This is where the global and static data variables are
+    stored (mode: `rw-`). It is internally divided into three distinct segments:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Initialized data segment***:* Pre-initialized variables are stored here;
+    static.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Uninitialized data segment**: Uninitialized variables are stored here (they
+    are auto-initialized to `0` at runtime; this region is sometimes called the *bss*);
+    static.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Heap segment***:* The *library APIs* for memory allocation and freeing (the
+    familiar `malloc(3)` family of routines) get memory from here. That''s also not
+    completely true. On modern systems, only `malloc()` instances below `MMAP_THRESHOLD`
+    (128 KB by default) get their memory from the heap. Any higher and it''s allocated
+    as a separate ''mapping'' in the process VAS (via the powerful `mmap(2)` system
+    call). It is a dynamic segment (it can grow/shrink). The last legally reference-able
+    location on the heap is referred to as the *program break.*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Libraries (text, data)**: All shared libraries that a process dynamically
+    links into are mapped (at runtime, via the loader) into the process VAS (mode:
+    `r-x`/`rw-`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Stack***:* A region of memory that uses the **Last In, First Out** (**LIFO**)
+    semantics; the stack is used for the purpose of *implementing a high-level language''s
+    function-calling* mechanism. It includes parameter passing, local variable instantiation
+    (and destruction), and return value propagation. It is a dynamic segment. On all
+    modern processors (including the x86 and ARM families), *the stack ''grows'' toward
+    lower addresses *(called a fully descending stack). Every time a function is called,
+    a *stack frame* is allocated and initialized as required; the precise layout of
+    a stack frame is very CPU dependent (you must refer to the respective CPU **Application
+    Binary Interface** (**ABI**) document for this; see the *Further reading* section
+    for references). The SP register (or equivalent) always points to the current
+    frame, the top of the stack; as stacks grow towards lower (virtual) addresses,
+    the top of the stack is actually the lowest (virtual) address! It''s non-intuitive
+    but true (mode: `rw-`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Of course, you will understand that processes must contain at least one *thread *of
+    execution (a thread is an execution path within a process); that one thread typically
+    being the `main()` function. In *Figure 6.2*, as an example, we show three threads
+    of execution – `main`*,* `thrd2`, and `thrd3`*. *Also, as expected, every thread
+    shares everything in the VAS *except *for the stack; as you'll know, every thread
+    has its own private stack. The stack of `main` is shown at the very top of the
+    process (user) VAS; the stacks of the `thrd2` and `thrd3` threads are shown as
+    being between the library mappings and the stack of `main` and is illustrated
+    with the two (blue) squares.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I have designed and implemented what I feel is a pretty useful learning/teaching
+    and debugging utility called ***procmap*** ([https://github.com/kaiwan/procmap](https://github.com/kaiwan/procmap))*;*
+    it's a console-based process VAS visualization utility. It can actually show you
+    the process VAS (in quite a bit of detail); we shall commence using it in the
+    next chapter. Don't let that stop you from trying it out right away though; do
+    clone it and give it a spin on your Linux system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you understand the basics of the process VAS, it's time to delve quite
+    a bit deeper into the kernel internals regarding the process VAS, the user and
+    kernel address spaces, and their threads and stacks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Organizing processes, threads, and their stacks – user and kernel space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The traditional **UNIX process model** – *Everything is a process; if it's not
+    a process, it's a file* – has a lot going for it. The very fact that it is still *the* model
+    followed by operating systems after a span of nearly five decades amply validates
+    this. Of course, nowadays, the **thread**is important; *a thread is merely an
+    execution path within a process*. Threads *share all* process resources, including
+    the user VAS, *except for the stack. *Every thread has its own private stack region
+    (this makes perfect sense; if not, how could threads truly run in parallel, as
+    it's the stack that holds execution context).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other reason we focus on the *thread *and not the process is made clearer
+    in [Chapter 10](5391e3c1-30ad-4c75-a106-301259064881.xhtml), *The CPU Scheduler,
+    Part 1**. *For now, we shall just say this: *the thread, not the process, is the
+    kernel schedulable entity* (also known as the KSE). This is actually a fallout
+    of a key aspect of the Linux OS architecture. On the Linux OS, every thread –
+    including kernel threads – maps to a kernel metadata structure called the **task
+    structure**. The task structure (also known as the *process descriptor*) is essentially
+    a large kernel data structure that the kernel uses as an attribute structure.
+    For every *thread* alive, the kernel maintains a corresponding *task structure*
+    (see *Figure 6.3*, and worry not, we shall cover more on the task structure in
+    the coming sections).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next really key point to grasp: we *require one stack per thread per privilege
+    level supported by the CPU. *On modern OSes such as Linux, we support two privilege
+    levels – *the unprivileged user mode (or user space) and the privileged kernel
+    mode (or kernel space)*. Thus, on Linux, *every user space thread alive has two
+    stacks*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**A user space stack**: This stack is in play when the thread executes user-mode
+    code paths.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**A kernel space stack**: This stack is in play when the thread switches to
+    kernel mode (via a system call or processor exception) and executes kernel code
+    paths (in process context).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Of course, every good rule has an exception: *kernel threads *are threads that
+    live purely within the kernel and thus have a "view" of *only *kernel (virtual)
+    address space; they cannot "see" userland. Hence, as they will only ever execute
+    kernel space code paths, they have **just one stack** – a kernel space stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Figure 6.3* divides up the address space into two – user space and kernel
+    space. In the upper part of the diagram – user space – you can see several processes
+    and their *user VASes.* In the bottom part – kernel space – you can see, corresponding
+    to every user-mode thread, a kernel metadata structure (struct `task_struct`,
+    which we shall cover a bit later in detail) and the kernel-mode stack of that
+    thread. In addition, we see (at the very bottom) three kernel threads (labeled
+    `kthrd1`*,* `kthrd2`, and `kthrdn`); as expected, they too have a `task_struct`
+    metadata structure representing their innards (attributes) and a kernel-mode stack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/13a036df-734c-43e5-aa34-1e219544fe96.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.3 – Processes, threads, stacks, and task structures – user and kernel
+    VAS
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help make this discussion practical, let''s execute a simple Bash script
+    (`ch6/countem.sh`) that counts the number of processes and threads currently alive.
+    I did this on my native x86_64 Ubuntu 18.04 LTS box; see the following resulting
+    output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: I'll leave it to you to look up the code of this simple script here: `ch6/countem.sh`. Study
+    the preceding output and understand it. You will realize, of course, that this
+    is a snapshot of the situation at a certain point in time. It can and does change.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the following sections, we divide up the discussion into two parts (corresponding
+    to the two address spaces) – that of what we see in Figure 6.3 in user space and
+    what is seen in Figure 6.3 in kernel space. Let's begin with the user space components.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User space organization
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'With reference to the `countem.sh` Bash script that we ran in the preceding section,
+    we will now break it down and discuss some key points, confining ourselves to
+    the *user space portion* of the VAS for now. Please take care to read and understand
+    this (the numbers we refer to in the following discussion are with reference to
+    our sample run of our `countem.sh` script in the preceding section). For the sake
+    of better understanding, I have placed the user space portion of the diagram here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/978bed7c-1694-41d8-9acf-74d496393d10.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.4 – User space portion of overall picture seen in Figure 6.3
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here (Figure 6.4) you can see three individual processes. Every process has
+    at least one thread of execution (the `main()`thread). In the preceding example,
+    we show three processes `P1`*, *`P2`, and `Pn`, with one, three, and two threads
+    in them respectively, including `main()`. From our preceding sample run of the
+    `countem.sh` script, `Pn` would have *n*=362.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do note that these diagrams are purely conceptual. In reality, the 'process'
+    with PID 2 is typically a single-threaded kernel thread called `kthreadd`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each process consists of several segments (technically, mappings*).* Broadly,
+    the user-mode segments (mappings) are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Text**: Code; `r-x`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Data segments**: `rw-`; consists of three distinct mappings – the initialized
+    data segment, the uninitialized data segment (or `bss`), and an ''upward-growing''
+    `heap`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Library mappings**: For the text and data of each shared library the process
+    dynamically links to'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Downward-growing stack(s)**'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Regarding these stacks, we saw from our preceding sample run that there are
+    1,053 user-mode threads currently alive on the system. This implies that there
+    are 1,053 user space stacks as well, as there will exist one user mode stack for
+    every user-mode thread alive. Of these user space thread stacks, we can say the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One user space stack is always present for the `main()` thread, it will be located
+    close to the very top – the high end – of the user VAS; if the process is single-threaded
+    (only a `main()`thread), then it will have just one user-mode stack; the `P1`
+    process in *Figure 6.4* shows this case.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If the process is multithreaded, it will have one user-mode thread stack per
+    thread alive (including `main()`); processes `P2` and `Pn` in *Figure 6.4* illustrate
+    this case. The stacks are allocated either at the time of calling `fork(2)` (for
+    `main()`) or `pthread_create(3)` (for the remaining threads within the process),
+    which results in this code path being executed in process context within the kernel:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: FYI, the `pthread_create(3)` library API on Linux invokes the (very Linux-specific)
+    `clone(2)` system call; this system call ends up calling `_do_fork()`; the `clone_flags`
+    parameter passed along informs the kernel as to how exactly to create the 'custom
+    process'; in other words, a thread!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These user space stacks are of course dynamic; they can grow/shrink up to the
+    stack size resource limit (`RLIMIT_STACK`, typically 8 MB; you can use the `prlimit(1)`
+    utility to look it up).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Having seen and understood the user space portion, now let's delve into the
+    kernel space side of things.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel space organization
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Continuing our discussion with reference to the `countem.sh` Bash script that
+    we ran in the previous section, we will now break it down and discuss some key
+    points, confining ourselves to the *kernel space portion* of the VAS. Please take
+    care to carefully read and understand this (while reading the numbers that were
+    output in our preceding sample run of the `countem.sh` script). For the sake of
+    better understanding I have placed the kernel space portion of the diagram here
+    (Figure 6.5):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f2eaae10-eb56-49f1-ad85-865bca0b20cc.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.5 – Kernel space portion of overall picture seen in Figure 6.3
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Again, from our preceding sample run, you can see that there are 1,053 user-mode
+    threads and 181 kernel threads currently alive on the system. This yields a total
+    of 1,234 kernel space stacks. How? As mentioned earlier, every user-mode thread
+    has two stacks – one user-mode stack and one kernel-mode stack. Thus, we''ll have
+    1,053 kernel-mode stacks for each of the user-mode threads, plus 181 kernel-mode
+    stacks for the (pure) kernel threads (recall, kernel threads have *only *a kernel-mode
+    stack; they cannot ''see'' user space at all). Let''s list a few characteristics
+    of kernel-mode stacks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There will be one kernel-mode stack for each application (user-mode) thread
+    alive, including `main()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Kernel-mode stacks are *fixed in size (static) and are quite small***. Practically
+    speaking, their size is 2 pages on 32-bit and 4 pages on 64-bit OSes (with a page
+    typically being 4 KB in size).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: They are allocated at thread creation time (usually boils down to `_do_fork()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Again, let''s be crystal clear on this: each user-mode thread has two stacks
+    – a user-mode stack and a kernel-mode stack. The exception to this rule is kernel
+    threads; they only have a kernel-mode stack (as they possess no user mapping and
+    thus no user space ''segments''). In the lower part of *Figure 6.5*, we show three *kernel
+    threads –* `kthrd1`, `kthrd2`, and `kthrdn` (in our preceding sample run, `kthrdn`
+    would have *n*=181). Further, each kernel thread has a task structure and a kernel-mode
+    stack allocated to it at creation time.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A kernel-mode stack is similar in most respects to its user-mode counterpart
+    – every time a function is called, a *stack frame *is set up (the frame layout
+    is particular to the architecture and forms a part of the CPU ABI document; see
+    the *Further reading *section for more on these details); the CPU has a register
+    to track the current location of the stack (usually called a **Stack Pointer**
+    (**SP**)), and the stack "grows" toward *lower* virtual addresses. But, unlike
+    the dynamic user-mode stack, *the kernel-mode stack is fixed in size and small.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: An important implication of the pretty small (two-page or four-page) kernel-mode
+    stack size for the kernel / driver developer – be very careful to not overflow
+    your kernel stack by performing stack-intensive work (such as recursion).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There exists a kernel configurable to warn you about high (kernel) stack usage
+    at compile time; here''s the text from the `lib/Kconfig.debug`file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`CONFIG_FRAME_WARN:`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Tell gcc to warn at build time for stack frames larger than this.`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Setting this too low will cause a lot of warnings.`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Setting it to 0 disables the warning.`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Requires gcc 4.4`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summarizing the current situation
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Okay, great, let''s now summarize our learning and findings from our preceding sample
+    run of the `countem.sh` script:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Task structures**:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Every thread alive (user or kernel) has a corresponding task structure (`struct
+    task_struct`) in the kernel; this is how the kernel tracks it and all its attributes
+    are stored here (you'll learn more in the *Understanding and accessing the kernel
+    task structure* section)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'With respect to our sample run of our `ch6/countem.sh` script:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'As there are a total of 1,234 threads (both user and kernel) alive on the system,
+    this implies a total of 1,234 *task (metadata) structures* in kernel memory (in
+    the code, `struct task_struct`), of which we can say the following:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 1,053 of these task structures represent user threads.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The remaining 181 task structures represent kernel threads.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Stacks**:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Every user space thread has two stacks:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A user mode stack (is in play when the thread executes user-mode code paths)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A kernel mode stack (is in play when the thread executes kernel-mode code paths)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A pure kernel thread has only one stack - a kernel mode stack
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'With respect to our sample run of our `ch6/countem.sh` script:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 1,053 user space stacks (in user land).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 1,053 kernel space stacks (in kernel memory).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 181 kernel space stacks (for the 181 kernel threads that are alive).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This comes together for a grand total of 1053+1053+181 = 2,287 stacks!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'While discussing user and kernel-mode stacks, we should also briefly mention
+    this point: many architectures (including x86 and ARM64) support a separate per-CPU
+    stack for *interrupt handling. *When an external hardware interrupt occurs, the
+    CPU''s control unit immediately re-vectors control to, ultimately, the interrupt
+    handling code (perhaps within a device driver). A separate per-CPU interrupt stack
+    is used to hold the stack frame(s) for the interrupt code path(s); this helps
+    avoid putting too much pressure on the existing (small) kernel-mode stack of the
+    process/thread that got interrupted.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now that you understand the overall organization of the user and kernel
+    spaces in terms of processes/threads and their stacks, let's move on to seeing
+    how you can actually 'view' the content of both the kernel and user space stacks.
+    Besides being useful for learning purposes, this knowledge can greatly aid you
+    in debugging situations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing the user and kernel stacks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The *stack *is often the key to a debug session. It is the stack, of course,
+    that holds the *current execution context* of the process or thread – where it
+    is now – which allows us to infer what it's doing. More importantly, being able
+    to see and interpret the thread's *call stack (or call chain/backtrace)* crucially
+    allows us to understand how exactly we got here. All this precious information
+    resides in the stack. But wait, there are two stacks for every thread – the user
+    space and the kernel space stack. How do we view them?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, we shall show two broad ways of viewing the kernel and user-mode stacks
+    of a given process or thread, firstly via the 'traditional' approach, and then
+    a more recent modern approach (via [e]BPF). Do read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traditional approach to viewing the stacks
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Let's first learn to view both the kernel and user-mode stacks of a given process
+    or thread using what we shall call the 'traditional' approach. Let's begin with
+    the kernel-mode stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing the kernel space stack of a given thread or process
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Good news; this is really easy. The Linux kernel makes the stack visible via
+    the usual mechanism to expose kernel internals to user space – the powerful `proc`filesystem
+    interfaces. Just peek under `/proc/<pid>/stack`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, okay, let''s look up the kernel-mode stack of our *Bash* process. Let''s
+    say that, on our x86_64 Ubuntu guest (running the 5.4 kernel), our Bash process''
+    PID is `3085`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On modern kernels, to avoid *information leakage*, viewing the kernel-mode stack
+    of a process or thread requires *root* access as a security requirement.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding output, each line represents a *call frame *on the stack.
+    To help decipher a kernel stack backtrace, it''s worth knowing the following points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It should be read in a bottom-up fashion (from bottom to top).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each line of output represents a *call frame*; in effect, a function in the
+    call chain.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A function name appearing as `??` implies that the kernel cannot reliably interpret
+    the stack. Ignore it, it's the kernel saying that it's an invalid stack frame
+    (a 'blip' left behind); the kernel backtrace code is usually right!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'On Linux, any `foo()` system call will typically become a `SyS_foo()` function
+    within the kernel. Also, very often  but not always, `SyS_foo()` is a wrapper
+    that invokes the ''real'' code `do_foo()`. A detail: in the kernel code, you might
+    see macros of the type `SYSCALL_DEFINEn(foo, ...)`; the macro becomes the `SyS_foo()` routine;
+    the number appended, `n` , is in the range [0, 6]; it''s the number of parameters
+    being passed to the kernel from user space for the system call.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Now look again at the preceding output; it should be quite clear: our *Bash*
+    process is currently executing the `do_wait()` function; it got there via a system
+    call, the `wait4()` system call! This is quite right; the shell works by forking
+    off a child process and then waiting for its demise via the `wait4(2)` system
+    call.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Curious readers (you!) should note that the `[<0>]` in the leftmost column of
+    each stack frame displayed in the preceding snippet are the placeholders for the *text
+    (code) address *of that function. Again, for *security* reasons (to prevent information
+    leakage), it is zeroed out on modern kernels. (Another security measure related
+    to the kernel and process layout is discussed in [Chapter 7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml), *Memory
+    Management Internals – Essentials*,in the *Randomizing the memory layout – KASLR*
+    and *User-mode ASLR* sections).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing the user space stack of a given thread or process
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Ironically, viewing the *user space stack *of a process or thread seems harder
+    to do on a typical Linux distro (as opposed to viewing the kernel-mode stack,
+    as we just saw in the previous section). There is a utility to do so: `gstack(1)`.
+    In reality, it''s just a simple wrapper over a script that invokes `gdb(1)` in
+    batch mode, getting `gdb` to invoke its `backtrace` command.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unfortunately, on Ubuntu (18.04 LTS at least), there seems to be an issue; the
+    `gstack` program was not found in any native package. (Ubuntu does have a `pstack(1)`
+    utility, but, at least on my test VM, it failed to work well.) A workaround is
+    to simply use `gdb` directly (you can always `attach <PID>` and issue the `[thread
+    apply all] bt` command to view the user mode stack(s)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On my x86_64 Fedora 29 guest system, though, the `gstack(1)` utility cleanly
+    installs and runs well; an example is as follows (our Bash process'' PID here
+    happens to be `12696`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, each line represents a call frame. Read it bottom-up. Clearly, *Bash*
+    executes a command and ends up invoking the `waitpid()` system call (in reality
+    on modern Linux systems, `waitpid()` is just a `glibc` wrapper over the actual
+    `wait4(2)` system call! Again, simply ignore any call frames labeled`??`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Being able to peek into the kernel and user space stacks (as shown in the preceding snippets),
+    and using utilities including `strace(1)` and `ltrace(1)` for tracing system and
+    library calls of a process/thread respectively, can be a tremendous aid when debugging!
+    Don't ignore them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now for a 'modern' approach to this question.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[e]BPF – the modern approach to viewing both stacks'
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Now – a lot more exciting! – let's learn (the very basics) of using a powerful
+    modern approach, leveraging (as of the time of writing) very recent technology
+    – called the **extended Berkeley Packet Filter** (**eBPF**; or simply, BPF. We
+    did mention the [e]BPF project in [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),
+    *Kernel Workspace Setup*, under the *Additional useful projects* section.) The
+    older BPF has been around a long time and has been used for network packet tracing;
+    [e]BPF is a recent innovation, available only as of 4.x Linux kernels (which of
+    course implies that you will need to be on a 4.x or more recent Linux system to
+    use this approach).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Directly using the underlying kernel-level BPF bytecode technology is (extremely)
+    difficult to do; thus, the good news is that there are several easy-to-use frontends
+    (tools and scripts) to this technology. (A diagram showing the current BCC performance
+    analysis tools can be found at [http://www.brendangregg.com/BPF/bcc_tracing_tools_early2019.png](http://www.brendangregg.com/BPF/bcc_tracing_tools_early2019.png); a
+    list of the [e]BPF frontends can be found at[http://www.brendangregg.com/ebpf.html#frontends](http://www.brendangregg.com/ebpf.html#frontends)*;*
+    these links are from *Brendan Gregg''s* blog.) Among the frontends, **BCC** and
+    **bpftrace** are considered very useful. Here, we shall simply provide a quick
+    demonstration using a BCC tool called `stackcount` (well, on Ubuntu at least it''s
+    named `stackcount-bpfcc(8)`). Another advantage: using this tool allows you to
+    see both the kernel and user-mode stacks at once; there''s no need for separate
+    tools.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can install the BCC tools for your *host *Linux distro by reading the installation
+    instructions here: [https://github.com/iovisor/bcc/blob/master/INSTALL.md](https://github.com/iovisor/bcc/blob/master/INSTALL.md).
+    Why not on our guest Linux VM? You can, *when running a distro kernel* (such as
+    an Ubuntu- or Fedora-supplied kernel). The reason: the installation of the BCC
+    toolset includes the installation of the `linux-headers-$(uname -r)` package;
+    the latter exists only for distro kernels (and not for our custom 5.4 kernel that
+    we''re running on the guest).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following example, we use the `stackcount` BCC tool (on my x86_64 Ubuntu
+    18.04 LTS host system) to look up the stacks of our VirtualBox Fedora31 guest
+    process (the virtual machine is, after all, a process on the host system!). For
+    this tool, you have to specify a function (or functions) of interest (interestingly,
+    you can specify either a user space or kernel space function and also use ''wildcards''
+    or a regular expression when doing so!); only when those function(s) are invoked
+    will the stacks be traced and reported. As an example, we select any function
+    containing the name `malloc`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[e]BPF programs might fail due to the new *kernel lockdown* feature being merged
+    into the mainline 5.4 kernel (it''s disabled by default though). It''s a **Linux
+    Security Module** (**LSM**) that enables an extra ''hard'' level of security on
+    Linux systems. Of course, security is a double-edged sword; having a very secure
+    system implicitly means that certain things will not work as expected, and this
+    includes some [e]BPF programs. Do refer to the *Further reading *section for more
+    on kernel lockdown.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `-d` option switch passed prints the delimiter `--`; it denotes the boundary
+    between the kernel-mode and the user-mode stack of the process. (Unfortunately,
+    as most production user-mode apps will have their symbolic information stripped,
+    most user-mode stack frames simply show up as "`[unknown]`".) On this system at
+    least, the kernel stack frames are very clear though; even the virtual address
+    of the text (code) function in question is printed on the left. (To help you better
+    understand the stack trace: firstly, read it bottom-up; next, as mentioned already,
+    on Linux, any `foo()` system call will typically become the `SyS_foo()` function within
+    the kernel, and often `SyS_foo()` is a wrapper around `do_foo()`, the actual worker
+    function.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the `stackcount-bpfcc` tool works only with Linux 4.6+, and requires
+    root access. Do see its man page for details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a second simpler example, we write a simple *Hello, world* program (with
+    the caveat that it''s in an infinite loop, so that we can capture the underlying
+    `write(2)` system calls as they occur), build it with symbolic info enabled (that
+    is, with `gcc -g ...`), and use a simple Bash script to perform the same job as
+    previously: tracing the kernel and user-mode stacks as it executes. (You will
+    find the code in `ch6/ebpf_stacktrace_eg/`.) A screenshot showing a sample run
+    (okay, here''s an exception: I''ve run the script on an x86_64 Ubuntu *20.04*
+    LTS host) looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9ed059b3-0b1e-4193-8417-f254e80a227b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.6 – A sample run using the stackcount-bpfcc BCC tool to trace both
+    kernel and user-mode stacks for the write() of our Hello, world process
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have merely scratched the surface here; [e]BPF tools such as BCC and `bpftrace`
+    really are the modern, powerful approach to system, app tracing and performance
+    analysis on the Linux OS. Do take the time to learn how to use these powerful
+    tools! (Each BCC tool also has a dedicated man page *with examples*.) We refer
+    you to the *Further reading *section for links on [e]BPF, BCC and `bpftrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's conclude this section by zooming out and looking at an overview of what
+    you have learned so far!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The 10,000-foot view of the process VAS
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Before we conclude this section, it's important to take a step back and see
+    the complete VASes of each process and how it looks for the system as a whole;
+    in other words, to zoom out and see the "10,000-foot view" of the complete system
+    address space. This is what we attempt to do with the following rather large and
+    detailed diagram (*Figure 6.7*), an extension or superset of our earlier *Figure
+    6.3*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For those of you reading a hard copy of the book, I'd definitely recommend you
+    view the book's figures in full color from this PDF document at [https://static.packt-cdn.com/downloads/9781789953435_ColorImages.pdf](_ColorImages.pdf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Besides what you have learned about and seen just now – the process user space
+    segments, the (user and kernel) threads, and the kernel-mode stacks – don''t forget
+    that there is a lot of other metadata within the kernel: the task structures,
+    the kernel threads, the memory descriptor metadata structures, and so on. They
+    all are very much a part of the *kernel VAS,* which is often called the *kernel
+    segment.* There''s more to the kernel segment than tasks and stacks. It also contains
+    (obviously!) the static kernel (core) code and data, in effect, all the major
+    (and minor) *subsystems* of the kernel, the arch-specific code, and so on (that
+    we spoke about in [Chapter 4](1c494ebd-e7ec-4a78-8695-5b97bdc3d6be.xhtml)*, Writing
+    Your First Kernel Module – LKMs Part 1,* under the *Kernel space components *section).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As just mentioned, the following diagram presents an attempt to sum up and
+    present all (well, much) of this information in one place:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ac9dfba9-f5a1-49d8-9d43-29f4abbc5afd.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.7 – The 10,000-foot view of the processes, threads, stacks, and task
+    structures of the user and kernel VASes
+  prefs: []
+  type: TYPE_NORMAL
+- en: Whew, quite a thing, isn't it? The red box in the kernel segment of the preceding diagram
+    encompasses the *core kernel code and data* – the major kernel subsystems, and
+    shows the task structures and kernel-mode stacks. The rest of it is considered
+    non-core stuff; this includes device drivers. (The arch-specific code can arguably
+    be viewed as core code; we just show it separately here.) Also, don't let the
+    preceding information overwhelm you; just focus on what we're here for right now
+    – the processes, threads, their task structures, and stacks. If you're still unclear
+    about it, be sure to re-read the preceding material.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's move on to actually understanding and learning how to reference the
+    key or 'root' metadata structure for every single thread alive – the *task structure*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and accessing the kernel task structure
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As you have learned by now, every single user and kernel space thread is internally
+    represented within the Linux kernel by a metadata structure containing all its
+    attributes – the **task structure***. *The task structure is represented in kernel
+    code as `include/linux/sched.h:struct task_struct`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's often, unfortunately, referred to as the "process descriptor," causing
+    no end of confusion! Thankfully, the phrase *task structure* is so much better;
+    it represents a runnable task, in effect, a *thread*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So there we have it: in the Linux design, every process consists of one or
+    more threads and *each thread maps to a kernel data structure called a task structure*
+    (`struct task_struct`)**.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The task structure is the "root" metadata structure for the thread – it encapsulates
+    all the information required by the OS for that thread. This includes information
+    on its memory (segments, paging tables, usage info, and more), CPU scheduling
+    details, any files it currently has open, its credentials, capability bitmasks,
+    timers, locks, **Asynchronous I/O** (**AIO**) contexts, hardware context, signaling,
+    IPC objects, resource limits, (optional) audit, security and profiling info, and
+    many more such details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Figure 6.8* is a conceptual representation of the Linux kernel *task structure*
+    and most of the information (metadata) it contains:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/2f60ac23-473c-4830-9ab4-ff1d4d6444cf.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 6.8 – Linux kernel task structure: struct task_struct'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As can be seen from *Figure 6.8*, the task structure holds a huge quantity
+    of information regarding every single task (process/thread) alive on the system
+    (again, I reiterate: this includes kernel threads as well). We show – in a compartmentalized
+    conceptual format in Figure 6.8 – the different kinds of attributes encapsulated
+    within this data structure. Also, as can be seen, certain attributes will be *inherited*
+    by a child process or thread upon `fork(2)` (or `pthread_create(3)`); certain
+    attributes will not be inherited and will be merely reset. (The kernel-mode stack
+    for'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For now, at least, suffice it to say that the kernel 'understands' whether a
+    task is a process or a thread. We'll later demonstrate a kernel module (`ch6/foreach/thrd_showall`) that
+    reveals exactly how we can determine this (hang on, we'll get there!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now let's start to understand in more detail some of the more important members
+    of the huge task structure; read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, I only intend to give you a 'feel' for the kernel task structure; we do
+    not delve deep into the details as it's not required for now. You will find that
+    in later parts of this book, we delve into specific areas as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking into the task structure
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Firstly, recall that the task structure is essentially the 'root' data structure
+    of the process or thread – it holds all attributes of the task (as we saw earlier).
+    Thus, it's rather large; the powerful `crash(8)` utility (used to analyze Linux
+    crash dump data or investigate a live system) reports its size on x86_64 to be
+    9,088 bytes, as does the `sizeof` operator.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The task structure is defined in the `include/linux/sched.h` kernel header (it''s
+    a rather key header). In the following code, we show its definition with the caveat
+    that we display only a few of its many members. (Also, the annotations in `<<
+    angle brackets like this >>` are used to very briefly explain the member(s)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Continuing with the task structure in the following code block, see the members
+    relating to memory management `(mm)`, the PID and TGID values, the credentials
+    structure, open files, signal handling, and many more. Again, it''s not the intention
+    to delve into (all of) them in detail; where appropriate, in later sections of
+    this chapter, and possibly in other chapters of this book, we shall revisit them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that the `struct task_struct` members in the preceding code are shown with
+    respect to the 5.4.0 kernel source; on other kernel versions, the members can
+    and do change! Of course, it should go without saying, this is true of the entire
+    book – all code/data is presented with regard to the 5.4.0 LTS Linux kernel (which
+    will be maintained up to December 2025).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now that you have a better idea of the members within the task structure,
+    how exactly do you access it and its various members? Read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accessing the task structure with current
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: You will recall, in our sample run of the preceding `countem.sh` script (in
+    the *Organizing processes, threads, and their stacks – user and kernel space*
+    section), we found that there are a total of 1,234 threads (both user and kernel)
+    alive on the system. This implies that there will be a total of 1,234 task structure
+    objects in the kernel memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'They need to be organized in a way that the kernel can easily access them as
+    and when required. Thus, all the task structure objects in kernel memory are chained
+    up on a *circular doubly linked list* called the **task list***.* This kind of
+    organization is required in order for various kernel code paths to iterate over
+    them (commonly the `procfs` code, among others). Even so, think on this: when
+    a process or thread is running kernel code (in process context), how can it find
+    out which `task_struct` belongs to it among the perhaps hundreds or thousands
+    that exist in kernel memory? This turns out to be a non-trivial task. The kernel
+    developers have evolved a way to guarantee you can find the particular task structure
+    representing the thread currently running the kernel code. It''s achieved via
+    a macro called `current`. Think of it this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking up `current` yields the pointer to `task_struct` of the thread that
+    is running the kernel code right now, in other words, *the process context running
+    right now on some particular processor core.*
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`current` is analogous (but of course, not exactly) to what object-oriented
+    languages call the `this` pointer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The implementation of the `current` macro is very architecture-specific. Here,
+    we do not delve into the gory details. Suffice it to say that the implementation
+    is carefully engineered to be fast (typically via an *O(1)* algorithm). For example,
+    on some **Reduced Instruction Set Computer** (**RISC**) architectures with many
+    general-purpose registers (such as the PowerPC and Aarch64 processors), a register
+    is dedicated to holding the value of `current`!
+  prefs: []
+  type: TYPE_NORMAL
+- en: I urge you to browse the kernel source tree and see the implementation details
+    of `current` (under `arch/<arch>/asm/current.h`). On the ARM32, an *O(1)* calculation
+    yields the result; on AArch64 and PowerPC it's stored in a register (and thus
+    the lookup is blazing fast). On x86_64 architectures, the implementation uses
+    a `per-cpu` *variable* to hold `current` (avoiding the use of costly locking).
+    Including the `<linux/sched.h>` header is required to include the definition of `current` in
+    your code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can use `current` to dereference the task structure and cull information
+    from within it; for example, the process (or thread) PID and name can be looked
+    up as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the next section, you will see a full-fledged kernel module that iterates
+    over the task list, printing out some details from each task structure it encounters
+    along the way.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determining the context
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As you now know, kernel code runs in one of two contexts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process (or task) context
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Interrupt (or atomic) context
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: They are mutually exclusive – kernel code runs in either the process or atomic/interrupt
+    context at any given point in time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Often, when writing kernel or driver code, it is imperative for you to first
+    figure out *what context* the code that you''re working on is running in. One
+    way to learn this is by employing the following macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It returns a Boolean: `True` if your code is running in process (or task) context,
+    where it''s – usually – safe to sleep; returning `False` implies you are in some
+    kind of atomic or interrupt context where it is never safe to sleep.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You might have come across the usage of the `in_interrupt()` macro; if it returns
+    `True`, your code is within an interrupt context, if `False`, it isn't. However,
+    the recommendation for modern code is to *not* rely on this macro (due to the
+    fact that **Bottom Half** (**BH**) disabling can interfere with this). Hence,
+    we recommend using `in_task()` instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hang on though! It can get a bit tricky: while `in_task()` returning `True`
+    does imply that your code is in process context, this fact by itself does *not *guarantee
+    that it''s currently *safe to sleep*. Sleeping really implies invoking the scheduler
+    code and a subsequent context switch (we cover this in detail in [Chapter 10](5391e3c1-30ad-4c75-a106-301259064881.xhtml),
+    *The CPU Scheduler – Part 1*, and [Chapter 11](d6e5ebd3-1f04-40e8-a240-2607c58b1299.xhtml),
+    *The CPU Scheduler – Part* 2). For example, you could be in process context but
+    holding a spinlock (a very common lock used within the kernel); the code between
+    the lock and unlock – the so-called *critical section* – must run atomically!
+    This implies that though your code may be in process (or task) context, it still
+    will cause a bug if it attempts to issue any blocking (sleeping) APIs!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, be careful: `current` is only considered valid when running in *process
+    context*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right; by now you have learned useful background information on the task structure,
+    how it can be accessed via the `current` macro, and the caveats to doing so –
+    such as figuring out the context that your kernel or driver code is currently
+    running in. So now, let's actually write some kernel module code to examine a
+    bit of the kernel task structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working with the task structure via current
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here, we will write a simple kernel module to show a few members of the task
+    structure and reveal the *process context *that its *init* and *cleanup* code
+    paths run in. To do so, we cook up a `show_ctx()` function that uses `current`
+    to access a few members of the task structure and display their values. It''s
+    invoked from both the *init* as well as the *cleanup* methods, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For reasons of readability and space constraints, only key parts of the source
+    code are displayed here. The entire source tree for this book is available in
+    its GitHub repository; we expect you to clone and use it: `git clone https://github.com/PacktPublishing/Linux-Kernel-Programming.git`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: As is highlighted in bold in the preceding snippet, you can see that (for some
+    members) we can simply dereference the `current` pointer to gain access to various `task_struct` members
+    and display them (via the kernel log buffer).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Great! The preceding code snippet does indeed show you how to gain access to
+    a few `task_struct` members directly via `current`; not all members, though, can
+    or should be accessed directly. Rather, the kernel provides some helper methods
+    to access them; let's get into this next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Built-in kernel helper methods and optimizations
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In the preceding code, we made use of a few of the kernel's *built-in helper
+    methods *to extract various members of the task structure. This is the recommended
+    approach; for example, we use `task_pid_nr()` to peek at the PID member instead
+    of directly via `current->pid`. Similarly, the process credentials within the
+    task structure (such as the `EUID` members we showed in the preceding code) are
+    abstracted within `struct cred` and access to them is provided via helper routines,
+    just like with `from_kuid()`, which we used in the preceding code. In a similar
+    fashion, there are several other helper methods; look them up in `include/linux/sched.h`
+    just below the `struct task_struct` definition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why is this the case? Why not simply access task structure members directly
+    via `current-><member-name>`? Well, there are various real reasons; one, perhaps
+    the access requires a *lock* to be taken (we cover details on the key topic of
+    locking and synchronization in the last two chapters of this book). Two, perhaps
+    there's a more optimal way to access them; read on to see more on this...
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, as shown in the preceding code, we can easily figure out whether the kernel
+    code (of our kernel module) is running in the process or interrupt context by
+    employing the `in_task()` macro – it returns `True` if in the process (or task)
+    context, and `False` if otherwise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interestingly, we also use the `likely()` macro (it becomes a compiler `__built-in_expect`
+    attribute) to give a hint to the compiler's branch prediction setup and optimize
+    the instruction sequence being fed into the CPU pipeline, thus keeping our code
+    on the "fast path" (more on this micro-optimization with the `likely()/unlikely()`
+    macros can be found in the *Further reading *section for this chapter). You will
+    see kernel code often employing the `likely()/unlikely()` macros in situations
+    where the developer "knows" whether the code path is likely or unlikely, respectively.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding `[un]likely()` macros are a good example of micro-optimization,
+    of how the Linux kernel leverages the `gcc(1)` compiler. In fact, until recently,
+    the Linux kernel could *only *be compiled with `gcc`; recently, patches are slowly
+    making compilation with `clang(1)` a reality. (FYI, the modern **Android Open
+    Source Project** (**AOSP**) is compiled with `clang`.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now that we have understood the workings of our kernel module's `show_ctx()`
+    function, let's try it out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trying out the kernel module to print process context info
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We build our `current_affair.ko` kernel module (we don''t show the build output
+    here) and then insert it into kernel space (via `insmod(8)` as usual). Now let''s
+    view the kernel log with `dmesg(1)`, then `rmmod(8)` it and use `dmesg(1)` again. The
+    following screenshot shows this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/d6b8c619-17e7-45e1-9f14-0de34a13eb35.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.9 – The output of the current_affairs.ko kernel module
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Clearly, as can be seen from the preceding screenshot, the *process context* –
+    the process (or thread) running the kernel code of `current_affairs.ko:current_affairs_init()`
+    – is the `insmod` process (see the output: ''`name        : insmod`''), and the `current_affairs.ko:current_affairs_exit()` process
+    context executing the cleanup code is the `rmmod` process!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice how the timestamps in the left column (`[sec.usec]`) in the preceding figure
+    help us understand that `rmmod` was called close to 11 seconds after `insmod`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There's more to this small demo kernel module than first meets the eye. It's
+    actually very helpful in understanding Linux kernel architecture. The following
+    section explains how this is so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Seeing that the Linux OS is monolithic
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Besides the exercise of using the `current` macro, a key point behind this
+    kernel module (`ch6/current_affairs`) is to clearly show you the *monolithic nature
+    of the Linux OS.* In the preceding code, we saw that when we performed the `insmod(8)` process
+    on our kernel module file (`current_affairs.ko`), it got inserted into the kernel
+    and its *init* code path ran; *who ran it?* Ah, that question is answered by checking
+    the output: the `insmod` process itself ran it in process context, thus proving
+    the monolithic nature of the Linux kernel! (Ditto with the `rmmod(8)` process
+    and the *cleanup* code path; it was run by the `rmmod` process in process context.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note carefully and clearly: there is no "kernel" (or kernel thread) that executes
+    the code of the kernel module, it''s the user space process (or thread) *itself* that,
+    by issuing system calls (recall that both the `insmod(8)` and `rmmod(8)` utilities
+    issue system calls), switches into kernel space and executes the code of the kernel
+    module. This is how it is with a monolithic kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, this type of execution of kernel code is what we refer to as *running
+    in process context*, as opposed to running in *interrupt context*. The Linux kernel,
+    though, isn't considered to be purely monolithic; if so, it would be a single
+    hard-coded piece of memory. Instead, like all modern OSes, Linux supports *modularization*
+    (via the LKM framework).
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an aside, do note that you can create and run *kernel threads* within kernel
+    space; they still execute kernel code in process context when scheduled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Coding for security with printk
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In our previous kernel module demo (`ch6/current_affairs/current_affairs.c`),
+    you noticed, I hope, the usage of `printk` with the ''special'' `%pK` format specifier.
+    We repeat the relevant code snippet here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Recall from our discussion in [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml),
+    *Writing Your First Kernel Module – LKMs Part 2*, in the *Proc filesystem tunables
+    affecting the system log* section, that when printing an address (firstly, you
+    really shouldn't be printing addresses in production) I urged you to not use the
+    usual `%p` (or `%px`) but the **`%pK`** format specifier instead. That's what
+    we've done in the preceding code; *this is for security*, *to prevent a kernel
+    information leak*. With a well-tuned (for security) system, `%pK` will result
+    in a mere hashed value and not the actual address being displayed. To show this,
+    we also display the actual kernel address via the `0x%px` format specifier just
+    for contrast.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Interestingly enough, `%pK` seems to have no effect on a default desktop Ubuntu
+    18.04 LTS system. Both formats – the `%pK` and the `0x%px` – turn out to print
+    identical values (as can be seen in Figure 6.9); this is *not* what''s expected.
+    On my x86_64 Fedora 31 VM, though, it does work as expected, yielding a mere hashed
+    (incorrect) value with `%pK` and the correct kernel address with `0x%px`. Here''s
+    the relevant output on my Fedora 31 VM:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding output, we can clearly see the difference.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On production systems (embedded or otherwise) be safe: set `kernel.kptr_restrict` to `1` (or
+    even better, to `2`), thus sanitizing pointers, and set `kernel.dmesg_restrict` to `1` (allowing
+    only privileged users to read the kernel log).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s move on to something more interesting: in the following section,
+    you will learn how to iterate over the Linux kernel''s *task lists*, thus in effect
+    learning how to obtain kernel-level information on every single process and/or
+    thread alive on the system.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iterating over the kernel's task lists
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As mentioned earlier, all the task structures are organized in kernel memory
+    in a linked list called the *task list *(allowing them to be iterated over). The
+    list data structure has evolved to become the very commonly used *circular doubly
+    linked list. *In fact, the core kernel code to work with these lists has been
+    factored out into a header called `list.h`; it's well known and expected to be
+    used for any list-based work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `include/linux/types.h:list_head` data structure forms the essential doubly
+    linked circular list; as expected, it consists of two pointers, one to the `prev`
+    member on the list and one to the `next` member.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can easily iterate over various lists concerned with tasks via conveniently
+    provided macros in the `include/linux/sched/signal.h` header file for versions
+    >= 4.11; note that for kernels 4.10 and older, the macros are in `include/linux/sched.h`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s make this discussion empirical and hands-on. In the following sections
+    we will write kernel modules to iterate over the kernel task list in two ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**One**: Iterate over the kernel task list and display all *processes* alive.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Two**: Iterate over the kernel task list and display all *threads* alive.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We show the detailed code view for the latter case. Read on and be sure to try
+    it out yourself!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iterating over the task list I – displaying all processes
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The kernel provides a convenient routine, the `for_each_process()` macro, which
+    lets you easily iterate over every *process *in the task list:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Clearly, the macro expands to a `for` loop, allowing us to loop over the circular
+    list. `init_task` is a convenient 'head' or starting pointer – it points to the
+    task structure of the very first user space process, traditionally `init(1)`,
+    now `systemd(1)`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the `for_each_process()` macro is expressly designed to only iterate
+    over the `main()` thread of every *process* and not the ('child' or peer) threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A brief snippet of our `ch6/foreach/prcs_showall` kernel module''s output is
+    shown here (when run on our x86_64 Ubuntu 18.04 LTS guest system):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice how, in the preceding snippet, the TGID and PID of each process are always
+    equal, 'proving' that the `for_each_process()` macro only iterates over the *main*
+    thread of every process (and not every thread). We explain the details in the
+    following section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll leave the studying and trying out of the sample kernel module at `ch6/foreach/prcs_showall` as
+    an exercise for you.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iterating over the task list II – displaying all threads
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To iterate over each *thread* that's alive and well on the system, we could
+    use the `do_each_thread() { ... } while_each_thread()` *pair* of macros; we write
+    a sample kernel module to do just this (here: `ch6/foreach/thrd_showall/`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before diving into the code, let''s build it, `insmod` it (on our x86_64 Ubuntu
+    18.04 LTS guest), and see the bottom part of the output it emits via `dmesg(1)`.
+    As displaying the complete output isn''t really possible here – it''s far too
+    large – I''ve shown only the lower part of the output in the following screenshot.
+    Also, we''ve reproduced the header (Figure 6.9) so that you can make sense of
+    what each column represents:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/eb7e55fa-09ee-4080-87b7-0eb3815a3ae3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6.10 – Output from our thrd_showall.ko kernel module
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In Figure 6.9, notice how all the (kernel-mode) stack start addresses (the
+    fifth column) end in zeroes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0xffff .... .... .000`, implying that the stack region is *always aligned
+    on a page boundary *(as `0x1000` is `4096` in decimal). This will be the case
+    as kernel-mode stacks are always fixed in size and a multiple of the system page
+    size (typically 4 KB).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Following convention, in our kernel module, we arrange that if the thread is a
+    *kernel thread*, its name shows up within square brackets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before continuing on to the code, we first need to examine in a bit of detail
+    the TGID and PID members of the task structure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Differentiating between the process and thread – the TGID and the PID
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Think about this: as the Linux kernel uses a unique task structure (`struct
+    task_struct`) to represent every thread, and as the unique member within it has
+    a PID, this implies that, within the Linux kernel, *every thread has a unique
+    PID*. This gives rise to an issue: how can multiple threads of the same process
+    share a common PID? This violates the POSIX.1b standard (*pthreads*; indeed, for
+    a while Linux was non-compliant with the standard, creating porting issues, among
+    other things).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To fix this annoying user space standards issue, Ingo Molnar (of Red Hat) proposed
+    and mainlined a patch way back, in the 2.5 kernel series. A new member called
+    the **Thread Group IDentifier** or TGID was slipped into the task structure. This
+    is how it works: if the process is single-threaded, the `tgid` and `pid` values
+    are equal. If it''s a multithreaded process, then the `tgid` value of the *main*
+    thread is equal to its `pid` value; other threads of the process will inherit
+    the *main* thread''s `tgid` value but will retain their own unique `pid` values.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To understand this better, let's take an actual example from the previous screenshot.
+    In Figure 6.9, notice how, if a positive integer appears in the last column on
+    the right, it represents the number of threads in the multithreaded process to
+    its immediate left.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, check out the `VBoxService` process seen in Figure 6.9; for your convenience,
+    we have duplicated that snippet as follows (note that we: eliminated the first
+    column, the `dmesg` timestamp, and added the header line, for better readability):
+    it has PID and TGID values of `938` representing its *main* thread (called `VBoxService`;
+    for clarity, we''ve shown it in bold font), and a total of *nine threads*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'What are the nine threads? First, of course, the *main* thread is `VBoxService`,
+    and the eight displayed below it are, by name: `RTThrdPP`, `control`, `timesync`,
+    `vminfo`, `cpuhotplug`, `memballoon`, `vmstats`, and `automount`. How do we know
+    this for sure? It''s easy: look carefully at the first and second columns in the
+    preceding code block that represent the TGID and PID respectively: if they are
+    the same, it''s the main thread of the process; *if the TGID repeats, the process
+    is multithreaded* and the PID value represents the unique IDs of the ''child''
+    threads.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a matter of fact, it''s entirely possible to see the kernel''s TGID/PID
+    representation in user space via the ubiquitous GNU `ps(1)` command, by using
+    its `-LA` options (among other ways to do so):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `ps(1)` labels are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first column is `PID` – this is actually representative of the `tgid` member
+    of the task structure within the kernel for this task
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second column is `LWP` (LightWeight Process or thread!) – this is actually
+    representative of the `pid` member of the task structure within the kernel for
+    this task.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Note that only with the `ps(1)` GNU  can you pass parameters (like `-LA`) and
+    see the threads; this isn''t possible with a lightweight implementation of `ps` like
+    that of *busybox*. It isn''t a problem though: you can always look up the same
+    by looking under procfs; in this example, under `/proc/938/task`, you''ll see
+    sub-folders representing the child threads. Guess what: this is actually how GNU `ps` works
+    as well!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, on to the code now...
+  prefs: []
+  type: TYPE_NORMAL
+- en: Iterating over the task list III – the code
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now let''s see the (relevant) code of our `thrd_showall` kernel module:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A few points to note regarding the preceding code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We use the `LINUX_VERSION_CODE()` macro to conditionally include a header, as
+    required.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Please ignore the *locking* work for now – usage (or the lack thereof) of the `tasklist_lock()` and `task_[un]lock()` APIs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Don''t forget the CPU idle thread! Every CPU core has a dedicated idle thread
+    (named `swapper/n`) that runs when no other thread wants to (`n` being the core
+    number, starting with `0`). The `do .. while` loop we run does not start at this
+    thread (nor does `ps(1)` ever show it). We include a small routine to display
+    it, making use of the fact that the hard-coded task structure for the idle thread
+    is available and exported at `init_task` (a detail: `init_task` always refers
+    to the first CPU''s – core # `0` – idle thread).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s continue: in order to iterate over every thread alive, we need to use
+    a *pair* of macros, forming a loop: the `do_each_thread() { ... } while_each_thread()` pair
+    of macros do precisely this, allowing us to iterate over every *thread* alive
+    on the system. The following code shows this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Referring to the preceding code, the `do_each_thread() { ... } while_each_thread()` pair
+    of macros form a loop,  allowing us to iterate over every *thread* alive on the
+    system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We follow a strategy of using a temporary variable (named `tmp`) to fetch a
+    data item, which we then append to a 'result' buffer, `buf`, which we print once
+    on every loop iteration.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Obtaining the `TGID`, `PID`, `task_struct`, and `stack` start addresses is trivial
+    – here, keeping it simple, we just use `current` to dereference them (of course,
+    you could use the more sophisticated kernel helper methods we saw earlier in this
+    chapter to do so as well; here, we wish to keep it simple). Also notice that here
+    we deliberately do *not *use the (safer) `%pK` printk format specifier but rather
+    the generic `%px` specifier in order to display the *actual* kernel virtual addresses
+    of the task structure and the kernel-mode stack .
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Clean up as required before looping over (increment a counter of total threads, `memset()`
+    the temporary buffers to `NULL`, and so on).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On completion, we return the total number of threads we have iterated across.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In the following code block, we cover the portion of code that was deliberately
+    left out in the preceding block. We retrieve the thread''s name and print it within
+    square brackets if it''s a kernel thread. We also query the number of threads
+    within the process. The explanation follows the code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On the preceding code, we can say the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A *kernel thread *has no user space mapping. The `main()` thread's `current->mm` is
+    a pointer to a structure of type `mm_struct` and represents the entire process'
+    *user space* mapping; if `NULL`, it stands to reason that this is a kernel thread
+    (as kernel threads have no user space mappings); we check and print the name accordingly.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We print the name of the thread as well (by looking up the `comm` member of
+    the task structure). You might question why we don''t use the `get_task_comm()` routine
+    to obtain the task''s name here; the short reason: it causes a *deadlock*! We
+    shall explore this (and how to avoid it) in detail in the later chapters on kernel
+    synchronization. For now, again,  we just do it the simple way.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We fetch the number of threads in a given process conveniently via the `get_nr_threads()` macro;
+    the rest is explained clearly in the code comment above the macro in the preceding
+    block.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Great! With this, we complete our discussion (for now) on Linux kernel internals
+    and architecture with a primary focus on processes, threads, and their stacks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we covered the key aspects of kernel internals that will help
+    you as a kernel module or device driver author to better and more deeply understand
+    the internal workings of the OS. You examined in some detail the organization
+    of and relationships between the process and its threads and stacks (in both user
+    and kernel space). We examined the kernel `task_struct` data structure and learned
+    how to iterate over the *task list* in different ways via kernel modules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Though it may not be obvious, the fact is that understanding these kernel internal
+    details is a necessary and required step in your journey to becoming a seasoned
+    kernel (and/or device driver) developer. The content of this chapter will help
+    you debug many system programming scenarios and lays the foundation for our deeper
+    exploration into the Linux kernel, particularly that of memory management.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next chapter and the couple that follow it are critical indeed: we''ll
+    cover what you need to understand regarding the deep and complex topic of memory
+    management internals. I suggest you digest the content of this chapter first,
+    browse through the Further reading links of interest, work on the exercises (*Questions*
+    section), and then, get to the next chapter!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

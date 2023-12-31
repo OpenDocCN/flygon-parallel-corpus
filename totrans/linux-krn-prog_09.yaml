@@ -1,0 +1,2517 @@
+- en: Memory Management Internals - Essentials
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel internals, especially regarding memory management, is a vast and complex
+    topic. In this book, I do not intend to delve into the deep, gory details of kernel
+    memory internals. At the same time, I would like to provide sufficient – and definitely required
+    – background knowledge for a budding kernel or device driver developer like you
+    to successfully tackle this key topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accordingly, this chapter will help you understand to sufficient depth the internals
+    of how memory management is performed on the Linux OS; this includes delving into
+    the **Virtual Memory** (**VM**) split, examining both the user-mode and kernel
+    segment of the process to a good level of depth, and covering the basics of how
+    the kernel manages physical memory. In effect, you will come to  understand the memory
+    maps – both virtual and physical – of the process and the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This background knowledge will go a long way in helping you correctly and efficiently
+    manage dynamic kernel memory (with a focus on writing kernel or driver code using
+    the **Loadable Kernel Module** (**LKM**) framework; this aspect - dynamic memory
+    management - in a practical fashion is the focal point of the next two chapters
+    in the book). As an important side benefit, armed with this knowledge, you will
+    find yourself becoming more proficient at the debugging of both user and kernel-space
+    code. (The importance of this cannot be overstated! Debugging code is both an
+    art and a science, as well as a reality.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, the areas we will cover include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the VM split
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Examining the process VAS
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Examining the kernel segment
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Randomizing the memory layout – [K]ASLR
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Physical memory
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I assume that you have gone through [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml), *Kernel
+    Workspace Setup*, and have appropriately prepared a guest VM running Ubuntu 18.04
+    LTS (or a later stable release) and installed all the required packages. If not,
+    I recommend you do this first. To get the most out of this book, I strongly recommend
+    you first set up the workspace environment, including cloning this book's GitHub
+    repository for the code ([https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming)),
+    and work on it in a hands-on fashion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I assume that you are familiar with basic virtual memory concepts, the user-mode
+    process **Virtual Address Space** (**VAS**) layout of segments, user-and kernel-mode stacks,
+    the task structure, and so on. If you're unsure on this footing, I strongly suggest
+    you read the preceding chapter first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the VM split
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will broadly be looking at how the Linux kernel manages
+    memory in two ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The virtual memory-based approach, where memory is virtualized (the usual case)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A view of how the kernel actually organizes physical memory (RAM pages)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: First, let's begin with the virtual memory view, and then discuss physical memory
+    organization later in the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we saw earlier in the previous chapter, in the *Understanding the basics
+    of the process Virtual Address Space (VAS)* section, a key property of the process,
+    VAS, is that it is completely self-contained, a sandbox. You cannot look outside
+    the box. In [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals
+    Essentials – Processes and Threads*, Figure 6.2, we saw that the process VAS ranges
+    from virtual address `0` to what we simply termed the high address. What is the
+    actual value of this high address? Obviously, it''s the highest extent of the
+    VAS and thus depends on the number of bits used for addressing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a Linux OS running on a 32-bit processor (or compiled for 32-bit), the highest
+    virtual address will be *2^(32) = 4 GB*.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On a Linux OS running on (and compiled for) a 64-bit processor, the highest
+    virtual address will be *2^(64) = 16 EB.* (EB is short for exabyte. Believe me,
+    it's an enormousquantity. 16 EB is equivalent to the number *16 x 10^(18).*)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For simplicity, to keep the numbers manageable, let's focus for now on the 32-bit
+    address space (we will certainly cover 64-bit addressing as well). So, according
+    to our discussions, on a 32-bit system, the process VAS is from 0 to 4 GB – this
+    region consists of empty space (unused regions, called **sparse regions** or **holes**)
+    and valid regions of memory commonly termed **segments** (or more correctly, **mappings**)
+    – text, data, library, and stack (all of this having been covered in some detail
+    in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals
+    Essentials – Processes and Threads*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: On our journey to understanding virtual memory, it's useful to take up the well-known
+    `Hello, world` C program and understand its inner workings on a Linux system;
+    this is what the next section covers!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking under the hood – the Hello, world C program
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Right, is there anyone here who knows how to code the canonical `Hello, world`
+    C program? Okay, very amusing, let''s check out the one meaningful line therein:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The process is calling the `printf(3)` function. Have you written the code of
+    the `printf()`? "No, of course not," you say, "it's within the standard `libc` C
+    library, typically `glibc` (GNU `libc`) on Linux." But hang on, unless the code
+    and data of `printf` (and similarly all other library APIs) is actually within
+    the process VAS, how can we ever access it? (Recall, you can't look *outside the
+    box*!) For that, the code (and data) of `printf(3)` (in fact, of the `glibc` library)
+    must be mapped within the process *box* – the process VAS. It is indeed mapped
+    within the process VAS, in the library segments or mappings (as we saw in [Chapter
+    6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals Essentials –
+    Processes and Threads*, *F**igure 6.1*). How did this happen?
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reality is that on application startup, as part of the C runtime environment
+    setup, there is a small **Executable and Linkable Format** (**ELF**) binary (embedded
+    into your `a.out` binary executable file) called the **loader **(`ld.so` or `ld-linux.so`).
+    It is given control early. It detects all required shared libraries and memory
+    maps all of them – the library text (code) and data segments – into the process
+    VAS by opening the library file(s) and issuing the `mmap(2)` system call. So,
+    now, once the code and data of the library are mapped within the process VAS,
+    the process can indeed access it, and thus – wait for it – the `printf()` API
+    can be successfully invoked! (We've skipped the gory details of memory mapping
+    and linkage here).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Further verifying this, the `ldd(1)` script (the following output is from an
+    x86_64 system) reveals that this is indeed the case:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A few quick points to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Every single Linux process – automatically and by default – links to a minimum
+    of two objects: the `glibc` shared library and the program loader (no explicit
+    linker switch is required).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The name of the loader program varies with the architecture. Here, on our x86_64
+    system, it's `ld-linux-x86-64.so.2`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the preceding `ldd` output, the address within parentheses on the right is
+    the virtual address of the location of the mapping. For example, in the preceding
+    output, `glibc` is mapped into our process VAS at the **User Virtual Address**
+    (**UVA**), which equals `0x00007feb7b85b000`. Note that it's runtime dependent
+    (it also varies due to **Address Space Layout Randomization** (**ASLR**) semantics
+    (seen later)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For security reasons (and on architectures besides x86), it's considered better
+    to use the `objdump(1)` utility to look up details like these.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Try performing `strace(1)` on the `Hello, world` binary executable and you will
+    see numerous `mmap()` system calls, mapping in `glibc` (and other) segments!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's further examine our simple `Hello, world`application more deeply.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Going beyond the printf() API
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As you will know, the `printf(3)` API translates to the `write(2)` system call,
+    which of course writes the `"Hello, world"` string to `stdout` (by default, the
+    terminal window or the console device).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We also understand that as `write(2)` is a system call, this implies that the
+    current process running this code – the process context – must now switch to kernel
+    mode and run the kernel code of `write(2)` (monolithic kernel architecture)! Indeed
+    it does. But hang on a second: the kernel code of `write(2)` is in kernel VAS (refer
+    to [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals
+    Essentials – Processes and Threads*, Figure 6.1). The point here is if the kernel
+    VAS is outside the box, then how in the world are we going to call it?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Well, it could be done by placing the kernel in a separate 4 GB VAS, but this
+    approach results in very slow context switching, so it's simply not done.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The way it is engineered is like this: both user and kernel VASes live in the
+    same ''box'' – the available VAS. How exactly? By *splitting* the available address
+    space between the user and kernel in some `User:Kernel :: u:k` ratio. This is
+    called the** VM split **(the ratio `u:k` being typically expressed in gigabytes,
+    terabytes, or even petabytes).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram is representative of a 32-bit Linux process having a *2:2* VM
+    split (in gigabytes); that is, the total 4 GB process VAS is split into 2 GB of
+    user space and 2 GB of kernel-space. This is often the typical VM split on an
+    ARM-32 system running the Linux OS:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ece3c732-866d-41d8-af9b-ac0a48e4d774.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.1 – User:Kernel :: 2:2 GB VM split on an ARM-32 system running Linux'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, now that the kernel VAS is within the box, it''s suddenly clear and critical
+    to understand this: when a user-mode process or thread issues a system call, there
+    is a context switch to the kernel''s 2 GB VAS (various CPU registers, including
+    the stack pointer, get updated) within the very same process''s VAS. The thread
+    issuing the system call now runs its kernel code in process context in privileged
+    kernel mode (and works on kernel-space data). When done, it returns from the system
+    call, context switching back into unprivileged user mode, and is now running user-mode
+    code within the first 2 GB VAS.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The exact virtual address where the kernel VAS – also known as the **kernel
+    segment*** –* begins is typically represented via the `PAGE_OFFSET` macro within
+    the kernel. We will examine this, and some other key macros as well, in the *Macros
+    and variables describing the kernel segment layout *section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Where is this decision regarding the precise location and size of the VM split
+    taken? Ah, on 32-bit Linux, it''s a kernel build-time configurable. It''s done
+    within the kernel build as part of the `make [ARCH=xxx] menuconfig` procedure
+    – for example, when configuring the kernel for a Broadcom BCM2835 (or the BCM2837)
+    **System on Chip** (**SoC**) (the Raspberry Pi being a popular board with this
+    very SoC). Here''s a snippet from the official kernel configuration file (the
+    output is from the Raspberry Pi console):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As seen in the preceding snippet, the `CONFIG_VMSPLIT_2G` kernel config option
+    is set to `y` implying that the default VM split is `user:kernel :: 2:2`. For
+    32-bit architectures, the VM split location is **tunable** (as can be seen in
+    the preceding snippet, `CONFIG_VMSPLIT_[1|2|3]G`; `CONFIG_PAGE_OFFSET` gets set
+    accordingly). With a 2:2 VM split, `PAGE_OFFSET` is literally halfway, at the
+    virtual address `0x8000 0000` (2 GB)!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The default VM split for the IA-32 processor (the Intel x86-32) is 3:1 (GB).
+    Interestingly, the (ancient) Windows 3.x OS running on the IA-32 had the same
+    VM split, showing that these concepts are essentially OS-agnostic. Later in this
+    chapter, we will cover several more architectures and their VM split, in addition
+    to other details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring the VM split is not directly possible for 64-bit architectures.
+    So, now that we understand the VM split on 32-bit systems, let's now move on to
+    examining how it's done on 64-bit systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: VM split on 64-bit Linux systems
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: First off, it is worth noting that on 64-bit systems, all 64 bits are not used
+    for addressing. On a standard or typical Linux OS configuration for the x86_64
+    with a (typical) 4 KB page size, we use (the **Least Significant Bit** (**LSB**))
+    48 bits for addressing. Why not the full 64 bits? It's simply too much! No existing
+    computer comes close to having even half of the full *2**^(64)** = 18,446,744,073,709,551,616* bytes,
+    which is equivalent to 16 EB (that's 16,384 petabytes) of RAM!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Why," you might well wonder, "do we equate this with RAM?". Please read on
+    – more material needs to be covered before this becomes clear. The *Examining
+    the kernel segment* section  is where you will understand this fully.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Virtual addressing and address translation
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Before diving further into these details, it's very important to clearly understand
+    a few key points.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Consider a small and typical code snippet from a C program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The address you see the `printf()` emit is a virtual address and not a physical
+    one. We distinguish between two kinds of virtual addresses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you run this code in a user space process, the address of variable `i` that
+    you will see is a UVA.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If you run this code within the kernel, or a kernel module (of course, you'd
+    then use the `printk()` API), the address of variable `i` you will see is a **Kernel
+    Virtual Address** (**KVA**).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Next, a virtual address is not an absolute value (an offset from `0`); it''s
+    actually a *bitmask*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a 32-bit Linux OS, the 32 available bits are divided into what's called the
+    **Page Global Directory** (**PGD**) value, the **Page Table** (**PT**) value,
+    and the offset.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These become indices via which the **MMU** (the **Memory Management Unit** that's
+    within the silicon of modern microprocessors), with access to the kernel page
+    tables for the current process context, performs address translation.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We do not intend on covering the deep details on MMU-level address translation
+    here. It's also very arch-specific. Do refer to the *Further reading* section
+    for useful links on this topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As might be expected, on a 64-bit system, even with 48-bit addressing, there
+    will be more fields within the virtual address bitmask.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Okay, if this 48-bit addressing is the typical case on the x86_64 processor,
+    then how are the bits in a 64-bit virtual address laid out? What happens to the
+    unused 16 MSB bits? The following figure answers the question; it''s a representation
+    of the breakup of a virtual address on an x86_64 Linux system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/dddfab92-3acb-47e2-bcb9-110da524f813.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.2 – Breakup of a 64-bit virtual address on the Intel x86_64 processor
+    with 4 KB pages
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Essentially, with 48-bit addressing, we use bits 0 to 47 (the LSB 48 bits)
+    and ignore the **Most Significant Bit** (**MSB**) 16 bits, treating it much as
+    a sign extension. Not so fast though; the value of the unused sign-extended MSB
+    16 bits varies with the address space you are in:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Kernel VAS**: MSB 16 bits are always set to `1`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**User VAS**: MSB 16 bits are always set to `0`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This is useful information! Knowing this, by merely looking at a (full 64-bit)
+    virtual address, you can therefore tell whether it''s a KVA or a UVA:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: KVAs on a 64-bit Linux system always follow the format `0xffff .... .... ....`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: UVAs always have the format `0x0000 .... .... ....`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**A word of caution**: the preceding format holds true only for processors
+    (MMUs, really) that self-define virtual addresses as being KVAs or UVAs; the x86
+    and ARM family of processors do fall in this bracket.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As can now be seen (and I reiterate here), the reality is that virtual addresses
+    are not absolute addresses (absolute offsets from zero, as you might have mistakenly
+    imagined) but are actually bitmasks. The fact is that memory management is a complex
+    area where the work is shared:**the OS is in charge of creating and manipulating
+    the paging tables of each process, the toolchain (compiler) generates virtual
+    addresses, and it's the processor MMU that actually performs runtime address translation,
+    translating a given (user or kernel) virtual address to a physical (RAM) address!**
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will not delve into further details regarding hardware paging (and various
+    hardware acceleration technologies, such as the **Translation Lookaside Buffer**
+    (**TLB**) and CPU caches) in this book. This particular topic is well covered
+    by various other excellent books and reference sites that are mentioned in the *Further
+    reading *section of this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Back to the VAS on a 64-bit processor. The available VAS on a 64-bit system
+    is a simply gigantic *2**^(64) **= 16 EB* (*16 x 10**^(18)* bytes!). The story
+    goes that when AMD engineers were first porting the Linux kernel to the x86_64
+    (or AMD64) 64-bit processor, they would have had to decide how to lay out the
+    process and kernel segments within this enormous VAS. The decision reached has
+    more or less remained identical, even on today''s x86_64 Linux OS. This enormous
+    64-bit VAS is split as follows. Here, we assume 48-bit addressing with a 4 KB
+    page size:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Canonical lower half, for 128 TB: User VAS and virtual address ranges from `0x0` to `0x0000
+    7fff ffff ffff`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Canonical upper half, for 128 TB: Kernel VAS and virtual address ranges from `0xffff
+    8000 0000 0000` to `0xffff ffff ffff ffff`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The word *canonical* effectively means *as per the law* or as *per common convention*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This 64-bit VM split on an x86_64 platform can be seen in the following figure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/8868926d-f362-4c96-9cad-544cfd2b7a4f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.3 – The Intel x86_64 (or AMD64) 16 EB VAS layout (48-bit addressing);
+    VM split is User : Kernel :: 128 TB : 128 TB'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding figure,the in-between unused region – a hole or sparse region
+    – is also called the **non-canonical addresses** region. Interestingly, with the
+    48-bit addressing scheme, the vast majority of the VAS is left unused. This is
+    why we term the VAS as being very sparse.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding figure is certainly not drawn to scale! Always keep in mind that
+    this is all *virtual* memory space, not physical.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To round off our discussion on the VM split, some common `user:kernel` VM split
+    ratios for different CPU architectures are shown in the following figure (we assume
+    an MMU page size of 4 KB):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/dae425dd-f5cb-4492-a14b-ad846c342920.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.4 – Common user:kernel VM split ratios for different CPU architectures
+    (for 4 KB page size)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We highlight the third row in bold red as it''s considered the common case:
+    running Linux on the x86_64 (or AMD64) architecture, with a `user:kernel :: 128
+    TB:128 TB` VM split. Also, be careful when reading the table: the numbers in the
+    sixth and eighth columns, End vaddr, are single 64-bit quantities each and not
+    two numbers. The number may have simply wrapped around. So, for example, in the
+    x86_64 row, column 6, it''s the *single* number `0x0000 7fff ffff ffff` and not
+    two numbers.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The third column, Addr Bits, shows us that, on 64-bit processors, no real-world
+    processor actually uses all 64 bits for addressing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Under the x86_64, there are two VM splits shown in the preceding table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first one, 128 TB : 128 TB (4-level paging) is the typical VM split being
+    used on Linux x86_64-bit systems as of today (embedded laptops, PCs, workstations,
+    and servers). It limits thephysical address space to 64 TB (of RAM).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The second one, 64 PB : 64 PB, is, as of the time of writing at least, still
+    purely theoretical; it comes with support for what is called 5-level paging from
+    4.14 Linux; the assigned VASes (56-bit addressing; a total of 128 petabytes of
+    VAS and 4 PB of physical address space!) is so enormous that, as of the time of
+    writing, no actual computer is (yet) using it.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that the two rows for the AArch64 (ARM-64) architecture running on Linux
+    are merely representative. The BSP vendor or platform team working on the product
+    could well use differing splits. As an interesting aside, the VM split on the
+    (old) Windows 32-bit OS is 2:2 (GB).
+  prefs: []
+  type: TYPE_NORMAL
+- en: What's actually residing within the kernel VAS, or as it's commonly called,
+    the kernel segment? All kernel code, data structures (including the task structures,
+    the lists, the kernel-mode stacks, paging tables, and so on), device drivers,
+    kernel modules, and so on are within here (as the lower half of *Figure 6.7* in [Chapter
+    6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml), *Kernel Internals Essentials –
+    Processes and Threads*, showed; we cover precisely this in some detail in the
+    *Understanding* *the kernel segment* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to realize that, as a performance optimization on Linux, kernel
+    memory is always non-swappable; that is, kernel memory can never be paged out
+    to a swap partition. User space memory pages are always candidates for paging,
+    unless locked (see the `mlock[all](2)` system calls).
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this background, you're now in a position to understand the full process
+    VAS layout. Read on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The process VAS – the full view
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Once again, refer to *Figure 7.1*; it shows the actual process VAS layout for
+    a single 32-bit process. The reality, of course – and this is key – is that **all
+    processes alive on the system have their own unique user-mode VAS but share the
+    same kernel segment***.* For some contrast from *Figure 7.1*, which showed a 2:2
+    (GB) VM split, the following figure shows the actual situation for a typical IA-32
+    system, with a 3:1 (GB) VM split:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/1302b8d9-478a-494d-b527-6556b8cc5c78.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.5 – Processes have a unique user VAS but share the kernel segment (32-bit
+    OS); IA-32 with a 3:1 VM split
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice in the preceding figure how the address space reflects a 3:1 (GB) VM
+    split. The user address space extends from `0` to `0xbfff ffff` (`0xc000 0000` is
+    the 3 GB mark; this is what the `PAGE_OFFSET` macro is set to), and the kernel
+    VAS extends from `0xc000 0000` (3 GB) to `0xffff ffff` (4 GB).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Later in this chapter, we will cover the usage of a useful utility called `procmap`. It
+    will help you literally visualize the VASes, both kernel and user VASes, in detail,
+    similar to how our preceding diagrams have been showing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few things to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the example shown in Figure 7.5, the value of `PAGE_OFFSET` is `0xc000 0000`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The figures and numbers we have shown here are not absolute and binding across
+    all architectures; they tend to be very arch-specific and many highly vendor-customized
+    Linux systems may change them.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Figure 7.5* details the VM layout on a 32-bit Linux OS. On 64-bit Linux, the *concepts *remain
+    identical, it''s just the numbers that (significantly) change. As shown in some
+    detail in the preceding sections, the VM split on an x86_64 (with 48-bit addressing) Linux
+    system becomes `User : Kernel :: 128 TB : 128 TB`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now that the fundamentals of the virtual memory layout of a process are understood,
+    you will find that it greatly helps in deciphering and making progress in difficult-to-debug
+    situations. As usual, there's still more to it; sections follow on the user space
+    and kernel-space memory map (the kernel segment), and some coverage on the physical
+    memory map as well. Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining the process VAS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have already covered the layout – the segments or mappings – that every process's
+    VAS is made up of (see the *Understanding the basics of* *the process **Virtual
+    Address Space (VAS)* section in [Chapter 6](e13fb379-a77f-4ba5-9de6-d6707b0214e6.xhtml)*,* *Kernel
+    Internals Essentials – Processes and Threads*). We learned that the process VAS
+    consists of various mappings or segments, and among them are text (code), data
+    segments, library mappings, and at least one stack. Here, we expand greatly on
+    that discussion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Being able to dive deep into the kernel and see various runtime values is an
+    important skill for a developer like you, as well as the user, QA, sysadmin, DevOps,
+    and so on. The Linux kernel provides us with an amazing interface to do precisely
+    this – it's, you guessed it, the `proc` filesystem (`procfs`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is always present on Linux (at least it should be) and is mounted under `/proc`*.* The `procfs`system
+    has two primary jobs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To provide a unified set of (pseudo or virtual) files and directories, enabling
+    you to look deep into the kernel and hardware internal details.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: To provide a unified set of root-writeable files, allowing the sysad to modify
+    key kernel parameters. These are present under `/proc/sys/` and are termed `sysctl` – they
+    are the tuning knobs of the Linux kernel.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Familiarity with the `proc` filesystem is indeed a must. I urge you to check
+    it out, and read the excellent man page on `proc(5)` as well. For example, simply
+    doing `cat /proc/PID/status` (where `PID` is, of course, the unique process identifier
+    of a given process or thread) yields a whole bunch of useful details from the
+    process or thread's task structure!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Conceptually similar to `procfs` is the `sysfs` filesystem, mounted under `/sys` (and
+    under it `debugfs`*,* typicallymounted at `/sys/kernel/debug`). `sysfs` is a representation
+    of 2.6 Linux's new device and driver model; it exposes a tree of all devices on
+    the system, as well as several kernel-tuning knobs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining the user VAS in detail
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let''s begin by checking out the user VAS of any given process. A pretty detailed
+    map of the user VAS is made available via `procfs`, particularly via the `/proc/PID/maps`
+    pseudo-file. Let''s learn how to use this interface to peek into a process''s
+    user space memory map. We will see two ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Directly via the `procfs` interface's `/proc/PID/maps` pseudo-file
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using a few useful frontends (making the output more human-digestible)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's start with the first one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Directly viewing the process memory map using procfs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Looking up the internal process details of any arbitrary process does require root access,
+    whereas looking up details of a process under your ownership (including the caller
+    process itself) does not. So, as a simple example, we will look up the calling
+    process''s VAS by using the `self` keyword in place of the PID. The following
+    screenshot shows this (on an x86_64 Ubuntu 18.04 LTS guest):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f77f3aa4-e443-40d4-8b06-25d1ad178bed.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.6 – Output of the cat /proc/self/maps command
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, you can actually see the user VAS of the `cat` process
+    – a veritable memory map of the user VAS of that process! Also, notice that the
+    preceding `procfs` output is sorted in ascending order by (user) virtual address
+    (UVA).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Familiarity with using the powerful `mmap(2)` system call will help greatly
+    in understanding further discussions. Do (at least) browse through its man page.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interpreting the /proc/PID/maps output
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: To interpret the output of Figure 7.6, read it one line at a time. **Each line
+    represents a segment or mapping of the user-mode VAS** of the process in question
+    (in the preceding example, it's of the `cat` process). Each line consists of the
+    following fields.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To make it easier, I will show just a single line of output whose fields we
+    will label and refer to in the following notes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the entire line represents a segment, or more correctly, a *mapping* within
+    the process (user) VAS. `uva` is the user virtual address. `start_uva` and `end_uva`
+    for each segment are displayed as the first two fields (or columns). Thus, the
+    length of the mapping (segment) is easily calculated (`end_uva`–`start_uva` bytes).
+    Thus, in the preceding line, `start_uva` is `0x555d83b65000` and `end_uva` is
+    `0x555d83b6d000` (and the length can be calculated to be 32 KB); but, what is
+    this segment? Do read on...
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The third field, `r-xp`, is actually a combination of two pieces of information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first three letters represent the mode (permissions) of the segment (in
+    the usual `rwx` notation).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The next letter represents whether the mapping is a private one (`p`) or a shared
+    one (`s`). Internally, this is set up by the fourth parameter to the `mmap(2)` system
+    call, `flags`; it's really **the** `mmap(2)` **system call that is internally
+    responsible for creating every segment or mapping within a process!**
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: So, for the preceding sample segment shown, the third field being the value
+    `r-xp`, we can now tell it's a text (code) segment and is a private mapping (as
+    expected).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The fourth field `start-off` (here, it's the value `0`) is the start offset
+    from the beginning of the file whose contents has been mapped into the process
+    VAS. Obviously, this value is only valid for file mappings. You can tell whether
+    the current segment is a file mapping by glancing at the penultimate (sixth) field.
+    For mappings that are not file-mapped – called **anonymous mappings** – it's always
+    `0` (examples would be the mappings representing the heap or stack segments).
+    In our preceding example line, it's a file mapping (that of `/bin/cat`) and the
+    offset from the beginning of that file is `0` bytes (the length of the mapping,
+    as we calculated in the preceding paragraph, is 32 KB).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fifth field (`08:01`) is of the form `mj:mn`, where `mj` is the major number
+    and `mn` is the minor number of the device file where the image resides. Similar
+    to the fourth field, it's only valid for file mappings, else it's simply shown
+    as `00:00`; in our preceding example line, it's a file mapping (that of `/bin/cat`),
+    and the major and minor numbers (of the *device* that the file resides on) are `8` and `1`,
+    respectively.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The sixth field (`524313`) represents the inode number of the image file –
+    the file whose contents are being mapped into the process VAS. The inode is the
+    key data structure of the **VFS (Virtual FileSystem)**; it holds all metadata
+    of the file object, everything except for its name (which is in the directory
+    file). Again, this value is only valid for file mappings and simply shows as `0`
+    otherwise. This is, in fact, a quick way to tell whether the mapping is file-mapped
+    or an anonymous mapping! In our preceding example mapping, clearly it''s a file
+    mapping (that of `/bin/cat`), and the inode number is `524313`. Indeed, we can
+    confirm this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The seventh and last field represents the pathname of the file whose contents
+    are being mapped into the user VAS. Here, as we're viewing the memory map of the `cat(1)` process,
+    the pathname (for the file-mapped segments) is `/bin/cat`, of course. If the mapping
+    represents a file, the file's inode number (the sixth field) shows up as a positive
+    quantity; if not – meaning it's a pure memory or anonymous mapping with no backing
+    store – the inode number shows up as `0` and this field will be empty.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It should by now be obvious, but we will point this out nevertheless – it is
+    a key point: all the preceding addresses seen are virtual, not physical. Furthermore,
+    they only belong to user space, hence they are termed UVAs and are always accessed
+    (and translated) via the unique paging tables for that process. Also, the preceding
+    screenshot was taken on a 64-bit (x86_64) Linux guest. Hence, here, we see 64-bit
+    virtual addresses.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Though the way the virtual addresses are displayed isn't as a full 64-bit number
+    – for example, as `0x555d83b65000` and not as `0x0000555d83b65000` – I want you
+    to notice how, because it's a **user virtual address** (a **UVA**), the MSB 16
+    bits are zero!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right, that covers how to interpret a particular segment or mapping, but there
+    seems to be a few strange ones – the `vvar`, `vdso`, and `vsyscall` mappings.
+    Let's see what they mean.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The vsyscall page
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Did you notice something a tad unusual in the output of Figure 7.6? The very
+    last line there – the so-called `vsyscall` entry – maps a kernel page (by now,
+    you know how we can tell: the MSB 16 bits of its start and end virtual addresses
+    are set). Here, we just mention the fact that this is an (old) optimization for
+    performing system calls. It works by alleviating the need to actually switch to
+    kernel mode for a small subset of syscalls that don''t really need to.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Currently, on the x86, these include the `gettimeofday(2)`, `time(2)`, and `getcpu(2)`
+    system calls. Indeed, the `vvar` and `vdso` (aka vDSO) mappings above it are (slightly)
+    modern variations on the same theme. If you are interested in finding out more
+    about this, visit the *Further reading *section for this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, you've now seen how to examine the user space memory map of any given process
+    by directly reading and interpreting the output of the `/proc/PID/maps` (pseudo)
+    file for the process with PID. There are other convenient frontends to do so;
+    we'll now check out a few.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Frontends to view the process memory map
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Besides the raw or direct format via `/proc/PID/maps` (which we saw how to interpret
+    in the previous section), there are some wrapper utilities that help us more easily
+    interpret the user-mode VAS. Among them are the additional (raw) `/proc/PID/smaps`pseudo-file,
+    the `pmap(1)` and `smem(8)` utilities, and my own simple utility (christened `procmap`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel provides detailed information on each segment or mapping via the `/proc/PID/smaps`pseudo-file
+    under `proc`. Do try `cat /proc/self/smaps` to see this for yourself. You will
+    notice that for each segment (mapping), a good amount of detail information is
+    provided on it. The man page on `proc(5)` helps explain the many fields seen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For both the `pmap(1)` and `smem(8)` utilities, I refer you to the man pages
+    on them for details. For example, with `pmap(1)`, the man page informs us of the
+    more verbose `-X` and `-XX` options:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Regarding the `smem(8)` utility, the fact is that it does *not* show you the
+    process VAS; rather, it''s more about answering an FAQ: namely, ascertaining which
+    process is taking up the most physical memory. It uses metrics such as **Resident
+    Set Size** (**RSS**), **P****roportional Set Size** (**PSS**), and **U****nique
+    Set Size** (**USS**) to throw up a clearer picture. I will leave the further exploration
+    of these utilities as an exercise to you, dear reader!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's move on to exploring how we can use a useful utility – `procmap`
+    – to view in quite a bit of detail both the kernel and user memory map of any
+    given process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The procmap process VAS visualization utility
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'As a small learning and teaching (and helpful during debug!) project, I have
+    authored and hosted a small project on GitHub going by the name of `procmap`*,* available
+    here: [https://github.com/kaiwan/procmap](https://github.com/kaiwan/procmap) (do
+    `git clone` it). A snippet from its `README.md` file helps explain its purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'An aside: at the time of writing this material (April/May 2020), the COVID-19
+    pandemic is in full swing across most of the globe. Similar to the earlier *SETI@home*
+    project ([https://setiathome.berkeley.edu/](https://setiathome.berkeley.edu/)),
+    the *Folding@home* project ([https://foldingathome.org/category/covid-19/](https://foldingathome.org/category/covid-19/))
+    is a distributed computing project that leverages internet-connected home (or
+    any) computers to help simulate and solve problems related to COVID-19 treatments
+    (among finding cures for several other serious diseases that affect us). You can
+    download the software from [https://foldingathome.org/start-folding/](https://foldingathome.org/start-folding/)
+    (install it, and it runs during your system''s idle cycles). I did just this;
+    here''s the FAH viewer (a nice GUI showing protein molecules!) process running
+    on my (native) Ubuntu Linux system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Alright, let''s interrogate its VAS using the `procmap` utility. How do we
+    invoke it? Simple, see what follows (due to a lack of space, I won''t show all
+    the information, caveats, and more here; do try it out yourself):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Do note that this `procmap` utility is not the same as the `procmap` utility
+    provided by BSD Unix. Also, it depends upon the `bc(1)` and `smem(8)` utilities;
+    please ensure they're installed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When I run the `procmap` utility with only `--pid=<PID>`, it will display both
+    the kernel and user space VASes of the given process. Now, as we have not yet
+    covered the details regarding the kernel VAS (or segment), I won't show the kernel-space
+    detailed output here; let's defer that to the upcoming section, *Examining the
+    kernel segment*. As we proceed, you will find partial screenshots of only the
+    user VAS output from the `procmap` utility. The complete output can be quite lengthy,
+    depending, of course, on the process in question; do try it out for yourself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you''ll see, it attempts to provide a basic visualization of the complete
+    process memory map – both kernel and user space VAS in a vertically tiled format
+    (as mentioned, here we just display truncated screenshots):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/edb272b2-8d74-4973-8c40-3e77350e541a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.7 – Partial screenshot: the first line of the kernel VAS output from
+    the procmap utility'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Notice, from the preceding (partial) screenshot, a few things:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `procmap` (Bash) script auto-detects that we're running on an x86_64 64-bit
+    system.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Though we're not focused on it right now, the output of the kernel VAS appears
+    first; this is natural as we show the output ordered by descending virtual address
+    (Figures 7.1, 7.3 and 7.5 reiterate this)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can see that the very first line (after the `KERNEL VAS` header) corresponds
+    to a KVA at the very top of the VAS – the value `0xffff ffff ffff ffff` (as we're
+    on 64-bit).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Moving on to the next part of the `procmap` output, let''s look at a truncated
+    view of the upper end of the user VAS of the `FAHViewer` process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/67891589-c023-45fe-a478-ec7f6546e983.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.8 – Partial screenshot: first few lines (high end) of the user VAS
+    output from the procmap utility'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 7.8 is a partial screenshot of the `procmap`output, and shows the user
+    space VAS; at the very top of it, you can see the (high) end UVA.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On our x86_64 system (recall, this is arch-dependent), the (high) `end_uva` value
+    is
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0x0000 7fff ffff ffff` and `start_uva` is, of course, `0x0`. How does `procmap` figure
+    out the precise address values? Ah, it''s fairly sophisticated: for the kernel-space
+    memory information, it uses a kernel module (an LKM!) to query the kernel and
+    sets up a config file depending on the system architecture; user space details,
+    of course, come from the `/proc/PID/maps` direct `procfs` pseudo-file.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an aside, the kernel component of `procmap`, a kernel module, sets up a way
+    to interface with user space – the `procmap` scripts – by creating and setting
+    up a `debugfs` (pseudo) file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot shows a partial screenshot of the low end of the user
+    mode VAS for the process, right down to the lowest UVA, `0x0`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/18776659-6b89-4ec7-a08a-0a6ea6afadea.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.9 – Partial screenshot: last few lines (low end) of the user VAS output
+    from the procmap utility'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last mapping, a single page, is, as expected, the null trap page (from UVA `0x1000`
+    to `0x0`; we will explain its purpose in the upcoming *The null trap page* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `procmap` utility, then, if enabled in its config file, calculates and displays
+    a few statistics; this includes the sizes of both the kernel and user-mode VASes,
+    the amount of user space memory taken up by sparse regions (on 64-bit, as in the
+    preceding example, it's usually the vast majority of the space!) as an absolute
+    number and a percentage, the amount of physical RAM reported, and finally, the
+    memory usage details for this particular process as reported by the `ps(1)` and
+    `smem(8)` utilities.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will find, in general, on a 64-bit system (see Figure 7.3), that the *sparse*
+    (empty) memory regions of the process VAS take up close to 100% of the available
+    address space! (It's often a number such as 127.99[...] TB of VAS out of the 128
+    TB available.) This implies that 99.99[...]% of the memory space is sparse (empty)!
+    This is the reality of the simply enormous VAS on a 64-bit system. Only a tiny
+    fraction of the gigantic 128 TB of VAS (as this is the case on the x86_64) is
+    actually in use. Of course, the actual amounts of sparse and used VAS depend on
+    the size of the particular application process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Being able to clearly visualize the process VAS can aid greatly when debugging
+    or analyzing issues at a deeper level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you're reading this book in its hardcopy format, be sure to download the
+    full-color PDF of diagrams/figures from the publisher's website: [https://static.packt-cdn.com/downloads/9781789953435_ColorImages.pdf](_ColorImages.pdf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: You will also see that the statistics printed out at the end of the output (if
+    enabled) show the number of **Virtual Memory Areas** (**VMAs**) set up for the
+    target process. The following section briefly explains what a VMA is. Let's get
+    to it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding VMA basics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In the output of `/proc/PID/maps`, each line of the output is actually extrapolated
+    from a kernel metadata structure called a VMA. It''s quite straightforward, really:
+    the kernel uses the VMA data structure to abstract what we have been calling a segment or mapping.
+    Thus, for every single segment in the user VAS, there is a VMA object maintained
+    by the OS. Please realize that only user space segments or mappings are governed
+    by the kernel metadata structure called the VMA; the kernel segment itself has
+    no VMAs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, how many VMAs will a given process have? Well, it's equal to the number
+    of mappings (segments) in its user VAS. In our example with the *FAHViewer* process,
+    it happened to have 206 segments or mappings, implying that there are 206 VMA
+    metadata objects – representing the 206 user space segments or mappings – for
+    this process in kernel memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Programmatically speaking, the kernel maintains a VMA "chain" (which is actually
+    a red-black tree data structure for efficiency reasons) via the task structure
+    rooted at `current->mm->mmap`. Why is the pointer called `mmap`? It''s very deliberate:
+    every time an `mmap(2)` system call – that is, a memory mapping operation – is
+    performed, the kernel generates a mapping (or "segment") within the calling process''s
+    (that is, within `current` instances) VAS and a VMA object representing it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The VMA metadata structure is akin to an umbrella encompassing the mapping
+    and includes all required information for the kernel to perform various kinds
+    of memory management: servicing page faults (very common), caching the contents
+    of a file during I/O into (or out of) the kernel page cache, and so on.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page fault handling is a very important OS activity, whose algorithm makes up
+    quite a bit of usage of the kernel VMA objects; in this book, though, we don't
+    delve into these details as it's largely transparent to kernel module/driver authors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just to give you a feel for it, we will show a few members of the kernel VMA
+    data structure in the following snippet; the comments alongside help explain their
+    purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It should now be clearer as to how `cat /proc/PID/maps` really works under
+    the hood: when the user space does, say, `cat /proc/self/maps`, a `read(2)` system
+    call is issued by `cat`; this results in the `cat` process switching to kernel
+    mode and running the `read(2)` system call code within the kernel with kernel
+    privileges. Here, the kernel **Virtual Filesystem Switch** (**VFS**) redirects
+    control to the appropriate `procfs` callback handler (function). This code iterates
+    (loops) over every VMA metadata structures (for `current`, which is our `cat`
+    process, of course), sending relevant information back to user space. The `cat`
+    process then faithfully dumps the data received via the read to `stdout`, and
+    thus we see it: all the segments or mappings of the process – in effect, the memory
+    map of the user-mode VAS!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Right, with this, we conclude this section, where we have covered details on
+    examining the process user VAS. This knowledge helps not only with understanding
+    the precise layout of user-mode VAS but also with debugging user space memory
+    issues!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's move on to understanding another critical aspect of memory management
+    – the detailed layout of the kernel VAS, in other words, the kernel segment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining the kernel segment
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As we have talked about in the preceding chapter, and as seen in *Figure 7.5*,
+    it's really critical to understand that all processes have their own unique user
+    VAS but share the kernel space – what we call the kernel segment or kernel VAS.
+    Let's begin this section by starting to examine some common (arch-independent)
+    regions of the kernel segment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel segment''s memory layout is very arch (CPU)-dependent. Nevertheless,
+    all architectures share some commonalities. The following basic diagram represents
+    both the user VAS and the kernel segment (in a horizontally tiled format), as
+    seen on an x86_32 with a 3:1 VM split:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9192b519-60a5-4db3-933a-a492f3036266.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.10 – User and kernel VASes on an x86_32 with a 3:1 VM split with focus
+    on the lowmem region
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s go over each region one by one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The user mode VAS**: This is the user VAS; we have covered it in detail in
+    the preceding chapter as well as earlier sections in this chapter; in this particular
+    example, it takes 3 GB of VAS (UVAs from `0x0` to `0xbfff ffff`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All that follows belongs to kernel VAS or the kernel segment; in this particular
+    example, it takes 1 GB of VAS (KVAs from `0xc000 0000` to `0xffff ffff`); let's
+    examine individual portions of it now.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The lowmem region**: This is where platform (system) RAM direct-maps into
+    the kernel. (We will cover this key topic in more detail in the *Direct-mapped
+    RAM and address translation* section*.* If you feel it helps, you can read that
+    section first and then return here). Skipping a bit ahead for now, let''s just
+    understand that the base location in the kernel segment where platform RAM is
+    mapped is specified by a kernel macro called `PAGE_OFFSET`. The precise value
+    of this macro is very arch-dependent; we will leave this discussion to a later
+    section. For now, we ask you to just take it on faith that on the IA-32 with a
+    3:1 (GB) VM split, the value of `PAGE_OFFSET` is `0xc000 0000`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The length or size of the kernel lowmem region is equal to the amount of RAM
+    on the system. (Well, at least the amount of RAM as seen by the kernel; enabling
+    the kdump facility, for example, has the OS reserve some RAM early). The virtual
+    addresses that make up this region are termed **kernel logical addresses** as
+    they are at a fixed offset from their physical counterparts. The core kernel and
+    device drivers can allocate (physically contiguous!) memory from this region via
+    various APIs (we cover precisely these APIs in detail in the following two chapters).
+    The kernel static text (code), data, and BSS (uninitialized data) memory also
+    resides within this lowmem region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The kernel vmalloc region**: This is a region of the kernel VAS that is completely
+    virtual. Core kernel and/or device driver code can allocate virtually contiguous
+    memory from this region using the `vmalloc()` (and friends) API. Again, we will
+    cover this in detail in [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml),
+    *Kernel Memory Allocation for Module Authors Part 1*, and [Chapter 9](dbb888a2-8145-4132-938c-1313a707b2f2.xhtml),
+    *Kernel Memory Allocation for Module Authors Part 2*. This is also the so-called
+    `ioremap` space.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The kernel modules space**: A region of kernel VAS is set aside for memory
+    taken up by the static text and data of **Loadable Kernel Modules** (**LKMs**).
+    When you perform `insmod(8)`, the underlying kernel code of the resulting `[f]init_module(2)`
+    system call allocates memory from this region (typically via the `vmalloc()` API)
+    and loads the kernel module''s (static) code and data there.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The preceding figure (Figure 7.10) is deliberately left simplistic and even
+    a bit vague as the exact kernel virtual memory layout is very arch-dependent.
+    We'll put off the temptation to draw a detailed diagram for a bit. Instead, to
+    make this discussion less pedantic and more practical and useful, we'll present,
+    in a soon-to-come section, a kernel module that queries and prints relevant information
+    regarding the kernel segment layout. Only then, once we have actual values for
+    various regions of the kernel segment for a particular architecture, will we present
+    a detailed diagram depicting this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Pedantically (as can be seen in Figure 7.10), the addresses belonging to the lowmem
+    region are termed kernel logical addresses (they''re at a fixed offset from their
+    physical counterparts), whereas the addresses for the remainder of the kernel
+    segment are termed KVAs. Though this distinction is made here, please realize
+    that, for all practical purposes, it''s a rather pedantic one: we will often simply
+    refer to all addresses within the kernel segment as KVAs.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before that, there are several other pieces of information to cover. Let''s
+    begin with another peculiarity, mostly brought about by the limitations of a 32-bit
+    architecture: the so-called high memory region of the kernel segment.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: High memory on 32-bit systems
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Regarding the kernel lowmem region that we briefly discussed previously, an
+    interesting observation ensues. On a 32-bit system with, say, a 3:1 (GB) VM split
+    (just as Figure 7.10 depicts), a system with (say) 512 MB of RAM will have its
+    512 MB RAM direct-mapped into the kernel starting at `PAGE_OFFSET` (3 GB or KVA `0xc000
+    0000`). This is quite clear.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But think about it: what would happen if the system has a lot more RAM, say,
+    2 GB? Now, it''s obvious that we cannot direct-map the whole of the RAM into the
+    lowmem region. It just cannot fit (as, in this example, the entire available kernel
+    VAS is just a gigabyte and RAM is 2 gigabytes)! So, on a 32-bit Linux OS, a certain
+    amount of memory (typically 768 MB on the IA-32) is allowed to be direct-mapped and
+    thus falls into the lowmem region. The remaining RAM is *indirectly mapped* into
+    another memory zone called `ZONE_HIGHMEM` (we think of it as a high-memory region
+    or *zone* as opposed to lowmem; more on memory zones follows in a later section, *Zones*).
+    More correctly, as the kernel now finds it impossible to direct-map all physical
+    memory at once, it sets up a (virtual) region where it can set up and use temporary
+    virtual mappings of that RAM. This is the so-called high-memory region.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't get confused by the phrase "high memory"; one, it's not necessarily placed
+    "high" in the kernel segment, and two, this is not what the `high_memory` global
+    variable represents – it (`high_memory`) represents the upper bound of the kernel's 
+    lowmem region. More on this follows in a later section, *Macros and variables
+    describing the kernel segment layout*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Nowadays, though (and especially with 32-bit systems being used more and more
+    infrequently), these concerns completely disappear on 64-bit Linux. Think about
+    it: on 64-bit Linux, the kernel segment size is a whopping 128 TB (!) on the x86_64\.
+    No single system in existence has anywhere close to this much RAM. Hence, all
+    platform RAM can indeed (easily) be direct-mapped into the kernel segment and
+    the need for `ZONE_HIGHMEM` (or equivalent) disappears.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, the kernel documentation provides details on this "high-memory" region.
+    Take a look if interested: [https://www.kernel.org/doc/Documentation/vm/highmem.txt](https://www.kernel.org/doc/Documentation/vm/highmem.txt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, let's now tackle the thing we've been waiting to do – writing a kernel
+    module (an LKM) to delve into some details regarding the kernel segment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Writing a kernel module to show information about the kernel segment
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As we have learned, the kernel segment consists of various regions. Some are
+    common to all architectures (arch-independent): they include the lowmem region
+    (which contains, among other things, the uncompressed kernel image – its code,
+    data, BSS), the kernel modules region, `vmalloc`/`ioremap` regions, and so on.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The precise location within the kernel segment where these regions lie, and
+    indeed which regions may be present, is very arch (CPU)-dependent. To help understand
+    and pin it down for any given system, let's develop a kernel module that queries
+    and prints various details regarding the kernel segment (in fact, if asked to,
+    it also prints some useful user space memory details).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing the kernel segment on a Raspberry Pi via dmesg
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Before jumping into and analyzing the code for such a kernel module, the fact
+    is that something pretty similar to what we''re attempting here – printing the
+    location and size of various interesting regions within the kernel segment/VAS
+    – is already performed at early boot on the popular Raspberry Pi (ARM) Linux kernel. In
+    the following snippet, we show the relevant output from the kernel log when the
+    Raspberry Pi 3 B+ (running the stock (default) 32-bit Raspberry Pi OS) boots:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: It's important to note that these preceding prints are very specific to the
+    OS and device. The default Raspberry Pi 32-bit OS prints this information out,
+    while others may not: **YMMV** (**Your Mileage May Vary**!). For example, with
+    the standard 5.4 kernel for Raspberry Pi that I built and ran on the device, these
+    informative prints weren't present. On recent kernels (as seen in the preceding
+    logs on the 4.19.97-v7+ Raspberry Pi OS kernel), for security reasons – that of
+    preventing kernel information leakage – many early `printk` functions will not
+    display a "real" kernel address (pointer) value; you might simply see it prints
+    the `0x(ptrval)` string.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This **`0x(ptrval)`** output implies that the kernel is deliberately not showing
+    even a hashed printk (recall the `%pK` format specifier from [Chapter 5](408b6f9d-42dc-4c59-ab3d-1074d595f9e2.xhtml),
+    *Writing Your First Kernel Module – LKMs Part 2*) as the system entropy is not
+    yet high enough. If you insist on seeing a (weakly) hashed printk, you can always
+    pass the `debug_boot_weak_hash` kernel parameter at boot (look up details on kernel
+    boot parameters here: [https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interestingly, (as mentioned in the preceding information box), the code that
+    prints this `Virtual kernel memory layout :`information is very specific to the
+    Raspberry Pi kernel patches! It can be found in the Raspberry Pi kernel source
+    tree here: [https://github.com/raspberrypi/linux/blob/rpi-5.4.y/arch/arm/mm/init.c](https://github.com/raspberrypi/linux/blob/rpi-5.4.y/arch/arm/mm/init.c).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, in order for you to query and print similar information, you must first
+    get familiar with some key kernel macros and globals.; let's do so in the next
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Macros and variables describing the kernel segment layout
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To write a kernel module that displays relevant kernel segment information,
+    we need to know how exactly to interrogate the kernel with regard to these details.
+    In this section, we will briefly describe a few key macros and variables within
+    the kernel representing the memory of the kernel segment (on most architectures,
+    in descending order by KVA):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The vector table** is a common OS data structure – it''s an array of function
+    pointers (aka a switching or jump table). It is arch-specific: ARM-32 uses it
+    to initialize its vectors such that when a processor exception or mode change
+    (such as an interrupt, syscall, page fault, MMU abort, and so on) occurs, the
+    processor knows what code to run:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Macro or variable** | **Interpretation** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VECTORS_BASE` | Typically ARM-32 only; start KVA of a kernel vector table
+    spanning 1 page |'
+  prefs: []
+  type: TYPE_TB
+- en: '**The fix map region** is a range of compile-time special or reserved virtual
+    addresses; they are employed at boot time to fix, into the kernel segment, required
+    kernel elements that must have memory available for them. Typical examples include
+    the setup of initial kernel page tables, early `ioremap` and `vmalloc` regions,
+    and so on. Again, it''s an arch-dependent region and is thus used differently
+    on different CPUs:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Macro or variable** | **Interpretation** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `FIXADDR_START` | Start KVA of the kernel fixmap region spanning `FIXADDR_SIZE`
+    bytes |'
+  prefs: []
+  type: TYPE_TB
+- en: '**Kernel modules** are allocated memory – for their static text and data –
+    within a specific range in the kernel segment. The precise location of the kernel
+    module region varies with the architecture. On ARM 32-bit systems, in fact, it''s
+    placed just above the user VAS; while on 64-bit, it''s usually higher up in the
+    kernel segment:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Kernel modules (LKMs) region** | **Memory allocated from here for static
+    code + data of LKMs** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **`MODULES_VADDR`** | Start KVA of the kernel modules region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `MODULES_END` | End KVA of kernel modules region; size is `MODULES_END - MODULES_VADDR`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '**KASAN***:* The modern kernel (4.0 onward for x86_64, 4.4 for ARM64) employs
+    a powerful mechanism to detect and report memory issues. It''s based on the user
+    space **Address SANitizer** *(***ASAN***)* code base and is thus called **Kernel
+    Address SANitizer** (**KASAN**)*.* Its power lies in ably (via compile-time instrumentation)
+    detecting memory issues such as **Use After Free** (**UAF**) and **Out Of Bounds**
+    (**OOB**) access (including buffer over/under flows). It, however, works *only
+    on 64-bit Linux* and requires a rather large **shadow memory region** (of a size
+    that is one-eighth that of the kernel VAS, whose extents we show if it''s enabled).
+    It''s a kernel configuration feature (`CONFIG_KASAN`) and is typically enabled
+    only for debug purposes (but it''s really crucial to keep it enabled during debug
+    and testing!):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **KASAN shadow memory region (only 64-bit)** | **[Optional] (only on 64-bit
+    and only if CONFIG_KASAN is defined; see more as follows)** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `KASAN_SHADOW_START` | Start KVA of the KASAN region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `KASAN_SHADOW_END` | End KVA of the KASAN region; size is `KASAN_SHADOW_END
+    - KASAN_SHADOW_START` |'
+  prefs: []
+  type: TYPE_TB
+- en: '**The vmalloc region** is the space from where memory for the `vmalloc()` (and
+    friends) APIs are allocated; we will cover various memory allocation APIs in detail
+    in the next two chapters:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **The vmalloc region** | **For memory allocated via vmalloc() and friends**
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **`VMALLOC_START`** | Start KVA of the `vmalloc` region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `VMALLOC_END` | End KVA of the `vmalloc` region; size is `VMALLOC_END - VMALLOC_START`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '**The** **lowmem region** – direct-mapped RAM into the kernel segment on a
+    `1:1 :: physical page frame:kernel page` basis – is in fact the region where the
+    Linux kernel maps and manages (typically) all RAM. Also, it''s often set up as
+    `ZONE_NORMAL` within the kernel (we will cover zones as well, a bit later):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Lowmem region** | **Direct-mapped memory region** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PAGE_OFFSET` | Start KVA of the lowmem region; also represents the start
+    of the kernel segment on some architectures and is (often) the VM split value
+    on 32-bit. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `high_memory` | End KVA of the lowmem region, upper bound of direct-mapped
+    memory; in effect, this value minus `PAGE_OFFSET` is the amount of (platform)
+    RAM on the system (careful, this is not necessarily the case on all arches though);
+    not to be confused with `ZONE_HIGHMEM`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '**The** **highmem region** or zone is an optional region. It might exist on
+    some 32-bit systems (typically, where the amount of RAM present is greater than
+    the size of the kernel segment itself). It''s often set up as `ZONE_HIGHMEM` in
+    this case (we will cover zones a bit later. Also, you can refer back to more on
+    this highmem region in the earlier section entitled *High memory on 32-bit systems*):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Highmem region (only possible on 32-bit)** | **[Optional] HIGHMEM may be
+    present on some 32-bit systems** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `PKMAP_BASE` | Start KVA of the highmem region, runs until `LAST_PKMAP` pages;
+    represents the kernel mapping of so-called high-memory pages (older, only possible
+    on 32-bit) |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The (uncompressed) **kernel image** itself – its code, `init`, and data regions
+    – are private symbols and thus unavailable to kernel modules; we don''t attempt
+    to print them:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **Kernel (static) image** | **The content of the uncompressed kernel image
+    (see the following); not exported and thus unavailable to modules** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `_text, _etext` | Start and end KVAs (respectively) of the kernel text (code)
+    region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `__init_begin, __init_end` | Start and end KVAs (respectively) of the kernel
+    `init` section region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `_sdata, _edata` | Start and end KVAs (respectively) of the kernel static
+    data region |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `__bss_start, __bss_stop` | Start and end KVAs (respectively) of the kernel
+    BSS (uninitialized data) region |'
+  prefs: []
+  type: TYPE_TB
+- en: '**The user VAS**: The last item, of course, is the process user VAS. It''s
+    below the kernel segment (when ordered by descending virtual address), and is
+    of size `TASK_SIZE` bytes. It was discussed in detail earlier in this chapter:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '| **User VAS** | **User Virtual Address Space (VAS)** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| (User-mode VAS follows)`TASK_SIZE` | (Examined in detail earlier via `procfs`
+    or our `procmap` utility script); the kernel macro `TASK_SIZE` represents the
+    size of the user VAS (bytes). |'
+  prefs: []
+  type: TYPE_TB
+- en: Well, that's that; we've seen several kernel macros and variables that, in effect,
+    describe the kernel VAS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Moving on to the code of our kernel module, you''ll soon see that its `init`
+    method calls two functions (that matter):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`show_kernelseg_info()`, which prints relevant kernel segment details'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`show_userspace_info()`, which prints relevant user VAS details (it''s optional,
+    decided via a kernel parameter)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We will start by describing the kernel segment function and seeing its output.
+    Also, the way the Makefile is set up, it links into the object file of our kernel
+    library code, `klib_llkd.c`*,* and generates a kernel module object called `show_kernel_seg.ko`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trying it out – viewing kernel segment details
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For clarity, we will show only relevant parts of the source code in this section.
+    Do clone and use the complete code from this book''s GitHub repository. Also,
+    recall the `procmap` utility mentioned earlier; it has a kernel component, an
+    LKM, which indeed does a similar job to this one – making kernel-level information
+    available to user space. With it being more sophisticated, we won''t delve into
+    its code here; seeing the code of the following demo kernel module `show_kernel_seg` is
+    more than sufficient here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code snippet displays the extents of the ARM vector table. Of
+    course, it's conditional. The output only occurs on an ARM-32 – hence the `#ifdef
+    CONFIG_ARM` preprocessor directive. (Also, our use of the `%px` printk format
+    specifier ensures the code is portable.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `SHOW_DELTA_*()` macros used here in this demo kernel module are defined
+    in our `convenient.h` header and are helpers that enable us to easily display
+    the low and high values passed to it, calculate the delta (the difference) between
+    the two quantities passed, and display it; here''s the relevant code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the following code, we show the code snippet that emits `printk` functions
+    describing the following region extents:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel module region
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: (Optional) KASAN region
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The vmalloc region
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The lowmem, and a possible highmem, region
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Regarding the kernel modules region, as explained in the detailed comment in
+    the following source, we try and keep the order as by descending KVAs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s build and insert our LKM on the ARM-32 Raspberry Pi 3 B+; the following
+    screenshot shows it being set up and then the kernel log:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/070ece9e-7253-4bba-9001-3cc1b3a69ea3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.11 – Output from the show_kernel_seg.ko LKM on a Raspberry Pi 3B+ running
+    stock Raspberry Pi 32-bit Linux
+  prefs: []
+  type: TYPE_NORMAL
+- en: As expected, the output we receive regarding the kernel segment perfectly matches
+    what the stock Raspberry Pi kernel itself prints at boot (you can refer back to
+    the *Viewing the kernel segment on a Raspberry Pi via dmesg* section to verify
+    this). As can be deciphered from the value of `PAGE_OFFSET` (the KVA `0x8000 0000`
+    in Figure 7.11), our Raspberry Pi's kernel's VM split is configured as 2:2 (GB)
+    (as the hexadecimal value `0x8000 0000` is 2 GB in decimal base. Interestingly,
+    the default Raspberry Pi 32-bit OS on the more recent Raspberry Pi 4 Model B device
+    is configured with a 3:1 (GB) VM split).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technically, on ARM-32 systems, at least, user space is slightly under 2 GB
+    (*2 GB – 16 MB = 2,032 MB*) as this 16 MB is taken as the *kernel module region*
+    just below `PAGE_OFFSET`; indeed, exactly this can be seen in Figure 7.11 (the
+    kernel module region here spans from `0x7f00 0000` to `0x8000 0000 `for 16 MB).
+    Also, as you'll soon see, the value of the `TASK_SIZE` macro – the size of the
+    user VAS – reflects this fact as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We present much of this information in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/caf083f0-6a88-4a75-a8e2-2a320b45d7e9.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.12 – The complete VAS of a process on ARM-32 (Raspberry Pi 3B+) with
+    a 2:2 GB VM split
+  prefs: []
+  type: TYPE_NORMAL
+- en: Do note that due to variations in differing models, the amount of usable RAM,
+    or even the device tree, the layout shown in Figure 7.12 may not precisely match
+    that on the Raspberry Pi you have.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Okay, now you know how to print relevant kernel segment macros and variables
+    within a kernel module, helping you understand the kernel VM layout on any Linux
+    system! In the following section, we will attempt to "see" (visualize) the kernel
+    VAS, this time via our `procmap` utility.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel VAS via procmap
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Okay, this is interesting: the view of the memory map layout seen in some detail
+    in the preceding figure is exactly what our aforementioned `procmap` utility provides!
+    As promised earlier, let''s now see screenshots of the kernel VAS when running
+    `procmap` (earlier, we showed screenshots of the user VAS).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To keep in sync with the immediate discussion, we will now show screenshots
+    of `procmap` providing a "visual" view of the kernel VAS on the very same Raspberry
+    Pi 3B+ system (we could specify the  `--only-kernel` switch to show only the kernel
+    VAS; we don''t do so here, though). As we have to run `procmap` on some process,
+    we arbitrarily choose *systemd* PID `1`; we also use the `--verbose` option switch.
+    However, it seems to fail:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0a141b0f-4c58-4675-954e-48d70c8ae89d.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.13 – Truncated screenshot showing the procmap kernel module build failing
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Why did it fail to build the kernel module (that''s part of the `procmap` project)?
+    I mention this in the project''s `README.md` file ([https://github.com/kaiwan/procmap/blob/master/README.md#procmap](https://github.com/kaiwan/procmap/blob/master/README.md#procmap)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: The kernel headers package for our *custom* 5.4 kernel (for the Raspberry Pi)
+    isn't available, hence it fails. While you can conceivably copy in the entire
+    5.4 Raspberry Pi kernel source tree onto the device and set up the `/lib/module/<kver>/build`
+    symbolic link, this isn't considered the right way to do so. So, what is? *Cross-compiling*
+    the `procmap` kernel module for the Raspberry Pi from your host, of course! We
+    have covered the details on cross-compiling the kernel itself for the Raspberry
+    Pi here in [Chapter 3](93e5c09d-6c80-47e7-91ab-d3f3f25d00e1.xhtml), *Building
+    the 5.x Linux Kernel from Source - Part 2*, in the *Kernel Build for the Raspberry
+    Pi* section; it, of course, applies to cross-compiling kernel modules as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I want to stress this point: the `procmap` kernel module build on the Raspberry
+    Pi only fails due to the lack of a Raspberry Pi-supplied kernel headers package
+    when running a custom kernel. If you are happy to work with the stock (default)
+    Raspberry Pi kernel (earlier called Raspbian OS), the kernel headers package is
+    certainly installable (or already installed) and everything will work. Similarly,
+    on your typical x86_64 Linux distribution, the `procmap.ko` kernel module gets
+    cleanly built and inserted at runtime. Do read the `procmap` project''s `README.md` file
+    in detail; within it, the section labeled *IMPORTANT: Running procmap on systems
+    other than x86_64* details how to cross-compile the `procmap` kernel module.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you successfully cross-compile the `procmap` kernel module on your host
+    system, copy across the `procmap.ko` kernel module (via `scp(1)`, perhaps) to
+    the device and place it under the `procmap/procmap_kernel` directory; now you're
+    ready to go!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s the copied-in kernel module (on the Raspberry Pi):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: (You can also run the `modinfo(8)` utility on it to verify that it's built for
+    ARM.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With this in place, let''s retry our `procmap` run to display the kernel VAS
+    details:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/2e812f0d-2abf-4b94-bc9c-9d82b5ea570c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.14 – Truncated screenshot showing the procmap kernel module successfully
+    inserted and various system details
+  prefs: []
+  type: TYPE_NORMAL
+- en: It does work now! As we've specified the `verbose` option to `procmap`, you
+    get to see its detailed progress, as well as – quite usefully – various kernel
+    variables/macros of interest and their current value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Okay, let''s continue and view what we''re really after – the "visual map"
+    of the kernel VAS on the Raspberry Pi 3B+, in descending order by KVA; the following
+    screenshot captures this output from `procmap`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/b7c5a153-2b47-422b-a128-b907bd31718d.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.15 – Partial screenshot of our procmap utility's output showing the
+    complete kernel VAS (Raspberry Pi 3B+ with 32-bit Linux)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The complete kernel VAS – from `end_kva` (value `0xffff ffff`) right to the
+    start of the kernel, `start_kva` (`0x7f00 0000`, which, as you can see, is the
+    kernel module region) – is displayed. Notice (in green color) the label on the
+    right of certain key addresses denoting what they are! For completeness, we also
+    included in the preceding screenshot the kernel-user boundary (and the upper portion
+    of the user VAS below the kernel segment, just as we have been saying all along!).
+    As the preceding output is on a 32-bit system, the user VAS immediately follows
+    the kernel segment. On a 64-bit system though, there is an (enormous!) "non-canonical"
+    sparse region between the start of the kernel segment and the top of the user
+    VAS. On the x86_64 (as we have already discussed), it spans the vast majority
+    of the VAS: 16,383.75 petabytes (out of a total VAS of 16,384 petabytes)!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: I will leave it as an exercise to you to run this `procmap` project and carefully
+    study the output (on your x86_64 or whichever box or VM). It also works well on
+    a BeagleBone Black embedded board with a 3:1 VM split, showing details as expected.
+    FYI, this forms an assignment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I also provide a solution in the form of three (large, stitched-together) screenshots
+    of `procmap`''s output on a native x86_64 system, a BeagleBone Black (AArch32)
+    board, and the Raspberry Pi running a 64-bit OS (AArch64) here: `solutions_to_assgn/ch7`.
+    Studying the code of `procmap`*,* and, especially relevant here, its kernel module
+    component, will certainly help. It''s open source, after all!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's finish this section by glancing at the user segment view that our earlier
+    demo kernel module – `ch7/show_kernel_seg` – provides.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trying it out – the user segment
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Now, let''s go back to our `ch7/show_kernel_seg`LKM demo program. We have provided
+    a kernel module parameter named `show_uservas`(defaulting to the value `0`); when
+    set to `1`, some details regarding the process context''s *user space* are displayed
+    as well. Here''s the definition of the module parameter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Right, on the same device (our Raspberry Pi 3 B+), let''s again run our `show_kernel_seg`
+    kernel module, this time requesting it to display user space details as well (via
+    the aforementioned parameter). The following screenshot shows the complete output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/a2b47043-b85d-4761-ac81-71b11c9a10a2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.16 – Screenshot of our show_kernel_seg.ko LKM's output showing both
+    kernel and user VAS details when running on a Raspberry Pi 3B+ with the stock
+    Raspberry Pi 32-bit Linux OS
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is useful; we can now literally see a (more or less) complete memory map
+    of the process – both the so-called "upper (canonical) half" kernel-space as well
+    as the "lower (canonical) half" user space – in one shot (yes, that's right, even
+    though the `procmap` project shows this better and in more detail).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I will leave it as an exercise to you to run this kernel module and carefully
+    study the output on your x86_64, or whichever box or VM. Do carefully go through
+    the code as well. We printed the user space details that you see in the preceding
+    screenshot, such as the segment start and end addresses, by dereferencing the 
+    `mm_struct` structure (the task structure member named `mm`) from `current`. Recall,
+    `mm` is the abstraction of the user mapping of the process. A small snippet of
+    the code that does this is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Remember the so-called null trap page at the very beginning of the user VAS?
+    (Again, `procmap`'s output – see *Figure 7.9* – shows the null trap page.) Let's
+    see what it's for in the following section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The null trap page
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Did you notice how the preceding diagrams (Figure 7.9) and, in and Figure 7.12,
+    at the extreme left edge (albeit very small!), a single page at the very beginning
+    of the user space, named the **null trap** page? What is it? That''s easy: virtual
+    page `0` is given no permissions (at the hardware MMU/PTE level). Thus, any access
+    to this page, be it `r`, `w`, or `x`  (read/write/execute), will result in the
+    MMU raising what is called a fault or exception. This will have the processor
+    jump to an OS handler routine (the fault handler). It runs, killing the culprit
+    trying to access a memory region with no permissions!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It''s very interesting indeed: the OS handler mentioned previously runs in
+    process context, and guess what `current`is: why, it''s the process (or thread)
+    that initiated this bad `NULL` pointer lookup! Within the fault handler code,
+    the `SIGSEGV` signal is delivered to the faulting process (`current`), causing
+    it to die (via a segfault). In a nutshell, this is how the well-known `NULL` pointer
+    dereference bug is caught by the OS.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing kernel documentation on the memory layout
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Back to the kernel segment; obviously, with a 64-bit VAS, the kernel segment
+    is *much* larger than on 32-bit. As we saw earlier, it''s typically 128 TB on
+    the x86_64\. Study again the VM split table shown previously (Figure 7.4 in the
+    section *VM split on 64-bit Linux systems*); there, the fourth column is the VM
+    split for different architectures. You can see how on the 64-bit Intel/AMD and
+    AArch64 (ARM64), the numbers are much larger than for their 32-bit counterparts.
+    For arch-specific details, we refer you to the ''official'' kernel documentation
+    on the process virtual memory layout here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Architecture** | **Documentation location in kernel source tree** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| ARM-32 | `Documentation/arm/memory.txt`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| AArch64 | `Documentation/arm64/memory.txt`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| x86_64 | `Documentation/x86/x86_64/mm.txt` Note: this document''s readability
+    was vastly improved recently (as of the time of writing) with commit `32b8976`
+    for Linux 4.20: [https://github.com/torvalds/linux/commit/32b89760ddf4477da436c272be2abc016e169031](https://github.com/torvalds/linux/commit/32b89760ddf4477da436c272be2abc016e169031).
+    I recommend you browse through this file: [https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt](https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt).
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: At the risk of repetition, I urge you to try out this `show_kernel_seg` kernel
+    module – and, even better, the `procmap` project ([https://github.com/kaiwan/procmap](https://github.com/kaiwan/procmap))
+    – on different Linux systems and study the output. You can then literally see
+    the "memory map" – the complete process VAS – of any given process, which includes
+    the kernel segment! This understanding is critical when working with and/or debugging
+    issues at the system layer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, at the risk of overstating it, the previous two sections – covering the
+    detailed examination of the *user and kernel VASes* – are very important indeed.
+    Do take the time required to go over them and work on the sample code and assignments.
+    Great going!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Moving along on our journey through the Linux kernel's memory management, let's
+    now check out another interesting topic – that of the [K]ASLR protection-via-memory-layout-randomization
+    feature. Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Randomizing the memory layout – KASLR
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In infosec circles, it's a well-known fact that, with **proc filesystem** (**procfs**)
+    and various powerful tools at their disposal, a malicious user, knowing in advance
+    the precise location (virtual addresses) of various functions and/or globals with
+    a process's VAS, could devise an attack to exploit and ultimately compromise a
+    given system. Thus, for security, to make it impossible (or at least difficult)
+    for attackers to rely on "known" virtual addresses, user space as well as kernel
+    space supports **ASLR (Address Space Layout Randomization) **and **KASLR (Kernel
+    ASLR)** techniques (often pronounced *Ass-**ler* / *Kass-ler*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The keyword here is *randomization:* this feature, when enabled, *changes the
+    location* of portions of the process (and kernel) memory layout in terms of absolute
+    numbers as it *offsets portions of memory* from a given base address by a random
+    (page-aligned) quantity. What "portions of memory" exactly are we talking about?
+    With respect to user space mappings (we will talk about KASLR later), the starting
+    addresses of shared libraries (their load address), `mmap(2)`-based allocations
+    (remember, any `malloc()` function (`/calloc/realloc`*)* above 128 KB becomes
+    an `mmap`-based allocation, not off the heap), stack start, the heap, and the
+    vDSO page; all of these can be randomized at process run (launch) time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hence, an attacker cannot depend on, say, a `glibc` function (such as `system(3)`)
+    being mapped at a particular fixed UVA in any given process; not only that, the
+    location will vary every time the process runs! Before ASLR, and on systems where
+    ASLR is unsupported or turned off, the location of symbols can be ascertained
+    in advance for a given architecture and software version (procfs plus utilities
+    like `objdump`, `readelf`, `nm`, and so on make this quite easy).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's key to realize that [K]ASLR is merely a statistical protection. In fact,
+    typically, not many bits are available for randomization and thus the entropy
+    isn't very good. This implies that the page-sized offsets are not too many, even
+    on 64-bit systems, thus leading to a possibly weakened implementation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's now briefly look at a few more details regarding both user mode and kernel-mode
+    ASLR (the latter being referred to as KASLR); the following sections cover these
+    areas, respectively.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User-mode ASLR
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: User-mode ASLR is usually what is meant by the term ASLR. It being enabled implies
+    this protection to be available on the user space mapping of every process. Effectively,
+    ASLR being enabled implies that the absolute memory map of user-mode processes
+    will vary every time they're run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ASLR has been supported on Linux for a very long time (since 2005 on 2.6.12).
+    The kernel has a tunable pseudo-file within procfs, to query and set (as root)
+    the ASLR status; here it is: `/proc/sys/kernel/randomize_va_space`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It can have three possible values; the three values and their meaning are shown
+    in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Tunable value** | **Interpretation of this value in `/proc/sys/kernel/randomize_va_space`**
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `0` | (User mode) ASLR turned OFF; or can be turned off by passing the kernel
+    parameter `norandmaps` at boot. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `1` | (User mode) ASLR is ON: `mmap(2)` based allocations, the stack, and
+    the vDSO page is randomized. It also implies that shared library load locations
+    and shared memory segments are randomized. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `2` | (User mode) ASLR is ON: all of the preceding (value `1`) *plus* the
+    heap location is randomized (since 2.6.25); this is the OS value by default. |'
+  prefs: []
+  type: TYPE_TB
+- en: '(As noted in an earlier section, *The vsyscall page*, the vDSO page is a system
+    call optimization, allowing some frequently issued system calls (`gettimeofday(2)`
+    being a typical one) to be invoked with less overhead. If interested, you can
+    look up more details on the man page on vDSO(7) here: [https://man7.org/linux/man-pages/man7/vdso.7.html](https://man7.org/linux/man-pages/man7/vdso.7.html).[)](https://man7.org/linux/man-pages/man7/vdso.7.html)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: User-mode ASLR can be turned *off* at boot by passing the `norandmaps` parameter
+    to the kernel (via the bootloader).
+  prefs: []
+  type: TYPE_NORMAL
+- en: KASLR
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Similar to (user) ASLR – and, more recently, from the 3.14 kernel onward – even
+    *kernel* VAS can be randomized (to some extent) by having KASLR enabled. Here,
+    the base location of the kernel and module code within the kernel segment will
+    be randomized by a page-aligned random offset from the base of RAM. This remains
+    in effect for that session; that is, until a power cycle or reboot.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Several kernel configuration variables exist, enabling the platform developer
+    to enable or disable these randomization options. As an example specific to the
+    x86, the following is quoted directly from `Documentation/x86/x86_64/mm.txt`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"Note that if CONFIG_RANDOMIZE_MEMORY is enabled, the direct mapping of all
+    physical memory, vmalloc/ioremap space and virtual memory map are randomized.
+    Their order is preserved but their base will be offset early at boot time."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'KASLR can be controlled at boot time by passing a parameter to the kernel (via
+    the bootloader):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Explicitly turned *off* by passing the `nokaslr` parameter
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Explicitly turned *on* by passing the `kaslr` parameter
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: So, what is the current setting on your Linux system? And can we change it?
+    Yes, of course (provided we have *root* access); the next section shows you how
+    to do so via a Bash script.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Querying/setting KASLR status with a script
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We provide a simple Bash script at `<book-source>/ch7/ASLR_check.sh`. It checks
+    for the presence of both (user-mode) ASLR as well as KASLR, printing (color-coded!)
+    status information about them. It also allows you to change the ASLR value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s give it a spin on our x86_64 Ubuntu 18.04 guest. As our script is programmed
+    to be color-coded, we show a screenshot of its output here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/dba461a6-a59f-4bb7-9161-d118e6960c4b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.17 – Screenshot showing the output when our ch7/ASLR_check.sh Bash
+    script runs on an x86_64 Ubuntu guest
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It runs, showing you that (at least on this box) both the user mode as well
+    as KASLR are indeed turned on. Not only that, we write a small "test" routine
+    to see ASLR functioning. It''s very simple: it runs the following command twice:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'From what you learned in an earlier section, *Interpreting the /proc/PID/maps
+    output*, you can now see in Figure 7.17, that the UVAs for the heap and stack
+    segments are *different in each run*, thus proving that the ASLR feature indeed
+    works! For example, look at the starting heap UVA: in the first run, it''s `0x5609
+    15f8 2000`, and in the second run, it''s `0x5585 2f9f 1000`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we will perform a sample run where we pass the parameter `0` to the script,
+    thus turning ASLR off; the following screenshot shows the (expected) output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/68e447d3-1b41-44ee-a652-3ac155e0d18a.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.18 – Screenshot showing how ASLR is turned off (via our ch7/ASLR_check.sh
+    script on an x86_64 Ubuntu guest)
+  prefs: []
+  type: TYPE_NORMAL
+- en: This time, we can see that ASLR was on by default, but we turned it off. This
+    is clearly highlighted in bold font and red in the preceding screenshot. (Do remember
+    to turn it on again.) Also, as expected, as it's off, the UVAs of both the heap
+    and stack (respectively) remain the same in both test runs, which is insecure.
+    I will leave it to you to browse through and understand the source code of the
+    script.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To take advantage of ASLR, applications must be compiled with the `-fPIE` and
+    `-pie` GCC flags (**PIE** stands for **Position Independent Executable**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both ASLR and KASLR protect against some types of attack vectors, the return-to-libc, **Return-Oriented
+    Programming**(ROP) ones being the typical cases. However, and unfortunately, white
+    and black hat security being the cat-and-mouse game it is, defeating [K]ASLR and
+    similar methodologies is something advanced exploits do quite well. Refer to this
+    chapter's *Further reading* section (under the *Linux kernel security* heading)
+    for more details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While on the topic of security, many useful tools exist to carry out vulnerability
+    checks on your system. Check out the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `checksec.sh` script ([http://www.trapkit.de/tools/checksec.html](http://www.trapkit.de/tools/checksec.html))
+    displays various "hardening" measures and their current status (for both individual
+    files and processes): RELRO, stack canary, NX-enabled, PIE, RPATH, RUNPATH, presence
+    of symbols, and compiler fortification.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: grsecurity's PaX suite.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `hardening-check` script (an alternative to checksec).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `kconfig-hardened-check` Perl script ([https://github.com/a13xp0p0v/kconfig-hardened-check](https://github.com/a13xp0p0v/kconfig-hardened-check))
+    checks (and suggests) kernel config options for security against some predefined
+    checklists.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Several others: Lynis, `linuxprivchecker.py`, memory, and so on.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: So, the next time you see differing kernel or user virtual addresses on multiple
+    runs or sessions, you will know it's probably due to the [K]ASLR protection feature. Now,
+    let's complete this chapter by moving on to an exploration of how the Linux kernel
+    organizes and works with physical memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Physical memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that we have examined the *virtual memory *view, for both user and kernel
+    VASes in some detail, let's turn to the topic of physical memory organization
+    on the Linux OS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Physical RAM organization
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The Linux kernel, at boot, organizes and partitions physical RAM into a tree-like
+    hierarchy consisting of nodes, zones, and page frames (page frames are physical
+    pages of RAM) (see Figure 7.19 and Figure 7.20). Nodes are divided into zones,
+    and zones consist of page frames. A node abstracts a physical "bank" of RAM, which
+    will be associated with one or more processor (CPU) cores. At the hardware level,
+    the microprocessors are connected to the RAM controller chip(s); any memory controller
+    chip, and thus any RAM, can be reached from any CPU as well, across an interconnect.
+    Now, obviously, being able to reach the RAM physically nearest the core on which
+    a thread is allocating (kernel) memory will lead to performance enhancement. This
+    very idea is leveraged by hardware and OSes that support the so-called NUMA model
+    (the meaning is explained shortly).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nodes
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Essentially, *nodes* are data structures used to denote a physical RAM module
+    on the system motherboard and its associated controller chipset. Yes, we''re talking
+    actual *hardware* here being abstracted via software metadata. It''s always associated
+    with a physical socket (or collection of processor cores) on the system motherboard.
+    Two types of hierarchies exist:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Non-Uniform Memory Access (NUMA)** **systems**: Where the core on which a
+    kernel allocation request occurs does matter (memory is treated *non* uniformly),
+    leading to performance improvements'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Uniform Memory Access (UMA)** **systems**: Where the core on which a kernel
+    allocation request occurs doesn''t matter (memory is treated uniformly)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'True NUMA systems are those whose hardware is multicore (two or more CPU cores,
+    SMP) *and* have two or more physical "banks" of RAM each of which is associated
+    with a CPU (or CPUs). In other words, NUMA systems will always have two or more
+    nodes, whereas UMA systems will have exactly one node (FYI, the data structure
+    that abstracts a node is called `pg_data_t` and is defined here: `include/linux/mmzone.h:pg_data_t`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why all this complexity, you may wonder? Well, it's – what else – all about
+    performance! NUMA systems (they typically tend to be rather expensive server-class
+    machines) and the OSes they run (Linux/Unix/Windows, typically) are designed in
+    such a way that when a process (or thread) on a particular CPU core wants to perform
+    a kernel memory allocation, the software guarantees that it does so with high
+    performance by taking the required memory (RAM) from the node closest to the core
+    (hence the NUMA moniker!). No such benefits accrue to UMA systems (your typical
+    embedded systems, smartphones, laptops, and desktops), nor do they matter. Enterprise-class
+    server systems nowadays can have hundreds of processors and terabytes, even a
+    few petabytes, of RAM! These are almost always architected as NUMA systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With the way that Linux is designed, though – and this is a key point – even
+    regular UMA systems are treated as NUMA by the kernel (well, pseudo-NUMA). They
+    will have *exactly one node;* so that's a quick way to check whether the system
+    is NUMA or UMA – if there are two or more nodes, it's a true NUMA system; only
+    one, and it's a "fake NUMA" or pseudo-NUMA box. How can you check? The `numactl(8)`
+    utility is one way (try doing `numactl --hardware`). There are other ways to (via
+    *procfs* itself). Hang on a bit, you'll get there...
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, a simpler way to visualize this: on a NUMA box, one or more CPU cores is
+    associated with a "bank" (a hardware module) of physical RAM. Thus, a NUMA system
+    is always a **Symmetric Multi Processor** (**SMP**) one.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To make this discussion practical, let''s briefly visualize the micro-architecture
+    of an actual server system – one running the AMD Epyc/Ryzen/Threadripper (and
+    the older Bulldozer) CPUs. It has the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A total of 32 CPU cores (as seen by the OS) within two physical sockets (P#0
+    and P#1) on the motherboard. Each socket consists of a package of 8x2 CPU cores
+    (8x2, as there are actually 8 physical cores each of which is hyperthreaded; the
+    OS sees even the hyperthreaded cores as usable cores).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A total of 32 GB of RAM split up into four physical banks of 8 GB each.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Thus, the Linux memory management code, upon detecting this topography at boot,
+    will set up *four nodes* to represent it. (We won't delve into the processor's
+    various (L1/L2/L3/etc) caches here; see the *Tip* box after the following diagram
+    for a way to see all of this.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following conceptual diagram shows an approximation of the four tree-like
+    hierarchies – one for each node – formed on some AMD server systems running the
+    Linux OS. Figure 7.19 conceptually shows the nodes/zones/page frames per physical
+    RAM bank on the system coupled to different CPU cores:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/5c7ffabc-ca83-4fc6-ba5a-7a05e9904389.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7.19 – (An approximate conceptual view of an) AMD server: physical memory
+    hierarchy on Linux'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Use the powerful `lstopo(1)` utility (and its associated `hwloc-*` – hardware
+    locality – utilities) to graphically view the hardware (CPU) topology of your
+    system! (On Ubuntu, install it with `sudo apt install hwloc`). FYI, the hardware
+    topography graphic of the previously mentioned AMD server system, generated by
+    `lstopo(1)`, can be seen here: [https://en.wikipedia.org/wiki/CPU_cache#/media/File:Hwloc.png](https://en.wikipedia.org/wiki/CPU_cache#/media/File:Hwloc.png).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To reassert the key point here: for performance (here with respect to Figure
+    7.19), a thread running some kernel or driver code in process context on, say,
+    CPU #18 or above requests the kernel for some RAM. The kernel''s MM layer, understanding
+    NUMA, will have the request serviced (as first priority) from any free RAM page
+    frames in any zone on NUMA node #2 (that is, from physical RAM bank #2) as it''s
+    "closest" to the processor core that the request was issued upon. Just in case
+    there are no free page frames available in any zone within NUMA node #2, the kernel
+    has an intelligent fallback system. It might now go across the interconnect and
+    request RAM page frames from another node:zone (worry not, we cover these aspects
+    in more detail in the following chapter).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Zones
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Zones can be thought of as Linux's way of smoothing out and dealing with hardware
+    quirks. These proliferate on the x86, where Linux "grew up," of course. They also
+    deal with a few software difficulties (look up `ZONE_HIGHMEM` on the now mostly
+    legacy 32-bit i386 architecture; we discussed this concept in an earlier section, *High
+    memory on 32-bit systems*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Zones consist of *page frames* – physical pages of RAM. More technically, a
+    range of **P****age Frame Numbers** (**PFNs**) are allocated to each zone within
+    a node:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/bf31a6e1-d55b-48cc-9f90-1dad2626c573.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.20 – Another view of the physical memory hierarchy on Linux – nodes,
+    zones, and page frames
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In Figure 7.10, you can see a generic (example) Linux system with *N* nodes
+    (from `0` to `N-1`), each node consisting of (say) three zones, each zone being
+    made up of physical pages of RAM – *page frames*. The number (and name) of zones
+    per node is dynamically determined by the kernel at boot. You can check out the
+    hierarchy on a Linux system by delving under *procfs.* In the following code,
+    we take a peek into a native Linux x86_64 system with 16 GB of RAM:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: The leftmost column reveals that we have exactly one node – `Node 0`. This tells
+    us we're actually on an *UMA system*, though of course the Linux OS will treat
+    it as a (pseudo/fake) NUMA system. This single node `0` is split into three zones,
+    labeled `DMA`, `DMA32`, and `Normal`, and each zone, of course, consists of page
+    frames. For now, ignore the numbers on the right; we will get to their meaning
+    in the following chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another way to notice how Linux "fakes" a NUMA node on UMA systems is visible
+    from the kernel log. We run the following command on the same native x86_64 system
+    with 16 GB of RAM. For readability, I replaced the first few columns showing the
+    timestamp and hostname with ellipses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can clearly see that, as the system is detected as not NUMA (thus, UMA),
+    the kernel fakes a node. The extents of the node are the total amount of RAM on
+    the system (here, `0x0-0x00000004427fffff`, which is indeed 16 GB). We can also
+    see that on this particular system, the kernel instantiates three zones – `DMA`, 
+    `DMA32`, and `Normal` – to organize the available physical page frames of RAM.
+    This is fine and ties in with the `/proc/buddyinfo` output we saw previously.
+    FYI, the data structure representing the *zone* on Linux is defined here: `include/linux/mmzone.h:struct
+    zone`. We will have occasion to visit it later in the book.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To better understand how the Linux kernel organizes RAM, let's start at the
+    very beginning – boot time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Direct-mapped RAM and address translation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'At boot, the Linux kernel "maps" all (usable) system RAM (aka *platform RAM*)
+    directly into the kernel segment. So, we have the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Physical page frame `0` maps to kernel virtual page `0`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Physical page frame `1` maps to kernel virtual page `1`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Physical page frame `2` maps to kernel virtual page `2`, and so on.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Thus, we call this a 1:1 or direct mapping, identity-mapped RAM, or linear addresses. A
+    key point is that all these kernel virtual pages are at a fixed offset from their
+    physical counterparts (and, as already mentioned, these kernel addresses are referred
+    to as kernel logical addresses). The fixed offset is the `PAGE_OFFSET` value (here,
+    `0xc000 0000`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, think of this. On a 32-bit system with a 3:1 (GB) VM split, physical address `0x0` =
+    kernel logical address `0xc000 0000` (`PAGE_OFFSET`). As already mentioned, the
+    terminology *kernel logical address *is applied to kernel addresses that are at
+    a fixed offset from their physical counterparts. Thus, direct-mapped RAM maps
+    to kernel logical addresses. This region of direct-mapped memory is often referred
+    to as the *low-memory* (or simply, **lowmem**) region within the kernel segment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have already shown an almost identical diagram earlier, in Figure 7.10. In
+    the following figure, it''s slightly modified to actually  show you how the first
+    three (physical) page frames of RAM map to the first three kernel virtual pages
+    (in the lowmem region of the kernel segment):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/318bdc85-faf9-49d4-83db-45b24c23dbe3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.21 – Direct-mapped RAM – lowmem region, on 32-bit with a 3:1 (GB) VM
+    split
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an example, Figure 7.21 shows a direct mapping of platform RAM to the kernel
+    segment on a 32-bit system with a 3:1 (GB) VM split. The point where physical
+    RAM address `0x0` maps into the kernel is the `PAGE_OFFSET` kernel macro (in the
+    preceding figure, it's kernel logical address `0xc000 0000`). Notice how Figure
+    7.21 also shows the *user VAS *on the left side, ranging from `0x0` to `PAGE_OFFSET-1` (of
+    size `TASK_SIZE` bytes). We have already covered details on the remainder of the
+    kernel segment in the *Examining the kernel segment* section previously.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Understanding this mapping of physical-to-virtual pages might well tempt you
+    into reaching these seemingly logical conclusions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Given a KVA, to calculate the corresponding **Physical Address** (**PA**) –
+    that is, to perform a KVA-to-PA calculation – simply do this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Conversely, given a PA, to calculate the corresponding KVA – that is, to perform
+    a PA-to-KVA calculation – simply do this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Do refer to Figure 7.21 again. The direct mapping of RAM to the kernel segment
+    (starting at `PAGE_OFFSET`) certainly predicates this conclusion. So, it is correct.
+    But hang on, please pay careful attention here: **these address translation calculations
+    work only for direct-mapped or linear addresses** – in other words, KVAs (technically,
+    the kernel logical addresses) – **within the kernel''s lowmem region, nothing
+    else!** For all UVAs, and any and all KVAs *besides* the lowmem region (which
+    includes module addresses, `vmalloc`/`ioremap` (MMIO) addresses, KASAN addresses,
+    the (possible) highmem region addresses, DMA memory regions, and so on), it does
+    *not* work!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you will anticipate, the kernel does indeed provide APIs to perform these
+    address conversions; of course, their implementation is arch-dependent. Here they
+    are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Kernel API** | **What it does** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `phys_addr_t virt_to_phys(volatile void *address)` | Converts the given virtual
+    address to its physical counterpart (return value) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `void *phys_to_virt(phys_addr_t address)` | Converts the given physical address
+    to a virtual address (return value) |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The `virt_to_phys()` API for the x86 has a comment above it clearly advocating
+    that this API (and its ilk) are **not to be used by driver authors**; for clarity
+    and completeness, we have reproduced the comment in the kernel source here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding comment mentions the (very common) `kmalloc()` API. Worry not,
+    it's covered in depth in the following two chapters. Of course, a similar comment
+    to the preceding is in place for the `phys_to_virt()` API as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So who – sparingly – uses these address conversion APIs (and the like)? The
+    kernel internal *mm* code, of course! As a demo, we do actually use them in at
+    least a couple of places in this book: in the following chapter, in an LKM called
+    `ch8/lowlevel_mem` (well actually, its usage is within a function in our "kernel
+    library" code, `klib_llkd.c`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: FYI, the powerful `crash(8)` utility can indeed translate any given virtual
+    address to a physical address via its `vtop` (virtual-to-physical) command (and
+    vice versa, via its `ptov` command!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Moving along, another key point: by mapping all physical RAM into it, do not
+    get misled into thinking that the kernel is *reserving* RAM for itself. No, it
+    isn''t; it''s merely *mapping* all of the available RAM, thus making it available
+    for allocation to anyone who wants it – core kernel code, kernel threads, device
+    drivers, or user space applications. This is part of the job of the OS; it is
+    the system resource manager, after all. Of course, a certain portion of RAM will
+    be taken up (allocated) – by the static kernel code, data, kernel page table,
+    and so on – at boot, no doubt, but you should realize that this is quite small.
+    As an example, on my guest VM with 1 GB RAM, the kernel code, data, and BSS typically
+    take up a combined total of about 25 MB of RAM. All kernel memory comes to about
+    100 MB, whereas user space memory usage is in the region of 550 MB! It''s almost
+    always user space that is the memory hogger.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can try using the `smem(8)` utility with the `--system -p` option switches
+    to see a summary of memory usage as percentages (also, use the `--realmem=` switch
+    to pass the actual amount of RAM on the system).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Back to the point: we know that kernel page tables are set up early in the
+    boot process. So, by the time applications start up, *the kernel has all RAM mapped
+    and available*, ready for allocation! Thus, we understand that while the kernel *direct-maps *page
+    frames into its VAS, user mode processes are not so lucky – they can only *indirectly
+    map *page frames via the paging tables set up by the OS (at process creation – `fork(2)` –
+    time) on a per-process basis. Again, it''s interesting to realize that memory
+    mapping via the powerful `mmap(2)` system call can provide the illusion of "direct
+    mapping" files or anonymous pages into the user VAS.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A few additional points to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: (a) For performance, kernel memory (kernel pages) can *never be swapped*, even
+    if they aren't in use
+  prefs: []
+  type: TYPE_NORMAL
+- en: (b) Sometimes, you might think, it's quite obvious that *user space memory pages map to
+    (physical) page frames (assuming the page is resident) via the paging tables set
+    up by the OS on a per-process basis*. Yes, but what about kernel memory pages?
+    Please be very clear on this point: *all kernel pages also map to page frames
+    via the kernel "master" paging table. Kernel memory, too, is virtualized, just
+    as user space memory is.* In this regard, for you, the interested reader, a QnA
+    I initiated on Stack Overflow: *How exactly do kernel virtual addresses get translated
+    to physical RAM?: *[http://stackoverflow.com/questions/36639607/how-exactly-do-kernel-virtual-addresses-get-translated-to-physical-ram](http://stackoverflow.com/questions/36639607/how-exactly-do-kernel-virtual-addresses-get-translated-to-physical-ram).(c)
+    Several memory optimization techniques have been baked into the Linux kernel (well,
+    many are configuration options); among them are **Transparent Huge Pages** (**THPs**)and,
+    critical for cloud/virtualization workloads, **Kernel Samepage Merging** (**KSM**,
+    aka memory de-duplication)*.* I refer you to the *Further reading *section of
+    this chapter for more information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Alright, with this coverage on some aspects of physical RAM management behind
+    us, we complete this chapter; excellent progress!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we delved – in quite some depth – into the big topic of kernel
+    memory management in a level of detail sufficient for a kernel module or device
+    driver author like you; also, there''s more to come! A key piece of the puzzle
+    – the VM split and how it''s achieved on various architectures running the Linux
+    OS – served as a starting point. We then moved into a deep examination of both
+    regions of this split: first, user space (the process VAS) and then the kernel
+    VAS (or kernel segment). Here, we covered many details and tools/utilities on
+    how to examine it (notably, via the quite powerful `procmap` utility). We built
+    a demo kernel module that can literally generate a pretty complete memory map
+    of the kernel and the calling process. User and kernel memory layout randomization
+    technology ([K]ASLR) was also briefly discussed. We closed the chapter by taking
+    a look at the physical organization of RAM within Linux.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: All of this information and the concepts learned within this chapter are actually
+    *very useful;* not only for designing and writing better kernel/device driver
+    code but very much also when you encounter system-level issues and bugs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter has been a long and indeed a critical one; great job on completing
+    it! Next, in the following two chapters, you will move on to learning key and
+    practical aspects of how exactly to allocate (and deallocate) kernel memory efficiently,
+    along with related important concepts behind this common activity. On, on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

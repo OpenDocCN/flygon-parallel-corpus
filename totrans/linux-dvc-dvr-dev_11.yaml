@@ -1,0 +1,2094 @@
+- en: Kernel Memory Management
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On Linux systems, every memory address is virtual. They do not point to any
+    address in the RAM directly. Whenever one accesses a memory location, a translation
+    mechanism is performed in order to match the corresponding physical memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let us start with a short story to introduce the virtual memory concept. Given
+    a hotel, there can be a phone in each room, having a private number. Any installed
+    phone, of course belongs to the hotel. None of them can be joined directly from
+    outside the hotel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you need to contact an occupant of a room, let us say your friend, he must
+    have given you the hotel''s switchboard number and the room number in which he
+    stays. Once you call the switchboard and give the room number of the occupant
+    you need to talk to, just at this moment, the receptionist redirects your call
+    to the real private phone of the room. Only the receptionist and the room occupant
+    know the private number mapping:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Every time someone in the city (or over the world) wants to contact a room
+    occupant, he has to pass by the hotline. He needs to know the right hotline number
+    of the hotel, and the room number. This way, `switchboard number + room number`
+    = virtual address, whereas `private phone number` corresponds to the physical
+    address. There are some rules related to hotels that apply on Linux as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Hotel** | **Linux** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| You cannot contact an occupant who has no private phone in the room. There
+    is not even a way to attempt to do this. Your call will be ended suddenly. | You
+    cannot access a non-existing memory in your address space. This will cause a segmentation
+    fault. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| You cannot contact an occupant who does not exist, or whose check-in the
+    hotel is not aware of, or whose information is not found by the switchboard. |
+    If you access unmapped memory, the CPU raises a page fault and the OS handles
+    it. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| You can''t contact an occupant whose stay is over. | You cannot access freed
+    memory. Maybe it has been allocated to another process |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Many hotels may have the same brand, but located at different places, each
+    of them having a different hotline number. If you make a mistake with the hotline
+    number. | Different processes may have the same virtual addresses mapped in their
+    address space, but pointing to another different physical addresses. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| There is a book (or software with a database) holding the mapping between
+    the room number and the private phone number, and consulted by the receptionist
+    on demand. | Virtual addresses are mapped to the physical memory by page tables,
+    which are maintained by the operating system kernel and consulted by the processor.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: That is how one can imagine the virtual addresses work on a Linux system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will deal with the whole Linux memory management system
+    covering following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory layout along with address translation and MMU
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory allocation mechanisms (page allocator, slab allocator, kmalloc allocator,
+    and so on)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I/O memory access
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Mapping kernel memory to user space and implementing `mmap()` callback function
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introducing Linux caching system
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Introducing the device managed resource framework (devres)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: System memory layout - kernel space and user space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Throughout this chapter, terms such as kernel space and user space will refer
+    to their virtual address space. On Linux systems, each process owns a virtual
+    address space. It is a kind of memory sandbox during the process life. That address
+    space is 4 GB in size on 32-bits systems (even on a system with physical memory
+    less than 4 GB). For each process, that 4 GB address space is split in two parts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: User space virtual addresses
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kernel space virtual addresses
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The way the split is done depends on a special kernel configuration option,
+    `CONFIG_PAGE_OFFSET` , which defines where the kernel addresses section starts
+    in a process address space. The common value is `0xC0000000` by default on 32-bit
+    systems, but this may be changed, as it is the case for i.MX6 family processors
+    from NXP, which uses `0x80000000` . In the whole chapter, we will consider `0xC0000000`
+    by default. This is called 3G/1G split, where the user space is given the lower
+    3 GB of virtual address space, and the kernel uses the upper remaining 1 GB. A
+    typical process''s virtual address space layout looks like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Both addresses used in the kernel and the user space are virtual addresses.
+    The difference is that accessing a kernel address needs a privileged mode. Privileged
+    mode has extended privileges. When the CPU runs the user space side code, the
+    active process is said to be running in the user mode; when the CPU runs the kernel
+    space side code, the active process is said to be running in the kernel mode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Given an address (virtual of course), one can distinguish whether it is a kernel
+    space or a user space address by using process layout shown above. Every address
+    falling into 0-3 GB, comes from the user space; otherwise, it is from the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is a reason why the kernel shares its address space with every process:
+    because every single process at a given moment uses system calls, which will involve
+    the kernel. Mapping the kernel''s virtual memory address into each process''s
+    virtual address space allow us to avoid the cost of switching out the memory address
+    space on each entry to (and exit from) the kernel. It is the reason why the kernel
+    address space is permanently mapped on top of each process in order to speed up
+    kernel access through system calls.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The memory management unit organizes memory into units of fixed size called
+    pages. A page consists of 4,096 bytes (4 KB). Even if this size may differ on
+    other systems, it is fixed on ARM and x86, which are architectures we are interested
+    in:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A memory page, virtual page, or simply page are terms one uses to refer to a
+    fixed-length contiguous block of virtual memory. The same name `page` is used
+    as a kernel data structure to represent a memory page.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On the other hand, a frame (or page frame) refers to a fixed-length contiguous
+    block of physical memory on top of which the operating system maps a memory page.
+    Each page frame is given a number, called **page frame number** (**PFN** ). Given
+    a page, one can easily get its PFN and vice versa, using the `page_to_pfn` and
+    `pfn_to_page` macros, which will be discussed in detail in the next sections.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A page table is the kernel and architecture data structure used to store the
+    mapping between virtual addresses and physical addresses. The key pair page/frame
+    describes a single entry in the page table. This represents a mapping.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Since a memory page is mapped to a page frame, it goes without saying that pages
+    and page frames have the same sizes, 4 K in our case. The size of a page is defined
+    in the kernel through the `PAGE_SIZE` macro.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are situations where one needs memory to be page-aligned. One says a memory
+    is page-aligned if its address starts exactly at the beginning of a page. For
+    example, on a 4 K page size system, 4,096, 20,480, and 409,600 are instances of
+    page-aligned memory addresses. In other words, any memory whose address is a multiple
+    of the system page size is said to be page-aligned.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kernel addresses – concept of low and high memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The Linux kernel has its own virtual address space as every user mode process
+    does. The virtual address space of the kernel (1 GB sized in 3G/1G split) is divided
+    into two parts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Low memory or LOWMEM, which is the first 896 MB
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: High Memory or HIGHMEM, represented by the top 128 MB
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Low memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The first 896 MB of kernel address space constitutes the low memory region.
+    Early at boot, the kernel permanently maps those 896 MB. Addresses that result
+    from that mapping are called **logical addresses** . These are virtual addresses,
+    but can be translated into physical addresses by subtracting a fixed offset, since
+    the mapping is permanent and known in advance. Low memory match with lower bound
+    of physical addresses. One could define low memory as being the memory for which
+    logical addresses exist in the kernel space. Most of the kernel memory function
+    returns low memory. In fact, to serve different purposes, kernel memory is divided
+    into a zone. Actually, the first 16 MB of LOWMEM is reserved for DMA usage. Because
+    of hardware limitations, the kernel cannot treat all pages as identical. We can
+    then identify three different memory zones in the kernel space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`ZONE_DMA` : This contains page frames of memory below 16 MB, reserved for
+    **Direct Memory Access** (**DMA** )'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ZONE_NORMAL` : This contains page frames of memory above 16 MB and below 896
+    MB, for normal use'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`ZONE_HIGHMEM` : This contains page frames of memory at and above 896 MB'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: That says on a 512 MB system, there will be no `ZONE_HIGHMEM` , 16 MB for `ZONE_DMA`
+    , and 496 MB for `ZONE_NORMAL` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another definition of logical addresses: addresses in kernel space, mapped
+    linearly on physical addresses, which can be converted into physical addresses
+    just with an offset, or applying a bitmask. One can convert a physical address
+    into a logical address using the `__pa(address)` macro, and then revert with the
+    `__va(address)` macro.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: High memory
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The top 128 MB of the kernel address space is called the high memory region.
+    It is used by the kernel to temporarily map physical memory above 1 G. When physical
+    memory above 1 GB (or more precisely, 896 MB), needs to be accessed, the kernel
+    uses those 128 MB to create temporary mapping to its virtual address space, thus
+    achieving the goal of being able to access all physical pages. One could define
+    high memory as being memory for which logical addresses do not exist, and which
+    is not mapped permanently into kernel address space. The physical memory above
+    896 MB is mapped on demand to the 128 MB of the HIGHMEM region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mapping to access high memory is created on the fly by the kernel, and destroyed
+    when done. This makes high memory access slower. That said, the concept of high
+    memory does not exist on the 64-bits systems, due to the huge address range (2^(64)
+    ), where the 3G/1G split does not make sense anymore.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User space addresses
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this section, we will deal with the user space by means of processes. Each
+    process is represented in the kernel as an instance of `struct task_struct` (see
+    `*include/linux/sched.h*` ), which characterizes and describes a process. Each
+    process is given a table of memory mapping, stored in a variable of type `struct
+    mm_struct` (see `*include/linux/mm_types.h*` ). You can then guess that there
+    is at least one `mm_struct` field embedded in each `task_struct` . The following
+    line is the part of struct `task_struct` definition that we are interested in:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The kernel global variable `current` , points to the current process. The field
+    `*mm` , points to its memory mapping table. By definition, `current->mm` points
+    to the current process memory mappings table.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now let us see what a `struct mm_struct` looks like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'I intentionally removed some fields we are not interested in. There are some
+    fields we will talk about later: `pgd` for example, which is a pointer to the
+    process''s base (first entry) level `1` table (PGD), written in the translation
+    table base address of the CPU at context switching. Anyway, before going further,
+    let us see the representation of a process address space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00019.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Process memory layout
+  prefs: []
+  type: TYPE_NORMAL
+- en: From the process point of view, a memory mapping can be seen as nothing but
+    a set of page table entries dedicated to a consecutive virtual address range.
+    That *consecutive virtual address range* is called memory area, or **virtual memory
+    area** (**VMA** ). Each memory mapping is described by a start address and length,
+    permissions (such as whether the program can read, write, or execute from that
+    memory), and associated resources (such as physical pages, swap pages, file contents,
+    and so on).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A `mm_struct` has two ways to store process regions (VMA):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a red-black tree, whose root element is pointed by the field `mm_struct->mm_rb`
+    .
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In a linked list, where the first element is pointed by the field ``mm_struct->mmap``
+    .
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Virtual Memory Area (VMA)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The kernel uses virtual memory areas to keep track of the processes memory mappings,
+    for example, a process having one VMA for its code, one VMA for each type of data,
+    one VMA for each distinct memory mapping (if any), and so on. VMAs are processor-independent
+    structures, with permissions and access control flags. Each VMA has a start address,
+    a length, and their sizes are always a multiple of page size (`PAGE_SIZE` ). A
+    VMA consists of a number of pages, each of which has an entry in the page table.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory regions described by VMA are always virtually contiguous, not physically.
+    One can check all VMAs associated with a process through the `/proc/<pid>/maps`
+    file, or using the `pmap` command on a process ID.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00020.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Image source: http://duartes.org/gustavo/blog/post/how-the-kernel-manages-your-memory/'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Each line in the preceding excerpt represents a VMA, and fields map the following
+    pattern: `{address (start-end)} {permissions} {offset} {device (major:minor)}
+    {inode} {pathname (image)}` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`address` : This represents the starting and ending address of the VMA.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`permissions` : This describes access right of the region: `r` (read), `w`
+    (write), and `x` (execute), including `p` (if the mapping is private) and `s`
+    (for shared mapping).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Offset` **:** In the case of file mapping (`mmap` system call), it is the
+    offset in the file where the mapping takes place. It is `0` otherwise.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`major:minor` **:** In case of file mapping, these represent the major and
+    minor number of the devices in which the file is stored (device holding the file).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`inode` : In the case of mapping from a file, the inode number of the mapped
+    file.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pathname` : This is the name of the mapped file, or left blank otherwise.
+    There are other region name such as `[heap]` , `[stack]` , or `[vdso]` , which
+    stands for virtual dynamic shared object, which is a shared library mapped by
+    the kernel into every process address space, in other to reduce performance penalties
+    when system calls switch to kernel mode.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each page allocated to a process belongs to an area; thus, any page that does
+    not live in the VMA does not exist and cannot be referenced by the process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: High memory is perfect for user space because user space's virtual address must
+    be explicitly mapped. Thus, most high memory is consumed by user applications.
+    `__GFP_HIGHMEM` and `GFP_HIGHUSER` are the flags for requesting the allocation
+    of (potentially) high memory. Without these flags, all kernel allocations return
+    only low memory. There is no way to allocate contiguous physical memory from user
+    space in Linux.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One can use the `find_vma` function to find the VMA that corresponds to a given
+    virtual address. `find_vma` is declared in `linux/mm.h` *:*
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The whole process of memory mapping can be obtained by reading files: `/proc/<PID>/map`
+    , `/proc/<PID>/smap` , and `/proc/<PID>/pagemap` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Address translation and MMU
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Virtual memory is a concept, an illusion given to a process so it thinks it
+    has large and almost infinite memory, and sometimes more than the system really
+    has. It is up to the CPU to make the conversion from virtual to physical address
+    every time one accesses a memory location. That mechanism is called address translation,
+    and is performed by the **Memory Management Unit (MMU** ), which is a part of
+    the CPU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MMU protects memory from unauthorized access. Given a process, any page that
+    needs to be accessed must exist in one of the process VMAs, and thus, must live
+    in the process page table (every process has its own).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory is organized by chunks of fixed size named **pages** for virtual memory,
+    and **frames** for physical memory, sized 4 KB in our case. Anyway, you do not
+    need to guess the page size of the system you write the driver for. It is defined
+    and accessible with the `PAGE_SIZE` macro in the kernel. Remember therefore, page
+    size is imposed by the hardware (CPU). Considering a 4 KB page sized system, bytes
+    0 to 4095 fall in page 0, bytes 4096-8191 fall in page 1, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The concept of page table is introduced to manage mapping between pages and
+    frames. Pages are spread over tables, so that each PTE corresponds to a mapping
+    between a page and a frame. Each process is then given a set of page tables to
+    describe its whole memory space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In order to walk through pages, each page is assigned an index (like an array),
+    called the page number. When it comes to frame, it is PFN**.** This way, virtual
+    memory addresses are composed of two parts: a page number and an offset. The offset
+    represents the 12 less significant bits of the address, whereas 13 less significant
+    bits represent it on 8 KB page size systems:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00021.gif)'
+  prefs: []
+  type: TYPE_IMG
+- en: Virtual address representation
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How do the OS or CPU know which physical address corresponds to a given virtual
+    address? They use the page table as the translation table, and know that each
+    entry''s index is a virtual page number, and the value is the PFN. To access physical
+    memory given a virtual memory, the OS first extracts the offset, the virtual page
+    number, and then walks through the process''s page tables in order to match virtual
+    page number to physical page. Once a match occurs, it is then possible to access
+    data into that page frame:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00022.gif)'
+  prefs: []
+  type: TYPE_IMG
+- en: Address translation
+  prefs: []
+  type: TYPE_NORMAL
+- en: The offset is used to point to the right location into the frame. Page table
+    does not only hold mapping between physical and virtual page number, but also
+    access control information (read/write access, privileges, and so on).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00023.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Virtual to physical address translation
+  prefs: []
+  type: TYPE_NORMAL
+- en: The number of bits used to represent the offset is defined by the kernel macro
+    `PAGE_SHIFT` . `PAGE_SHIFT` is the number of bits to shift one bit left to obtain
+    the `PAGE_SIZE` value. It is also the number of bits to right-shift to convert
+    the virtual address to the page number and the physical address to the page frame
+    number. The following are the definitions of these macros from `/include/asm-generic/page.h`
+    in the kernel sources*:*
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Page table is a partial solution. Let us see why. Most architecture requires
+    32 bits (4 bytes) to represent a PTE. Each process having its private 3 GB user
+    space address, we need 786,432 entries to characterize and cover a process address
+    space. It represents too much physical memory spent per process, just to characterize
+    the memory mappings. In fact, a process generally uses a small but scattered portion
+    of its virtual address space. To resolve that issue, the concept of *level* is
+    introduced. Page tables are hierarchized by level (page level). The space necessary
+    to store a multi-level page table only depends on the virtual address space actually
+    in use, instead of being proportional to the maximum size of the virtual address
+    space. This way, unused memory is no longer represented, and the page table walk
+    through time is reduced. This way, each table entry in level N will point to an
+    entry in table of level N+1\. Level 1 is the higher level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Linux uses a four-level paging model:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Page Global Directory** (**PGD** ): It is the first level (level 1) page
+    table. Each entry''s type is `pgd_t` in kernel (generally an `unsigned long` ),
+    and point on an entry in table at the second level. In kernel, the structure `tastk_struct`
+    represents a process''s description, which in turn has a member (`mm` ) whose
+    type is `mm_struct` , and that characterizes and represents the process''s memory
+    space. In the `mm_struct` , there is a processor-specific field `pgd` , which
+    is a pointer on the first entry (entry 0) of the process''s level-1 (PGD) page
+    table. Each process has one and only one PGD, which may contain up to 1024 entries.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**P** **age Upper Directory** (**PUD** ): This exist only on architectures
+    using four-level tables. It represent the socong level of indirection.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**P** **age Middle Directory** ( **PMD** ): This is the third indirection level,
+    and exists only on architectures using four-level tables.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Page Table** (**PTE** ): Leaves of the tree. It is an array of `pte_t` ,
+    where each entry points to the physical page.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All levels are not always used. The i.MX6's MMU only supports a 2 level page
+    table (`PGD` and `PTE` ), it is the case for almost all 32-bit CPUs) In this case,
+    `PUD` and `PMD` are simply ignored.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00024.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Two-level tables overview
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might ask how MMU is aware of the process page table. It is simple, MMU
+    does not store any address. Instead, there is a special register in the CPU, called
+    **page table base register** (**PTBR** ) or **Translation Table Base Register
+    0** (**TTBR0** ), which points to the base (entry 0) of the level-1 (top level)
+    page table (PGD) of the process. It is exactly where the field `pdg` of `struct
+    mm_struct` points: `current->mm.pgd == TTBR0` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: At context switch (when a new process is scheduled and given the CPU), the kernel
+    immediately configures the MMU, and updates the PTBR with the new process's `pgd`
+    . Now when a virtual address is given to MMU, it uses the PTBR's content to locate
+    the process's level-1 page table (PGD), and then it uses the level-1 index, extracted
+    from the **most significant bits** (**MSBs** ) of the virtual address, to find
+    the appropriate table entry, which contains a pointer to the base address of the
+    appropriate level-2 page table. Then, from that base address, it uses the level-2
+    index to find the appropriate entry and so on until it reaches the PTE. ARM architecture
+    (i.MX6 in our case) has a 2-level page table. In this case, the level-2 entry
+    is a PTE, and points to the physical page (PFN). Only the physical page is found
+    at this step. To access the exact memory location in the page, the MMU extracts
+    the memory offset, also part of the virtual address, and points on the same offset
+    in the physical page.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When a process needs to read from or write into a memory location (of course
+    we're talking about virtual memory), the MMU performs a translation into that
+    process's page table, to find the right entry (`PTE` ). The virtual page number
+    is extracted (from the virtual address) and used by the processor as an index
+    into the processes page table to retrieve its page table entry. If there is a
+    valid page table entry at that offset, the processor takes the page frame number
+    from this entry. If not, it means the process accessed an unmapped area of its
+    virtual memory. A page fault is then raised and the OS should handle it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the real world, address translation requires a page table walk, and it is
+    not always a one-shot operation. There are at least as many memory accesses as
+    there are table levels. A four-level page table would require four memory accesses.
+    In other words, every virtual access would result in five physical memory accesses.
+    The virtual memory concept would be useless if its access were four times slower
+    than a physical access. Fortunately, SoC manufacturers worked hard to find a clever
+    trick to address this performance issue: modern CPUs use a small associative and
+    very fast memory called **translation lookaside buffer** (**TLB** ), in order
+    to cache the PTEs of recently accessed virtual pages.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page look up and TLB
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before the MMU proceeds to address translation, there is another step involved.
+    As there is a cache for recently accessed data, there is also a cache for recently
+    translated addresses. As a data cache speeds up the data accessing process, TLB
+    speeds up virtual address translation (yes, address translation is a tricky task.
+    It is content-addressable memory, abbreviated (**CAM** ), where the key is the
+    virtual address and the value is the physical address. In other words, the TLB
+    is a cache for the MMU. At each memory access, the MMU first checks for recently
+    used pages in the TLB, which contains a few of the virtual address ranges to which
+    physical pages are currently assigned.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How does TLB work
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On a virtual memory access, the CPU walks through the TLB trying to find the
+    virtual page number of the page that is being accessed. This step is called TLB
+    lookup. When a TLB entry is found (a match occurred), one says there is a **TLB
+    hit** and the CPU just keeps running and uses the PFN found in the TLB entry to
+    calculate the target physical address. There is no page fault when a TLB hit occurs.
+    As one can see, as long as a translation can be found in the TLB, virtual memory
+    access will be as fast as a physical access. If no TLB entry is found (no match
+    occured), one says there is a **TLB miss** .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On a TLB miss event, there are two possibilities, depending on the processor
+    type, TLB miss events can be handled by the software, or by the hardware, through
+    the MMU:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Software handling** : The CPU raises a TLB miss interruption, caught by the
+    OS. The OS then walks through the process''s page table to find the right PTE.
+    If there is a matching and valid entry, then the CPU installs the new translation
+    in the TLB. Otherwise, the page fault handler is executed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Hardware handling** : It is up to the CPU (the MMU in fact) to walk through
+    the process''s page table in hardware. If there is a matching and valid entry,
+    the CPU adds the new translation in the TLB. Otherwise, the CPU raises a page
+    fault interruption, handled by the OS.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In both cases, the page fault handler is the same: the `do_page_fault()` function
+    is executed, which is architecture-dependent. For ARM, the `do_page_fault` is
+    defined in `arch/arm/mm/fault.c` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00025.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: MMU and TLB walkthrough process
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page table and Page directory entries are architecture-dependent. It is up to
+    the Operating system to ensure that the structure of the table corresponds to
+    a structure recognized by the MMU. On the ARM processor, you must write the location
+    of the translation table in CP15 (coprocessor 15) register c2, and then enable
+    the caches and the MMU by writing to the CP15 register c1\. Have a look at both
+    [http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dui0056d/BABHJIBH.htm](http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.dui0056d/BABHJIBH.htm)
+    and [http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0433c/CIHFDBEJ.html](http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0433c/CIHFDBEJ.html)
+    for detailed information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory allocation mechanism
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Let us look at the following figure, showing us different memory allocators
+    existing on a Linux-based system, and discuss it later:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Inspired from: [http://free-electrons.com/doc/training/linux-kernel/linux-kernel-slides.pdf](http://free-electrons.com/doc/training/linux-kernel/linux-kernel-slides.pdf)
+    .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00026.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Overview of kernel memory allocator
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is an allocation mechanism to satisfy any kind of memory request. Depending
+    on what you need memory for, you can choose the one closer to your goal. The main
+    allocator is the **Page Allocator** , which only works with pages (a page being
+    the smallest memory unit it can deliver). Then comes the **SLAB Allocator** that
+    is built on top of the page allocator, getting pages from it and returning smaller
+    memory entities (by mean of slabs and caches). This is the allocator on which
+    the **kmalloc Allocator** relies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Page allocator is the low-level allocator on the Linux system, the one on which
+    other allocators rely on. System's physical memory is made up of fixed-size blocks
+    (called page frames). A page frame is represented in the kernel as an instance
+    of the `struct page` structure. A page is the smallest unit of memory that the
+    OS will give to any memory request at low level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Page allocation API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'You will have understood that the kernel page allocator allocates and deallocates
+    blocks of pages using the buddy algorithm. Pages are allocated in blocks that
+    are powers of 2 in size (in order to get the best from the buddy algorithm). That
+    means that it can allocate a block 1 page, 2 pages, 4 pages, 8, 16, and so on:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`alloc_pages(mask, order)` allocates 2^(order) pages and returns an instance
+    of `struct page` which represents the first page of the reserved block. To allocate
+    only one page, order should be 0\. It is what `alloc_page(mask)` does:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`__free_pages()` is used to free memory allocated with `alloc_pages()` function.
+    It takes a pointer to the allocated page(s) as a parameter, with the same order
+    as was used for allocation.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are other functions working in the same way, but instead of an instance
+    of struct page, they return the address (virtual of course) of the reserved block.
+    These are `__get_free_pages(mask, order)` and `__get_free_page(mask)` :'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`free_pages()` is used to free page allocated with `__get_free_pages()` . It
+    takes the kernel address representing the start region of allocated page(s), along
+    with the order, which should be the same as that used for allocation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In either case, `mask` specifies details about the request, which are the memory
+    zones and the behavior of allocators. Choices available are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`GFP_USER` , for user memory allocation.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_KERNEL` , the commonly used flag for kernel allocation.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_HIGHMEM` **,** which requests memory from the HIGH_MEM zone.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_ATOMIC` , which allocates memory in an atomic manner that cannot sleep.
+    Used when one needs to allocate memory from an interrupt context.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There is a warning on using `GFP_HIGHMEM` , which should not be used with `__get_free_pages()`
+    (or `__get_free_page()` ). Since HIGHMEM memory is not guaranteed to be contiguous,
+    you can''t return an address of a memory allocated from that zone. Globally only
+    a subset of `GFP_*` is allowed in memory-related functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: The maximum number of pages one can allocate is 1024\. It means that on a 4
+    Kb sized system, you can allocate up to 1024*4 Kb = 4 MB at most. It is the same
+    for `kmalloc` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Conversion functions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `page_to_virt()` function is used to convert the struct page (as returned
+    by `alloc_pages()` for example) into the kernel address. `virt_to_page()` takes
+    a kernel virtual address and returns its associated struct page instance (as if
+    it was allocated using the `alloc_pages()` function). Both `virt_to_page()` and
+    `page_to_virt()` are defined in `<asm/page.h>` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The macro `page_address()` can be used to return the virtual address that corresponds
+    to the beginning address (the logical address of course) of a struct page instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can see how it is used in the `get_zeroed_page()` function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`__free_pages()` and `free_pages()` can be mixed. The main difference between
+    them is that `free_page()` takes a virtual address as a parameter, whereas `__free_page()`
+    takes a `struct page` structure.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Slab allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Slab allocator is the one on which `kmalloc()` relies. Its main purpose is to
+    eliminate the fragmentation caused by memory (de)allocation that would be caused
+    by the buddy system in the case of small size memory allocation, and speed up
+    memory allocation for commonly used objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The buddy algorithm
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To allocate memory, the requested size is round up to a power of two, and the
+    buddy allocator searches the appropriate list. If no entries exist on the requested
+    list, an entry from the next upper list (which has blocks of twice the size of
+    the previous list) is split into two halves (called **buddies** ). The allocator
+    uses the first half, while the other is added to the next list down. This is a
+    recursive approach, which stops when either the buddy allocator successfully finds
+    a block which we can be split, or reaches the largest size of block and there
+    are no free blocks available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The following case study is heavily inspired from [http://dysphoria.net/OperatingSystems1/4_allocation_buddy_system.html](http://dysphoria.net/OperatingSystems1/4_allocation_buddy_system.html)
+    . For example, if the minimum allocation size is 1 KB, and the memory size is
+    1 MB, the buddy allocator will create an empty list for 1 KB holes, empty list
+    for 2 KB holes, one for 4 KB holes, 8 KB, 16 KB, 32 KB, 64 KB, 128 KB, 256 KB,
+    512 KB, and one list for 1 MB holes. All of them are initially empty, except for
+    the 1 MB list which has only one hole.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now let us imagine a scenario where we want to allocate a **70K** block. The
+    buddy allocator will round it up to **128K** , and end up splitting the 1 MB into
+    two **512K** blocks, then **256K** , and finally **128K** , then it will allocate
+    one of the **128K** blocks to the user. The following are schemes that summarize
+    this scenario:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00027.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Allocation using buddy algorithm
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The deallocation is as fast as allocation. The following figure summarize the
+    deallocation algorithm:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00028.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Deallocation using buddy algorithm
+  prefs: []
+  type: TYPE_NORMAL
+- en: A journey into the slab allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before we introduce the slab allocator, let us define some terms it uses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Slab** : This is a contiguous piece of physical memory made of several page
+    frames. Each slab is divided into equal chunks of the same size, used to store
+    specific types of kernel object, such as inodes, mutexes, and so on. Each slab
+    is then an array of objects.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Cache** : It is made of one or more slabs in a linked list, and they are
+    represented in the kernel as instances the of `struct kmem_cache_t` structure.
+    The cache only stores objects of the same type (for example, inodes only, or only
+    address space structures)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Slabs may be in one of the following states:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Empty** : This is where all objects (chunks) on the slab are marked as free'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Partial** : Both used and free objects exist in the slab'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Full** : All objects on the slab are marked as used'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It is up to the memory allocator to build caches. Initially, each slab is marked
+    as empty. When one (code) allocates memory for a kernel object, the system looks
+    for a free location for that object on a partial/free slab in a cache for that
+    type of object. If not found, the system allocates a new slab and adds it into
+    the cache. The new object gets allocated from this slab, and the slab is marked
+    as **partial** . When the code is done with the memory (memory freed), the object
+    is simply returned to the slab cache in its initialized state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It is the reason why the kernel also provides helper functions to obtain zeroed
+    initialized memory, in order to get rid of the previous content. The slab keeps
+    a reference count of how many of its objects are being used, so that when all
+    slabs in a cache are full and another object is requested, the slab allocator
+    is responsible for adding new slabs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00029.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: Slab cache overview
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is a bit like creating a per-object allocator. The system allocate one cache
+    per type of object, and only objects of the same type can be stored in a cache
+    (For example, only `task_struct` structure).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are different kinds of slab allocator in the kernel, depending on whether
+    or not one needs compactness, cache-friendliness, or raw speed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **SLOB** , which is as compact as possible
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **SLAB** , which is as cache-friendly as possible
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **SLUB** , which is quite simple and requires fewer instruction cost counts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: kmalloc family allocation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`kmalloc` is a kernel memory allocation function, such as `malloc()` in user
+    space. Memory returned by `kmalloc` is contiguous in physical memory and in virtual
+    memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00030.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The kmalloc allocator is the general and higher-level memory allocator in the
+    kernel, which relies on the SLAB allocator. Memory returned from kmalloc has a
+    kernel logical address because it is allocated from the `LOW_MEM` region, unless
+    `HIGH_MEM` is specified. It is declared in `<linux/slab.h>` , which is the header
+    to include when using kmalloc in your driver. The following is the prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`size` specifies the size of the memory to be allocated (in bytes). `flag`
+    determines how and where memory should be allocated. Available flags are the same
+    as the page allocator (`GFP_KERNEL` , `GFP_ATOMIC` , `GFP_DMA` , and so on).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`GFP_KERNEL` : This is the standard flag. We cannot use this flag in the interrupt
+    handler because its code may sleep. It always returns memory from `LOM_MEM` zone
+    (hence a logical address).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_ATOMIC` : This guarantees the atomicity of the allocation. The only flag
+    to use when we are in the interrupt context. Please do not abuse this, since it
+    uses an emergence pool of memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_USER` : This allocates memory to a user space process. Memory is then
+    distinct and separated from that allocated to the kernel.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_HIGHUSER` : This allocates memory from `HIGH_MEMORY` zone'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`GFP_DMA` : This allocates memory from `DMA_ZONE` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On successful allocation of memory, kmalloc returns the virtual address of the
+    chunk allocated, guaranteed to be physically contiguous. On error, it returns
+    `NULL` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Kmalloc relies on SLAB caches when allocating small size memories. In this case,
+    the kernel rounds the allocated area size up to the size of the smallest SLAB
+    cache in which it can fit. Always use it as your default memory allocator. In
+    architectures used in this book (ARM and x86), the maximum size per allocation
+    is 4 MB, and 128 MB for total allocations. Have a look at [https://kaiwantech.wordpress.com/2011/08/17/kmalloc-and-vmalloc-linux-kernel-memory-allocation-api-limits/
+    .](https://kaiwantech.wordpress.com/2011/08/17/kmalloc-and-vmalloc-linux-kernel-memory-allocation-api-limits/)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `kfree` function is used to free the memory allocated by kmalloc. The following
+    is the prototype of `kfree()` ;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let us see an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Other family-like functions are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`krealloc()` is the kernel equivalent of the user space `realloc()` function.
+    Because memory returned by `kmalloc()` retains the contents from its previous
+    incarnation, there could be a security risk if it''s exposed to user space. To
+    get zeroed kmalloc''ed memory, one should use `kzalloc` . `kzfree()` is the freeing
+    function for `kzalloc()` , whereas `kcalloc()` allocates memory for an array,
+    and its parameters `n` and `size` represent respectively the number of elements
+    in the array and the size of an element.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since `kmalloc()` returns a memory area in the kernel permanent mapping (which
+    mean physically contiguous), the memory address can be translated to a physical
+    address using `virt_to_phys()` , or to a IO bus address using `virt_to_bus()`
+    . These macros internally call either `__pa()` or `__va()` if necessary. The physical
+    address (`virt_to_phys(kmalloc'ed address)` ), downshifted by `PAGE_SHIFT` , will
+    produce a PFN of the first page from which the chunk is allocated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: vmalloc allocator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`vmalloc()` is the last kernel allocator we will discuss in the book. It returns
+    memory only contiguous on the virtual space (not physically contiguous):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/Image00031.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The returned memory always comes from `HIGH_MEM` zone. Addresses returned cannot
+    be translated into a physical one or into bus address, because one cannot assert
+    that the memory is physically contiguous. It means memory returned by `vmalloc()`
+    can't be used outside the microprocessor (you cannot easily use it for DMA purposes).
+    It is correct to use `vmalloc()` to allocate memory for a large (it does not make
+    sense to use it to allocate one page for example) sequential that exists only
+    in software, for example, a network buffer. It is important to note that `vmalloc()`
+    is slower than `kmalloc()` or page allocator functions, because it must retrieve
+    the memory, build the page tables, or even remap into a virtually contiguous range,
+    whereas `kmalloc()` never does that.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before using this vmalloc API, you should include this header in the code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following are the vmalloc family prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`size` is the size of memory you need to allocate. Upon successful allocation
+    of memory, it returns the address of the first byte of the allocated memory block.
+    On failure, it returns a `NULL` . `vfree` function, which is used to free the
+    memory allocated by `vmalloc()` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is an example of using `vmalloc` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: One can use `/proc/vmallocinfo` to display all vmalloc'ed memory on the system.
+    `VMALLOC_START` and `VMALLOC_END` are two symbols that delimit the vmalloc address
+    range. They are architecture-dependent and defined in `<asm/pgtable.h>` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process memory allocation under the hood
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let us focus on the lower level allocator, which allocates pages of memory.
+    The kernel will report allocation of frame pages (physical pages) until really
+    necessary (when those are actually accessed, by reading or writing). This on-demand
+    allocation is called **lazy-allocation** , eliminating the risk of allocating
+    pages that will never be used.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Whenever a page is requested, only the page table is updated, in most of the
+    cases, a new entry is created, which means only virtual memory is allocated. Only
+    when you access the page, an interrupt called **page fault** is raised. This interrupt
+    has a dedicated handler, called the page fault handler, and is called by the MMU
+    in response to an attempt to access virtual memory, which did not immediately
+    succeed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Actually, a page fault interrupt is raised whatever the access type is (read,
+    write, execute), to a page whose entry in the page table has not got the appropriate
+    permission bits set to allow that type of access. The response to that interrupt
+    falls in one of the following three ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The hard fault** : The page does not reside anywhere (neither in the physical
+    memory nor a memory-mapped file), which means the handler cannot immediately resolve
+    the fault. The handler will perform I/O operations in order to prepare the physical
+    page needed to resolve the fault, and may suspend the interrupted process and
+    switch to another while the system works to resolve the issue.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The soft fault** : The page resides elsewhere in memory (in the working set
+    of another process). It means the fault handler may resolve the fault by immediately
+    attaching a page of physical memory to the appropriate page table entry, adjusting
+    the entry, and resuming the interrupted instruction.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The fault cannot be resolved** : This will result in a bus error or segv.
+    `SIGSEGV` is sent to the faulty process, killing it (the default behavior) unless
+    a signal handler has been installed for `SIGSEV` to change the default behavior.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory mappings generally start out with no physical pages attached, by defining
+    the virtual address ranges without any associated physical memory. The actual
+    physical memory is allocated later in response to a page fault exception, when
+    the memory is accessed, since the kernel provides some flags to determine whether
+    the attempted access was legal, and specify the behavior of the page fault handler.
+    Thus, the user space `brk(), mmap()` and similar allocate (virtual) space, but
+    physical memory is attached later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A page fault occurring in the interrupt context causes a **double fault** interrupt,
+    which usually panics the kernel (calling the `panic()` function) . It is the reason
+    why memory allocated in the interrupt context is taken from a memory pool, which
+    does not raise page fault interrupts. If an interrupt occurs when a double fault
+    is being handled, a triple fault exception is generated, causing the CPU to shut
+    down and the OS immediately reboots. This behavior is actually arc-dependent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The copy-on-write (CoW) case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The CoW (heavily used with `fork()` ) is a kernel feature that does not allocate
+    several time the memory for a data shared by two or more processes, until a process
+    touches it (write into it); in this case memory is allocated for its private copy.
+    The following shows how a page fault handler manages CoW (one-page case study):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A PTE is added to the process page table, and marked as un-writable.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The mapping will result in a VMA creation in the process VMA list. The page
+    is added to that VMA and that VMA is marked as writable.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'On page access (at the first write), the fault handler notices the difference,
+    which means: **this is a Copy on write** . It will then allocate a physical page,
+    which is assigned to the PTE added above, update the PTE flags, flush the TLB
+    entry, and execute the `do_wp_page()` function, which can copy the content from
+    the shared address to the new location.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Work with I/O memory to talk with hardware
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Apart from performing data RAM-oriented operations, one can perform I/O memory
+    transactions, to talk with the hardware. When it comes to the access device''s
+    register, the kernel offers two possibilities depending on the system architecture:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Through the I/O ports** : This is also called **Port Input Output** (**PIO**
+    ). Registers are accessible through a dedicated bus, and specific instructions
+    (`in` and `out` , in assembler generally) are needed to access those registers.
+    It is the case on x86 architectures.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Memory Mapped Input Output** (**MMIO** ): This is the most common and most
+    used method. The device''s registers are mapped to memory. Simply read and write
+    to a particular address to write to the registers of the device. It is the case
+    on ARM architectures.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: PIO devices access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On a system on which PIO is used, there are two different address spaces, one
+    for memory, which we have already discussed, and the other one for I/O ports,
+    called the port address space, limited to 65,536 ports only. This is a old way,
+    and very uncommon nowadays.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel exports a few functions (symbols) to handle I/O port. Prior to accessing
+    any port regions, we must first inform the kernel that we are using a range of
+    ports using the `request_region()` function, which will return `NULL` on error.
+    Once done with the region, one must call `release_region()` . These are both declared
+    in `linux/ioport.h` . Their prototypes are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Those functions inform the kernel about your intention to use/release of a region
+    `len` ports, starting from `start` . The `name` parameter should be set with the
+    name of your device. Their use is not mandatory. This is a kind of politeness,
+    which prevents two or more drivers from referencing the same range of ports. One
+    can display information about the ports actually in use on the system by reading
+    the content of `/proc/ioports` files.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once one is done with region reservation, one can access the port using the
+    following functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'which respectively access (read) 8-, 16-, or 32-bits sized (wide) ports, and
+    the following functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: which write `b` data, 8-, 16-, or 32-bits sized, into `addr` port.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fact that PIO uses a different set of instruction to access I/O ports or
+    MMIO is a disadvantage because PIO requires more instructions than normal memory
+    to accomplish the same task. For instance, 1-bit testing has only one instruction
+    in MMIO, whereas PIO requires reading the data into a register before testing
+    the bit, which is more than one instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MMIO devices access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Memory-mapped I/O reside same address space than memory. The kernel uses part
+    of the address space normally used by RAM (`HIGH_MEM` actually) to map the devices
+    registers, so that instead of having real memory (that is, RAM) at that address,
+    I/O device take place. Thus, communicating to an I/O device becomes like reading
+    and writing to memory addresses devoted to that I/O device.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like PIO, there are MMIO functions, to inform the kernel about our intention
+    to use a memory region. Remember it is a pure reservation only. These are `request_mem_region()`
+    and `release_mem_region()` :'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: It is also a politeness.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One can display memory regions actually in use on the system by reading the
+    content of the `/proc/iomem` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Prior to accessing a memory region (and after you successfully request it),
+    the region must be mapped into kernel address space by calling special architecture-dependent
+    functions (which make use of MMU to build the page table, and thus cannot be called
+    from the interrupt handler). These are `ioremap()` and `iounmap()` , which handle
+    cache coherency too:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`ioremap()` returns a `__iomem void` pointer to the start of the mapped region.
+    Do not be tempted to deference (get/set the value by reading/writing to the pointer)
+    such pointers. The kernel provides functions to access ioremap''ed memories. These
+    are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`ioremap` builds new page tables, just as `vmalloc` does. However, it does
+    not actually allocate any memory but instead, returns a special virtual address
+    that one can use to access the specified physical address range.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On 32-bit systems, the fact that MMIO steals physical memory address space to
+    create mapping for memory-mapped I/O devices is a disadvantage, since it prevents
+    the system from using the stolen memory for general RAM purpose.
+  prefs: []
+  type: TYPE_NORMAL
+- en: __iomem cookie
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`__iomem` is a kernel cookie used by Sparse, a semantic checker used by the
+    kernel to find possible coding faults. To take advantage of the features offered
+    by Sparse, it should be enabled at kernel compile time; if not, `__iomem` cookie
+    will be ignored anyway.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `C=1` in the command line will enable Sparse for you, but parse should
+    be installed first on your system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For example, when building a module, use:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Alternatively, if the makefile is well written, just type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following shows how __iomem is defined in the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It prevents us from faulty drivers performing I/O memory access. Adding the
+    `__iomem` for all I/O accesses is a way to be stricter too. Since even I/O access
+    is done through virtual memory (on systems with MMU), this cookie prevents us
+    from using absolute physical addresses, and requires us to use `ioremap()` , which
+    will return a virtual address tagged with `__iomem` cookie:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: So we can use dedicated functions, such as `ioread23()` and `iowrite32()` .
+    You may wonder why one does not use the `readl()` /`writel()` function. Those
+    are deprecated, since these do not make sanity checks and are less secure (no
+    `__iomem` required), than `ioreadX()` /`iowriteX()` family functions, which accept
+    only `__iomem` addresses.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In addition, `noderef` is an attribute used by Sparse to make sure programmers
+    do not dereference a `__iomem` pointer. Even though it could work on some architecture,
+    you are not encouraged to do that. Use the special `ioreadX()` /`iowriteX()` function
+    instead. It is portable and works on every architecture. Now let us see how Sparse
+    will warn us when dereferencing a `__iomem` pointer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'First, Sparse is not happy because of the wrong type initializer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Or:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Sparse is still not happy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This last example makes Sparse happy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The two rules that you must remember are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Always use `__iomem` where it is required whether it is as a return type or
+    as a parameter type, and use Sparse to make sure you did so
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Do not dereference a `__iomem` pointer; use a dedicated function instead
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory (re)mapping
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kernel memory sometimes needs to be remapped, either from kernel to user space,
+    or from kernel to kernel space. The common use case is remapping the kernel memory
+    to user space, but there are other cases, when one need to access high memory
+    for example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: kmap
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Linux kernel permanently maps 896 MB of its address space to the lower 896 MB
+    of the physical memory (low memory). On a 4 GB system, there is only 128 MB left
+    to the kernel to map the remaining 3.2 GB of physical memory (high memory). Low
+    memory is directly addressable by the kernel because of the permanent and one-to-one
+    mapping. When it comes to high memory (memory above 896 MB), the kernel has to
+    map the requested region of high memory into its address space, and the 128 MB
+    mentioned before are especially reserved for this. The function used to perform
+    this trick, `kmap()` . `kmap()` , is used to map a given page into the kernel
+    address space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`page` is a pointer to the `struct page` structure to map. When a high memory
+    page is allocated, it is not directly addressable. `kmap()` is the function one
+    must call to temporarily map high memory into the kernel address space. The mapping
+    will last until `kunmap()` is called:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: By temporarily, I mean the mapping should be undone as soon as it is not needed
+    anymore. Remember, 128 MB is not enough to map 3.2 GB. The best programming practice
+    is to unmap high memory mappings when no longer required. It is why the `kmap()`
+    - `kunmap()` sequence has to be entered around every access to the high memory
+    page. .
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This function works on both high memory and low memory. That says, if the page
+    structure resides in low memory, then just the virtual address of the page is
+    returned (because low memory pages already have permanent mappings). If the page
+    belongs to high memory, a permanent mapping is created in the kernel''s page tables
+    and the address is returned:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: Mapping kernel memory to user space
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Mapping physical addresses is one of the most useful functionalities, especially
+    in embedded systems. Sometime you may want to share part of kernel memory with
+    user space. As said earlier, CPU runs in unprivileged mode when running in user
+    space. To let a process access a kernel memory region, we need to remap that region
+    into the process address space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using remap_pfn_range
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '`remap_pfn_range()` maps physical memory (by means of kernel logical address)
+    to a user space process. It is particularly useful for implementing the `mmap()`
+    system call.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After calling the `mmap()` system call on a file (whether it is a device file
+    or not), the CPU will switch to privileged mode, and run the corresponding `file_operations.mmap()`
+    kernel function, which in turn will call `remap_pfn_range()` . The kernel PTE
+    of the mapped region will be derived, and given to the process, of course, with
+    different protection flags. The process's VMA list is updated with a new VMA entry
+    (with appropriate attributes) , which will use PTE to access the same memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thus, instead of wasting memory by copying, the kernel just duplicates the
+    PTEs. However, kernel and user space PTE have different attributes. `remap_pfn_range()`
+    has the following prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: A successful call will return `0` , and a negative error code on failure. Most
+    of the arguments for `remap_pfn_range()` are provided when the `mmap()` method
+    is called.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`vma` : This is the virtual memory area provided by the kernel in the case
+    of a `file_operations.mmap()` call. It corresponds to the user process `vma` into
+    which the mapping should be done.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`addr` : This is the user virtual address where VMA should start (`vma->vm_start`
+    ), which will result in a mapping from a virtual address range between `addr`
+    and `addr + size` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`pfn` : This represents the page frame number of the kernel memory region to
+    map. It corresponds to the physical address right-shifted by `PAGE_SHIFT` bits.
+    The `vma` offset (offset into the object where the mapping must start) should
+    be taken into account to produce the PFN. Since the `vm_pgoff` field of the VMA
+    structure contains the offset value in the form of the number of pages, it is
+    precisely what you need (with a `PAGE_SHIFT` left-shifting) to extract the offset
+    in the form of bytes: `offset = vma->vm_pgoff << PAGE_SHIFT` ). Finally, `pfn
+    = virt_to_phys(buffer + offset) >> PAGE_SHIFT` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`size` : This is the dimension, in bytes, of the area being remapped.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`prot` : This represents the protection requested for the new VMA. The driver
+    can mangle the default value, but should use the value found in `vma->vm_page_prot`
+    as the skeleton using the OR operator, since some of its bits are already set
+    by user space. Some of these flags are:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`VM_IO` , which specifies a device''s memory mapped I/O'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`VM_DONTCOPY` , which tells the kernel not to copy this `vma` on fork'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`VM_DONTEXPAND` , which prevents `vma` from expanding with `mremap(2)`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`VM_DONTDUMP` , prevents the `vma` from being included in the core dump'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: One may need to modify this value in order to disable caching if using this
+    with I/O memory (`vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);` ).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using io_remap_pfn_range
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `remap_pfn_range()` function discussed does not apply anymore when it comes
+    to mapping I/O memory to user space. In this case, the appropriate function is
+    `io_remap_pfn_range()` , whose parameters are the same. The only thing that changes
+    is where the PFN comes from. Its prototype looks like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: There is no need to use `ioremap()` when at tempting to map I/O memory to user
+    space. -`ioremap()` is intended for kernel purposes (mapping I/O memory into kernel
+    address space), where as `io_remap_pfn_range` is for user space purposes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just pass your real physical I/O address (downshifted by `PAGE_SHIFT` to produce
+    a PFN) directly to `io_remap_pfn_range()` . Even if there are some architectures
+    where `io_remap_pfn_range()` is defined as being `remap_pfn_range()` , there are
+    other architectures where it is not the case. For portability reasons, you should
+    only use `remap_pfn_range()` in situations where the PFN parameter points to RAM,
+    and `io_remap_pfn_range()` in situations where `phys_addr` refers to I/O memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The mmap file operation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Kernel `mmap` function is part of `struct file_operations` structure, which
+    is executed when the user executes the system call `mmap(2)` , used to maps physical
+    memory into a user virtual address. The kernel translates any access to that mapped
+    region of memory through the usual pointer dereferences into a file operation.
+    It is even possible to map device physical memory directly to user space (see
+    `/dev/mem` ). Essentially writing to memory becomes like writing into a file.
+    It is just a more convenient way of calling `write()` .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Normally, user space processes cannot access device memory directly for security
+    purposes. Therefore, user space processes use the `mmap()` system call to ask
+    kernel to map the device into the virtual address space of the calling process.
+    After the mapping, the user space process can write directly into the device memory
+    through the returned address.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The mmap system call is declared as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The driver should have defined the mmap file operation (`file_operations.mmap`
+    ) in order to support `mmap(2)` . From the kernel side, the mmap field in the
+    driver''s file operation structure (`struct file_operations` structure) has the
+    following prototype:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'where:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`filp` is a pointer to the open device file for the driver that results from
+    the translation of the fd parameter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`vma` is allocated and given as a parameter by the kernel. It is a pointer
+    to the user process''s vma where the mapping should go. To understand how the
+    kernel creates the new vma, let''s recall the `mmap(2)` system call''s prototype:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The parameters of this function somehow affect some fields of the vma:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`addr` : is the user space''s virtual address where the mapping should start.
+    It has an impact on `vma>vm_start` . If `NULL` (the most portable way) was specified,
+    automatically determinate the correct address.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`length` : This specifies the length of the mapping, and indirectly has an
+    impact on `vma->vm_end` . Remember, the size of a `vma` is always a multiple of
+    `PAGE_SIZE` . In other words, `PAGE_SIZE` is always the smallest size a `vma`
+    can have. The kernel will always alter the size of the `vma` so that is is a multiple
+    of `PAGE_SIZE` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`prot` : This affects the permissions of the VMA, which the driver can find
+    in `vma->vm_pro` . As discussed earlier, the driver can update these values, but
+    not alter them.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`flags` : This determine the type of mapping that the driver can find in `vma->vm_flags`
+    . The mapping can be private or shared.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`offset` : This specifies the offset within the mapped region, thus mangling
+    the value of `vma->vm_pgoff` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implementing mmap in the kernel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Since user space code cannot access kernel memory, the purpose of the `mmap()`
+    function is to derive one or more protected kernel page table entries (which correspond
+    to the memory to be mapped) and duplicate the user space page tables, remove the
+    kernel flag protection, and set permission flags that will allow the user to access
+    the same memory as the kernel without needing special privileges.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The steps to write a mmap file operation are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Get the mapping offset and check whether it is beyond our buffer size or not:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Check if the mapping size is bigger than our buffer size:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Get the PFN which corresponds to the PFN of the page where the `offset` position
+    of our buffer falls:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Set the appropriate flag, whether I/O memory is present or not:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Disable caching using `vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot)`
+    .
+  prefs:
+  - PREF_UL
+  - PREF_UL
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Set the `VM_IO` flag: `vma->vm_flags |= VM_IO` .'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Prevent the VMA from swapping out: `vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP`
+    . In kernel versions older than 3.7, you should use only the `VM_RESERVED` flag
+    instead.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Call `remap_pfn_range` with the PFN calculated, the size, and the protection
+    flags:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Pass your mmap function to the `struct file_operations` structure:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: Linux caching system
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Caching is the process by which frequently accessed or newly written data is
+    fetched from, or written to a small and faster memory, called a **cache** .
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dirty memory is data-backed (for example, file-backed) memory whose content
+    has been modified (typically in a cache) but not written back to the disk yet.
+    The cached version of the data is newer than the on-disk version, meaning that
+    both versions are out of sync. The mechanism by which cached data is written back
+    on the disk (back store) is called **writeback** . We will eventually update the
+    on-disk version, bringing the two in sync. *Clean memory* is file-backed memory
+    in which the contents are in sync with the disk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Linux delays write operations in order to speed up the read process, and reduces
+    disk wear leveling by writing data only when necessary. A typical example is the
+    `dd` command. Its complete execution does not mean that the data is written to
+    the target device; this is the reason why `dd` in most cases is chained to a `sync`
+    command.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is a cache?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A cache is temporary, small, and fast memory used to keep copies of data from
+    larger and often very slow memory, typically placed in systems where there is
+    a working set of data accessed far more often than the rest (for example, hard
+    drive, memory).
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the first read occurs, let us say a process requests some data from the
+    large and slower disk, the requested data is returned to the process, and a copy
+    of accessed data is tracked and cached as well. Any consequent read will fetch
+    data from the cache. Any data modification will be applied in the cache, not on
+    the main disk. Then, the cache region whose content has been modified and differs
+    (is newer than) from the on-disk version will be tagged as **dirty** . When the
+    cache runs full, and since cached data is tacked, new data begins to evict the
+    data that has not been accessed and has been sitting idle for the longest, so
+    that if it is needed again, it will have to be fetched from the large/slow storage
+    again.
+  prefs: []
+  type: TYPE_NORMAL
+- en: CPU cache – memory caching
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are three cache memories on the modern CPU, ordered by size and access
+    speed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **L1** cache that has the smallest amount of memory (often between 1k and
+    64k) is directly accessible by the CPU in a single clock cycle, which makes it
+    the fastest as well. Frequently used things are in L1 and remain in L1 until some
+    other thing's usage becomes more frequent than the existing one and there is less
+    space in L1\. If so, it is moved to a bigger space L2.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **L2** cache is the middle level, with a larger amount of memory (up to
+    several megabytes) adjacent to the processor, which can be accessed in a small
+    number of clock cycles. This applies when moving things from L2 to L3.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The **L3** cache, even slower than L1 and L2, may be two times faster than
+    the main memory (RAM). Each core may have its own L1 and L2 cache; therefore,
+    they all share the L3 cache. Size and speed are the main criteria that change
+    between each cache level: L1 < L2 < L3\. Whereas original memory access may be
+    100 ns for example, the L1 cache access can be 0.5 ns.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A real-life example is how a library may put several copies of the most popular
+    titles on display for easy and fast access, but have a large-scale archive with
+    a far greater collection available, at the inconvenience of having to wait for
+    a librarian to go get it for you. The display cases would be analogous to a cache,
+    and the archive would be the large, slow memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The main issue that a CPU cache addresses is latency, which indirectly increases
+    the throughput, because access to uncached memory may take a while.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux page cache – disk caching
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The page cache, as its name suggests, is a cache of pages in RAM, containing
+    chunks of recently accessed files. The RAM acts as a cache for pages that resides
+    on the disk. In other words, it is the kernel cache of file contents. Cached data
+    may be regular filesystem files, block device files, or memory-mapped files. Whenever
+    a `read()` operation is invoked, the kernel first checks whether the data resides
+    in the page cache, and immediately returns it if found. Otherwise, the data will
+    be read from the disk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a process needs to write data without any caching involved, it has to use
+    the `O_SYNC` flag, which guarantees the `write()` command will not return before
+    all data has been transferred to the disk, or the `O_DIRECT` , flag, which only
+    guarantees that no caching will be used for data transfer. That says, `O_DIRECT`
+    actually depends on filesystem used and is not recommended.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Specialized caches (user space caching)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '**Web browser cache** : This stores frequently accessed web pages and images
+    onto the disk, instead of fetching them from the web. Whereas the first access
+    to online data may last for more than hundreds of milliseconds, the second access
+    will fetch data from the cache (which is a disk in this case) in only 10 ms.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**libc or user-app cache** : Memory and disk cache implementations will try
+    to guess what you need to use next, while browser caches keep a local copy in
+    case you need to use it again.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Why delay writing data to disk?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are essentially two reasons to that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Better usage of the disk characteristics; this is efficiency
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Allows the application to continue immediately after a write; this is performance
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For example, delaying disk access and processing data only when it reaches a
+    certain size may improve disk performance, and reduce wear leveling of eMMC (on
+    embedded systems). Every chunk write is merged into a single and contiguous write
+    operation. Additionally, written data is cached, allowing the process to return
+    immediately so that any subsequent read will fetch the data from the cache, resulting
+    in a more responsive program. Storage devices prefer a small number of large operations
+    instead of several small operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By reporting write operation on the permanent storage later, we can get rid
+    of latency issues introduced by these disks, which are relatively slow.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Write caching strategies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Depending on the cache strategy, several benefits may be enumerated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reduced latency on data accessing, thus increasing application performance
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Improved storage lifetime
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Reduced system work load
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Reduced risk of data loss
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Caching algorithms usually fall into one of the following three different strategies:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **write-through** **cache** , where any write operation will automatically
+    update both the memory cache and the permanent storage. This strategy is preferred
+    for applications where data loss cannot be tolerated, and applications that write
+    and then frequently re-read data (since data is stored in the cache and results
+    in low read latency).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The **write-around** **cache** , which is similar to write-through, with the
+    difference that it immediately invalidates the cache (which is also costly for
+    the system since any write results in automatic cache invalidation). The main
+    consequence is that any subsequent read will fetch data from the disk, which is
+    slow, thus increasing latency. It prevents the cache from being flooded with data
+    that will not be subsequently read.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Linux employs the third and last strategy, called **write back cache** , which
+    can write data to the cache every time a change occurs without updating the corresponding
+    location in the main memory. Instead, the corresponding pages in the page cache
+    are marked as **dirty** (this task is done by MMU using TLB) and added to a so-called
+    list, maintained by the kernel. The data is written into the corresponding location
+    in the permanent storage only at specified intervals or under certain conditions.
+    When the data in the pages is up to date with the data in the page cache, the
+    kernel removes the pages from the list, and they are not marked dirty.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'On Linux systems, you can find this from `/proc/meminfo` under `Dirty` :'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: The flusher threads
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The write back cache defers I/O data operations in the page cache. A set or
+    kernel threads, called flusher threads, are responsible for that. Dirty page write
+    back occurs when any one of the following situations is satisfied:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When free memory falls below a specified threshold to regain memory consumed
+    by dirty pages.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When dirty data lasts until a specific period. The oldest data is written back
+    to the disk to ensure that dirty data does not remain dirty indefinitely.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: When a user process invokes the `sync()` and `fsync()` system calls. This is
+    an on demand write back.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Device-managed resources – Devres
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Devres is a kernel facility helping the developer by automatically freeing the
+    allocated resource in a driver. It simplifies errors handling in `init` /`probe`
+    /`open` functions. With devres, each resource allocator has its managed version
+    that will take care of resource release and freeing for you.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section heavily relies on the *Documentation/driver-model/devres.txt* file
+    in the kernel source tree, which deals with devres API and lists supported functions
+    along with their descriptions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The memory allocated with resource-managed functions is associated with the
+    device. devres consists of a linked list of arbitrarily sized memory areas associated
+    with a `struct device` . Each devers resource allocator inserts the allocated
+    resource in the list. The resource remains available until it is manually freed
+    by the code, when the device is detached from the system, or when the driver is
+    unloaded. Each devres entry is associated with a `release` function. There are
+    different ways to release a devres. No matter what, all devres entries are released
+    on driver detach. On release, the associated release function is invoked and then
+    the devres entry is freed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is the list of resources available for a driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory for private data structures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Interrutps (IRQs)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory region allocation (`request_mem_region()` )
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: I/O mapping of memory regions (`ioremap()` )
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Buffer memory (possibly with DMA mapping)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Different framework data structures: Clocks, GPIOs, PWMs, USB phy, regulators,
+    DMA, and so on'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Almost every function discussed in this chapter has its managed version. In
+    the majority of cases, the name given to the managed version of a function is
+    obtained by prefixing the original function name with `devm` . For example, `devm_kzalloc()`
+    is the managed version of `kzalloc()` . Additionally, parameters remain unchanged,
+    but are shifted to the right, since the first parameter is the struct device for
+    which the resource is allocated. There is an exception for functions for which
+    the non-managed version is already given a struct device in its parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: When the device is detached from the system or the driver for the device is
+    unloaded, that memory is freed automatically. It is possible to free the memory
+    with `devm_kfree()` if it's no longer needed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The old way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The right way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter is one of the most important chapters. It demystifies memory management
+    and allocation (how and where) in the kernel. Every memory aspect is discussed
+    and detailed, as well as dvres is also explained. The caching mechanism is briefly
+    discussed in order to give an overview of what goes on under the hood during I/O
+    operations. It is a strong base from which introduce and understand the next chapter,
+    which deals with DMA.
+  prefs: []
+  type: TYPE_NORMAL

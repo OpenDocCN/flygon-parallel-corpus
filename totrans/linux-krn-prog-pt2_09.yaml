@@ -1,0 +1,2318 @@
+- en: Kernel Synchronization - Part 2
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter continues the discussion from the previous chapter, on the topic
+    of kernel synchronization and dealing with concurrency within the kernel in general.
+    I suggest that if you haven't already, first read the previous chapter, and then
+    continue with this one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here, we shall continue our learning with respect to the vast topic of kernel synchronization
+    and handling concurrency when in kernel space. As before, the material is targeted
+    at kernel and/or device driver developers. In this chapter, we shall cover the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the atomic_t and refcount_t interfaces
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the RMW atomic operators
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the reader-writer spinlock
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Cache effects and false sharing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lock-free programming with per-CPU variables
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lock debugging within the kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory barriers – an introduction
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using the atomic_t and refcount_t interfaces
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In our simple demo misc character device driver program''s (`miscdrv_rdwr/miscdrv_rdwr.c`)
+    `open` method (and elsewhere), we defined and manipulated two static global integers, `ga`
+    and `gb`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'By now, it should be obvious to you that this – the place where we operate
+    on these integers – is a potential bug if left as is: it''s shared writable data
+    (in a shared state) and therefore *a critical section, thus requiring protection
+    against* *concurrent access*. You get it; so, we progressively improved upon this.
+    In the previous chapter, understanding the issue, in our `ch12/1_miscdrv_rdwr_mutexlock/1_miscdrv_rdwr_mutexlock.c`
+    program, we first used a *mutex lock* to protect the critical section. Later,
+    you learned that using a *spinlock* to protect non-blocking critical sections
+    such as this one would be (far) superior to using a mutex in terms of performance;
+    so, in our next driver, `ch12/2_miscdrv_rdwr_spinlock/2_miscdrv_rdwr_spinlock.c`,
+    we used a spinlock instead:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: That's good, but we can do better still! Operating upon global integers turns
+    out to be such a common occurrence within the kernel (think of reference or resource
+    counters getting incremented and decremented, and so on) that the kernel provides
+    a class of operators called the **refcount** and **atomic integer operators**
+    or interfaces; these are very specifically designed to atomically (safely and
+    indivisibly) operate on **only integers**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The newer refcount_t versus older atomic_t interfaces
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'At the outset of this topic area, it''s important to mention this: from the
+    4.11 kernel, there is a newer and better set of interfaces christened the `refcount_t` APIs,
+    meant for a kernel space object''s reference counters. It greatly improves the
+    security posture of the kernel (via much-improved **Integer OverFlow** (**IoF**) and
+    **Use After Free **(**UAF**) protection as well as memory ordering guarantees,
+    which the older `atomic_t` APIs lack). The `refcount_t` interfaces, like several
+    other security technologies used on Linux, have their origins in work done by
+    The PaX Team – [https://pax.grsecurity.net/](https://pax.grsecurity.net/) (it
+    was called `PAX_REFCOUNT`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having said that, the reality is that (as of the time of writing) the older
+    `atomic_t` interfaces are still very much in use within the kernel core and drivers
+    (they are slowly being converted, with the older `atomic_t` interfaces being moved
+    to the newer `refcount_t` model and the API set). Thus, in this topic, we cover
+    both, pointing out differences and mentioning which `refcount_t` API supersedes
+    an `atomic_t` API wherever applicable. Think of the `refcount_t` interfaces as
+    a variant of the (older) `atomic_t` interfaces, which are specialized toward reference
+    counting.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A key difference between the `atomic_t` operators and the `refcount_t` ones
+    is that the former works upon signed integers whereas the latter is essentially
+    designed to work upon only an `unsigned int` quantity; more specifically, and
+    this is important, it works only within a strictly specified range: `1` to **`UINT_MAX-1` **(or
+    `[1..INT_MAX]` when `!CONFIG_REFCOUNT_FULL`). The kernel has a config option named
+    `CONFIG_REFCOUNT_FULL`; if set, it performs a (slower and more thorough) "full"
+    reference count validation. This is beneficial for security but can result in
+    slightly degraded performance (the typical default is to keep this config turned
+    off; it''s the case with our x86_64 Ubuntu guest).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Attempting to set a `refcount_t` variable to `0` or negative, or to `[U]INT_MAX` or
+    above, is impossible; this is good for preventing integer underflow/overflow issues
+    and thus preventing the use-after-free class bug in many cases! (Well, it's not
+    impossible; it results in a (noisy) warning being fired via the `WARN()` macro.)
+    Think about it, `refcount_t` variables are meant to be used *only for kernel object
+    reference counting, nothing else*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, this is indeed the required behavior; the reference counter must start
+    at a positive value (typically `1` when the object is newly instantiated), is
+    incremented (or added to) whenever the code gets or takes a reference, and is
+    decremented (or subtracted from) whenever the code puts or leaves a reference
+    on the object. You are expected to carefully manipulate the reference counter
+    (matching your gets and puts), always keeping its value within the legal range.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Quite non-intuitively, at least for the generic arch-independent refcount implementation,
+    the `refcount_t` APIs are internally implemented over the `atomic_t` API set.
+    For example, the `refcount_set()` API – which atomically sets a refcount''s value
+    to the parameter passed – is implemented like this within the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It''s a thin wrapper over `atomic_set()` (which we will cover very shortly).
+    The obvious FAQ here is: why use the refcount API at all? There are a few reasons:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The counter saturates at the `REFCOUNT_SATURATED` value (which is set to `UINT_MAX` by
+    default) and will not budge once there. This is critical: it avoids wrapping the
+    counter, which could cause weird and spurious UAF bugs; this is even considered
+    as a key security fix ([https://kernsec.org/wiki/index.php/Kernel_Protections/refcount_t](https://kernsec.org/wiki/index.php/Kernel_Protections/refcount_t)).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Several of the newer refcount APIs do provide **memory ordering** guarantees;
+    in particular the `refcount_t` APIs – as compared to their older `atomic_t` cousins
+    – and the memory ordering guarantees they provide are clearly documented at [https://www.kernel.org/doc/html/latest/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t](https://www.kernel.org/doc/html/latest/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t) (do
+    have a look if you're interested in the low-level details).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Also, realize that arch-dependent refcount implementations (when they exist;
+    for example, x86 does have it, while ARM doesn't) can differ from the previously-mentioned
+    generic one.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'What exactly is *memory ordering* and how does it affect us? The fact is, it''s
+    a complex topic and, unfortunately, the inner details on this are beyond the scope
+    of this book. It''s worth knowing the basics: I suggest you read up on the **Linux-Kernel
+    Memory Model** (**LKMM**), which includes coverage on processor memory ordering
+    and more. We refer you to good documentation on this here: *Explanation of the
+    Linux-Kernel Memory Model* ([https://github.com/torvalds/linux/blob/master/tools/memory-model/Documentation/explanation.txt](https://github.com/torvalds/linux/blob/master/tools/memory-model/Documentation/explanation.txt)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The simpler atomic_t and refcount_t interfaces
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Regarding the `atomic_t` interfaces, we should mention that all the following
+    `atomic_t` constructs are for 32-bit integers only; of course, with 64-bit integers
+    now being commonplace, 64-bit atomic integer operators are available as well.
+    Typically, they are semantically identical to their 32-bit counterparts with the
+    difference being in the name (`atomic_foo()` becomes `atomic64_foo()`). So the
+    primary data type for 64-bit atomic integers is called `atomic64_t` (AKA `atomic_long_t`).
+    The `refcount_t` interfaces, on the other hand, cater to both 32 and 64-bit integers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following table shows how to declare and initialize an `atomic_t` and `refcount_t`
+    variable, side by side so that you can compare and contrast them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '|  | **(Older) atomic_t (32-bit only)** | **(Newer) refcount_t (both 32- and
+    64-bit)** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Header file to include | `<linux/atomic.h>` | `<linux/refcount.h>` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Declare and initialize a variable | `static atomic_t gb = ATOMIC_INIT(1);`
+    | `static refcount_t gb = REFCOUNT_INIT(1);` |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Table 17.1 – The older atomic_t versus the newer refcount_t interfaces for
+    reference counting: header and init'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The complete set of all the `atomic_t` and `refcount_t` APIs available within
+    the kernel is pretty large; to help keep things simple and clear in this section,
+    we only list some of the more commonly used (atomic 32-bit) and `refcount_t` interfaces
+    in the following table (they operate upon a generic `atomic_t` or `refcount_t`
+    variable, `v`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Operation** | **(Older) atomic_t interface** | **(Newer) refcount_t interface
+    [range: 0 to [U]INT_MAX]** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Header file to include | `<linux/atomic.h>` | `<linux/refcount.h>` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Declare and initialize a variable | `static atomic_t v = ATOMIC_INIT(1);`
+    | `static refcount_t v = REFCOUNT_INIT(1);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically read the current value of `v` | `int atomic_read(atomic_t *v)`
+    | `unsigned int refcount_read(const refcount_t *v)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically set `v` to the value `i` | `void atomic_set(atomic_t *v, i)` |
+    `void refcount_set(refcount_t *v, int i)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically increment the `v` value by `1`  | `void atomic_inc(atomic_t *v)`
+    | `void refcount_inc(refcount_t *v)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically decrement the `v` value by `1`  | `void atomic_dec(atomic_t *v)`
+    | `void refcount_dec(refcount_t *v)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically add the value of `i` to `v` | `void atomic_add(i, atomic_t *v)`
+    | `void refcount_add(int i, refcount_t *v)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically subtract the value of `i` from `v` | `void atomic_sub(i, atomic_t
+    *v)` | `void refcount_sub(int i, refcount_t *v)` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically add the value of `i` to `v` and return the result | `int atomic_add_return(i,
+    atomic_t *v)` | `bool refcount_add_not_zero(int i, refcount_t *v)` (not a precise
+    match; adds `i` to `v` unless it''s `0`.) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Atomically subtract the value of `i` from `v` and return the result | `int
+    atomic_sub_return(i, atomic_t *v)` | `bool refcount_sub_and_test(int i, refcount_t
+    *r)` (not a precise match; subtracts `i` from `v` and tests; returns `true` if
+    resulting refcount is `0`, else `false`.) |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Table 17.2 – The older atomic_t versus the newer refcount_t interfaces for
+    reference counting: APIs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You've now seen several `atomic_t` and `refcount_t` macros and APIs; let's quickly
+    check out a few examples of their usage in the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examples of using refcount_t within the kernel code base
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In one of our demo kernel modules regarding kernel threads (in `ch15/kthread_simple/kthread_simple.c`),
+    we created a kernel thread and then employed the `get_task_struct()` inline function
+    to mark the kernel thread''s task structure as being in use. As you can now guess,
+    the `get_task_struct()` routine increments the task structure''s reference counter
+    – a `refcount_t` variable named `usage` – via the `refcount_inc()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The converse routine, `put_task_struct()`, performs the subsequent decrement
+    on the reference counter. The actual routine employed by it internally, `refcount_dec_and_test()`,
+    tests whether the new refcount value has dropped to `0`; if so, it returns `true`,
+    and if this is the case, it implies that the task structure isn''t being referenced
+    by anyone. The call to `__put_task_struct()` frees it up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Another example of the refcounting APIs in use within the kernel is found in
+    `kernel/user.c` (which helps track the number of processes, files, and so on that
+    a user has claimed via a per-user structure):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/52aff2e3-0b4e-4e2c-a5ff-a71048b50e91.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.1 – Screenshot showing the usage of the refcount_t interfaces in kernel/user.c
+  prefs: []
+  type: TYPE_NORMAL
+- en: Look up the `refcount_t` API interface documentation ([https://www.kernel.org/doc/html/latest/driver-api/basics.html#reference-counting](https://www.kernel.org/doc/html/latest/driver-api/basics.html#reference-counting));
+    `refcount_dec_and_lock_irqsave()` returns `true` and withholds the spinlock with
+    interrupts disabled if able to decrement the reference counter to `0`, and `false`
+    otherwise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an exercise for you, convert our earlier `ch16/2_miscdrv_rdwr_spinlock/miscdrv_rdwr_spinlock.c` driver
+    code to use refcount; it has the integers `ga` and `gb`, which, when being read
+    or written, were protected via a spinlock. Now, make them refcount variables and
+    use the appropriate `refcount_t` APIs when working on them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Careful! Don''t allow their values to go out of the allowed range, `[0..[U]INT_MAX]`!
+    (Recall that the range is `[1..UINT_MAX-1]` for full refcount validation (`CONFIG_REFCOUNT_FULL`
+    being on) and `[1..INT_MAX]` when it''s not full validation (the default)).Doing
+    so typically leads to the `WARN()` macro being invoked (the code for this demo
+    seen in *Figure 7.1* isn''t included in our GitHub repository):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/24843ce0-e46c-41a2-bf1d-8c467aea70a3.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.2 – (Partial) screenshot showing the WARN() macro firing when we wrongly
+    attempt to set a refcount_t variable to <= 0
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel has an interesting and useful test infrastructure called the **Linux
+    Kernel Dump Test Module** (**LKDTM**); see `drivers/misc/lkdtm/refcount.c` for
+    many test cases being run on the refcount interfaces, which you can learn from...
+    FYI, you can also use LKDTM via the kernel's fault injection framework to test
+    and evaluate the kernel's reaction to faulty scenarios (see the documentation
+    here: *Provoking crashes with Linux Kernel Dump Test Module (LKDTM)* – [https://www.kernel.org/doc/html/latest/fault-injection/provoke-crashes.html#provoking-crashes-with-linux-kernel-dump-test-module-lkdtm](https://www.kernel.org/doc/html/latest/fault-injection/provoke-crashes.html#provoking-crashes-with-linux-kernel-dump-test-module-lkdtm)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The atomic interfaces covered so far all operate on 32-bit integers; what about
+    on 64-bit? That's what follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 64-bit atomic integer operators
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As mentioned at the start of this topic, the set of `atomic_t` integer operators
+    we have dealt with so far all operate on traditional 32-bit integers (this discussion
+    doesn''t apply to the newer `refcount_t` interfaces; they anyway operate upon
+    both 32 and 64-bit quantities). Obviously, with 64-bit systems becoming the norm
+    rather than the exception nowadays, the kernel community provides an identical
+    set of atomic integer operators for 64-bit integers. The difference is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Declare the 64-bit atomic integer as a variable of type `atomic64_t` (that is, `atomic_long_t`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For all operators, in place of the `atomic_` prefix, use the `atomic64_` prefix.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'So, take the following examples:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In place of `ATOMIC_INIT()`, use `ATOMIC64_INIT()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In place of `atomic_read()`, use `atomic64_read()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In place of `atomic64_dec_if_positive()`, use `atomic64_dec_if_positive()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Recent C and C++ language standards – C11 and C++11 – provide an atomic operations
+    library that helps developers implement atomicity in an easier fashion due to
+    the implicit language support; we won''t delve into this aspect here. A reference
+    can be found here (C11 also has pretty much the same equivalents): [https://en.cppreference.com/w/c/atomic](https://en.cppreference.com/w/c/atomic).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that all these routines – both the 32- and 64-bit atomic ​`_operators` –
+    are **arch-independent**. A key point worth repeating is that any and all operations
+    performed upon an atomic integer must be done by declaring the variable as `atomic_t`
+    and via the methods provided. This includes initialization and even a (integer)
+    read operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In terms of internal implementation, a `foo()` atomic integer operator is typically
+    a macro that becomes an inline function, which in turn invokes the arch-specific `arch_foo()` function. As
+    usual, glancing through the official kernel documentation on atomic operators
+    is always a good idea (within the kernel source tree, it''s here: `Documentation/atomic_t.txt`;
+    go to [https://www.kernel.org/doc/Documentation/atomic_t.txt](https://www.kernel.org/doc/Documentation/atomic_t.txt)).
+    It neatly categorizes the numerous atomic integer APIs into distinct sets. FYI,
+    arch-specific *memory ordering issues* do affect the internal implementation.
+    Here, we won''t delve into the internals. If interested, refer to this page on
+    the official kernel documentation site at [https://www.kernel.org/doc/html/v4.16/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t](https://www.kernel.org/doc/html/v4.16/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t)
+    (also, details on memory ordering go beyond the scope of this book; check out
+    the kernel documentation at [https://www.kernel.org/doc/Documentation/memory-barriers.txt](https://www.kernel.org/doc/Documentation/memory-barriers.txt) for
+    more on this).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We haven''t attempted to show all the atomic and refcount APIs here (it''s
+    really not necessary); the official kernel documentation covers it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`atomic_t` interfaces:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: S*emantics and Behavior of Atomic and Bitmask Operations* ([https://www.kernel.org/doc/html/v5.4/core-api/atomic_ops.html#semantics-and-behavior-of-atomic-and-bitmask-operations](https://www.kernel.org/doc/html/v5.4/core-api/atomic_ops.html#semantics-and-behavior-of-atomic-and-bitmask-operations))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: API ref: Atomics ([https://www.kernel.org/doc/html/latest/driver-api/basics.html#atomics](https://www.kernel.org/doc/html/latest/driver-api/basics.html#atomics))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '(Newer) `refcount_t` interfaces for kernel object reference counting:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`refcount_t` API compared to `atomic_t` ([https://www.kernel.org/doc/html/latest/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t](https://www.kernel.org/doc/html/latest/core-api/refcount-vs-atomic.html#refcount-t-api-compared-to-atomic-t))'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: API ref: Reference counting ([https://www.kernel.org/doc/html/latest/driver-api/basics.html#reference-counting](https://www.kernel.org/doc/html/latest/driver-api/basics.html#reference-counting))
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's move on to the usage of a typical construct when working on drivers –
+    **Read Modify Write** (**RMW**). Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the RMW atomic operators
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A more advanced set of atomic operators called the RMW APIs is available as
+    well. Among its many uses (we show a list in the coming section) is that of performing
+    atomic RMW operations on bits, in other words, performing bitwise operations atomically
+    (safely, indivisibly). As a device driver author operating upon device or peripheral
+    *registers*, this is indeed something you will find yourself using.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The material in this section assumes you have at least a basic understanding
+    of accessing peripheral device (chip) memory and registers; we have covered this
+    in detail in [Chapter 3](7399aaad-197a-4a1b-aa1a-edec3d4e3faa.xhtml), *Working
+    with Hardware I/O Memory*. Please ensure you understand it before moving further.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Very often, you''ll need to perform bit operations (with the bitwise `AND &` and
+    bitwise `OR |` being the most commonplace operators) on registers; this is done
+    to modify its value, setting and/or clearing some bits within it. The thing is,
+    merely performing some C manipulation to query or set device registers isn''t
+    quite enough. No, sir: don''t forget about concurrency issues! Read on for the
+    full story.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: RMW atomic operations – operating on device registers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let''s quickly go over some basics first: a byte consists of 8 bits, numbered
+    from bit `0`, the **Least Significant Bit** (**LSB**), to bit `7`, the **Most
+    Significant Bit** (**MSB**). (This is actually formally defined as the `BITS_PER_BYTE` macro in
+    `include/linux/bits.h`, along with a few other interesting definitions.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **register** is basically a small piece of memory within the peripheral device;
+    typically, its size, the register bit width, is one of 8, 16, or 32 bits. The
+    device registers provide control, status, and other information and are often
+    programmable. This, in fact, is largely what you as a driver author will do –
+    program the device registers appropriately to make the device do something, and
+    query it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To flesh out this discussion, let''s consider a hypothetical device that has
+    two registers: a status register and a control register, each 8 bits wide. (In
+    the real world, every device or chip has a *datasheet* that will provide a detailed
+    specification of the chip and register-level hardware; this becomes an essential
+    document for the driver author). Hardware folks usually design devices in such
+    a way that several registers are sequentially clubbed together in a larger piece
+    of memory; this is called register banking. By having the base address of the
+    first register and the offset to each following one, it becomes easy to address any
+    given register (here, we won''t delve into how exactly registers are "mapped"
+    into the virtual address space on an OS such as Linux). For example, the (purely
+    hypothetical) registers may be described like this in a header file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, say that in order to turn on our fictional device, the datasheet informs
+    us we can do so by setting bit `7` (the MSB) of the control register to `1`. As
+    every driver author quickly learns, there is a hallowed sequence for modifying
+    registers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Read** the register''s current value into a temporary variable.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Modify** the variable to the desired value.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Write** back the variable to the register.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'This is often called the **RMW** **sequence**; so, great, we write the (pseudo)code
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: (FYI, the actual routines used on Linux **MMIO** – **memory-mapped I/O** – are
+    `ioread[8|16|32]()` and `iowrite[8|16|32]()`.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A key point here: *this isn''t good enough*; the reason is **concurrency, data
+    races!** Think about it: a register (both CPU and device registers) is in fact
+    a *global shared writable memory location*; thus, accessing it *constitutes a
+    critical section*, which you have to take care to protect from concurrent access!
+    The how is easy; we could just use a spinlock (for now at least). It''s trivial
+    to modify the preceding pseudocode to insert the `spin_[un]lock()` APIs in the
+    critical section – the RMW sequence.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, there is an even better way to achieve data safety when dealing with
+    small quantities such as integers; we have already covered it: *atomic operators*!
+    Linux, however, goes further, providing a set of atomic APIs for both of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Atomic non-RMW operations** (the ones we saw earlier, in the *Using the atomic_t
+    and refcount_t interfaces* section)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Atomic RMW operations**; these include several types of operators that can
+    be categorized into a few distinct classes: arithmetic, bitwise, swap (exchange),
+    reference counting, miscellaneous, and barriers'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s not reinvent the wheel; the kernel documentation ([https://www.kernel.org/doc/Documentation/atomic_t.txt](https://www.kernel.org/doc/Documentation/atomic_t.txt))
+    has all the information required. We''ll show just a relevant portion of this
+    document as follows, quoting directly from the `Documentation/atomic_t.txt` kernel
+    code base:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Good; now that you're aware of these RMW (and non-RMW) operators, let's get
+    practical – we'll check out how to use the RMW operators for bit operations next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the RMW bitwise operators
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Here, we''ll focus on employing the RMW bitwise operators; we''ll leave it
+    to you to explore the others (refer to the kernel docs mentioned). So, let''s
+    think again about how to more efficiently code our pseudocode example. We can
+    set (to `1`) any given bit in any register or memory item using the `set_bit()`
+    API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: This atomically – safely and indivisibly – sets the `nr`th bit of `p` to `1`.
+    (The reality is that the device registers (and possibly device memory) are mapped
+    into kernel virtual address space and thus appear to be visible as though they
+    are RAM locations – such as the address `p` here. This is called MMIO and is the
+    common way by which driver authors map in and work with device memory.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thus, with the RMW atomic operators, we can safely achieve what we''ve (incorrectly)
+    attempted previously – turning on our (fictional) device – with a single line
+    of code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following table summarizes common RMW bitwise atomic APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **RMW bitwise atomic API** | **Comment** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `void set_bit(unsigned int nr, volatile unsigned long *p);` | Atomically set
+    (set to `1`) the `nr`th bit of `p`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `void clear_bit(unsigned int nr, volatile unsigned long *p)` | Atomically clear
+    (set to `0`) the `nr`th bit of `p`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `void change_bit(unsigned int nr, volatile unsigned long *p)` | Atomically toggle the `nr`th
+    bit of `p`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| *The following APIs return the previous value of the bit being operated upon
+    (nr)* |  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `int test_and_set_bit(unsigned int nr, volatile unsigned long *p)` | Atomically
+    set the `nr`th bit of `p` returning the previous value (kernel API doc at [https://www.kernel.org/doc/htmldocs/kernel-api/API-test-and-set-bit.html](https://www.kernel.org/doc/htmldocs/kernel-api/API-test-and-set-bit.html)).
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `int test_and_clear_bit(unsigned int nr, volatile unsigned long *p)` | Atomically
+    clear the `nr`th bit of `p` returning the previous value. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `int test_and_change_bit(unsigned int nr, volatile unsigned long *p)` | Atomically
+    toggle the `nr`th bit of `p` returning the previous value. |'
+  prefs: []
+  type: TYPE_TB
+- en: Table 17.3 – Common RMW bitwise atomic APIs
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Careful: these atomic APIs are not just atomic with respect to the CPU core
+    they''re running upon, but now with respect to all/other cores. In practice, this
+    implies that if you''re performing atomic operations in parallel on multiple CPUs,
+    that is, if they (can) race, then it''s a critical section and you must protect
+    it with a lock (typically a spinlock)!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trying out a few of these RMW atomic APIs will help build your confidence in
+    using them; we do so in the section that follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using bitwise atomic operators – an example
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s check out a quick kernel module that demonstrates the usage of the Linux
+    kernel''s RMW atomic bit operators ( `ch13/1_rmw_atomic_bitops`). You should realize
+    that these operators can work on *any memory*, both a (CPU or device) register
+    or RAM; here, we operate on a simple static global variable (named `mem`) within
+    the example LKM. It''s very simple; let''s check it out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We include the required headers and declare and initialize a few global variables
+    (notice how our `MSB` variable uses `BIT_PER_BYTE`). We employ a simple macro, `SHOW()`,
+    to display the formatted output with the printk. The `init` code path is where
+    the actual work is done:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The RMW atomic operators we use here are highlighted in bold font. A key part
+    of this demo is to show that using the RMW bitwise atomic operators is not only
+    much easier but also much faster than using the traditional approach where we
+    manually perform the RMW operation within the confines of a spinlock. Here are
+    the two functions for both of these approaches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We call these functions early in our `init` method; notice that we take timestamps
+    (via the `ktime_get_real_ns()` routine) and display the time taken via our `SHOW_DELTA()`
+    macro (defined in our `convenient.h` header). Right, here''s the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/5cc09eb6-4fc6-4857-9222-b4d1c51e833b.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.3 – Screenshot of output from our ch13/1_rmw_atomic_bitops LKM, showing
+    off some of the atomic RMW  operators at work
+  prefs: []
+  type: TYPE_NORMAL
+- en: (I ran this demo LKM on my x86_64 Ubuntu 20.04 guest VM.) The modern approach
+    – via the `set_bit()` RMW atomic bitwise API – took, in this sample run, just
+    415 nanoseconds to execute; the traditional approach was about 265 times slower!
+    The code (via `set_bit()`) is so much simpler as well...
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a somewhat related note to the atomic bitwise operators, the following section
+    is a very brief look at the highly efficient APIs available within the kernel
+    for searching a bitmask – a fairly common operation in the kernel, as it turns
+    out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Efficiently searching a bitmask
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Several algorithms depend on performing a really fast search of a bitmask;
+    several scheduling algorithms (such as `SCHED_FIFO` and `SCHED_RR`, which you
+    learned about in the companion guide *Linux Kernel Programming -* *Chapter 10*, *The
+    CPU Scheduler – Part 1*, and *Chapter 11*, *The CPU Scheduler – Part 2*) often
+    internally require this. Implementing this efficiently becomes important (especially
+    for OS-level performance-sensitive code paths). Hence, the kernel provides a few
+    APIs to scan a given bitmask (these prototypes are found in `include/asm-generic/bitops/find.h`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`unsigned long find_first_bit(const unsigned long *addr, unsigned long size)`:
+    Finds the first set bit in a memory region; returns the bit number of the first
+    set bit, else (no bits are set) returns `@size`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`unsigned long find_first_zero_bit(const unsigned long *addr, unsigned long
+    size)`: Finds the first cleared bit in a memory region; returns the bit number
+    of the first cleared bit, else (no bits are cleared) returns `@size`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Other routines include `find_next_bit()`, `find_next_and_bit()`, `find_last_bit()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Looking through the <`linux/bitops.h>` header reveals other quite interesting
+    macros as well, such as `for_each_{clear,set}_bit{_from}()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the reader-writer spinlock
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Visualize a piece of kernel (or driver) code wherein a large, global, doubly
+    linked circular list (with a few thousand nodes) is being searched. Now, since
+    the data structure is global (shared and writable), accessing it constitutes a
+    critical section that requires protection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Assuming a scenario where searching the list is a non-blocking operation, you'd
+    typically use a spinlock to protect the critical section. A naive approach might
+    propose not using a lock at all since we're *only reading data* within the list,
+    not updating it. But, of course (as you have learned), even a read on shared writable
+    data has to be protected to protect against an inadvertent write occurring simultaneously,
+    thus resulting in a dirty or torn read.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, we conclude that we require the spinlock; we imagine the pseudocode might
+    look something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, what's the problem? Performance, of course! Imagine several threads on a
+    multicore system ending up at this code fragment more or less at the same time;
+    each will attempt to take the spinlock, but only one winner thread will get it,
+    iterate over the entire list, and then perform the unlock, allowing the next thread
+    to proceed. In other words, as expected, execution is now *serialized*, dramatically
+    slowing things down. But it can't be helped; or can it?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Enter the **reader-writer spinlock**. With this locking construct, it''s required
+    that all threads performing reads on the protected data will ask for a **read
+    lock**, whereas any thread requiring write access to the list will ask for an
+    **exclusive write lock**. A read lock will be granted immediately to any thread
+    that asks as long as no write lock is currently in play. In effect, this construct
+    *allows all readers concurrent access to the data, meaning, in effect, no real locking
+    at all*. This is fine, as long as there are only readers. The moment a writer
+    thread comes along, it requests a write lock. Now, normal locking semantics apply:
+    the writer **will have to wait** for all readers to unlock. Once that happens,
+    the writer gets an exclusive write lock and proceeds. So now, if any readers or
+    writers attempt access, they will be forced to wait to spin upon the writer''s
+    unlock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thus, for those situations where the access pattern to data is such that reads
+    are performed very often and writes are rare, and the critical section is a fairly
+    long one, the reader-writer spinlock is a performance-enhancing one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reader-writer spinlock interfaces
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Having used spinlocks, using the reader-writer variant is straightforward;
+    the lock data type is abstracted as the `rwlock_t` structure (in place of `spinlock_t`)
+    and, in terms of API names, simply substitute `read` or `write` in place of `spin`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The most basic APIs of the reader-writer spinlock are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As an example, the kernel''s `tty` layer has code to handle a **Secure Attention
+    Key** (**SAK**); the SAK is a security feature, a means to prevent a Trojan horse-type
+    credentials hack by killing all processes associated with the TTY device. This
+    will happen when the user presses the SAK ([https://www.kernel.org/doc/html/latest/security/sak.html](https://www.kernel.org/doc/html/latest/security/sak.html)).
+    When this actually happens (that is, when the user presses the SAK, mapped to
+    the `Alt-SysRq-k` sequence by default), within its code path, it has to iterate
+    over all tasks, killing the entire session and any threads that have the TTY device
+    open. To do so, it must take, in read mode, a reader-writer spinlock called `tasklist_lock`.
+    The (truncated) relevant code is seen as follows, with `read_[un]lock()` on `tasklist_lock`
+    highlighted:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As an aside, in the companion guide *Linux Kernel Programming - Chapter 6, Kernel
+    Internals Essentials* section *Processes and Threads* *Iterating over the task
+    list*, we did something kind of similar: we wrote a kernel module ([https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch6/foreach/thrd_showall/thrd_showall.c](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch6/foreach/thrd_showall/thrd_showall.c))
+    that iterated over all threads in the task list, spewing out a few details about
+    each thread. So, now that we understand the deal regarding concurrency, shouldn''t
+    we have taken this very lock – `tasklist_lock` – the reader-writer spinlock protecting
+    the task list? Yes, but it didn''t work (`insmod(8)` failed with the message `thrd_showall:
+    Unknown symbol tasklist_lock (err -2)`). The reason, of course, is that this `tasklist_lock` variable is
+    *not* exported and thus is unavailable to our kernel module.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As another example of a reader-writer spinlock within the kernel code base,
+    the `ext4` filesystem uses one when working with its extent status tree. We don't
+    intend to delve into the details here; we will simply mention the fact that a
+    reader-writer spinlock (within the inode structure, `inode->i_es_lock`) is quite heavily
+    used here to protect the extent status tree against data races  (`fs/ext4/extents_status.c`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are many such examples within the kernel source tree; many places in the
+    network stack including the ping code (`net/ipv4/ping.c`) use `rwlock_t`, routing
+    table lookup, neighbor, PPP code, filesystems, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just as with regular spinlocks, we have the typical variations on the reader-writer
+    spinlock APIs: `{read,write}_lock_irq{save}()` paired with the corresponding `{read,write}_unlock_irq{restore}()`,
+    as well as the `{read,write}_{un}lock_bh()` interfaces. Note that even the read
+    IRQ lock disables kernel preemption.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A word of caution
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Issues do exist with reader-writer spinlocks. One typical issue with it is
+    that, unfortunately, **writers can starve** when blocking on several readers.
+    Think about it: let''s say that three reader threads currently have the reader-writer
+    lock. Now, a writer comes along wanting the lock. It has to wait until all three
+    readers perform the unlock. But what if, in the interim, more readers come along
+    (which is entirely possible)? This becomes a disaster for the writer, who has
+    to now wait even longer – in effect, starve. (Carefully instrumenting or profiling
+    the code paths involved might be necessary to figure out whether this is indeed
+    the case.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Not only that, *cache effects* – known as cache ping-pong – can and do occur
+    quite often when several reader threads on different CPU cores are reading the
+    same shared state in parallel (while holding the reader-writer lock); we in fact
+    discuss this in the *Cache effects and false sharing* section). The kernel documentation
+    on spinlocks ([https://www.kernel.org/doc/Documentation/locking/spinlocks.txt](https://www.kernel.org/doc/Documentation/locking/spinlocks.txt))
+    says pretty much the same thing. Here''s a quote directly from it: "*NOTE! reader-writer
+    locks require more atomic memory operations than simple spinlocks. Unless the
+    reader critical section is long, you are* *better* *off just using spinlocks*."
+    In fact, the kernel community is working toward removing reader-writer spinlocks
+    as far as is possible, moving them to superior lock-free techniques (such as **RCU
+    - Read Copy Update**, an advanced lock-free technology). Thus, gratuitous use of
+    reader-writer spinlocks is ill advised.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The neat and simple kernel documentation on the usage of spinlocks (written
+    by Linus Torvalds himself), which is well worth reading, is available here: [https://www.kernel.org/doc/Documentation/locking/spinlocks.txt](https://www.kernel.org/doc/Documentation/locking/spinlocks.txt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reader-writer semaphore
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We earlier mentioned the semaphore object ([Chapter 6](f456f2ea-ca5f-4d0f-b9c0-55b9ae92f659.xhtml),
+    *Kernel Synchronization – Part 1*, in the *The semaphore and the mutex* section),
+    contrasting it with the mutex. There, you understood that it's preferable to simply
+    use a mutex. Here, we point out that within the kernel, just as there exist reader-writer
+    spinlocks, so do there exist *reader-writer semaphores*. The use cases and semantics
+    are similar to that of the reader-writer spinlock. The relevant macros/APIs are
+    (within `<linux/rwsem.h>`) `{down,up}_{read,write}_{trylock,killable}()`. A common
+    example within the `struct mm_struct` structure (which is itself within the task
+    structure) is that one of the members is a reader-writer semaphore: `struct rw_semaphore
+    mmap_sem;`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Rounding off this discussion, we'll merely mention a couple of other related
+    synchronization mechanisms within the kernel. A synchronization mechanism that
+    is heavily used in user space application development (we're thinking particularly
+    of the Pthreads framework in Linux user space) is the **Condition Variable** (**CV**). In
+    a nutshell, it provides the ability for two or more threads to synchronize with
+    each other based on the value of a data item or some specific state. Its equivalent
+    within the Linux kernel is called the *completion mechanism*. Please find details
+    on its usage within the kernel documentation at [https://www.kernel.org/doc/html/latest/scheduler/completion.html#completions-wait-for-completion-barrier-apis](https://www.kernel.org/doc/html/latest/scheduler/completion.html#completions-wait-for-completion-barrier-apis).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The *sequence lock* is used in mostly write situations (as opposed to the reader-write
+    spinlock/semaphore locks, which are suitable in mostly read scenarios), where
+    the writes far exceed the reads on the protected variable. As you can imagine,
+    this isn't a very common occurrence; a good example of using sequence locks is
+    the update of the `jiffies_64` global.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the curious, the `jiffies_64` global's update code begins here: `kernel/time/tick-sched.c:tick_do_update_jiffies64()`.
+    This function figures out whether an update to jiffies is required, and if so, calls `do_timer(++ticks);` to
+    actually update it. All the while, the `write_seq[un]lock(&jiffies_lock);` APIs
+    provide protection over the mostly write-critical section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cache effects and false sharing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Modern processors make use of several levels of parallel cache memory within
+    them, in order to provide a very significant speedup when working on memory (we
+    briefly touched upon this in the companion guide *Linux Kernel Programming -* *Chapter
+    8*, *Kernel Memory Allocation for Module Authors – Part 1*, in the *Allocating slab
+    memory* section). We realize that modern CPUs do *not* really read and write RAM
+    directly; no, when the software indicates that a byte of RAM is to be read starting
+    at some address, the CPU actually reads several bytes – a whole **cacheline**
+    of bytes (typically 64 bytes) from the starting address into all the CPU caches
+    (say, L1, L2, and L3: levels 1, 2, and 3). This way, accessing the next few elements
+    of sequential memory results in a tremendous speedup as it''s first checked for in
+    the caches (first in L1, then L2, then L3, and a cache hit becomes likely). The
+    reason it''s (much) faster is simple: accessing CPU cache memory takes typically
+    one to a few (single-digit) nanoseconds, whereas accessing RAM can take anywhere
+    between 50 and 100 nanoseconds (of course, this depends on the hardware system
+    in question and the amount of money you''re willing to shell out!).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Software developers take advantage of such phenomena by doing things such as
+    the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keeping important members of a data structure together (hopefully, within a
+    single cacheline) and at the top of the structure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Padding a structure member such that we don't fall off a cacheline (again, these points
+    have been covered in the companion guide *Linux Kernel Programming -* *Chapter
+    8*, *Kernel Memory Allocation for Module Authors – Part 1*, in the *Data structures
+    – a few design tips* section)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: However, risks are involved and things do go wrong. As an example, consider
+    two variables declared like so: `u16 ax = 1, bx = 2;` (`u16` denotes an unsigned
+    16-bit integer value).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, as they have been declared adjacent to each other, they will, in all likelihood,
+    occupy the same CPU cacheline at runtime. To understand what the issue is, let''s
+    take an example: consider a multicore system with two CPU cores, with each core
+    having two CPU caches, L1 and L2, as well as a common or unified L3 cache. Now, a
+    thread, *T1*, is working on variable `ax` and another thread, *T2*, is concurrently
+    (on another CPU core) working on variable `bx`. So, think about it: when thread
+    *T1*, running on CPU `0`, accesses `ax` from main memory (RAM), its CPU caches
+    will get populated with the current values of `ax` and `bx` (as they fall within
+    the same cacheline!). Similarly, when thread *T2*, running on, say, CPU `1`, accesses
+    `bx` from RAM, its CPU caches will get populated with the current values of both
+    variables as well. *Figure 7.4* conceptually depicts the situation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/7eb6e6e6-512c-4d87-aed2-ca0f146ed57d.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.4 – Conceptual depiction of the CPU cache memory when threads T1 and
+    T2 work in parallel on two adjacent variables, each on a distinct one
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Fine so far; but what if *T1* performs an operation, say, `ax ++`, while concurrently,
+    *T2* performs `bx ++`? Well, so what? (By the way, you might wonder: why aren''t
+    they using a lock? The interesting thing is, it''s quite irrelevant to this discussion;
+    there''s no data race as each thread is accessing a different variable. The issue
+    is with the fact that they''re in the same CPU cacheline.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s the issue: **cache coherency**. The processor and/or the OS in conjunction
+    with the processor (this is all very arch-dependent stuff) will have to keep the
+    caches and RAM synchronized or coherent with each other. Thus, the moment *T1* modifies
+    `ax`, that particular cacheline of CPU `0` will have to be invalidated, that is,
+    a CPU `0`-cache-to-RAM flush of the CPU cacheline will occur to update RAM to
+    the new value, and then immediately, a RAM-to-CPU `1`-cache update must also occur
+    to keep everything coherent!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: But the cacheline contains `bx` as well, and, as we said, `bx` has also been
+    modified on CPU `1` by *T2.* Thus, at about the same time, the CPU `1` cacheline
+    will be flushed to RAM with the new value of `bx` and subsequently updated to
+    CPU `0`'s caches (all the while, the unified L3 cache too will be read from/updated
+    as well). As you can imagine, any updates on these variables will result in a
+    whole lot of traffic over the caches and RAM; they will bounce. In fact, this
+    is often referred to as **cache ping-pong**! This effect is very detrimental,
+    significantly slowing down processing. This phenomenon is known as **false sharing**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Recognizing false sharing is the hard part; we must look for variables living
+    on a shared cacheline that are updated by different contexts (threads or whatever
+    else) simultaneously.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Interestingly, an earlier implementation of a key data structure in the memory
+    management layer, `include/linux/mmzone.h:struct zone`, suffered from this very
+    same false sharing issue: two spinlocks that were declared adjacent to each other!
+    This has long been fixed (we briefly discussed *memory zones* in the companion
+    guide *Linux Kernel Programming -* *Chapter 7*, *Memory Management Internals –
+    Essentials*, in the *Physical RAM organization/zones* section).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How do you fix this false sharing? Easy: just ensure that the variables are
+    spaced far enough apart to guarantee that they *do not share the same cacheline*
+    (dummy padding bytes are often inserted between variables for this purpose). Do
+    refer to the references to false sharing in the *Further reading* section as well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lock-free programming with per-CPU variables
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As you have learned, when operating upon shared writable data, the critical
+    section must be protected in some manner. Locking is perhaps the most common technology
+    used to effect this protection. It''s not all rosy, though, as performance can
+    suffer. To realize why, consider a few analogies to a lock: one would be a funnel,
+    with the stem of the funnel just wide enough to allow one thread at a time to
+    flow through, no more. Another is a single toll booth on a busy highway or a traffic
+    light at a busy intersection. These analogies help us visualize and understand
+    why locking can cause bottlenecks, slowing performance down to a crawl in some
+    drastic cases. Worse, these adverse effects can be multiplied on high-end multicore
+    systems with a few hundred cores; in effect, locking doesn''t scale well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another issue is that of *lock contention*; how often is a particular lock
+    being acquired? Increasing the number of locks within a system has the benefit
+    of lowering the contention for a particular lock between two or more processes
+    (or threads). This is called **lock proficiency**. However, again, this is not
+    scalable to an enormous extent: after a while, having thousands of locks on a
+    system (the case with the Linux kernel, in fact) is not good news – the chances
+    of subtle deadlock conditions arising is multiplied significantly.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, many challenges exist – performance issues, deadlocks, priority inversion
+    risks, convoying (due to lock ordering, fast code paths might need to wait for
+    the first slower one that's taken a lock that the faster ones also require), and
+    so on. Evolving the kernel in a scalable manner a whole level further has mandated
+    the use of *lock-free algorithms* and their implementation within the kernel.
+    These have led to several innovative techniques, among them being per-CPU (PCP)
+    data, lock-free data structures (by design), and RCU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this book, though, we elect to cover only per-CPU as a lock-free programming
+    technique in some detail. The details regarding RCU (and its associated lock-free
+    data structure by design) are beyond this book's scope. Do refer to the *Further
+    reading *section of this chapter for several useful resources on RCU, its meaning,
+    and its usage within the Linux kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Per-CPU variables
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As the name suggests, **per-CPU variables** work by keeping *a copy* of the
+    variable, the data item in question, assigned to each (live) CPU on the system.
+    In effect, we get rid of the problem area for concurrency, the critical section,
+    by avoiding the sharing of data between threads. With the per-CPU data technique,
+    since every CPU refers to its very own copy of the data, a thread running on that
+    processor can manipulate it without any worry of racing. (This is roughly analogous
+    to local variables; as locals are on the private stack of each thread, they aren't
+    shared between threads, thus there's no critical section and no need for locking.)
+    Here, too, the need for locking is thus eliminated – making it a *lock-free *technology!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, think of this: if you are running on a system with four live CPU cores,
+    then a per-CPU variable on that system is essentially an array of four elements:
+    element `0` represents the data value on the first CPU, element `1` the data value
+    on the second CPU core, and so on. Understanding this, you''ll realize that per-CPU
+    variables are also roughly analogous to the user space Pthreads **Thread Local
+    Storage** (**TLS**) implementation where each thread automatically obtains a copy
+    of the (TLS) variable marked with the `__thread` keyword. There, and here with
+    per-CPU variables, it should be obvious: use per-CPU variables for small data
+    items only. This is because the data item is reproduced (copied) with one instance
+    per CPU core (on a high-end system with a few hundred cores, the overheads do
+    climb). We mention some examples of per-CPU usage in the kernel code base (in
+    the *Per-CPU usage within the kernel* section).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, when working with per-CPU variables, you must use the helper methods (macros and
+    APIs) provided by the kernel and not attempt to directly access them (much like
+    we saw with the refcount and atomic operators).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working with per-CPU
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Let's approach the helper APIs and macros (methods) for per-CPU data by dividing
+    the discussion into two portions. First, you will learn how to allocate, initialize,
+    and subsequently free a per-CPU data item. Then, you will learn how to work with
+    (read/write) it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocating, initialization, and freeing per-CPU variables
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'There are broadly two types of per-CPU variables: statically and dynamically
+    allocated ones. Statically allocated per-CPU variables are allocated at compile
+    time itself, typically via one of these macros: `DEFINE_PER_CPU` or `DECLARE_PER_CPU`.
+    Using the `DEFINE` one allows you to allocate and initialize the variable. Here''s
+    an example of allocating a single integer as a per-CPU variable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, on a system with, say, four CPU cores, it would conceptually appear like
+    this at initialization:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/eaad779b-7052-464c-8e37-a11bac841004.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.5 – Conceptual representation of a per-CPU data item on a system with
+    four live CPUs
+  prefs: []
+  type: TYPE_NORMAL
+- en: (The actual implementation is quite a bit more complex than this, of course;
+    please refer to the *Further reading* section of this chapter to see more on the
+    internal implementation.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a nutshell, using per-CPU variables is good for performance enhancement
+    on time-sensitive code paths because of the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We avoid using costly, performance-busting locks.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The access and manipulation of a per-CPU variable is guaranteed to remain on
+    one particular CPU core; this eliminates expensive cache effects such as cache
+    ping-pong and false sharing (covered in the *Cache effects and false sharing* section).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Dynamically allocating per-CPU data can be achieved via the `alloc_percpu()` or
+    `alloc_percpu_gfp()` wrapper macros, simply passing the data type of the object
+    to allocate as per-CPU, and, for the latter, passing along the `gfp` allocation
+    flag as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: The underlying `__alloc_per_cpu[_gfp]()` routines are exported via `EXPORT_SYMBOL_GPL()`
+    (and thus can be employed only when an LKM is released under a GPL-compatible
+    license).
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you've learned, the resource-managed `devm_*()` API variants allow you (typically
+    when writing drivers) to conveniently use these routines to allocate memory; the
+    kernel will take care of freeing it, helping prevent leakage scenarios. The `devm_alloc_percpu(dev,
+    type)` macro allows you to use this as a resource-managed version of `__alloc_percpu()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The memory allocated via the preceding routine(s) must subsequently be freed
+    using the `void free_percpu(void __percpu *__pdata)` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Performing I/O (reads and writes) on per-CPU variables
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'A key question, of course, is how exactly can you access (read) and update
+    (write) to per-CPU variables? The kernel provides several helper routines to do
+    so; let''s take a simple example to understand how. We define a single integer
+    per-CPU variable, and at a later point in time, we want to access and print its
+    current value. You should realize that, being per-CPU, the value retrieved will
+    be auto-calculated *based on the CPU core the code is currently running on*; in
+    other words, if the following code is running on core `1`, then in effect, the
+    `pcpa[1]` value is fetched (it''s not done exactly like this; this is just conceptual):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The pair of `{get,put}_cpu_var()` macros allows us to safely retrieve or modify
+    the per-CPU value of the given per-CPU variable (its parameter). It''s important
+    to understand that the code between `get_cpu_var()` and `put_cpu_var()` (or equivalent)
+    is, in effect, a critical section – an atomic context – *where kernel preemption
+    is disabled and any kind of blocking (or sleeping) is disallowed*. If you do anything
+    here that blocks (sleeps) in any manner, it''s a kernel bug. For example, see
+    what happens if you try to allocate memory via `vmalloc()` within the `get_cpu_var()`/`put_cpu_var()`
+    pair of macros:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: (By the way, calling the `printk()` (or `pr_<foo>()`) wrappers as we do within
+    the critical section is fine as they're non-blocking.) The issue here is that
+    the `vmalloc()` API is possibly a blocking one; it might sleep (we discussed it
+    in detail in the companion guide *Linux Kernel Programming -* *Chapter 9*, *Kernel
+    Memory Allocation for Module Authors – Part 2*, in the *Understanding and using
+    the kernel vmalloc() API *section), and the code between the `get_cpu_var()`/`put_cpu_var()` pair
+    must be atomic and non-blocking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Internally, the `get_cpu_var()` macro invokes `preempt_disable()`, disabling
+    kernel preemption, and `put_cpu_var()` undoes this by invoking `preempt_enable()`.
+    As seen earlier (in the companion guide *Linux Kernel Programming* chapters on
+    *CPU scheduling*), this can be nested and the kernel maintains a `preempt_count` variable
+    to figure out whether kernel preemption is actually enabled or disabled.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The upshot of all this is that you must carefully match the `{get,put}_cpu_var()`
+    macros when using them (for example, if we call the `get` macro twice, we must
+    also call the corresponding `put` macro twice).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `get_cpu_var()` is an *lvalue* and can thus be operated upon; for example,
+    to increment the per-CPU `pcpa` variable, just do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can also (safely) retrieve the current per-CPU value via the macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, to retrieve the per-CPU `pcpa` variable for every CPU core on the system,
+    use the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: FYI, you can always use the `smp_processor_id()` macro to figure out which CPU
+    core you're currently running upon; in fact, this is precisely how our `convenient.h:PRINT_CTX()`
+    macro does it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a similar manner, the kernel provides routines to work with pointers to variables
+    that require to be per-CPU, the `{get,put}_cpu_ptr()` and `per_cpu_ptr()` macros.
+    These macros are heavily employed when working with a per-CPU data structure (as
+    opposed to just a simple integer); we safely retrieve the pointer to the structure
+    of the CPU we're currently running upon, and use it (`per_cpu_ptr()`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Per-CPU – an example kernel module
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A hands-on session with our sample per-CPU demo kernel module will definitely
+    help in using this powerful feature (code here: `ch13/2_percpu`). Here, we define
+    and use two per-CPU variables:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A statically allocated and initialized per-CPU integer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A dynamically allocated per-CPU data structure
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'As an interesting way to help demo per-CPU variables, let''s do this: we shall
+    arrange for our demo kernel module to spawn off a couple of kernel threads. Let''s
+    call them `thrd_0` and `thrd_1`. Furthermore, once created, we shall make use
+    of the CPU mask (and API) to *affine* our `thrd_0` kernel thread on CPU `0` and
+    our `thrd_1` kernel thread on CPU `1` (hence, they will be scheduled to run on
+    only these cores; of course, we must test this code on a VM with at least two
+    CPU cores).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following code snippets illustrate how we define and use the per-CPU variables
+    (we leave out the code that creates the kernel threads and sets up their CPU affinity
+    masks, as they are not relevant to the coverage of this chapter; nevertheless,
+    it''s key to browse through the full code and try it out!):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Why not use the resource-managed `devm_alloc_percpu()` instead? Yes, you should
+    when appropriate; here, though, as we're not writing a proper driver, we don't
+    have a `struct device *dev` pointer handy, which is the required first parameter
+    to `devm_alloc_percpu()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'By the way, I faced an issue when coding this kernel module; to set the CPU
+    mask (to change the CPU affinity for each of our kernel threads), the kernel API
+    is the `sched_setaffinity()` function, which, unfortunately for us, is *not exported*,
+    thus preventing us from using it. So, we perform what is definitely considered
+    a hack: obtain the address of the uncooperative function via `kallsyms_lookup_name()`
+    (which works when `CONFIG_KALLSYMS` is defined) and then invoke it as a function pointer.
+    It works, but is most certainly not the right way to code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our design idea is to create two kernel threads and have each of them differently
+    manipulate the per-CPU data variables. If these were ordinary global variables,
+    this would certainly constitute a critical section and we would of course require
+    a lock; but here, precisely because they are *per-CPU* and because we guarantee
+    that our threads run on separate cores, we can concurrently update them with differing
+    data! Our kernel thread worker routine is as follows; the argument to it is the
+    thread number (`0` or `1`). We accordingly branch off and manipulate the per-CPU
+    data (we have our first kernel thread increment the integer three times, while
+    our second kernel thread decrements it three times):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The effect at runtime is interesting; see the following kernel log:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0d0e4a40-1aa3-497e-b350-ea9980367d31.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.6 – Screenshot showing the kernel log when our ch13/2_percpu/percpu_var
+    LKM runs
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the last three lines of output in *Figure 7.6*, you can see a summary of
+    the values of our per-CPU data variables on CPU `0` and CPU `1` (we show it via
+    our `disp_vars()` function). Clearly, for the per-CPU `pcpa` integer (as well
+    as the `pcp_ctx` data structure), the values are *different* as expected, *without
+    explicit locking*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel module just demonstrated uses the `for_each_online_cpu(i)` macro
+    to display the value of our per-CPU variables on each online CPU. Next, what if
+    you have, say, six CPUs on your VM but want only two of them to be "live" at runtime?
+    There are several ways to arrange this; one is to pass the `maxcpus=n` parameter to
+    the VM''s kernel at boot – you can see if it''s there by looking up `/proc/cmdline`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$ cat /proc/cmdline` `BOOT_IMAGE=/boot/vmlinuz-5.4.0-llkd-dbg root=UUID=1c4<...>
+    ro console=ttyS0,115200n8 console=tty0  quiet splash 3 **maxcpus=2**` Also notice
+    that we''re running on our custom `5.4.0-llkd-dbg` debug kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Per-CPU usage within the kernel
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Per-CPU variables are quite heavily used within the Linux kernel; one interesting
+    case is in the implementation of the `current` macro on the x86 architecture (we
+    covered using the `current` macro in the companion guide *Linux Kernel Programming
+    -* *Chapter 6*, *Kernel Internals Essentials – Processes and Threads*, in the *Accessing
+    the task structure with current* section). The fact is that `current` is looked
+    up (and set) every so often; keeping it as a per-CPU ensures that we keep its
+    access lock-free! Here''s the code that implements it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `DECLARE_PER_CPU()` macro declares the variable named `current_task` as
+    a per-CPU variable of type `struct task_struct *`. The `get_current()` inline
+    function invokes the `this_cpu_read_stable()` helper on this per-CPU variable,
+    thus reading the value of `current` on the CPU core that it''s currently running
+    on (read the comment at [https://elixir.bootlin.com/linux/v5.4/source/arch/x86/include/asm/percpu.h#L383](https://elixir.bootlin.com/linux/v5.4/source/arch/x86/include/asm/percpu.h#L383) to
+    see what this routine''s about). Okay, that''s fine, but an FAQ: where does this `current_task` per-CPU
+    variable get updated? Think about it: the kernel must change (update) `current`
+    *whenever its context switches* to another task.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'That''s exactly the case; it is indeed updated within the context-switching
+    code (`arch/x86/kernel/process_64.c:__switch_to()`; at [https://elixir.bootlin.com/linux/v5.4/source/arch/x86/kernel/process_64.c#L504](https://elixir.bootlin.com/linux/v5.4/source/arch/x86/kernel/process_64.c#L504)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, a quick experiment to show per-CPU usage within the kernel code base
+    via `__alloc_percpu()`: run `cscope -d` in the root of the kernel source tree
+    (this assumes you''ve already built the `cscope` index via `make cscope`). In
+    the `cscope` menu, under the `Find functions calling this function:` prompt, type `__alloc_percpu`.
+    The result is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/73938e5c-c45f-4c4b-a974-213b2c3d03a9.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.7 – (Partial) screenshot of the output of cscope -d showing kernel
+    code that calls the __alloc_percpu() API
+  prefs: []
+  type: TYPE_NORMAL
+- en: This, of course, is just a partial list of per-CPU usage within the kernel code
+    base, tracking only use via the `__alloc_percpu()` underlying API. Searching for
+    functions calling `alloc_percpu[_gfp]()` (wrappers over `__alloc_percpu[_gfp]()`)
+    reveals many more hits.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With this, having completed our discussions on kernel synchronization techniques
+    and APIs, let''s finish this chapter by learning about a key area: tools and tips
+    when debugging locking issues within kernel code!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lock debugging within the kernel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The kernel has several means to help debug difficult situations with regard
+    to kernel-level locking issues, *deadlock* being a primary one.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just in case you haven't already, do ensure you've first read the basics on
+    synchronization, locking, and deadlock guidelines from the previous chapter ([Chapter
+    6](f456f2ea-ca5f-4d0f-b9c0-55b9ae92f659.xhtml), *Kernel Synchronization – Part
+    1*, especially the *Exclusive execution and atomicity* and *Concurrency concerns
+    within the Linux kernel* sections).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With any debug scenario, there are different points at which debugging occurs,
+    and thus perhaps differing tools and techniques that should/could be used. Very
+    broadly speaking, a bug might be noticed at, and thus debugged at, a few different
+    points in time (within the **Software Development Life Cycle** (**SDLC**), really):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: During development
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: After development but before release (testing, **Quality Assurance** (**QA**),
+    and so on)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: After internal release
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: After release, in the field
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'A well-known and unfortunately true homily: the "further" a bug is exposed
+    from development, the costlier it is to fix! So you really do want to try and
+    find and fix them as early as possible!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As this book is focused squarely on kernel development, we shall focus here
+    on a few tools and techniques for debugging locking issues at development time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Important**: We expect that by now, you''re running on a debug kernel, that
+    is, a kernel deliberately configured for development/debug purposes. Performance
+    will take a hit, but that''s okay – we''re out bug hunting now! We covered the
+    configuration of a typical debug kernel in the companion guide *Linux Kernel Programming*
+    *-* Chapter 5, *Writing Your First Kernel Module – LKMs Part 2*, in the *Configuring
+    a debug kernel *section, and have even provided a sample kernel configuration
+    file for debugging here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch5/kconfigs/sample_kconfig_llkd_dbg.config](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch5/kconfigs/sample_kconfig_llkd_dbg.config).
+    Specifics on configuring the debug kernel for lock debugging are in fact covered
+    next.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Configuring a debug kernel for lock debugging
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Due to its relevance and importance to lock debugging, we will take a quick
+    look at a key point from the *Linux Kernel patch submission checklist* document
+    ([https://www.kernel.org/doc/html/v5.4/process/submit-checklist.html](https://www.kernel.org/doc/html/v5.4/process/submit-checklist.html))
+    that''s most relevant to our discussions here, on enabling a debug kernel (especially
+    for lock debugging):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Though not covered in this book, I cannot fail to mention a very powerful dynamic
+    memory error detector called **Kernel Address SANitizer** (**KASAN**). In a nutshell,
+    it uses compile-time instrumentation-based dynamic analysis to catch common memory-related
+    bugs (it works with both GCC and Clang). **ASan** (**Address Sanitizer**), contributed
+    by Google engineers, is used to monitor and detect memory issues in user space
+    apps (covered in some detail and compared with valgrind in the *Hands-On System
+    Programming for Linux* book). The kernel equivalent, KASAN, has been available
+    since the 4.0 kernel for both x86_64 and AArch64 (ARM64, from 4.4 Linux). Details
+    (on enabling and using it) can be found within the kernel documentation ([https://www.kernel.org/doc/html/v5.4/dev-tools/kasan.html#the-kernel-address-sanitizer-kasan](https://www.kernel.org/doc/html/v5.4/dev-tools/kasan.html#the-kernel-address-sanitizer-kasan));
+    I highly recommend you enable it in your debug kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As covered in the companion guide *Linux Kernel Programming -* Chapter 2, *Building
+    the 5.x Linux Kernel from Source – Part 1*, we can configure our Linux kernel
+    specifically for our requirements. Here (within the root of the 5.4.0 kernel source
+    tree), we perform `make menuconfig` and navigate to the `Kernel hacking / Lock
+    Debugging (spinlocks, mutexes, etc...)` menu (see *Figure 7.8*, taken on our x86_64
+    Ubuntu 20.04 LTS guest VM):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/d401a93d-b5fc-4a84-ae7c-3990a73b3500.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.8 – (Truncated) screenshot of the kernel hacking / Lock Debugging (spinlocks,
+    mutexes, etc...) menu with required items enabled for our debug kernel
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Figure 7.8* is a (truncated) screenshot of the ` <Kernel hacking > Lock Debugging
+    (spinlocks, mutexes, etc...)` menu with required items enabled for our debug kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead of interactively having to go through each menu item and selecting the `<Help>` button
+    to see what it's about, a much simpler way to gain the same help information is
+    to peek inside the relevant Kconfig file (that describes the menu). Here, it's
+    `lib/Kconfig.debug`, as all debug-related menus are there. For our particular
+    case, search for the `menu "Lock Debugging (spinlocks, mutexes, etc...)"` string,
+    where the `Lock Debugging` section begins (see the following table).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following table summarizes what each kernel lock debugging configuration
+    option helps debug (we haven''t shown all of them and, for some of them, have
+    directly quoted from the `lib/Kconfig.debug` file):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Lock debugging menu title** | ** What it does** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Lock debugging: prove locking correctness (`CONFIG_PROVE_LOCKING`) | This
+    is the `lockdep` kernel option – turn it on to get rolling proof of lock correctness
+    at all times. Any possibility of locking-related deadlock *is reported even before
+    it actually occurs*; very useful! (Explained shortly in more detail.) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Lock usage statistics (`CONFIG_LOCK_STAT`) | Tracks lock contention points
+    (explained shortly in more detail). |'
+  prefs: []
+  type: TYPE_TB
+- en: '| RT mutex debugging, deadlock detection (`CONFIG_DEBUG_RT_MUTEXES`) | "*This
+    allows rt mutex semantics violations and rt mutex related deadlocks (lockups)
+    to be detected and reported automatically*." |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Spinlock and `rw-lock` debugging: basic checks (`CONFIG_DEBUG_SPINLOCK`)
+    | Turning this on (along with `CONFIG_SMP`) helps catch missing spinlock initialization
+    and other common spinlock errors. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Mutex debugging: basic checks (`CONFIG_DEBUG_MUTEXES`) | "*This feature allows
+    mutex semantics violations to be detected and reported*." |'
+  prefs: []
+  type: TYPE_TB
+- en: '| RW semaphore debugging: basic checks (`CONFIG_DEBUG_RWSEMS`) | Allows mismatched
+    RW semaphore locks and unlocks to be detected and reported. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Lock debugging: detect incorrect freeing of live locks (`CONFIG_DEBUG_LOCK_ALLOC`)
+    | "*This feature will check whether any held lock (spinlock, rwlock, mutex or
+    rwsem) is incorrectly freed by the kernel, via any of the memory-freeing routines*
+    (`kfree(), kmem_cache_free(), free_pages(), vfree()`*, etc.), whether a live lock
+    is incorrectly reinitialized via* `spin_lock_init()/mutex_init()`*/etc., or whether
+    there is any lock held during task exit*." |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Sleep inside atomic section checking (`CONFIG_DEBUG_ATOMIC_SLEEP`) | "*If
+    you say Y here, various routines which may sleep will become very noisy if they
+    are called inside atomic sections: when a spinlock is held, inside an rcu read
+    side critical section, inside preempt disabled sections, inside an interrupt,
+    etc...*" |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Locking API boot-time self-tests (`CONFIG_DEBUG_LOCKING_API_SELFTESTS`) |
+    "*Say Y here if you want the kernel to run a short self-test during bootup. The
+    self-test checks whether common types of locking bugs are detected by debugging
+    mechanisms or not. (if you disable lock debugging then those bugs wont be detected
+    of course.) The following locking APIs are covered: spinlocks, rwlocks,* *mutexes
+    and rwsems*." |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Torture tests for locking (`CONFIG_LOCK_TORTURE_TEST`) | "*This option provides
+    a kernel module that runs torture tests on kernel locking primitives. The kernel
+    module may be built after the fact on the running kernel to be tested, if desired." (Can
+    be built either inline with ''`Y`'' or externally as a module with ''*`M`*'')*."
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: Table 17.4 – Typical kernel lock debugging configuration options and their meaning
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As suggested previously, turning on all or most of these lock debug options
+    within a debug kernel used during development and testing is a good idea. Of course,
+    as expected, doing so might considerably slow down execution (and use more memory);
+    as in life, this is a trade-off you have to decide on: you gain detection of common
+    locking issues, errors, and deadlocks, at the cost of speed. It''s a trade-off
+    you should be more than willing to make, especially when developing (or refactoring)
+    the code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The lock validator lockdep – catching locking issues early
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The Linux kernel has a tremendously useful feature begging to be taken advantage
+    of by kernel developers: a runtime locking correctness or locking dependency validator;
+    in short, **lockdep**. The basic idea is this: the `lockdep` runtime comes into
+    play whenever any locking activity occurs within the kernel – the taking or the
+    release of *any* kernel-level lock, or any locking sequence involving multiple
+    locks.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is tracked or mapped (see the following paragraph for more on the performance
+    impact and how it's mitigated). By applying well-known rules for correct locking
+    (you got a hint of this in the previous chapter in the *Locking guidelines and
+    deadlock* section), `lockdep` then makes a conclusion regarding the validity of
+    the correctness of what was done.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The beauty of it is that `lockdep` achieves 100% mathematical proof (or closure)
+    that a lock sequence is correct or not. The following is a direct quote from the
+    kernel documentation on the topic ([https://www.kernel.org/doc/html/v5.4/locking/lockdep-design.html](https://www.kernel.org/doc/html/v5.4/locking/lockdep-design.html)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"*The validator achieves perfect, mathematical ‘closure’ (proof of locking
+    correctness) in the sense that for every simple, standalone single-task locking
+    sequence that occurred at least once during the lifetime of the kernel, the validator
+    proves it with a 100% certainty that no combination and timing of these locking
+    sequences can cause any class of lock related deadlock.*"'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Furthermore, `lockdep` warns you (by issuing the `WARN*()` macros) of any violation
+    of the following classes of locking bugs: deadlocks/lock inversion scenarios,
+    circular lock dependencies, and hard IRQ/soft IRQ safe/unsafe locking bugs. This
+    information is precious; validating your code with `lockdep` can save hundreds
+    of wasted hours of productivity by catching locking issues early. (FYI, `lockdep`
+    tracks all locks and their locking sequence or "lock chains"; these can be viewed
+    through `/proc/lockdep_chains`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A word on *performance mitigation*: you might well imagine that, with literally
+    thousands or more lock instances floating around, it would be absurdly slow to
+    validate every single lock sequence (yes, in fact, it turns out to be a task of
+    order `O(N^2)` algorithmic time complexity!). This would just not work; so, `lockdep`
+    works by verifying any locking scenario (say, on a certain code path, lock A is
+    taken, then lock B is taken – this is referred to as a *lock sequence* or *lock
+    chain*) **only once**, the very first time it occurs. (It knows this by maintaining
+    a 64-bit hash for every lock chain it encounters.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Primitive user space approaches: A very primitive – and certainly not guaranteed
+    – way to try and detect deadlocks is via user space by simply using GNU `ps(1)`;
+    doing `ps -LA -o state,pid,cmd | grep "^D"` prints any threads in the `D` – *uninterruptible
+    sleep *(`TASK_UNINTERRUPTIBLE`) – state. This could – but may not – be due to
+    a deadlock; if it persists for a long while, chances are higher that it is a deadlock. Give
+    it a try! Of course, `lockdep` is a far superior solution. (Note that this only
+    works with GNU `ps`, not the lightweight ones such as `busybox ps`.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other useful user space tools are `strace(1)` and `ltrace(1)` – they provide
+    a detailed trace of every system and library call, respectively, issued by a process
+    (or thread); you might be able to catch a hung process/thread and see where it
+    got stuck (using `strace -p PID` might be especially useful on a hung process).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The other point that you need to be clear about is this: `lockdep` *will* issue
+    warnings regarding (mathematically) incorrect locking *even if no deadlock actually
+    occurs at runtime*! `lockdep` offers proof that there is indeed an issue that
+    could conceivably cause a bug (deadlock, unsafe locking, and so on) at some point
+    in the future if no corrective action is taken; it''s usually dead right; take
+    it seriously and fix the issue. (Then again, typically, nothing in the software
+    universe is 100% correct 100% of the time: what if a bug creeps into the `lockdep`
+    code itself? There''s even a `CONFIG_DEBUG_LOCKDEP` config option. The bottom line
+    is that we, the human developers, must carefully assess the situation, checking
+    for false positives.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, `lockdep` works upon a *lock class*; this is simply a "logical" lock as
+    opposed to "physical" instances of that lock. For example, the kernel's open file
+    data structure, `struct file`, has two locks – a mutex and a spinlock – and each
+    of them is considered a lock class by `lockdep`. Even if a few thousand instances
+    of `struct file` exist in memory at runtime, `lockdep` will track it as a class
+    only. For more detail on `lockdep`'s internal design, we refer you to the official
+    kernel documentation on it ([https://www.kernel.org/doc/html/v5.4/locking/lockdep-design.html](https://www.kernel.org/doc/html/v5.4/locking/lockdep-design.html)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examples – catching deadlock bugs with lockdep
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Here, we shall assume that you''ve by now built and are running upon a debug
+    kernel with `lockdep` enabled (as described in detail in the *Configuring a debug
+    kernel for lock debugging* section). Verify that it is indeed enabled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: Okay, good! Now, let's get hands-on with some deadlocks, seeing how `lockdep`
+    will help you catch them. Read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Example 1 – catching a self deadlock bug with lockdep
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As a first example, let''s travel back to one of our kernel modules from the
+    companion guide *Linux Kernel Programming -* *Chapter 6*, *Kernel Internals Essentials
+    – Processes and Threads*, in the *Iterating over the task list* section, here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch6/foreach/thrd_showall/thrd_showall.c](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/ch6/foreach/thrd_showall/thrd_showall.c).
+    Here, we looped over each thread, printing some details from within its task structure;
+    with regard to this, here''s a code snippet where we obtain the name of the thread
+    (recall that it''s in a member of the task structure called `comm`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This works, but there appears to be a better way to do it: instead of directly
+    looking up the thread''s name with `t->comm` (as we do here), the kernel provides
+    the `{get,set}_task_comm()` helper routines to both get and set the name of the
+    task. So, we rewrite the code to use the `get_task_comm()` helper macro; the first
+    parameter to it is the buffer to place the name into (it''s expected that you''ve
+    allocated memory to it), and the second parameter is the pointer to the task structure
+    of the thread whose name you are querying (the following code snippet is from
+    here: `ch13/3_lockdep/buggy_thrdshow_eg/thrd_showall_buggy.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: When compiled and inserted into the kernel on our test system (a VM, thank goodness),
+    it can get weird, or even just simply hang! (When I did this, I was able to retrieve
+    the kernel log via `dmesg(1)` before the system became completely unresponsive.).
+  prefs: []
+  type: TYPE_NORMAL
+- en: What if your system just hangs upon insertion of this LKM? Well, that's a taste
+    of the difficulty of kernel debugging! One thing you can try (which worked for
+    me when trying this very example on a x86_64 Fedora 29 VM) is to reboot the hung
+    VM and look up the kernel log by leveraging systemd's powerful `journalctl(1)`
+    utility with the `journalctl --since="1 hour ago"` command; you should be able
+    to see the printks from `lockdep` now. Again, unfortunately, it's not guaranteed
+    that the key portion of the kernel log is saved to disk (at the time it hung)
+    for `journalctl` to be able to retrieve. This is why using the kernel's **kdump**
+    feature – and then performing postmortem analysis of the kernel dump image file
+    with `crash(8)` – can be a lifesaver (see resources on using `kdump` and crash
+    in the *Further reading *section for this chapter).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Glancing at the kernel log, it becomes clear: `lockdep` has caught a (self)
+    deadlock (we show relevant parts of the output in the screenshot):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/adff4dda-3a9e-4c92-9c57-db9a988a0872.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.9 – (Partial) screenshot showing the kernel log after our buggy module
+    is loaded; lockdep catches the self deadlock!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though a lot more detail follows (including the stack backtrace of the kernel
+    stack of `insmod(8)` – as it was the process context, in this case, register values, and
+    so on), what we see in the preceding figure is sufficient to deduce what happened.
+    Clearly, `lockdep` tells us `insmod/2367 is trying to acquire lock:`, followed
+    by `but task is already holding lock:`. Next (look carefully at *Figure 7.9*),
+    the lock that `insmod` is holding is `(p->alloc_lock)` (for now, ignore what follows
+    it; we will explain it shortly) and the routine that actually attempts to acquire
+    it (shown after `at:`) is `__get_task_comm+0x28/0x50`. Now, we''re getting somewhere:
+    let''s figure out what exactly occurred when we called `get_task_comm()`; we find
+    that it''s a macro, a wrapper around the actual worker routine, `__get_task_comm()`.
+    Its code is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Ah, there''s the problem: the `__get_task_comm()` function *attempts to reacquire
+    the very same lock that we''re already holding, causing (self) deadlock*! Where
+    did we acquire it? Recall that the very first line of code in our (buggy) kernel
+    module after entering the loop is where we call `task_lock(t)`, and then just
+    a few lines later, we invoke `get_task_comm()`, which internally attempts to reacquire
+    the very same lock: the result is *self deadlock*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Furthermore, finding which particular lock this is easy; look up the code of
+    the `task_lock()` routine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, it all makes sense now; it's a spinlock within the task structure named `alloc_lock`,
+    just as `lockdep` informs us.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`lockdep`''s report has some amount of puzzling notations. Take the following
+    lines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Ignoring the timestamp, the number in the leftmost column of the second line
+    seen in the preceding code block is the 64-bit lightweight hash value used to
+    identify this particular lock sequence. Notice it''s precisely the same as the
+    hash in the following line; so, we know it''s the very same lock being acted upon!
+    `{+.+.}` is lockdep''s notation for what state this lock was acquired in (the
+    meaning: `+` implies lock acquired with IRQs enabled, `.` implies lock acquired
+    with IRQs disabled and not in the IRQ context, and so on). These are explained
+    in the kernel documentation ([https://www.kernel.org/doc/Documentation/locking/lockdep-design.txt](https://www.kernel.org/doc/Documentation/locking/lockdep-design.txt));
+    we''ll leave it at that.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A detailed presentation on interpreting `lockdep` output was given by Steve
+    Rostedt at a Linux Plumber''s Conference (back in 2011); the relevant slides are
+    informative, exploring both simple and complex deadlock scenarios and how `lockdep`
+    can detect them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Lockdep: How to read its cryptic output* ([https://blog.linuxplumbersconf.org/2011/ocw/sessions/153](https://blog.linuxplumbersconf.org/2011/ocw/sessions/153)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fixing it
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Now that we understand the issue here, how do we fix it? Seeing lockdep''s
+    report (*Figure 7.9*) and interpreting it, it''s quite simple: (as mentioned)
+    since the task structure spinlock named `alloc_lock` is already taken at the start
+    of the `do-while` loop (via `task_lock(t)`), ensure that before calling the `get_task_comm()`
+    routine (which internally takes and releases this same lock), you unlock it, then
+    perform `get_task_comm()`, then lock it again.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot (*Figure 7.10*) shows the difference (via the `diff(1)` utility)
+    between the older buggy version (`ch13/3_lockdep/buggy_thrdshow_eg/thrd_showall_buggy.c`)
+    and the newer fixed version of our code (`ch13/3_lockdep/fixed_lockdep/thrd_showall_fixed.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/a0ceead6-e333-44c6-81a6-cab46b8a29fe.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.10 – (Partial) screenshot showing the key part of the difference between
+    the buggy and fixed versions of our demo thrdshow LKM
+  prefs: []
+  type: TYPE_NORMAL
+- en: Great; another example follows – that of catching an AB-BA deadlock!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Example 2 – catching an AB-BA deadlock with lockdep
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As one more example, let''s check out a (demo) kernel module that quite deliberately
+    creates a **circular dependency**, which will ultimately result in a deadlock.
+    The code is here: `ch13/3_lockdep/deadlock_eg_AB-BA`. We''ve based this module
+    on our earlier one (`ch13/2_percpu`); as you''ll recall, we create two kernel
+    threads and ensure (by using a hacked `sched_setaffinity()`) that each kernel
+    thread runs on a unique CPU core (the first kernel thread on CPU core `0` and
+    the second on core `1`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This way, we have concurrency. Now, within the threads, we have them work with
+    two spinlocks, `lockA` and `lockB`. Understanding that we have a process context
+    with two or more locks, we document and follow a lock ordering rule: *first take
+    lockA, then lockB*. Great; so, one way it should *not* be done is like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This, of course, is the classic AB-BA deadlock! Because the program (*kernel
+    thread 1*, actually) ignored the lock ordering rule (when the `lock_ooo` module
+    parameter is set to `1`), it deadlocks. Here''s the relevant code (we haven''t
+    bothered showing the whole program here; please clone this book''s GitHub repository
+    at [https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming) and
+    try it out yourself):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Our kernel thread `0` does it correctly, following the lock ordering rule;
+    the code relevant to our kernel thread `1` (continued from the previous code)
+    is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Build and run it with the `lock_ooo` kernel module parameter set to `0` (the
+    default); we find that, obeying the lock ordering rule, all is well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, we run it with the `lock_ooo` kernel module parameter set to `1` and find
+    that, as expected, the system locks up! We''ve disobeyed the lock ordering rule,
+    and we pay the price as the system deadlocks! This time, rebooting the VM and
+    doing `journalctl --since="10 min ago"` got me lockdep''s report:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `lockdep` report is quite amazing. Check out the lines after the sentence
+    `Possible unsafe locking scenario:`; it pretty much precisely shows what actually
+    occurred at runtime – the **out-of-order** (**ooo**) locking sequence on `CPU1
+    : lock(lockB); --> lock(lockA);`! Since `lockA` is already taken by the kernel
+    thread on CPU `0`, the kernel thread on CPU `1` spins forever – the root cause
+    of this AB-BA deadlock.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Furthermore, quite interestingly, soon after module insertion (with `lock_ooo`
+    set to `1`), the kernel also detected a soft lockup bug. The printk is directed
+    to our console at log level `KERN_EMERG`, allowing us to see this even though
+    the system appears to be hung. It even shows the relevant kernel threads where
+    the issue originated (again, this output is on my x86_64 Ubuntu 20.04 LTS VM running
+    the custom 5.4.0 debug kernel):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: (FYI, the code that detected this and spewed out the preceding messages is here: `kernel/watchdog.c:watchdog_timer_fn()`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One additional note: the `/proc/lockdep_chains` output also "proves" the incorrect
+    locking sequence was taken (or exists):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: Also, recall that `lockdep` reports only once – the first time – that a lock
+    rule on any kernel lock is violated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: lockdep – annotations and issues
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Let's wrap up this coverage with a couple more points on the powerful `lockdep`
+    infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: lockdep annotations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In user space, you will be familiar with using the very useful `assert()` macro.
+    There, you assert a Boolean expression, a condition (for example, `assert(p ==
+    5);`). If the assertion is true at runtime, nothing happens and execution continues;
+    when the assertion is false, the process is aborted and a noisy `printf()` to
+    `stderr` indicates which assertion and where it failed. This allows developers
+    to check for runtime conditions that they expect. Thus, assertions can be very
+    valuable – they help catch bugs!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a similar manner, `lockdep` allows the kernel developer to assert that a
+    lock is held at a particular point, via the `lockdep_assert_held()` macro. This
+    is called a **lockdep annotation**. The macro definition is displayed here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: The assertion failing results in a warning (via `WARN_ON()`). This is very valuable
+    as it implies that though that lock `l` is supposed to be held now, it really
+    isn't. Also notice that these assertions only come into play when lock debugging
+    is enabled (this is the default when lock debugging is enabled within the kernel;
+    it only gets turned off when an error occurs within `lockdep` or the other kernel
+    locking infrastructure). The kernel code base, in fact, uses `lockdep` annotations
+    all over the place, both in the core as well as the driver code. (There are a
+    few variations on the `lockdep` assertion of the form `lockdep_assert_held*()`
+    as well as the rarely used `lockdep_*pin_lock()` macros.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: lockdep issues
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A couple of issues can arise when working with `lockdep`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Repeated module loading and unloading can cause `lockdep`'s internal lock class
+    limit to be exceeded (the reason, as explained within the kernel documentation,
+    is that loading a `x.ko` kernel module creates a new set of lock classes for all
+    its locks, while unloading `x.ko` does not remove them; it's actually reused).
+    In effect, either don't repeatedly load/unload modules or reset the system.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Especially in those cases where a data structure has an enormous number of locks
+    (such as an array of structures), failing to properly initialize every single
+    lock can result in `lockdep` lock-class overflow.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `debug_locks` integer is set to `0` whenever lock debugging is disabled
+    (even on a debug kernel); this can result in this message showing up: `*WARNING*
+    lock debugging disabled!! - possibly due to a lockdep warning`. This could even
+    happen due to `lockdep` issuing warnings earlier. Reboot your system and retry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though this book is based on the 5.4 LTS kernel, a powerful feature was (very
+    recently as of the time of writing) merged into the 5.8 kernel: the **Kernel Concurrency
+    Sanitizer** (**KCSAN**). It''s a data race detector for the Linux kernel that
+    works via compile-time instrumentation. You can find more details in these LWN
+    articles: *Finding race conditions with KCSAN*, LWN, October 2019 ([https://lwn.net/Articles/802128/](https://lwn.net/Articles/802128/))
+    and *Concurrency bugs should fear the big bad data-race detector (part 1)*, LWN,
+    April 2020 ([https://lwn.net/Articles/816850/](https://lwn.net/Articles/816850/)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, FYI, several tools do exist for catching locking bugs and deadlocks in *user
+    space apps*. Among them are the well-known `helgrind` (from the Valgrind suite),
+    **TSan** (**Thread Sanitizer**), which provides compile-time instrumentation to
+    check for data races in multithreaded applications, and lockdep itself; lockdep
+    can be made to work in user space as well (as a library)! Moreover, the modern
+    [e]BPF framework provides the `deadlock-bpfcc(8)` frontend. It's designed specifically
+    to find potential deadlocks (lock order inversions) in a given running process
+    (or thread).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lock statistics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A lock can be *contended*, which is when, a context wants to acquire the lock
+    but it has already been taken, so it must wait for the unlock to occur. Heavy
+    contention can create severe performance bottlenecks; the kernel provides lock
+    statistics with a view *to easily identifying heavily contended locks*. Enable
+    lock statistics by turning on the `CONFIG_LOCK_STAT` kernel configuration option (without
+    this, the `/proc/lock_stat` entry will not be present, the typical case on most
+    distribution kernels).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The lock stats code takes advantage of the fact that `lockdep` inserts hooks
+    into the locking code path (the `__contended`, `__acquired`, and `__released`
+    hooks) to gather statistics at these crucial points. The neatly written kernel
+    documentation on lock statistics ([https://www.kernel.org/doc/html/latest/locking/lockstat.html#lock-statistics](https://www.kernel.org/doc/html/latest/locking/lockstat.html#lock-statistics))
+    conveys this information (and a lot more) with a useful state diagram; do look
+    it up.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing lock stats
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'A few quick tips and essential commands to view lock statistics are as follows
+    (this assumes, of course, that `CONFIG_LOCK_STAT` is on):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Do what?** | **Command** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Clear lock stats | `sudo sh -c "echo 0 > /proc/lock_stat"` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Enable lock stats | `sudo sh -c "echo 1 > /proc/sys/kernel/lock_stat"` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Disable lock stats | `sudo sh -c "echo 0 > /proc/sys/kernel/lock_stat"` |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Next, a simple demo to see locking statistics: we write a very simple Bash
+    script, `ch13/3_lockdep/lock_stats_demo.sh` (check out its code in this book''s
+    GitHub repo). It clears and enables locking statistics, then simply runs the `cat
+    /proc/self/cmdline` command. This will actually trigger a chain of code to run
+    deep within the kernel (within `fs/proc` mostly); several global – shared writable
+    – data structures will need to be looked up. This will constitute a critical section
+    and thus locks will be acquired. Our script will disable lock stats, and then
+    grep the locking statistics to see a few locks, filtering out the rest:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On running it, the output we obtained is as follows (again, on our x86_64 Ubuntu
+    20.04 LTS VM running our custom 5.4.0 debug kernel):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/20d96e77-c316-468f-b4d2-5eb8cd5cb015.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7.11 – Screenshot showing our lock_stats_demo.sh script running, displaying
+    some of the lock statistics
+  prefs: []
+  type: TYPE_NORMAL
+- en: '(The output in *Figure 7.11* is pretty long horizontally and thus wraps.) The
+    time displayed is in microseconds. The `class name` field is the lock class; we
+    can see several locks associated with the task and memory structures (`task_struct`
+    and `mm_struct`)! Instead of duplicating the material, we refer you to the kernel documentation
+    on lock statistics, which explains each of the preceding fields (`con-bounces`,
+    `waittime*`, and so on; hint: `con` is short for contended) and how to interpret
+    the output. As expected, see, in *Figure 7.11*, in this simple case, the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first field, `class_name`, is the lock class; the (symbolic) name of the
+    lock is seen here.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There's really no contention for locks (fields 2 and 3).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The wait times (`waittime*`, fields 3 to 6) are 0.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `acquisitions` field (#9) is the total number of times the lock was acquired
+    (taken); it's positive (and even goes to over 300 for mm_struct semaphore `&mm->mmap_sem*`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The last four fields, 10 to 13, are the cumulative lock hold time statistics
+    (`holdtime-{min|max|total|avg}`). Again, here, you can see that mm_struct `mmap_sem*` locks
+    have the longest average hold time.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: (Notice the task structure's spinlock named `alloc_lock` is taken as well; we
+    came across it in the *Example 1 – catching a self deadlock bug with lockdep* section).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The most contended locks on the system can be looked up via `sudo grep ":" /proc/lock_stat
+    | head`. Of course, you should realize that this is from when the locking statistics
+    were last reset (cleared).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that lock statistics can get disabled due to lock debugging being disabled;
+    for example, you might come across this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: This warning might necessitate you rebooting the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: All right, you're almost there! Let's finish this chapter with some brief coverage
+    of memory barriers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory barriers – an introduction
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Last but not least, let's briefly address another concern – that of the **memory
+    barrier**. What does it mean? Sometimes, a program flow becomes unknown to the
+    human programmer as the microprocessor, the memory controllers, and the compiler *can
+    reorder* memory reads and writes. In the majority of cases, these "tricks" remain
+    benign and optimized. But there are cases – typically across hardware boundaries,
+    such as CPU cores on multicore systems, CPU to peripheral device, and vice versa
+    on **UniProcessor** (**UP**) – where this reordering *should not occur*; the original
+    and intended memory load and store sequences must be honored. The *memory barrier* (typically
+    machine-level instructions embedded within the `*mb*()` macros) is a means to
+    suppress such reordering; it's a way to force both the CPU/memory controllers
+    and the compiler to order instruction/data in a desired sequence.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Memory barriers can be placed into the code path by using the following macros: `#include
+    <asm/barrier.h>`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`rmb()`: Inserts a read (or load) memory barrier into the instruction stream'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`wmb()`: Inserts a write (or store) memory barrier into the instruction stream'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`mb()`: A general memory barrier; quoting directly from the kernel documentation
+    on memory barriers ([https://www.kernel.org/doc/Documentation/memory-barriers.txt](https://www.kernel.org/doc/Documentation/memory-barriers.txt)), "*A
+    general memory barrier gives a guarantee that all the LOAD and STORE operations
+    specified before the barrier will appear to happen before all the LOAD and STORE
+    operations specified after the barrier with respect to the other components of
+    the system*."'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The memory barrier ensures that unless the preceding instruction or data access
+    executes, the following ones will not, thus maintaining the ordering. On some
+    (rare) occasions, DMA being the likely one, driver authors use memory barriers.
+    When using DMA, it's important to read the kernel documentation ([https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt](https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt)).
+    It mentions where memory barriers are to be used and the perils of not using them;
+    see the example that follows for more on this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As the placement of memory barriers is typically a fairly perplexing thing to
+    get right for many of us, we urge you to refer to the relevant technical reference
+    manual for the processor or peripheral you're writing a driver for, for more details.
+    For example, on the Raspberry Pi, the SoC is the Broadcom BCM2835 series; referring
+    to its peripherals manual – the *BCM2835 ARM Peripherals* manual ([https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf](https://www.raspberrypi.org/app/uploads/2012/02/BCM2835-ARM-Peripherals.pdf)), section 1.3,
+    *Peripheral access precautions for correct memory ordering* – is helpful to sort
+    out when and when not to use memory barriers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An example of using memory barriers in a device driver
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As one example, take the Realtek 8139 "fast Ethernet" network driver. In order
+    to transmit a network packet via DMA, it must first set up a DMA (transmit) descriptor
+    object. For this particular hardware (NIC chip), the DMA descriptor object is
+    defined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The DMA descriptor object, christened `struct cp_desc`, has three "words."
+    Each of them has to be initialized. Now, to ensure that the descriptor is correctly
+    interpreted by the DMA controller, it''s often critical that the writes to the
+    DMA descriptor are seen in the same order as the driver author intends. To guarantee
+    this, memory barriers are used. In fact, the relevant kernel documentation – the
+    *Dynamic DMA mapping Guide* ([https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt](https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt))
+    – tells us to ensure that this is indeed the case. So, for example, when setting
+    up the DMA descriptor, you must code it as follows to get correct behavior on
+    all platforms:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Thus, check out how the DMA transmit descriptor is set up in practice (by the
+    Realtek 8139 driver code, as follows):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: The driver, acting upon what the chip's datasheet requires, requires that the
+    words `txd->opts2` and `txd->addr` are stored to memory, followed by the storage
+    of the `txd->opts1` word. As *the order in which these writes go through is important*, the
+    driver makes use of the `wmb()` write memory barrier. (Also, FYI, RCU is certainly
+    a user of appropriate memory barriers to enforce memory ordering.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Furthermore, using the `READ_ONCE()` and `WRITE_ONCE()` macros on individual
+    variables *absolutely guarantees that the compiler and the CPU will do what you
+    mean*. It will preclude compiler optimizations as required, use memory barriers
+    as required, and guarantee cache coherency when multiple threads on different
+    cores simultaneously access the variable in question.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For details, do refer to the kernel documentation on memory barriers ([https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt](https://www.kernel.org/doc/Documentation/DMA-API-HOWTO.txt)).
+    It has a detailed section entitled *WHERE ARE MEMORY BARRIERS NEEDED?*. The good
+    news is that it's mostly taken care of under the hood; for a driver author, it's
+    only when performing operations such as setting up DMA descriptors or initiating
+    and ending CPU-to-peripheral (and vice versa) communication that you might require
+    a barrier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One last thing – an (unfortunate) FAQ: will using the `volatile` keyword magically
+    make concurrency concerns disappear? Of course not. The `volatile` keyword merely
+    instructs the compiler to disable common optimizations around that variable (things
+    outside this code path could also modify the variable marked as `volatile`), that''s
+    all. This is often required and useful when working with MMIO. With regard to
+    memory barriers, interestingly, the compiler won''t reorder reads or writes on
+    a variable marked as `volatile` with respect to other volatile variables. Still,
+    atomicity is a separate construct, *not* guaranteed by using the `volatile` keyword.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Well, what do you know!? Congratulations, you have done it, you have completed
+    this book!
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we continued from the previous chapter in our quest to learn
+    more about kernel synchronization. Here, you learned how to more efficiently and
+    safely perform locking on integers, via both `atomic_t` and the newer `refcount_t`
+    interface. Within this, you learned how the typical RMW sequence can be atomically
+    and safely employed in a common activity for driver authors – updating a device's
+    registers. The reader-writer spinlock, interesting and useful, though with several
+    caveats, was then covered. You saw how easy it is to mistakenly create adverse
+    performance issues caused by unfortunate caching side effects, including looking
+    at the false sharing problem and how to avoid it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A boon to developers – lock-free algorithms and programming techniques – was
+    then covered in some detail, with a focus on per-CPU variables within the Linux
+    kernel. It's important to learn how to use these carefully (especially the more
+    advanced forms such as RCU). Finally, you learned what memory barriers are and
+    where they are typically used.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Your long journey in working within the Linux kernel (and related areas, such
+    as device drivers) has begun in earnest now. Do realize, though, that without
+    constant hands-on practice and actually working on these materials, the fruits
+    quickly fade away... I urge you to stay in touch with these topics and others.
+    As you grow in knowledge and experience, contributing to the Linux kernel (or
+    any open source project for that matter) is a noble endeavor, one you would do
+    well to undertake.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As we conclude, here is a list of questions for you to test your knowledge regarding
+    this chapter's material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book's GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

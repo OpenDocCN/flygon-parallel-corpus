@@ -1,0 +1,3786 @@
+- en: Handling Hardware Interrupts
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we''ll focus on a really key aspect of writing a device driver:
+    what hardware interrupts are and, more importantly, how exactly you, as a driver
+    author, handle them. The fact is, a large percentage of peripherals (that you''re
+    interested in writing a device driver for) indicate their need for immediate action
+    via the OS or driver by asserting a hardware interrupt. This is, in effect, an
+    electrical signal that ultimately alerts the processor''s control unit (typically,
+    this alert must redirect control to the affected peripheral''s interrupt handler
+    routine as it requires immediate attention).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To handle these kinds of interrupts, you need to understand some of the fundamentals
+    of how they work; that is, how the OS handles them and, most importantly, how
+    you as a driver author are expected to work with them. An additional layer of
+    complexity is added by the fact that Linux, being a VM-based rich OS, requires
+    and uses some abstraction in the way it works with interrupts. So, you will begin
+    by learning about the (very) basic workflow regarding how to handle a hardware
+    interrupt. Then, we will look at the topics that a driver author like yourself
+    will be primarily interested in: how exactly to allocate an IRQ and write the
+    code of the handler routine itself – there are some very specific dos and don''ts!
+    We will then cover the motivation behind and the usage of the newer threaded interrupt
+    model, enabling/disabling specific IRQs, viewing information about IRQ lines via
+    proc, and what top and bottom halves are for and how to use them. We''ll finish
+    this chapter by answering a few FAQs on interrupt handling.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hardware interrupts and how the kernel handles them
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Allocating the hardware IRQ
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implementing the interrupt handler routine
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Working with the threaded interrupts model
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Enabling and disabling IRQs
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Viewing all allocated interrupt (IRQ) lines
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using top and bottom halves
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A few remaining FAQs answered
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's get started!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'This chapter assumes that you''ve gone through the *Preface* section *To get
+    the most out of this book* and have appropriately prepared a guest VM running
+    Ubuntu 18.04 LTS (or a later stable release) and installed all the required packages.
+    If not, I highly recommend you do this first. To get the most out of this book,
+    I strongly recommend you first set up the workspace environment, including cloning
+    this book''s GitHub repository for the code, and work on it in a hands-on fashion.
+    The repository can be found here: [https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2](https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/tree/main/ch4).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hardware interrupts and how the kernel handles them
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Many, if not most, peripheral controllers use a hardware interrupt to inform
+    the OS or device driver that some (usually urgent) action is required. Typical
+    examples include network adapters (NICs), block devices (disks), USB devices,
+    AV devices, **human interface devices** (**HIDs**) such as keyboards, mice, touchscreens,
+    and video screens, clocks/timer chips, DMA controllers, and so on. The primary
+    idea behind hardware interrupts is efficiency. Instead of continually polling
+    the chip (on a battery-backed device, this can result in rapidly draining the
+    battery!), the interrupt is a means to have the low-level software run only as
+    and when required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s a quick hardware-level overview (without getting into too much detail):
+    modern system motherboards will have an interrupt controller chip of some sort,
+    which is often called the **[IO][A]PIC**, short for **IO-[Advanced] Programmable
+    Interrupt Controller**, on x86 (the kernel documents for the x86 IO-APIC can be
+    found at [https://www.kernel.org/doc/html/latest/x86/i386/IO-APIC.html#io-apic](https://www.kernel.org/doc/html/latest/x86/i386/IO-APIC.html#io-apic))
+    or a **generic interrupt controller** (**GIC**) on ARM. The PIC (to keep it simple,
+    we''ll just use the generic term PIC) has one line to the CPU''s interrupt pin.
+    Onboard peripherals capable of asserting interrupts will have an IRQ line to the
+    PIC.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**IRQ **is the common abbreviated term for **Interrupt ReQuest***; *it denotes
+    the interrupt line (or lines) that''s allocated to a peripheral device.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s say that the peripheral device in question is a network adapter (a NIC)
+    and a network packet is received. The (highly simplified) flow is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The peripheral device (the NIC) now needs to emit (assert) a hardware interrupt;
+    thus, it asserts its line on the PIC (low or high logic as required; all this
+    is internal to the hardware).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The PIC, on seeing that a peripheral line has been asserted, saves the asserted
+    line value in a register.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The PIC then asserts the CPU's interrupt pin.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The control unit on the processor checks for the presence of hardware interrupts
+    on every CPU after every single machine instruction runs. Thus, if a hardware
+    interrupt occurs, it will certainly come to know about it almost immediately.
+    The CPU will then raise a hardware interrupt (of course interrupts can be masked;
+    we'll discuss this in more detail later in the *Enabling and disabling IRQs* section).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The low-level (BSP/platform) code on the OS will be hooked into this and will
+    react (this is often code that's at the assembly level); for example, on the ARM-32,
+    the low-level C entry point for a hardware interrupt is `arch/arm/kernel/irq.c:asm_do_IRQ()`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: From here, the OS executes code paths that ultimately invoke the registered
+    interrupt handler routine(s) of the driver(s) this interrupt is to be serviced
+    by. (Again, it's not our intention to focus on the hardware layer and even the
+    arch-specific platform-level details of hardware interrupts in this chapter. I'd
+    like to focus on what's of relevance to you as the driver author – how to handle
+    them!).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'The hardware interrupt is literally the top priority on the Linux OS: it preempts
+    whatever''s currently running – be it user or kernel-space code paths – in order
+    to run. Having said that, later, we will see that on modern Linux kernels, it''s
+    possible to employ a threaded interrupt model that changes things; a little patience
+    please – we''ll get there!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's digress. We mentioned an example of a typical peripheral device,
+    a network controller (or NIC), and have essentially said that it services packet
+    transmission and reception (Tx/Rx) via hardware interrupts. This used to be true,
+    but this isn't always the case with modern high-speed NICs (typically 10 Gbps
+    and higher). Why? The answer is interesting: the extreme speed at which interrupts
+    will literally interrupt the processor can cause the system to land in a problematic situation
+    called **livelock**;a situation where it cannot cope with the extremely high interrupt
+    demand! As with deadlocks (covered in [Chapter 6](f456f2ea-ca5f-4d0f-b9c0-55b9ae92f659.xhtml),
+    *Kernel Synchronization – Part 1*), the system effectively tends to freeze or
+    hang. So, what do we do regarding livelock? Most high-end modern NICs support
+    a polled-mode of operation; modern OSes such as Linux have a network receive path
+    infrastructure called **NAPI** (it's nothing to do with babies, mind you – it's short
+    for **New API**) that allows the driver to switch between interrupt and polled
+    mode based on demand and hence process network packets (on the receive path) more
+    efficiently.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we've introduced hardware interrupts, let's learn how you, as a driver
+    author, can work with them. Most of the remaining sections in this chapter will
+    deal with this. Let's start by learning how to allocate or register an IRQ line.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocating the hardware IRQ
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Often, a key part of writing a device driver is really the work of trapping
+    into and handling the hardware interrupt that the chip you're writing the driver
+    for emits. How do you do this? The trouble is that the way that hardware interrupts
+    are routed from the interrupt controller chip(s) to the CPU(s) varies widely;
+    it is very platform-specific. The good news is that the Linux kernel provides
+    an abstraction layer to abstract away all the hardware-level differences; it's
+    referred to as the **generic interrupt (or IRQ) handling layer**. Essentially,
+    it performs the required work under the hood and exposes APIs and data structures
+    that are completely generic. Thus, at least theoretically, your code will work
+    on any platform. This **generic IRQ layer** is what we, primarily as driver authors,
+    shall be using, of course; all the APIs and helper routines we use fall into this
+    category.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Recall that it''s really the core kernel that, at least initially, handles
+    the interrupt (as we learned in the previous section). It then refers to an array
+    of linked lists (a very common data structure on Linux; here, the index to the
+    array is the IRQ number) to figure out the driver-level function(s) to invoke.
+    (Without going into too much detail, the node on the lists is the IRQ descriptor
+    structure; that is, `include/linux/interrupt.h:struct irqaction`.) But how do
+    you get your driver''s interrupt handler function onto this list so that the kernel
+    can invoke it when an interrupt from your device occurs? Ah, that''s the key: you
+    register it with the kernel. Modern Linux provides at least four ways (APIs) via
+    which you can register interest in an interrupt line, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`request_irq()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`devm_request_irq()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`request_threaded_irq()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`devm_request_threaded_irq()` (recommended!)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's tackle them one by one (there are additional routines that are slight
+    variations of them). Along the way, we'll look at some code from a few drivers
+    and learn how to work with threaded interrupts. There's a lot to learn and do;
+    let's get on with it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocating your interrupt handler with request_irq()
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Just as we saw with I/O memory and I/O ports, the IRQ line(s) is considered
+    a **resource** that the kernel is in charge of. The `request_irq()` kernel API
+    can be thought of as the traditional means by which driver authors register their
+    interest in an IRQ and allocate this resource to themselves, thus allowing the
+    kernel to invoke their handler when the interrupt asynchronously  arrives.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It might strike you that this discussion seems very analogous to user space
+    **signal handling**. There, we call the `sigaction(2)` system call to register
+    interest in a signal. When the signal (asynchronously) arrives, the kernel invokes
+    the registered signal handler (user mode) routine!
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are some key differences here. First, a user space signal handler is not
+    an interrupt; second, the user space signal handler runs purely in non-privileged
+    user mode; in contrast, the kernel space interrupt handler of your driver runs (asynchronously)
+    with kernel privileges and in an interrupted context!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Furthermore, some signals are really the software side effect of a **processor
+    exception** being raised; broadly speaking, the processor will raise a **fault,
+    trap, or abort** when something illegal occurs and it has to "trap" (switch) to
+    kernel space to handle it. A process or thread attempting to access an invalid
+    page (or without sufficient permissions) causes the MMU to raise a fault or an
+    abort; this leads to the OS fault handling code raising the `SIGSEGV` signal upon
+    the process context (i.e. upon `current`)! However, raising an exception of some
+    sort does *not* always imply there's a problem – a system call is nothing but
+    a trap to the OS; that is, a programmed exception (via `syscall / SWI` on x86/ARM).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following comment (which has been partially reproduced in the following
+    snippet) from the kernel source tells us more about what the `request[_threaded]_irq()` API
+    does:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Actually, `request_irq()` is merely a thin wrapper over the `request_threaded_irq()` API;
+    we will discuss this API later. The signature of the `request_irq()` API is as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Always include the `linux/interrupt.h` header file. Let''s examine each of
+    the parameters to `request_irq()` one by one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`int irq`: This is the IRQ line that you''re attempting to register or trap/hook
+    into. This means that when this particular interrupt fires, your interrupt handler
+    function (the second parameter, `handler_func`) is invoked. The question regarding
+    `irq` is: how do I find out what the IRQ number is? We addressed this generic
+    issue in [Chapter 3](7399aaad-197a-4a1b-aa1a-edec3d4e3faa.xhtml), *Working with
+    Hardware I/O Memory*, in the (really key) *Obtaining the device resources* section.
+    To quickly reiterate, **an IRQ line is a resource**, which means it is obtained
+    in the usual manner – on modern embedded systems, it''s obtained by parsing the **Device
+    Tree** (**DT**); the older way was to hard code the values within board-specific
+    source files (relax, you will see an example of querying the IRQ line via the
+    DT in the *IRQ allocation – the modern way – the managed interrupt facility* section).
+    On PC-type systems, you might have to resort to interrogating the bus that the
+    device lives on (for cold devices). Here, the PCI bus (and friends) is very common.
+    The kernel even provides PCI helper routines you can use to query resources from
+    it, and thus find out the assigned IRQ line.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`irq_handler_t (*handler_func)(int, void *)`: This parameter is a pointer to
+    the interrupt handler function (in C, just providing the function''s name is sufficient).
+    This, of course, is the code that will be asynchronously invoked when the hardware
+    interrupt fires. Its job is to service the interrupt (more on this later). How
+    does the kernel know where it is? Recall `struct irqaction`, which is the structure
+    that''s populated by the `request_irq()` routine. One of its members is `handler`,
+    and is set to this second parameter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`unsigned long flags`: This, the third parameter to `request_irq()`, is a flag
+    bitmask. When it''s set to zero, it implements its default behavior (we''ll discuss
+    some key interrupt flags in the *Setting interrupt flags* section).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`const char *name`: This is the name of the code/driver that owns the interrupt.
+    Typically, this is set to the name of the device driver (this way, `/proc/interrupts` can
+    show you the name of the driver that is using the interrupt; it''s the right-most
+    column; details follow in the *Viewing all allocated interrupt (IRQ)* *lines*
+    section.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`void *dev`: This, the fifth and last parameter to `request_irq()`, allows
+    you to pass any data item you wish to (often called a cookie) to the interrupt
+    handler routine, which is a common software technique. In the second parameter,
+    you can see that the interrupt handler routine is of the `void *` type. This is
+    where this parameter gets passed.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Most real-world drivers will have some kind of context or private data structure
+    where they store all required information. Furthermore, this context structure
+    is often embedded into the driver's device (often specialized by the subsystem
+    or driver framework) structure. In fact, the kernel typically helps you do so;
+    for example, network drivers use `alloc_etherdev()` to embed their data into `struct
+    net_device`, platform drivers embed their data into the `platform_device.device.platform_data` member
+    of `struct platform_device`, I2C client drivers employ the `i2c_set_clientdata()` helper
+    to "set" their private/context data into the `i2c_client` structure, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that when you're using a *shared* interrupt (we'll explain this shortly),
+    you *must *initialize this parameter to a non-NULL value (otherwise, how will `free_irq()` know
+    which handler to free?). If you do not have a context structure or anything specific
+    to pass along, passing the `THIS_MODULE` macro here will do the trick (assuming
+    you're writing the driver using the loadable kernel module framework; it's the
+    pointer to your kernel module's metadata structure; that is, `struct module`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The return value from `request_irq()` is an integer, as per the usual `0/-E`
+    kernel convention (see the companion guide *Linux Kernel Programming -* *Chapter
+    4*, *Writing Your First Kernel Module – LKMs Part 1*, the section *The 0/-E return
+    convention*), it's `0` on success, and a negative `errno` value on failure. As
+    the `__must_check` compiler attribute clearly specifies, you are certainly expected
+    to check for the failure case (this is good programming practice in any case).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Linux Driver Verification (LDV) project**: In the companion guide *Linux
+    Kernel Programming,* *Chapter 1* *- Kernel Workspace Setup*, in the section *The
+    LDV - Linux Driver Verification - project*, we mentioned that this project has
+    useful "rules" with respect to various programming aspects of Linux modules (drivers,
+    mostly) as well as the core kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With regard to our current topic, here's one of the rules, a negative one, implying
+    that you *cannot *do this: "*Making no delay when probing for IRQs*" ([http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0037](http://linuxtesting.org/ldv/online?action=show_rule&rule_id=0037)). This
+    discussion really applies to x86[_64] systems. Here, in some circumstances, you
+    might need to physically probe for the correct IRQ line number. For this purpose,
+    the kernel provides an "autoprobe" facility via the `probe_irq_{on|off}()` APIs
+    (`probe_irq_on()` returns a bitmask of potential IRQ lines that can be used).
+    The thing is, a delay is required between the `probe_irq_on()` and `probe_irq_off()` APIs;
+    not invoking this delay can cause issues. The LDV page mentioned previously covers
+    this in some detail, so do take a look. The actual API used to perform the delay
+    is typically `udelay()`. Worry not, we cover it (and several others) in detail
+    in [Chapter 5](c7d2d826-9d8a-439f-b843-06fa72db36b9.xhtml), *Working with Kernel
+    Timers, Threads, and Workqueues* in the section *Delaying for a given time in
+    the kernel*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Where in the driver's code should you call the `request_irq()` API (or its equivalent)?
+    For pretty much all modern drivers that adhere to the modern **Linux Device Model** (**LDM**), the
+    modern kernel framework for devices and drivers, the `probe()` method (this is
+    a function, really) is the right place.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Freeing the IRQ line
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Conversely, when the driver is being unloaded or the device is being detached,
+    the `remove()` (or `disconnect()`) method is the right place where you should
+    call the converse routine – `free_irq()` – to free the IRQ line back to the kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter to `free_irq()` is the IRQ line to free back to the kernel.
+    The second parameter is, again, the same value that's passed to the interrupt
+    handler (via the last parameter to `request_irq()`), so you must typically populate
+    it with either the device structure pointer (which embeds your driver's context
+    or private data structure) or the `THIS_MODULE` macro.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The return value is the *device name* argument that you passed as the fourth
+    parameter of the `request_irq()` routine (yes, it's a string) on success and `NULL` on
+    failure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It''s important that you, as the driver author, take care to do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Disable the interrupt on the board before calling `free_irq()` when the IRQ
+    line is being shared
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Call it from process context only
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Also, `free_irq()` will only return when any and all the executing interrupts
+    for this IRQ line have completed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before we look at some code, we need to briefly cover two additional areas:
+    interrupt flags and the notion of level/edge-triggered interrupts.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting interrupt flags
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'When allocating an interrupt (IRQ line) with the `{devm_}request{_threaded}_irq()` APIs
+    (we''ll cover the variants of `request_irq()` shortly), you can specify certain
+    interrupt flags that will affect the interrupt line''s configuration and/or behavior.
+    The parameter that''s responsible for this is `unsigned long flags` (as we mentioned
+    in the *Allocating your interrupt handler with request_irq()* section). It''s
+    important to realize it''s a bitmask; you can bitwise-OR several flags to get
+    their combined effect. The flag values fall broadly into a few classes: flags
+    to do with IRQ line sharing, interrupt threading, and suspend/resume behavior.
+    They''re all in the `linux/interrupt.h` header in `IRQF_foo` format. The following
+    are some of the most common ones:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`IRQF_SHARED`: This allows you to share the IRQ line between several devices
+    (required for devices on the PCI bus).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`IRQF_ONESHOT`: The IRQ is not enabled after the hardirq handler finishes executing.
+    This flag is typically used by threaded interrupts (covered in the *Working with
+    the threaded interrupts model* section) to ensure that the IRQ remains disabled
+    until the threaded handler completes.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `__IRQF_TIMER` flag is a special case. It's used to mark the interrupt as
+    a timer interrupt. As seen in the companion guide *Linux Kernel Programming,*
+    *Chapter 10*, *The CPU Scheduler - Part 1*, and *Chapter 11*, *The CPU Scheduler
+    - Part 2*, when we looked at CPU scheduling, that the timer interrupt fires at
+    periodic intervals and is responsible for implementing the kernel's timer/timeout
+    mechanisms, scheduler-related housekeeping, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The timer interrupt flags are specified by this macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: In addition to specifying that it's marked as the timer interrupt (`__IRQF_TIMER`),
+    the `IRQF_NO_SUSPEND` flag specifies that the interrupt remains enabled even when
+    the system goes into a suspend state. Furthermore, the `IRQF_NO_THREAD` flag specifies
+    that this interrupt cannot use the threaded model (we'll cover this in the *Working
+    with the threaded interrupts model* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are several other interrupt flags we can use, including `IRQF_PROBE_SHARED`,  `IRQF_PERCPU`,
+    `IRQF_NOBALANCING`, `IRQF_IRQPOLL`, `IRQF_FORCE_RESUME`, `IRQF_EARLY_RESUME`,
+    and `IRQF_COND_SUSPEND`. We won't cover them explicitly here (take a look at the
+    comment header briefly describing them in the `linux/interrupt.h` header file).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's gain a brief understanding of what level- and edge-triggered interrupts
+    are.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding level- and edge-triggered interrupts – a brief note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'When a peripheral asserts an interrupt, the interrupt controller is triggered
+    to latch this event. The electrical characteristics that it uses to trigger the
+    hardware interrupt in the CPU fall into two broad categories:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Level-triggered**: The interrupt is triggered when the level changes (from
+    inactive to active or asserted); until it''s deasserted, the line remains in the
+    asserted state. This happens even after your handler returns; if the line is still
+    asserted, you will get the interrupt again.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Edge-triggered**: The interrupt triggers only once when the level changes
+    from inactive to active.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Additionally, the interrupt could be high or low triggered, on the rising or
+    falling (clock) edge. The kernel allows this to be configured and specified via
+    additional flags such as `IRQF_TRIGGER_NONE`, `IRQF_TRIGGER_RISING`, `IRQF_TRIGGER_FALLING`,
+    `IRQF_TRIGGER_HIGH`, `IRQF_TRIGGER_LOW`, and so on. These low-level electrical
+    characteristics of the peripheral chip are typically pre-configured within the
+    BSP-level code or specified in the DT.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Level-triggered interrupts force you to understand the interrupt source so that
+    you can correctly deassert (or *ack*) it (in the case of a shared IRQ, after checking
+    that it's for you). Typically, this is the first thing you must do when you're
+    servicing it; otherwise, it will keep firing. For example, if the interrupt is
+    triggered when a certain device register hits the value `0xff`, for example, then
+    the driver must set the register to, say, `0x0` before deasserting it! This is
+    easy to see but can be difficult to handle correctly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, edge-triggered interrupts are easy to work with since no
+    knowledge of the interrupt source is required, but they can also be easy to miss!
+    In general, firmware designers use edge-triggered interrupts (though this isn't
+    a rule). Again, these characteristics are really at the hardware/firmware boundary.
+    You should study the datasheet and any allied documentation (such as Application
+    Notes from the OEM) provided for the peripheral you're writing the driver for.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You might by now realize that writing a device driver (well!) requires two distinct
+    knowledge domains. First, you'll need to have a deep understanding of the hardware/firmware
+    and how it works - it's **theory of operation** (**TOO**), its control/data planes,
+    register banks, I/O memory, and so on. Second, you'll need to have a deep (enough)
+    understanding of the OS (Linux) and its kernel/driver framework, how Linux works,
+    memory management, scheduling, interrupt models, and so on. Also, you need to
+    understand the modern LDM and kernel driver frameworks and how to go about debugging
+    and profiling them. The better you get at these things, the better you'll be at
+    writing the driver!
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll learn how to find out what kind of triggering is being used in the *Viewing
+    all allocated (IRQ) lines* section. Check out the *Further reading *section for
+    more links concerning IRQ edge/level triggering.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's move on and look at something interesting. To help assimilate what
+    you've learned so far, we'll look at some small snippets of code from a Linux
+    network driver!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code view 1 – the IXGB network driver
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'It''s time to look at some code. Let''s take a look at some small portions
+    of code for the Intel IXGB network adapter driver (which drives several Intel
+    network adapters in the 82597EX series). Among the many available on the market,
+    Intel has a product line called the **IXGB network adapter**. The controller is
+    the Intel 82597EX; these are typically 10-gigabit ethernet adapters meant for
+    servers (Intel''s product brief on this controller can be found at [https://www.intel.com/Assets/PDF/prodbrief/pro10GbE_LR_SA-DS.pdf](https://www.intel.com/Assets/PDF/prodbrief/pro10GbE_LR_SA-DS.pdf)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/64a61ae6-eae6-494f-a160-2abc85728f77.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.1 – The Intel PRO/10GbE LR server adapter (IXGB, 82597EX) network adapter
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, let''s take a look at it invoking `request_irq()` to allocate the IRQ
+    line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code snippet, you can see the driver invoking the `request_irq()` API
+    to allocate this interrupt within the network driver''s `ixgb_up()` method. This
+    method is invoked when the network interface is brought up (by networking utilities
+    such as `ip(8)` or (older) `ifconfig(8)`). Let''s look at the parameters passed
+    to `request_irq()` here, in turn:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, the IRQ number – the first parameter – is queried from the `irq` member
+    of the `pci_dev` structure (as this device lives on the PCI bus). The `pdev` structure
+    pointer is within this driver's context (or private) metadata structure named `ixgb_adapter`.
+    Its member is called `irq`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second parameter is the pointer to the interrupt handler routine (it's often
+    referred to as the *hardirq handler*; we'll look at all this in a lot more detail
+    later); here, it's the function named `ixgb_intr()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The third parameter is the `flags` bitmask. You can see that here the driver
+    specifies that this interrupt is shared (via the `IRQF_SHARED` flag). It's part
+    of the PCI specification for devices on this bus to share their interrupt lines.
+    This implies that the driver will need to verify that the interrupt is really
+    meant for it. It does this in the interrupt handler (it's usually very hardware-specific
+    code, typically checking a given register for some expected value).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The fourth parameter is the name of the driver handling this interrupt. It's
+    obtained via the specialized `net_device` structure's `name` member (which has
+    been registered to the kernel's net framework by  this driver calling `register_netdev()` in
+    its probe method, `ixgb_probe()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The fifth parameter is the value to pass along to the interrupt handler routine.
+    As we mentioned previously, it's (again) the specialized `net_device` structure
+    (which internally has the driver's context structure (`struct ixgb_adapter`) embedded
+    within it!).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Conversely, when the network interface goes down, the `ixgb_down()` method
+    is invoked by the kernel. When this happens, it disables NAPI and frees up the
+    IRQ line with `free_irq()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now that you've learned how to trap into a hardware interrupt via `request_irq()`,
+    we need to understand some key points about writing the code of the interrupt
+    handler routine itself, which is where the actual work of handling the interrupt
+    is performed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the interrupt handler routine
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Often, the interrupt is the hardware peripheral''s way of informing the system –
+    the driver, really – that data is available and that it should pick it up. This
+    is what typical drivers do: they grab the incoming data from the device buffers
+    (or port, or whatever). Not just that, it''s also possible that there are user
+    mode processes (or threads) that want this data. Thus, they have quite possibly
+    opened the device file and have issued the `read(2)` (or equivalent) system call.
+    This has them currently blocking (sleeping) upon this very event; that is, data
+    arriving from the device.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On detecting that data currently isn't available, the driver's *read* method
+    typically puts the process context to sleep using one of the `wait_event*()` APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, once your driver's interrupt handler has fetched the data into some kernel
+    buffer, it typically awakens the sleeping readers. They now run through the driver's
+    read method (in process context), pick up the data, and transfer it to the user
+    space buffer as required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This section has been split into two broad parts. First, we'll learn what we
+    can and cannot do in our interrupt handler. Then, we'll cover the mechanics of
+    writing the code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interrupt context guidelines – what to do and what not to do
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The interrupt handler routine is your typical C code, with some caveats. A
+    few key points regarding the design and implementation of your hardware interrupt
+    handler are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The handler runs in an interrupt context, so do not block**: First and foremost,
+    this code always runs in an interrupt context; that is, an atomic context. On
+    a preemptible kernel, preemption is disabled, so there are some limitations regarding
+    what it can and cannot do. In particular, it cannot do anything that directly
+    or indirectly invokes the scheduler (`schedule()`)!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In effect, you **cannot** do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Transfer data to and from kernel to user space as it might cause a page fault,
+    which isn't allowed in an atomic context.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use the `GFP_KERNEL` flag in memory allocation. You must use the `GFP_ATOMIC`
+    flag so that the allocation is non-blocking – it either succeeds or fails immediately.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Invoke any API that's blocking (that, down the line, calls `schedule()`). In
+    other words, it has to be purely non-blocking code paths. (We covered why in some
+    detail in As seen in the companion guide *Linux Kernel Programming -* *Chapter
+    8*, *Kernel Memory Allocation for Module Authors – Part 1*, in the *Never sleep
+    in interrupt or atomic contexts* section).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Interrupt masking**: By default, while your interrupt handler is running,
+    **all** interrupts on the local CPU core where your handler is executing are masked
+    (disabled), and the particular interrupt you''re handling is masked **across all
+    cores**. Thus, your code is inherently reentrant-safe.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Keep it fast!:** You are writing code that will literally interrupt other
+    processes – other "business" that the system was running before you rudely interrupted
+    it; thus, you must do what''s required, as fast as is possible, and return, allowing
+    the interrupted code path to continue. Important system software metrics include
+    the worst-case interrupt length and the worst-case interrupt''s disabled time
+    (we''ll cover some more on this in the *Measuring metrics and latency* section
+    at the end of this chapter).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These points are important enough to merit more detail, so we'll cover them
+    more thoroughly in the following subsections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't block – spotting possibly blocking code paths
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This really boils down to the fact that when you''re in an interrupt or atomic
+    context, don''t do anything that will call`schedule()`*. *Now, let''s look at
+    what happens if our interrupt handler''s pseudocode looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Did you spot the big fat potential (though perhaps still subtle) bugs here?
+    (Take a moment to spot them before moving on.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, the invocation of `kzalloc()` with the `GFP_KERNEL` flag might cause
+    its kernel code to invoke `schedule()`! If it does, this will result in an "Oops,"
+    which is a kernel bug. In typical production environments, this causes the kernel
+    to panic (as the *sysctl* named `panic_on_oops` is typically set to `1` in production;
+    doing `sysctl kernel.panic_on_oops` will show you the current setting). Next,
+    the `copy_to_user()` invocation might result in a page fault and therefore necessitate
+    a context switch, which will, of course, invoke `schedule()`; this is just not
+    possible -again, a serious bug - in an atomic or interrupt context!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, more generically, let''s your interrupt handler calls a function, `a()`, with
+    the call chain for `a()` being as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, you can see that calling `a()` ultimately results in `schedule()` being
+    called, which, as we just pointed out, will result in an "Oops", which is a kernel
+    bug. So, the question here is, how do you, the driver developer, know that when
+    you call `a()`, it results in `schedule()` being called? There are a few points
+    you need to understand and leverage regarding this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: (As mentioned in the companion guide *Linux Kernel Programming -* *Chapter 8*,
+    *Kernel Memory Allocation for Module Authors – Part 1*) One way you can find out in
+    advance if your kernel code will ever enter an atomic or interrupt context is
+    by looking at the kernel directly. When you're configuring the kernel (again, as
+    seen in the companion guide *Linux Kernel Programming,* recall `make menuconfig` from *Linux
+    Kernel Programming -* *Chapter 2*, *Building the 5.x Linux Kernel from Source
+    – Part 1*), you can turn on a kernel config option that will help you spot exactly
+    this circumstance. Take a look under the Kernel Hacking / Lock Debugging menu.
+    There, you will find a Boolean tunable called Sleep inside atomic section checking.
+    Turn it ON!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The config option is named `CONFIG_DEBUG_ATOMIC_SLEEP`; you can always grep
+    your kernel's config file for it. As seen in the companion guide *Linux Kernel
+    Programming -* *Chapter 5,* *Writing Your First Kernel Module - LKMs Part 2*,
+    in the *Configuring a debug kernel *section, we specified that this option should
+    be turned ON!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next (this is a bit pedantic, but it will help you!), make it a habit to look
+    up the kernel documentation on the function in question (even better, briefly
+    look up its code). The fact that it's a blocking call will usually be documented
+    or specified in the comment header.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The kernel has a helper macro called `might_sleep()`; it''s a useful debugging
+    aid for just these situations! The following screenshot (from the kernel source, `include/linux/kernel.h`)
+    explains it clearly:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![](img/12db57d4-3c8a-457e-877b-6ed082d76051.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.2 – The comment for might_sleep() is helpful
+  prefs: []
+  type: TYPE_NORMAL
+- en: Along the same lines, the kernel provides helper macros such as `might_resched()`, `cant_sleep()`, `non_block_start()`, `non_block_end()`,
+    and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just to remind you, we mentioned pretty much the same thing - regarding not
+    blocking within an atomic context - in the companion guide *Linux Kernel Programming,* *Chapter
+    8,  Kernel Memory Allocation for Module Authors Part 1* in the *Dealing with the
+    GFP flags* section (and elsewhere). Furthermore, we also showed you how the useful
+    LDV project (mentioned back in companion guide *Linux Kernel Programming*, *Chapter
+    1, Kernel Workspace Setup*, in the section *The LDV - Linux Driver Verification
+    - project*) has caught and fixed several such violations within kernel and driver
+    module code.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: At the beginning of this section, we mentioned that, often, sleeping user space readers
+    block upon the arrival of data. Its arrival is typically signaled by the hardware
+    interrupt. Then, your interrupt handler routine fetches the data into a kernel
+    VAS buffer and wakes up the sleepers. Hey, isn't that disallowed? No – the `wake_up*()` APIs
+    are non-blocking in nature. The thing you need to understand is that they only
+    switch the process' (or thread's) state from asleep (`TASK_{UN}INTERRUPTIBLE`)
+    to awake, ready to run (`TASK_RUNNING`). This does not invoke the scheduler; the
+    kernel will do that at the next opportunity point (we discussed CPU scheduling
+    in the companion guide *Linux Kernel Programming, **Chapter 10*, *The CPU Scheduler
+    – Part 1*, and *Chapter 11*, *The CPU Scheduler – Part 2*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Interrupt masking – the defaults and controlling it
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Recall that the interrupt controller chip (the PIC/GIC) will have a mask register.
+    The OS can program it **to mask or block hardware interrupts** as required (of
+    course, some interrupts may be unmaskable; the**non-maskable interrupt** (**NMI**)
+    is a typical case that we  discuss later in this chapter).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to realize, though, that keeping interrupts enabled (unmasked)
+    as much as possible is a critical measure of OS quality!Why? If an interrupt(s)
+    is blocked, the peripheral cannot be responded to and the system's performance
+    lags or suffers as a result (merely pressing and releasing a keyboard key results
+    in two hardware interrupts). You must keep interrupts enabled for as long as possible.
+    Locking with the spinlock will cause interrupts and preemption to be disabled!
+    Keep the critical section short (we'll cover locking in depth in the last two
+    chapters of this book).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, when it comes to the default behavior on the Linux OS, when a hardware
+    interrupt occurs and that interrupt isn''t masked (always the default), let''s
+    say it''s IRQn (where *n* is the IRQ number), **the kernel ensures that while
+    its interrupt (hardirq) handler executes, all interrupts on the local CPU core
+    where the handler is executing are disabled and IRQn is disabled across all CPUs**.
+    Thus, your handler code is inherently reentrant-safe. This is good as it means
+    you never have to worry about the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Masking interrupts yourself
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When to run atomically, to completion and without interruption, on that CPU
+    core
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As we'll see later, a bottom-half can still be interrupted by a top-half, thus
+    necessitating locking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While IRQn executes on, say, CPU core 1, other interrupts remain enabled (unmasked)
+    on all CPU cores but core 1\. Thus, on multicore system hardware, interrupts can
+    run in parallel on different CPU cores. This is fine as long as they don't step
+    on each other's toes, with respect to global data! If they do, you'll have to
+    employ locking, something we'll cover in detail in this book's last two chapters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Furthermore, on Linux, **all interrupts are peers**, so there is no priority
+    among them; in other words, they all run at the same priority. Provided it's unmasked,
+    any hardware interrupt can interrupt the system at any point in time; an interrupt
+    can even interrupt interrupts! However, they typically don't do the latter. This
+    is because, as we have just learned, while an interrupt IRQn is running on a CPU
+    core, all the interrupts on that core are disabled (masked) and IRQn is disabled
+    globally (across all cores) until it completes; the exception is an NMI.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keep it fast
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'An interrupt is what is suggests: it interrupts normal work on the machine;
+    it''s a bit of an annoyance that has to be tolerated. Context has to be saved,
+    the handler has to be executed (along with bottom halves, which we will cover
+    in the *Understanding and using top and bottom halves* section), and then context
+    must be restored to whatever got interrupted. So, you get the idea: it''s a critical
+    code path, so don''t plod along – **be fast and non-blocking!**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It also brings up the question, how fast is fast? While the answer is, of course,
+    platform-dependent, a heuristic is this: keep your interrupt processing as fast
+    as is possible, **within tens of microseconds**. If it consistently exceeds 100
+    microseconds, then the need for alternate strategies does come up. We''ll cover
+    what you can do when this occurs later in the chapter.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With regard to our simple `my_interrupt()` pseudocode snippet (shown in the
+    *Don't block – spotting possibly blocking code paths* section), first, ask yourself,
+    must I really allocate memory in a critical non-blocking needs-to-execute-fast
+    code path such as an interrupt handler? Can you design the module/driver to allocate
+    the memory earlier (and just use the pointer)?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, the reality is that, at times, quite a lot of work has to be done to
+    correctly service the interrupt (network/block drivers are good examples). We
+    shall cover some typical strategies we can use to deal with this shortly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Writing the interrupt handler routine itself
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, let''s quickly learn the mechanical part of it. The signature of the hardware
+    interrupt handler routine (often referred to as the **hardirq** routine) is as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The interrupt handler routine is invoked by the kernel''s generic IRQ layer
+    when a hardware IRQ that your driver has registered interest in (via the `request_irq()` or
+    friends APIs) is triggered. It receives two parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first parameter is the IRQ line (an integer). Triggering this causes this
+    handler to be invoked.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second parameter is the value that was passed via the last parameter to `request_irq()`.
+    As we mentioned previously, it's typically the driver's specialized device structure
+    that embeds the driver context or private data. Because of this, its data type
+    is the generic `void *`, allowing `request_irq()` to pass any type along, typecasting
+    it appropriately in the handler routine and using it.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The handler is regular C code, but with all the caveats we mentioned in the
+    preceding section! Take care to follow those guidelines. Though the details are
+    hardware-specific, typically, your interrupt handler's first responsibility is
+    to clear the interrupt on the board, in effect, acknowledging it and telling the
+    PIC as much. This is usually achieved by writing some specific bits into a specified hardware
+    register on the board or controller; read the datasheet for your particular chip,
+    chipset or hardware device to figure this out. Here, the `in_irq()` macro will
+    return `true`, informing you that your code is currently in a hardirq context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The rest of the work that's done by the handler is obviously very device-specific.
+    For example, an input driver will want to scan the key code (or touchscreen coordinates
+    or mouse key/movement or whatever) that was just pressed or released from some
+    register or peripheral memory location and perhaps save it in some memory buffer.
+    Alternatively, it might immediately pass it up the stack to a generic input layer
+    above it. We won't try and delve into those details here. Again, the driver framework
+    is what you need to understand for your driver type; this is beyond the scope
+    of this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What about the value to return from your hardirq handler? The `irqreturn_t` return
+    value is an `enum` and looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding comment header clearly points out its meaning. Essentially, the
+    generic IRQ framework insists that you return the `IRQ_HANDLED` value if your
+    driver handled the interrupt. If the interrupt was not yours or you couldn't handle
+    it, you should return the `IRQ_NONE` value. (This helps the kernel detect spurious
+    interrupts as well. If you cannot figure out whether it's your interrupt, simply
+    return `IRQ_HANDLED`.) We'll see how `IRQ_WAKE_THREAD` is used shortly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's look at some more code! In the next section, we'll check out the
+    hardware interrupt handler code for two drivers (we came across these earlier
+    in this and the previous chapter).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code view 2 – the i8042 driver's interrupt handler
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'In the previous chapter, [Chapter 3](7399aaad-197a-4a1b-aa1a-edec3d4e3faa.xhtml),
+    *Working with Hardware I/O Memory*, in the *A PIO example – the i8042* section,
+    we learned how the i8042 device driver uses some very simple helper routines to
+    perform I/O (read/write) on the I/O ports of the i8042 chip (this is often the
+    keyboard/mouse controller on x86 systems). The following code snippet shows some
+    of the code for its hardware interrupt handler routine; you can clearly see it
+    reading both the status and data registers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the `serio_interrupt()` call is how this driver passes on the data it
+    read from the hardware to the upper "input" layer, which will process it further
+    and ultimately have it ready for the user space process to consume. (Take a look
+    at the *Questions *section at the end of this chapter; one of the exercises for
+    you to try is writing a simple "key logger" device driver.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code view 3 – the IXGB network driver's interrupt handler
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s take a look at another example. Here, we''re looking at the hardware
+    interrupt handler of the Intel IXGB ethernet adapter''s device driver, which we
+    mentioned earlier:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet, notice how the driver gains access to its private
+    (or context) metadata structure (`struct ixgb_adapter`) from the `net_device` structure
+    (the specialized structure for network devices) it receives as the second parameter;
+    this is very typical. (Here, the `netdev_priv()` helper used to extract the driver's
+    private structure from the generic `net_device` structure is somewhat analogous
+    to the well-known `container_of()` helper macro. In fact, this helper is also
+    often employed in similar situations.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, it performs a peripheral I/O memory read via the `IXGB_READ_REG()` macro (it''s
+    using the MMIO approach – see the previous chapter for details on MMIO; `IXGB_READ_REG()` is
+    a macro that invokes the `readl()` API we covered in the previous chapter – the
+    older style routine for performing a 32-bit MMIO read). Don''t miss the key point
+    here: this is how the driver determines whether the interrupt is meant for it,
+    as, recall, it''s a shared interrupt! If it is meant for it (the likely case),
+    it proceeds with its job; since this adapter supports NAPI, the driver now schedules
+    polled NAPI reads to suck up network packets as they come in and sends them up
+    the network protocol stack for further processing (well, it''s really not that simple;
+    the actual memory transfer work will be performed over DMA).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, a diversion but an important one: you need to learn how to allocate the
+    IRQ line the modern way – via the `devm_*` APIs. This is known as the managed
+    approach.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: IRQ allocation – the modern way – the managed interrupt facility
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Many modern drivers employ the kernel's *devres* or managed APIs framework for
+    various purposes. The managed APIs in modern Linux kernels give you the advantage
+    of not having to worry about freeing up resources that you've allocated (we have
+    covered a few of them already, including `devm_k{m,z}alloc()` and `devm_ioremap{_resource}()`).
+    Of course, you must use them appropriately, typically in the probe method (or
+    `init` code) of the driver.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It is recommended that, when writing drivers, you use this newer API style.
+    Here, we''ll show how you to employ the `devm_request_irq()` API in order to allocate
+    (register) your hardware interrupt. Its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter is the pointer to the `device` structure of the device (which,
+    as we saw in [Chapter 1](239d8da6-0342-441a-823e-d3766f0d97b6.xhtml), *Writing
+    a Simple misc Character Device Driver*, has to be obtained by registering to the
+    appropriate kernel framework). The five remaining parameters are identical to
+    `request_irq()`; we won't repeat them here. The whole point is that, once registered,
+    you are freed from calling `free_irq()`; the kernel will automatically invoke
+    it as required (on driver removal or device detachment). This greatly helps us
+    developers avoid common and infamous leakage type bugs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help clarify its use, let''s quickly look at an example. The following is
+    a bit of the code from the V4L TV tuner driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we saw in regard to getting the physical address for MMIO in [Chapter 3](7399aaad-197a-4a1b-aa1a-edec3d4e3faa.xhtml),
+    *Working with Hardware I/O Memory*, in the *Obtaining the device resources* section,
+    here, the same driver employs the `platform_get_resource()` API to extract the IRQ
+    number (specifying the type of resource as an IRQ line with `IORESOURCE_IRQ`).
+    Once it has it, it issues the `devm_request_irq()` API to allocate or register
+    the interrupt! As is therefore expected, a search for `free_irq()` in this driver
+    yields no results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, we'll learn what a threaded interrupt is, how to work with one, and, more
+    importantly, the *why* of it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working with the threaded interrupts model
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As seen in the companion guide *Linux Kernel Programming -* *Chapter 11*, *The
+    CPU Scheduler – Part 2*, in the *Converting mainline Linux into an RTOS* section,
+    we covered the real-time patch for Linux (RTL), which allows you to patch, configure,
+    build, and run Linux as an RTOS! If you're hazy on this, please refer back to
+    this. We won't repeat the same information here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Real-Time Linux**(**RTL**) project's work has been steadily back-ported
+    into the mainline Linux kernel. One of the key changes wrought by RTL was merging
+    the **threaded interrupts** feature into the mainline kernel. This occurred in
+    kernel version 2.6.30 (June 2009). This technology does something that, at first
+    glance, seems very weird: it "converts" the hardware interrupt handler into, essentially,
+    a kernel thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you will learn in the next chapter, a kernel thread is really very similar
+    to a user mode thread – it runs independently, in the process context and has
+    its own task structure (and thus its own PID, TGID, and so on), which means it
+    can be scheduled; that is, when in the runnable state, it fights with other contender
+    threads to run on a CPU core. The key difference is that a user mode thread always
+    has two address spaces – the process VAS that it belongs to (user space) and the
+    kernel VAS, which it switches to when it issues a system call. A kernel thread,
+    on the other hand, runs purely in kernel space and has no view of the user space;
+    it only sees the kernel VASthat it always executes in (technically, its `current-mm` value is
+    always `NULL`!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, how do you decide if you should use a threaded interrupt? We need to cover
+    a few more topics before this becomes completely clear (for those of you who are
+    impatient, here''s the short answer: use a threaded interrupt handler when (as
+    a quick heuristic) the interrupt work takes over 100 microseconds; skip ahead
+    to the *Hardirqs, tasklets, threaded handlers – what to use when* section and
+    see the table there for a quick look).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's learn how to employ the threaded interrupt model by checking out
+    the available APIs – both the regular and managed ones. Then, we'll learn how
+    to use the managed version and how to employ it within a driver. After that, we'll
+    look at its internal implementation and delve more into the why of it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Employing the threaded interrupt model – the API
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to understand the threaded interrupt model''s inner workings, let''s
+    take a look at the relevant APIs. We''ve already covered using the `request_irq()` API.
+    Let''s look at its implementation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This API is merely a thin wrapper over the `request_threaded_irq()` API! Its
+    signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The parameters, except for the third one, are identical to `request_irq()`.
+    The following are a few key points to note:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`irq_handler_t handler`: The second parameter is a pointer to the usual interrupt
+    handler function. We now refer to it as the primary handler. If it''s null and `thread_fn` (the
+    third parameter) is non-null, a default primary handler (of the kernel''s) is
+    auto-installed (if you''re wondering about this default primary handler, we''ll
+    cover it in more detail in the *Internally implementing the threaded interrupt* section).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`irq_handler_t thread_fn`: The third parameter is a pointer to the threaded
+    interrupt function; the API behavior depends on whether you pass this parameter
+    as null or not:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If it's non-null, then the actual servicing of the interrupt is performed by
+    this function. It runs within the context (process) of a dedicated kernel thread
+    – it's a threaded interrupt!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If it's null, which is the default when you call `request_irq()`, only the primary
+    handler runs, and no kernel thread is created.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The primary handler if specified (second parameter), is run in what''s referred
+    to as the **hardirq** or hard interrupt context (as was the case with `request_irq()`).
+    If the primary handler is non-null, thenyou are expected to write it''s code and
+    (minimally) do the following in it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Verify the interrupt is for you; if it's not, return `IRQ_NONE`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If it is for you, then you can clear and/or disable the interrupt on the board/device.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Return `IRQ_WAKE_THREAD`; this will cause the kernel to wake up the kernel thread
+    representing your threaded interrupt handler. The name of the kernel thread will
+    be in the format `irq/irq#-name`. This kernel thread will now internally invoke
+    the `thread_fn()` function, where you perform the actual interrupt handling work.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: On the other hand, if the primary handler is null, then just your threaded handler
+    – the function specified by the third parameter – will be automatically run **as
+    a kernel thread** by the OS when the interrupt fires.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As with `request_irq()`, the return value from `request_threaded_irq()` is an
+    integer, following the usual `0/-E` kernel convention: `0` on success and a negative
+    `errno` value on failure. You are expected to check it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Employing the managed threaded interrupt model – the recommended way
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Again, using the managed API for allocating a threaded interrupt would be the
+    recommended approach for a modern driver. The kernel provides the `devm_request_threaded_irq()` API
+    for this very purpose:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: All the parameters besides the first one, which is the pointer to the device
+    structure, are the same as those for `request_threaded_irq()`. The key advantage
+    of this is that you don't need to worry about freeing up the IRQ line. The kernel
+    will auto-free it on device detach or driver removal, as we learned with `devm_request_irq()`. As
+    with `request_threaded_irq()`, the return value from `devm_request_threaded_irq()` is
+    an integer, following the usual `0/-E` kernel convention: `0` on success and a
+    negative errno value on failure; you are expected to check it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Don't forget! Using the managed `devm_request_threaded_irq()` API is the modern
+    recommended approach for allocating a threaded interrupt. However, note that it
+    won't always be the right approach; see the *Constraints when using a threaded
+    handler* section for more information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signature of the threaded interrupt handler function is identical to that
+    for the hardirq interrupt handler:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: The parameters have the same meaning as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Threaded interrupts often use the `IRQF_ONESHOT` interrupt flag; the kernel
+    comment in `include/linux/interrupt.h` describes it best:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: As a matter of fact, the kernel **insists that you use** the `IRQF_ONESHOT` flag
+    when your driver is incorporating a threaded handler and the primary handler is
+    the kernel default. Not using the `IRQF_ONESHOT` flag would be deadly when level-triggered
+    interrupts are in play. To be safe, the kernel throws an error - when this flag
+    isn't present in the `irqflags` bitmask parameter - even for edge-triggering.
+    If you're curious, the code at `kernel/irq/manage.c:__setup_irq()` checks for
+    just this (link: [https://elixir.bootlin.com/linux/v5.4/source/kernel/irq/manage.c#L1486](https://elixir.bootlin.com/linux/v5.4/source/kernel/irq/manage.c#L1486)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: A kernel parameter called `threadirqs` exists that you can pass to the kernel
+    command line (via the bootloader). This force threads all the interrupt handlers
+    except those marked explicitly as `IRQF_NO_THREAD`*.* To find out more about this
+    kernel parameter, go to [https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the following subsection, we'll take a look at one of the Linux driver's
+    STM32 microcontrollers. Here, we will focus on how interrupt allocation is done
+    via the "managed" API that we just covered.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code view 4 – the STM32 F7 microcontroller's threaded interrupt handler
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The STM32 F7 is part of a series of microcontrollers that have been manufactured
+    by STMicroelectronics, based on the ARM-Cortex M7F core:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/beaa7b0f-7523-4633-8ba4-0fcc9a157cb2.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.3 – The STM32F103 microcontroller pinout with some I2C pins highlighted
+    (see the lower left)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Image Credit: The preceding image, which has been slightly added to by myself,
+    has been taken from [https://www.electronicshub.org/wp-content/uploads/2020/02/STM32F103C8T6-Blue-Pill-Pin-Layout.gif](https://www.electronicshub.org/wp-content/uploads/2020/02/STM32F103C8T6-Blue-Pill-Pin-Layout.gif).
+    Image by Rasmus Friis Kjekisen. This image falls under Creative Commons CC BY-SA
+    1.0 ([https://creativecommons.org/licenses/by-sa/1.0/](https://creativecommons.org/licenses/by-sa/1.0/)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Linux kernel supports the STM32 F7 via various drivers and DTS files. Here,
+    we''ll take a look at a tiny bit of the code for the I2C bus driver (`drivers/i2c/busses/i2c-stm32f7.c`)
+    for this microcontroller. It allocates two hardware interrupts:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The event IRQ line, via the `devm_request_threaded_irq()` API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The error IRQ line, via the `request_irq()` API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The code that allocates the IRQ lines is, as expected, within its probe method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Let's focus on the call to `devm_request_threaded_irq()`. The first parameter
+    is the pointer to the device structure. Since this is a platform driver (registered
+    via the `module_platform_driver` wrapper macro), its probe method receives the `struct
+    platform_device *pdev` parameter; the `device` structure is extracted from it.
+    The second parameter is the IRQ line to allocate. Again, as we've already seen,
+    it's extracted via a helper routine. Here, this is the `platform_get_irq()` API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The third parameter specifies the primary handler; that is the hardirq. Since
+    it's non-null, this routine will be invoked when the IRQ is triggered. It performs
+    hardware-specific verification on the device and the I2C transfer, and if all
+    is okay, it returns the `IRQ_WAKE_THREAD` value. This awakens the threaded interrupt routine,
+    the fourth parameter, and the function `stm32f7_i2c_isr_event_thread()` runs as
+    a kernel thread in process context! The `irqflags` parameter, which is set to `IRQF_ONESHOT`,
+    is typical with threaded handlers; it specifies that the IRQ line remains disabled
+    until the threaded handler completes (not just the hardirq). The threaded handler
+    routine does its work and returns `IRQ_HANDLED` when it's finished.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since the error IRQ line is allocated via the `devm_request_irq()` API, and
+    because we have already covered how to use this API (refer to the *IRQ allocation
+    – the modern way – the managed interrupt facility* section), we won't repeat any
+    information regarding it here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's look at how the kernel internally implements the threaded interrupt
+    model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Internally implementing the threaded interrupt
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As we mentioned previously, if the primary handler is null and the thread function
+    is non-null, the kernel uses a default primary handler. The function is called `irq_default_primary_handler()` and all
+    it does is return the `IRQ_WAKE_THREAD` value, thus waking up (and making schedulable)
+    the kernel thread.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Furthermore, the actual kernel thread that runs your `thread_fn` routine is
+    created within the code of the `request_threaded_irq()` API. The call graph (as
+    of version 5.4.0 of the Linux kernel) is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The invocation of the `kthread_create()` API is as follows. Here, you can clearly
+    see how the format of the new kernel thread''s name will be in `irq/irq#-name`
+    format:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here (we don't show the code), the new kernel thread is programmed to be set
+    to the `SCHED_FIFO` scheduling policy and the `MAX_USER_RT_PRIO/2` real-time scheduling
+    priority, which typically has a value of `50` (the `SCHED_FIFO` range is from `1` to `99`,
+    and `MAX_USER_RT_PRIO` is `100`). We'll cover why this is important in the *Why
+    use threaded interrupts?* section. If you're unsure about the thread scheduling
+    policy and its priority, please refer to the companion guide *Linux Kernel Programming
+    -* *Chapter 10*, *The CPU Scheduler – Part 1*, the *The POSIX scheduling policies*
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kernel manages this kernel thread representing the threaded interrupt handler
+    in its entirety. As we've already seen, it creates it on IRQ allocation via the `[devm_]request_threaded_irq()` API;
+    then, the kernel thread simply sleeps. It is awoken on demand by the kernel, whenever
+    the allocated IRQ is triggered; the kernel will destroy it when `free_irq()` is
+    invoked. Don't worry about the details at the moment; we'll cover kernel threads and
+    other interesting topics in the next chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, although you have learned how to use the threaded interrupt model, it's
+    not been clearly explained why (and when)you should. The next section will cover
+    this in detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why use threaded interrupts?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A key question that''s usually asked is, why should I use threaded interrupts
+    at all when the regular hardirq-type interrupt exists? The complete answer is
+    a bit elaborate; the following are the primary reasons why:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To really make it real time.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It eliminates/reduces softirq bottlenecks. Since the threaded handler actually
+    runs its code in process context, it's not considered to be as critical a code
+    path as a hardirq handler; hence, you can take a little longer with interrupt
+    handling.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: While a hardirq executes IRQn, that IRQ line is disabled on all the cores across
+    the system. If it takes a while to execute to completion (of course, you should
+    design it so that it doesn't), then the system's response can significantly drop;
+    on the other hand, while a threaded handler executes, the hardware IRQ line is enabled by
+    default. This is good for performance and responsiveness. (Note that there will
+    be many cases where the driver will not want this behavior; that is, it will want
+    IRQ to be disabled while it processes it. To do that, specify the `IRQF_ONSEHOT` flag.)
+  prefs:
+  - PREF_UL
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In a nutshell, as a quick rule of thumb, **when the interrupt handling consistently
+    takes over 100 microseconds, use the threaded interrupt model** (see the table
+    in *Hardirqs, tasklets, threaded handlers – what to use when* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the following subsections, we will expand on these points.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threaded interrupts – to really make it real time
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: This is a key point and requires some explanation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Prioritization on the standard Linux OS goes from highest to lowest priority
+    as follows (we''ll suffix each bullet point with the *context* it runs in; it
+    will be either process or interrupt. If you''re unclear on this point, it''s very
+    important you understand this; do refer to the companion guide *Linux Kernel Programming
+    - **Chapter 6*, *Kernel Internals Essentials – Processes and Threads*, the *Understanding
+    Process and Interrupt Contexts* section, for more information):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Hardware interrupts**: These preempt anything and everything. The hardirq handler
+    runs atomically (to completion, without interruption) on the CPU; `context:interrupt`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Real-time threads** (the `SCHED_FIFO` or `SCHED_RR` scheduling policy), both
+    kernel and user space, with positive real-time priority (`rtprio`); `context:process`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A kernel thread at the same realtime priority (`current-rtprio`) gets a slight
+    priority bump over a user space thread at the same realtime priority.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Processor exceptions**: This includes system calls (they''re really synchronous
+    exceptions; for example, `syscall` on the x86, `SWI` on ARM), page faults, protection
+    faults, and so on; `context:process`*.*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**User mode threads**: They use the `SCHED_OTHER` scheduling policy by default
+    with an `rtprio` of `0`; `context:process`*.*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following diagram shows relative prioritization on Linux (this diagram
+    is a bit simplistic; a more refined diagram is seen later via *Figure 4.10* and
+    *Figure 4.11*):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9decdc81-d105-45f1-8e71-a471632f4fc5.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.4 – Relative prioritization on the standard Linux OS
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's say you are working on a real-time multithreaded application. Of the dozens
+    of threads that are alive within the process, three of them (let's call them threads
+    A, B, and C for simplicity) are considered to be critical "real-time" threads.
+    Accordingly, you have the app grant them a scheduling policy of `SCHED_FIFO` and
+    real-time priorities of 30, 45, and 60 to threads A, B, and C, respectively (if
+    you're unclear on these points, please refer to the companion guide *Linux Kernel
+    Programming - Chapter 10*, *The CPU Scheduler - Part 1*, and *Chapter 11*, *The
+    CPU Scheduler - Part 2*, on CPU scheduling). Since it's a real-time app, the maximum
+    time that it can take these threads to complete their work is curtailed. In other
+    words, a *deadline exists; *for our example scenario, let's say that the **worst-case deadline** for
+    thread B to complete its work is 12 milliseconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, in terms of relative priorities, how will this work? For simplicity, let's
+    say that the system has a single CPU core. Now, another thread, X (running with
+    the scheduling policy `SCHED_OTHER` and with a real-time priority of `0`, which
+    is the default scheduling policy/priority value), is currently executing code
+    on the CPU. However, if the "event" that any of your real-time threads is waiting
+    upon occurs, it will preempt the currently executing thread and run. This is what's
+    expected; recall that the fundamental rule for real-time scheduling is very simple: *the
+    highest priority runnable thread must be the thread that's running*. Okay; that's
+    good. Now, we need to consider hardware interrupts. A hardware interrupt, as we've
+    seen, has the highest priority. This means it will preempt anything and everything,
+    including your (so-called) real-time thread (see the preceding diagram)!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's say that interrupt processing takes 200 microseconds; on a rich OS such
+    as Linux, this isn't considered too bad. However, in this situation, five hardware
+    interrupts will consume 1 millisecond; what if the device becomes busy (many incoming
+    data packets, for example) and emits, say, 20 hardware interruptsin a continuous
+    stream? This will certainly be given priority and will consume (at least) 4 milliseconds!
+    Your real-time thread(s) will definitely be preempted while interrupt processing
+    runs and will be unable to gain the CPU it needs until it's far too late! The
+    (12 ms) deadline will have long expired and the system will fail (if yours is
+    a true real-time app, this could be catastrophic).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following diagram represents this scenario conceptually (for conciseness
+    and clarity, we have only shown one of our user space `SCHED_FIFO` real-time threads;
+    that is, thread B at `rtprio` 45):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/2d7f4c41-b170-4c4c-b628-2b63b473f6ff.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 4.5: The hardirq model – a user mode RT SCHED_FIFO thread interrupted
+    by a hardware interrupt flood; deadline missed'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Real-time thread B is depicted as running from time `t0` (on the x-axis; the
+    y-axis represents the real-time priority; thread B's `rtprio` is 45); it has 12
+    ms (a hard deadline) to complete its work. However, let's say that after 6 ms
+    have elapsed (at time `t1`), a hardware interrupt fires.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In *Figure 4.5*, we haven''t shown the low-level interrupt setup code that
+    executes. Now a hardware interrupt firing at time `t1` results in the interrupt
+    handler being invoked; that is, the hardirq (shown as the big black vertical double-arrow
+    in the preceding diagram). Obviously, the hardware interrupt preempts thread B.
+    Now, let''s say it takes 200 microseconds to execute; that''s not much, but what
+    if a flood of interrupts (say 20 of them, thus eating up 4 ms) arrives! This is
+    depicted in the preceding diagram: the interrupts continue at a rapid rate until
+    time `t2`; only after they all complete will context be restored. Thus, the scheduling
+    code runs and (let''s say) context switches back to thread B, giving it the processor
+    (we take, on a modern Intel CPU, a conservative context switching time of 50 microseconds:
+    [https://blog.tsunanet.net/2010/11/how-long-does-it-take-to-make-context.html](https://blog.tsunanet.net/2010/11/how-long-does-it-take-to-make-context.html)).
+    However, soon after, at time `t3`, the hardware interrupt fires once more, preempting
+    B again. This can go on indefinitely; the RT thread will eventually run (when
+    the interrupt storm is complete) but may or may not meet its deadline! This is
+    the main issue.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The problem that was described in the preceding paragraph doesn't go away by
+    simply raising the real-time priority of your user mode threads; the hardirq hardware
+    interrupts will still always preempt them, regardless of their priority.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'By backporting the **threaded interrupt** from the RTL project to mainline
+    Linux, we can **solve** this problem. How? Think about it: with the *threaded
+    interrupt* model, the majority of the interrupt handling work is now performed
+    by a `SCHED_FIFO` kernel thread running with a real-time priority of `50`. So,
+    simply design your user space applications to have, where essential, `SCHED_FIFO`
+    RT threads with real-time priorities **higher than `50`**. **This will ensure
+    that they run in preference to the hardware interrupt handler!**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The key idea here is that a user mode thread under the `SCHED_FIFO` policy and
+    a real-time priority 50, can, in effect, preempt the (threaded) hardware interrupt! Quite
+    a thing indeed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, for our example scenario, let''s now assume we''re using threaded interrupts.
+    Next, tweak the user space multithreaded app''s design: assign our three real-time
+    threads a policy of `SCHED_FIFO` and real-time priorities of 60, 65, and 70\.
+    The following diagram conceptually depicts this scenario (for clarity, we have
+    only shown one of our user space `SCHED_FIFO` threads, thread B, this time at
+    `rtprio` of `65`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/9e8f7bd2-2822-44d8-b5f9-1a0c30c5b1f9.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.6 – Threaded interrupt model – a user mode RT SCHED_FIFO rtprio 50
+    thread can preempt the threaded interrupt; deadline achieved
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding diagram, RT thread B is now at the `SCHED_FIFO` scheduling
+    policy with an `rtprio` of `65`. It has up to 12 ms to complete (reach its deadline).
+    Again, say it executes for 6 ms (`t0` to `t1`); at time `t1`, a hardware interrupt
+    fires. Here, the low-level setup code and the (kernel default or driver's) hardirq
+    handler will execute immediately, preempting anything on the processor. However,
+    the hardirq or primary handler takes a very short time to execute (a few microseconds
+    at the most). This is, as we have already discussed, the primary handler that
+    is now executing; it will do the bare minimum work required before returning the
+    `IRQ_WAKE_THREAD` value, which will have the kernel wake up the kernel thread
+    representing the threaded handler. However – and this is the key – the threaded
+    interrupt, which is `SCHED_FIFO` with a priority of `50`, is now competing with
+    other runnable threads for the CPU resource. Since thread B is a `SCHED_FIFO` real-time
+    thread with an rtprio of `65`, **it will beat the threaded handler to the CPU
+    and will run instead!**
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To summarize, in the preceding diagram, the following is happening:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Time `t0` to `t1`: the user mode RT thread (`SCHED_FIFO`, `rtprio 65`) is executing
+    its code (for 6 ms)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: At time `t1`, the thin gray bar represents the hardirq low-level setup/BSP code.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The thin black double-arrow vertical line represents the primary hardirq handler
+    (both the above take just a few microseconds to complete).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The blue color bar is the scheduling code.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The purple bar (at `t3` + 50 us) represents the threaded interrupt handler running
+    at rtprio `50`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The upshot of all this is that thread B completes its work well within its deadline
+    (here, as an example, it's met its deadline in just over 10 ms).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unless time constraints are extremely critical, using the threaded interrupt
+    model to handle your device's interrupts works very well for most devices and
+    drivers. At the time of writing, the devices that tend to remain within the traditional
+    top/bottom half approach (covered in detail in the *Understanding and using top
+    and bottom halves* section) are typically high-performance network, block, and
+    (some) multimedia devices.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Constraints when using a threaded handler
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'One last thing regarding threaded handlers: the kernel won''t blindly allow
+    you to use a threaded handler for any IRQ; it honors some constraints. At the
+    time of registering your thread handler (via the `[devm_]request_threaded_irq()`
+    APIs), it performs several validity checks, one of which we''ve mentioned already: `IRQF_ONESHOT` must
+    be present for a threaded handler.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It also depends on the actual IRQ line; for example, I once tried using a threaded
+    handler for IRQ `1` on x86 (it''s typically the i8042 keyboard/mouse controller
+    chip''s interrupt line). It failed, with the kernel showing the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, from the preceding output, we can see that the i8042 will only accept the `0x80` bitmask
+    for the IRQ flags, whereas I passed a value of `0x2080`; a little checking will
+    show that the `0x2000` flag is indeed the `IRQF_ONESHOT` flag; apparently, this
+    causes a mismatch and isn't allowed. Not only that, but notice who flagged the
+    error – it was the kernel's generic IRQ layer (`genirq`) checking things under
+    the hood. (Note that this kind of error checking isn't restricted to threaded
+    interrupts.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, certain critical devices will find that using threaded handlers will actually
+    slow them down; this is pretty typical for modern NICs, block devices, and some
+    multimedia devices. They typically use the hardirq top half and tasklet/softirq
+    bottom half mechanisms (this will be explained in the *Understanding and using
+    top and bottom halves* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Working with either hardirq or threaded handlers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Before we conclude this section, there''s one more interesting point to take
+    into consideration: the kernel provides an IRQ allocation API that, based on certain
+    circumstances, will either set up your interrupt handler as a traditional hardirq
+    handler or as a threaded handler. This API is called `request_any_context_irq()`;
+    note that it''s exported as GPL-only though. Its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The parameters are identical to that of `request_irq()`. When invoked, this
+    routine will decide whether the interrupt handler function – the  `handler` parameter –
+    will run in an atomic hardirq context or in a sleep-capable process context, that
+    of a kernel thread – in other words, as a threaded handler. How will you know
+    which context `handler()` will run in? The return value let''s you know based
+    on the context that `handler()` will run in:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If it's going to run in a hardirq context, it returns a value of `IRQC_IS_HARDIRQ`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If it's going to run in a process/threaded context, it returns a value of `IRQC_IS_NESTED`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A negative `errno` will be returned on failure (you're expected to check this).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: What does this really imply, though? Essentially, there are controllers that
+    are on slow buses (I2C is a great example); they spawn off handlers that use so-called
+    "nested" interrupts, which really means that the handler isn't atomic in nature.
+    It might invoke functions that sleep (again, I2C functions are a good example
+    of this), and thus are required to be preemptible. Using the `request_any_context_irq()`
+    API ensures that if this is the case, the underlying generic IRQ code detects
+    it and gives you an appropriate handling interface. The GPIO-driven matrix keypad
+    driver is another example that makes use of this API (`drivers/input/keyboard/matrix_keypad.c`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With this coverage, you now understand what threaded interrupts are and why
+    they can be very useful. Now, let''s take a look at a shorter topic: how you,
+    as the driver author, can selectively enable/disable IRQ lines.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enabling and disabling IRQs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Typically, it''s the core kernel (and/or arch-specific) code that handles low-level
+    interrupt management. This includes doing things such as masking them as and when
+    required. Nevertheless, some drivers, as well as the OS, require fine-grained
+    control when enabling/disabling hardware interrupts. As your driver or module
+    code runs with kernel privileges, the kernel provides (exported) helper routines
+    that allow you to do exactly this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Brief comment** | **API or helper routine** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Disable/enable all interrupts on the local processor** |  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Unconditionally disables all interrupts on the local (current) processor
+    core. | `local_irq_disable()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Unconditionally enables all interrupts on the local (current) processor core.
+    | `local_irq_enable()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Saves the state (interrupt mask) of, and then disables all interrupts on 
+    the local (current) processor core. The state is saved in the `flags` parameter
+    that''s passed. | `local_irq_save(unsigned long flags);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Restores the state (interrupt mask) that''s passed, thus enabling interrupts
+    on the local (current) processor core as per the `flags` parameter. | `local_irq_restore(unsigned
+    long flags);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Disable/enable a specific IRQ line** |  |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Disables IRQ line `irq`; will wait for – and synchronize – any pending interrupts
+    (on that IRQ line) to complete before returning. | `​void disable_irq(unsigned
+    int irq);` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Disables IRQ line `irq`; won''t wait for any pending interrupts (on that
+    IRQ line) to complete (`nosync`). | `void disable_irq_nosync(unsigned int irq);`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Disables IRQ line `irq` and waits for the active hardirq handler to complete
+    before returning. It returns `false` if any threaded handlers pertaining to this
+    IRQ line are active (requires GPL). | `bool disable_hardirq(unsigned int irq);`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Enables IRQ line `irq`; undoes the effect of one call to `disable_irq()`.
+    | `​void enable_irq(unsigned int irq);` |'
+  prefs: []
+  type: TYPE_TB
+- en: The `local_irq_disable() / local_irq_enable()` helpers are designed to disable/enable all
+    interrupts (except NMI) on the local or current processor core.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The implementation on x86[_64] of `local_irq_disable()`/`local_irq_enable()` is
+    done via the (in)famous `cli`/`sti` pair of machine instructions; in the bad old
+    days, these used to disable/enable interrupts across the system, on all CPUs. Now,
+    they work on a per-CPU basis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `disable_{hard}irq*()`/`enable_irq()` helpers are designed to selectively
+    disable/enable a particular IRQ line and to be called as a pair. A few of the
+    aforementioned routines can be called from an interrupt context, though this should
+    be done with care! it's just safer to ensure you call them from process context.
+    The "with care" statement is there because several of these helpers work by internally
+    invoking non-blocking routines, such as `cpu_relax()`, that wait by repeatedly
+    running some machine instructions on the processor. (`cpu_relax()` is a good example
+    of this "needs to be used with care" case as it works by calling the `nop` machine
+    instruction in an infinite loop; the loop is exited when any hardware interrupt
+    fires, which is exactly what we're waiting for! Now, waiting for a while when
+    in the interrupt context is considered a wrong thing to do; hence the "with care"
+    statement.) The kernel commit for `disable_hardirq()` (link: [https://github.com/torvalds/linux/commit/02cea3958664723a5d2236f0f0058de97c7e4693](https://github.com/torvalds/linux/commit/02cea3958664723a5d2236f0f0058de97c7e4693))
+    explains that it's there to be used in situations where, *like netpoll, there
+    is a need to disable an interrupt from an atomic context*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When disabling an interrupt, take care to ensure you're not holding (have locked)
+    any shared resource that the handler might use. This will result in a (self) deadlock!
+    (Locking and its many scenarios will be explained in a lot more detail in the
+    last two chapters of this book.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The NMI
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: All the preceding APIs and helpers work on all hardware interrupts except for
+    the **non-maskable interrupt** (**NMI**)***. ***The NMI is an arch-specific interrupt
+    and is used to implement stuff such as hardware watchdogs and debug features (for
+    example, an unconditional kernel stack dump for all cores; we'll show an example
+    of this very shortly). Also, NMI interrupt lines cannot be shared.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A quick example of exploiting the NMI can be shown with the kernel's so-called
+    **magic SysRq** facility. To see the keyboard hotkeys that are assigned for magic
+    SysRq, you must invoke or trigger it by typing in the `[Alt][SysRq][letter]` key
+    combination.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'magic SysRq triggering: Instead of getting your fingers all twisted typing `[Alt][SysRq][letter]`,
+    there''s an easier – and more importantly non-interactive – way to do so: just
+    echo the relevant letter to a proc pseudofile (as root, of course): `echo letter/proc/sysrq-trigger`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But which letter do we need to type in? The following output shows a quick
+    way you can find out. This is a kind of quick-help for magic SysRq (I did this
+    on my Raspberry Pi 3B+):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The one we're currently interested in is shown in bold – the letter `l` (that's
+    a lowercase L) – `show-backtrace-all-active-cpus(l)`. Once triggered, it literally
+    does as promised – it shows a stack backtrace of the kernel-mode stack on all
+    active CPUs! (This can be a useful debugging aid as you will see what each CPU
+    core is running right now.) How? It does this by sending an NMI to them; that
+    is, to all CPU cores! This is one way we can see exactly what the CPUs are up
+    to at the very moment the command was triggered! This could be very useful when
+    something is hanging the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here, `echo l /proc/sysrq-trigger` (as root) does the trick! The following
+    partial screenshot shows the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/79f72a3d-c1fa-4bc9-9d0d-a6c26353cfed.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.7 – The output when the NMI is sent to all CPUs, showing the kernel
+    stack backtrace on each of them
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding screenshot, you can see that `bash` PID 633 is running on CPU `0` and
+    that the kernel thread, `swapper/1`, is running on CPU `1` (the kernel stack for
+    each can be seen; read it in a bottom-up fashion).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The magic SysRq facility''s code can be found at `drivers/tty/sysrq.c`; it''s
+    interesting to browse through. The following is the approximate call graph for
+    what happens on the x86 when the magic SysRq `l` is triggered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: The last function actually becomes the generic (not arch-specific) code at `lib/nmi_backtrace.c:nmi_trigger_cpumask_backtrace()`. The
+    code here triggers the CPU backtrace by sending an NMI to each CPU. This is achieved
+    via the `nmi_cpu_backtrace()` function. This function, in turn, displays the information
+    we saw in the preceding screenshot by invoking the `show_regs()` or `dump_stack()` routines,
+    which ultimately become arch-specific code to dump the CPU registers, as well
+    as the kernel-mode stack. The code is also intelligent enough to not attempt to
+    show a backtrace on those CPU cores that are in a low power (idle) state.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Again, things are not always simple in the real world; see this article by
+    Steven Rostedt on the complex issues people have faced with the x86 NMI and how
+    they''ve been addressed: *The x86 NMI iret problem*, March 2012: [https://lwn.net/Articles/484932/](https://lwn.net/Articles/484932/).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we haven't actually seen the kernel view of allocated IRQ lines; the
+    interface is, quite naturally, via the `procfs` filesystem; let's delve into it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing all allocated interrupt (IRQ) lines
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that you have understood sufficient details about IRQs and interrupt handling,
+    we can (finally!) leverage the kernel''s `proc`filesystem so that we can peek
+    at the currently allocated IRQs. We can do this by reading the content of the `/proc/interrupts` pseudofile.
+    We''ll show a couple of screenshots: the first (*Figure 4.8*) shows the IRQ status
+    – the number of interrupts serviced per CPU per I/O device – on my Raspberry Pi
+    ZeroW, while the second (*Figure 4.9*) shows this on our "usual" x86_64 Ubuntu
+    18.04 VM:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/97cb838d-8a47-42f0-81ed-e47551ee8883.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.8 – IRQ status on a Raspberry Pi ZeroW
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the preceding `/proc/interrupts` output, one line (or record) is emitted
+    for each IRQ line on the system. Let''s interpret each column of the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first column is the IRQ number that's been allocated.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second column (onward) shows the number of hardirqs that have been serviced
+    by each CPU core (from system startup until now). The number represents the number
+    of times the interrupt handler ran on that CPU core (the number of columns varies,
+    depending on the number of active cores that are handling IRQs on the system).
+    In the preceding screenshot, the Raspberry Pi Zero has only one CPU core, whereas
+    our x86_64 VM has two (virtualized) CPU cores that interrupts are distributed
+    over and handled (more on this in the *Load balancing interrupts and IRQ affinity* section).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The third (or later) column shows the interrupt controller chip. On x86 (the
+    fourth column in *Figure 4.9*), the name IO-APIC means that the interrupt controller
+    is an enhanced one that's used on multicore systems to distribute interrupts to
+    various cores or CPU groups (on high-end systems, multiple IO-APICs may be in
+    play).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The column after that displays the type of interrupt triggering that's being
+    used; that is, level or edge triggering (we discussed this in the *Understanding
+    level- and edge-triggered interrupts* section). Here, `Edge`tells us that the
+    IRQ is edge-triggered. The number that's prefixed to it (for example, `35 Edge` in
+    the preceding screenshot) is very system-dependent. It often represents the interrupt
+    source (that the kernel maps to an IRQ line; many embedded device drivers often
+    use GPIO pins to serve as interrupt sources). It's best not to attempt to interpret
+    it (unless you actually know how to) and just rely on the IRQ number instead (the
+    first column).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The last column on the right states the current owner of the IRQ line. Typically,
+    this is the name of the device driver or kernel component (that allocated this
+    IRQ line via one of the `*request_*irq()` APIs).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '![](img/4cfcd782-9fe7-4648-85a6-d1d1df254a38.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.9 – IRQ status on an x86_64 Ubuntu 18.04 VM (truncated screenshot)
+  prefs: []
+  type: TYPE_NORMAL
+- en: From the 2.6.24 kernel, for x86 and AMD64 systems (or x86_64), even non-device
+    (I/O) interrupts (system interrupts) are displayed here, such as the NMI, **local
+    timer interrupt** (**LOC**), PMI, IWI, and so on. You can see in *Figure 4.9*,
+    the last line displays `IWI`, which is the **Inter-Work Interrupt**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The kernel procfs code that displays the preceding output of `/proc/interrupts` –
+    that is, its `show`method – can be found at `kernel/irq/proc.c:show_interrupts()`
+    (link: [https://elixir.bootlin.com/linux/v5.4/source/kernel/irq/proc.c#L438](https://elixir.bootlin.com/linux/v5.4/source/kernel/irq/proc.c#L438)).
+    First, it prints the header line, then emits a one-line "record" for each IRQ
+    line. The statistics are mainly obtained from within the metadata structure for
+    each IRQ line – `struct irq_desc`; within each IRQ, it loops over every processor
+    core (via the `for_each_online_cpu()` helper routine), printing the number of
+    hardirqs that have been served for each of them. Finally (last column), it prints
+    the "owner" of the IRQ line via the `name` member of `struct irqaction`. The arch-specific
+    interrupts for the x86 (such as the `NMI`, `LOC`, `PMI`, and `IWI` IRQs) are displayed
+    via the code at `arch/x86/kernel/irq.c:arch_show_interrupts()`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the x86, IRQ `0` is always the **timer interrupt**. In the companion guide
+    *Linux Kernel Programming -* *Chapter 10*, *The CPU Scheduler - Part 1*, we learned
+    that, in theory, the timer interrupt fires `HZ` times per second. In practice,
+    for efficiency, this has now been replaced with a per-CPU periodic **high-resolution
+    timer** (**HRT**); it shows up as the IRQ named **LOC** (for **LOCal**) for timer
+    interrupts in `/proc/interrupts`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This actually explains why the number of hardware timer interrupts under the `timer` row
+    is very low; check this out (on an x86_64 guest with four (virtual) CPUs):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$ egrep "timer|LOC" /proc/interrupts ; sleep 1 ; egrep "timer|LOC" /proc/interrupts`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`  0:         33          0          0          0   IO-APIC   2-edge      timer`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`LOC:      11038      11809      10058       8848   Local timer interrupts`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`  0:         33          0          0          0   IO-APIC   2-edge      timer`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`LOC:      11104      11844      10086       8889   Local timer interrupts`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`$` Notice how IRQ `0` doesn''t increment but the `LOC` IRQ does indeed (per
+    CPU core).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `/proc/stat` pseudofile also provides some information on utilizing servicing
+    interrupts on a per-CPU basis and the number of interrupts that can be serviced
+    (please refer to the man page on `proc(5)` for more details).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Softirqs, as explained in detail in the *Understanding and using top and bottom
+    halves* section, can be viewed via `/proc/softirqs`; more on this later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With that, you''ve learned how to view the allocated IRQ lines. However, one
+    major aspect of interrupt handling remains: understanding the so-called top-half/bottom-half
+    dichotomies, why they exist, and how to work with them. We''ll look at this in
+    the next section.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using top and bottom halves
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Much emphasis has been put on the fact that your interrupt handler must complete
+    its work quickly (as explained in the *Keep it fast* section and elsewhere). Having
+    said that, a practical issue does crop up. Let''s consider this scenario: you
+    have allocated IRQn and have written the interrupt handler function to handle
+    this interrupt when it arrives. As you may recall, the function we''re talking
+    about here, commonly referred to as the **hardirq** or **ISR (Interrupt Service
+    Routine)** or primary handler, is the second parameter to the `request_{threaded}_irq()` API, the
+    third parameter to the `devm_request_irq()` API, and the fourth parameter to the `devm_request_threaded_irq()` API.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we mentioned previously, there''s a quick heuristic to follow: if your hardirq routine''s
+    processing consistently exceeds 100 microseconds, then you will need to use alternate
+    strategies. Let''s say that your handler finishes well within this time; in this
+    case, there''s no issue at all! But what if it does require more time? Perhaps
+    the low-level specification for the peripheral entails that you do a number of
+    things when the interrupt arrives (say there are 10 items to complete). You correctly
+    write the code to do so, but it pretty much always exceeds the time limit (100
+    microseconds as a thumb rule)! So, what do you do? On the one hand, there are
+    these kernel folks yelling at you to finish fast; on the other, the low-level
+    spec for the peripheral demands that you follow several key steps in order to
+    correctly handle the interrupt! (Talk about being on the horns of a dilemma!)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we hinted at earlier, there are two broad strategies that are followed in
+    cases like these:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Employ a thread interrupt to handle the majority of the work; considered the
+    modern approach.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use a "bottom half" routine to handle the majority of the work; the traditional
+    approach.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We covered the conceptual understanding, practical usage and the *why* of threaded
+    interrupts in detail in the *Working with the threaded interrupts model* section.
+    In the top-bottom-half model, this is the approach:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The so-called **top half** is the function that is initially invoked when the
+    hardware interrupt is triggered. This is thus familiar to you - it''s nothing
+    but the **hardirq**, ISR, or primary handler routine that you registered via one
+    of the `*request_*irq()` APIs (just for clarity: via one of these APIs: `request_irq()`
+    / `devm_request_irq()` / `request_threaded_irq()` / `devm_request_threaded_irq()`.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We also register a so-called **bottom half** routine to perform the majority
+    of the interrupt handling work.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'In other words, interrupt handling is **split into two halves** – top and bottom.
+    However, this isn''t really a pleasing way to describe it (as the English word half makes
+    you intuitively think that the routines are of approximately the same size); the
+    reality is more like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The top half performs the bare minimum work required (typically, acknowledging
+    the interrupt, perhaps turning it off on the board for the duration of the top
+    half, and then performing any (minimal) hardware-specific work including receiving/sending
+    some data as is required from/to the device).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The bottom half routine carries out the majority of the interrupt handling work.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'So, what is the bottom half? It''s just a C function that''s appropriately
+    registered with the kernel. The actual registration API you should use depends
+    on the *type* of bottom half you intend to use. There are three types:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The old **bottom-half** mechanism, which is now deprecated; it's abbreviated
+    as **BH** (you can pretty much ignore it).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The modern recommended (if you''re using this top-bottom-half technology in
+    the first place) mechanism: the **tasklet**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The underlying kernel mechanism: the **softirq**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You will come to see that the tasklet is actually built upon a kernel softirq.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s the thing: the top half – the hardirq handler that we''ve been working
+    with until now – does, as we mentioned previously, the bare minimum work; it then
+    "schedules" its bottom half and exits (returns). The word schedule here does not
+    mean it calls `schedule()`, as that would be ridiculous (we''re in an interrupt
+    context, after all!); it''s just the word that''s used to describe the fact. The
+    kernel will guarantee that the bottom half runs as soon as possible once the top
+    half completes; in particular, no user or kernel thread will ever preempt it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hang on a second, though: even if we do all this – splitting the handler into
+    two halves and have them collectively execute the work – then how have we saved
+    any time? That was the original intent, after all. Won''t it take an even longer
+    time to complete now with the overhead of invoking two functions as opposed to
+    one? Ah, this brings us to a really key point: **the top half (hardirq) always
+    runs with all interrupts disabled (masked) on the current CPU and the IRQ it''s
+    handling disabled (masked) across all CPUs, but the bottom half handler runs with
+    all interrupts enabled.**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that the bottom half is still very much running in an atomic or interrupt
+    context! So, the same caveats that apply to the hardirq (top half) handler also
+    apply to the bottom-half handler:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You cannot transfer data (to or from user kernel spaces).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can only allocate memory (if you really must) with the `GFP_ATOMIC` flag.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You cannot, ever, directly or indirectly, call `schedule()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'This bottom-half handling is a subset of what''s known as the kernel''s *deferred
+    functionality* prowess; the kernel has several of these deferred functionality mechanisms:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Workqueues (based on kernel threads); `context:process`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Bottom half/tasklet (based on softirqs); `context:interrupt`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Softirqs; `context:interrupt`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: kernel timers; `context:interrupt`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We will cover kernel timers and workqueues in [Chapter 5](c7d2d826-9d8a-439f-b843-06fa72db36b9.xhtml), *Working
+    with Kernel Timers, Threads, and Workqueues.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: All these mechanisms allows the kernel (or driver) to specify that some work
+    must be carried out later (it's deferred), when it is safe to do so.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, you should be able to understand that the threaded interrupt
+    mechanism we''ve already discussed is somewhat akin to a deferred functionality
+    mechanism. This is considered the modern approach to use; again, though its performance
+    is acceptable for most peripherals, a few device classes – typically network/block/multimedia
+    – might still require the traditional top-bottom-half mechanisms to provide high
+    enough performance. Also, we emphasize yet again: both top and bottom halves always
+    run in an atomic (interrupt) context, whereas threaded handlers actually run in
+    process context; you can view this as an advantage or disadvantage. The fact is
+    that although the threaded handler is technically within the process context,
+    it''s really best to perform fast non-blocking operations within it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Specifying and using a tasklet
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A key difference between a tasklet and the kernel's softirq mechanism is that
+    tasklets are simply easier to work with, making them a good choice for your typical
+    driver. Of course, if you can use a threaded handler instead, just do that; later,
+    we'll show a table that will help you decide what to use and when. One of the
+    key things that makes tasklets easier to use is the fact that (on an SMP system)
+    a particular tasklet will never run in parallel with itself; in other words, a
+    given tasklet will run on exactly one CPU at a time (making it non-concurrent,
+    or serialized, with respect to itself).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The header comment in `linux/interrupt.h` gives us some important properties
+    of the tasklet as well:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: We'll show the `tasklet_schedule()` function shortly. The last point in the
+    preceding comment block will be covered in the last two chapters of this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, how can we use a tasklet? First, we have to set it up with the `tasklet_init()`
+    API; then, we have to schedule it for execution. Let's learn how to do this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Initializing the tasklet
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `tasklet_init()` function initializes a tasklet; its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s check out its parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`struct tasklet_struct *t`: This structure is the metadata representing the
+    tasklet. As you already know, a pointer, by itself, has no memory! Remember to
+    allocate memory to the data structure and then pass the pointer here.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`void (*func)(unsigned long)`: This is the tasklet function itself – **the
+    "bottom half"** that runs once the hardirq completes; this bottom half function
+    performs the majority of the interrupt handling process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`unsigned long data`: Any data item you wish to pass along to the tasklet routine
+    (a cookie).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Where should this initialization work be performed? Typically, this is done
+    within the driver's *probe* (or `init`) function. So, now that it's been initialized
+    and is ready to go, how do we invoke it? Let's find out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running the tasklet
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The tasklet is the bottom half. Thus, in the top half, which is your hardirq handler
+    routine, the last thing you should do before returning is "schedule" your tasklet
+    to execute:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Simply pass the pointer to your (initialized) tasklet structure to the `tasklet_schedule()`
+    API; the kernel will handle the rest. What does the kernel do? It schedules this
+    tasklet to execute; practically speaking, your tasklet's function code is guaranteed
+    to run before control returns to the task that was interrupted in the first place
+    (be it a user or kernel thread). More details can be found in the *Understanding
+    how the kernel runs softirqs* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Regarding the tasklet, there are a few things you need to be clear about:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The tasklet executes its code in an interrupt (atomic) context; it's actually
+    a softirq context. So, remember, all the restrictions that apply to top halves
+    apply here too! (Check out the *Interrupt context guidelines – what to do and
+    what not to do* section for detailed information on restrictions)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Synchronization (on an SMP box):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A given tasklet will never run in parallel with itself.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Different tasklets *can *run in parallel on different CPU cores.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Your tasklet can itself be interrupted by a hardirq, including your own IRQ!
+    This is because tasklets, by default, run with all interrupts enabled on the local
+    core, and, of course, hardirq's are the very top priority on the system
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Locking implications really do matter – we'll cover these areas in detail in
+    the last two chapters of this book (particularly when we cover *spinlocks*).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Some (generic driver) sample code is as follows (for clarity, we''ve avoided
+    showing any error paths):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet, we declared a global pointer, `ts`, to `struct
+    tasklet_struct`; in the `init`code of the driver, we registered the driver as
+    belonging to the `misc`kernel framework. Next, we allocated RAM to the tasklet
+    structure (via the useful `devm_kzalloc()` API). Next, we initialized the tasklet
+    via the `tasklet_init()` API. Notice that we specified the function name (second
+    parameter) and simply passed `0` as the third parameter, which is the cookie to
+    pass along (many real drivers pass their context/private data structure pointer
+    here). We then allocated an IRQ line (via the `devm_request_irq()` API).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s continue looking at the code of this generic driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, let's imagine we did whatever minimal work was required
+    in our top half (the `my_hardirq_handler()` function). We then primed our tasklet
+    so that it can run by invoking the `tasklet_schedule()` API. You'll find that
+    the tasklet will run almost immediately after the hardirq (in the preceding code,
+    the tasklet function is called `mydrv_tasklet()`). In the tasklet, you are expected
+    to perform the majority of the interrupt processing work. Within it, we called
+    our macro `PRINT_CTX()`; as you will see in the *Fully figuring out the context*
+    section, it prints various details regarding our current context, which is helpful
+    for debugging/learning (you'll find it shows, among other things, that we're currently
+    running in interrupt context).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead of the `tasklet_schedule()` API, you can use an alternate routine, via
+    the `tasklet_hi_schedule()` API. This internally makes the tasklet become the
+    *highest priority softirq* (softirq priority `0`)! (More information can be found
+    in the *Understanding the kernel softirq mechanism* section.) Note that this is
+    almost never done; the default (softirq) priority that a tasklet enjoys is usually
+    more than sufficient. Setting it to the `hi` level is really only meant for extreme
+    cases; avoid it as far as is possible.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On version 5.4.0 Linux, there *are* 70-odd instances of the `tasklet_hi_schedule()`
+    function being used by drivers. The drivers are typically high-performance network
+    drivers – a few GPU, crypto, USB, and mmc drivers, as well as a few other drivers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When it comes to tasklets, the kernel keeps evolving. Recent (as the time of
+    writing, July 2020) patches by *Kees Cook* and others are looking to modernize
+    the tasklet routine (callback). For more information regarding this, please go
+    to [https://www.openwall.com/lists/kernel-hardening/2020/07/16/1](https://www.openwall.com/lists/kernel-hardening/2020/07/16/1).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the kernel softirq mechanism
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'At this point, you understand that the bottom half, the tasklet, is a deferred
+    functionality mechanism that, while running, doesn''t mask interrupts. They''re
+    designed to allow you to get the best of both worlds: they allow the driver to
+    do fairly lengthy interrupt processing if the situation demands it *and* do it
+    in a deferred safe manner while simultaneously allowing the business of the system
+    (via hardware interrupts) to continue.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You''ve already learned how to use the tasklet – it''s a great example of a
+    deferred functionality mechanism. But how are they internally implemented? The
+    kernel implements tasklets via an underlying facility called the **softirq** (or
+    **software-interrupt**) mechanism*.* Though on the surface they''re analogous
+    to the threaded interrupt we saw earlier, it''s really very different in many
+    important ways. The following characteristics of softirqs will help you understand
+    them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Softirqs are a pure internal kernel deferred functionality mechanism in the
+    sense that they are statically assigned at kernel compile time (they're all hard-coded
+    into the kernel); you cannot dynamically create a new softirq.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The kernel (as of version 5.4) provides a total of 10 discrete softirqs:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Each softirq is designed to serve a particular need, usually associated with
+    a very particular hardware interrupt or kernel activity. (The exceptions here
+    are perhaps the soft IRQs reserved for the generic tasklet: `HI_SOFTIRQ`  and `TASKLET_SOFTIRQ`.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: These 10 softirqs have a priority ordering (and will be consumed in that order).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The tasklet is, in fact, a thin abstraction on top of a particular softirq (`TASKLET_SOFTIRQ`),
+    one of the 10 available. The tasklet is the only one that can be registered, run,
+    and deregistered at will, making it an ideal choice for many device drivers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Softirqs run in interrupt – softirq – context; the `in_softirq()` macro returns
+    `true` here, implying you are in a softirq (or tasklet) context.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: All softirq servicing is considered a high priority on the system. Next to the
+    hardware interrupt (the `hardirq/ISR/primary` handler), the softirq has the highest
+    priority on the system. Pending softirqs are consumed by the kernel *before *the
+    process context that was interrupted in the first place is restored.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following diagram is a superset of our earlier depiction of priorities
+    on standard Linux; this one includes softirqs (within which is the tasklet):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/cdb5a54d-d4ea-4ac3-b64f-cba27cd50639.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.10 – Relative priorities on standard Linux, showing softirqs as well
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, yes, as you can see, softirqs are a very high-priority mechanism on Linux;
+    there are 10 distinct ones at differing priorities. What they are, and what they're
+    meant for, will be covered in the next subsection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Available softirqs and what they are for
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The work that''s carried out by a given softirq is statically compiled into
+    the kernel image (it''s fixed). This coupling of the softirq and the action it
+    takes (in effect, the code it runs, via the `action` function pointer) is done
+    via the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following diagram is a conceptual representation of the available softirqs
+    and their priority level on Linux (as of kernel version 5.4), with `0` being the
+    highest and `9` the lowest softirq priority level:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f4db6866-2a3b-414f-b0e2-88a2e21c1dfa.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.11 – The 10 softirqs on Linux in order of priority (0:highest, 9:lowest)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following table sums up the individual kernel''s softirqs in order of their
+    priority (`0`: `HI_SOFTIRQ` being the highest priority one), along with the action
+    or vector, its functionality, and a comment mentioning what its use case is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Softirq#** | **Softirq** | **Comment (what it''s used for/does)** | **"action"
+    or "vector" function** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `0` | `HI_SOFTIRQ` | **Hi-tasklet**: The highest priority softirq; used when
+    `tasklet_hi_schedule()` is invoked. It is not recommended for the majority of
+    use cases. Use the regular tasklet instead (softirq #`6`). | `tasklet_hi_action()`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `1` | `TIMER_SOFTIRQ` | **Timer**: The timer interrupt''s bottom half runs
+    expired timers along with other "housekeeping" tasks (including the scheduler
+    CPU `runqueue` + `vruntime` updates, increments of the well-known `jiffies_64` variable,
+    and so on). | `run_timer_softirq()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `2` | `NET_TX_SOFTIRQ` | **Net**: Network stack transmit path bottom half
+    (qdisc). | `net_tx_action()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `3` | `NET_RX_SOFTIRQ` | **Net**: Network stack receive path bottom half
+    (NAPI polling). | `net_rx_action()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `4` | `BLOCK_SOFTIRQ` | **Block**: Block processing (complete the I/O op;
+    invokes the complete function of block MQ, `blk_mq_ops`). | `blk_done_softirq()`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `5` | `IRQ_POLL_SOFTIRQ` | **irqpoll**: Implements the kernel''s block layer
+    polled IRQ mode (equivalent to the network layer''s NAPI processing). | `irq_poll_softirq()`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `6` | `TASKLET_SOFTIRQ` | **Regular tasklet**: Implements the tasklet bottom-half
+    mechanism, the only dynamic (flexible) softirq: can be registered, used, and deregistered
+    by drivers as required. | `tasklet_action()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `7` | `SCHED_SOFTIRQ` | **sched**: Used for periodic load balancing by the
+    CFS scheduler on SMP; migrates tasks to other runqueues if required. | `run_rebalance_domains()`
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `8` | `HRTIMER_SOFTIRQ` | **HRT**: Used for **high-resolution timers** (**HRT**).
+    It was removed in version 4.2 and reentered the kernel in a better form in version
+    4.16. | `hrtimer_run_softirq()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `9` | `RCU_SOFTIRQ` | **RCU**: Performs **read copy update** (**RCU**) processing,
+    a form of lock-free technology used within the core kernel. | `rcu_core_si() /
+    rcu_process_callbacks()` |'
+  prefs: []
+  type: TYPE_TB
+- en: It's interesting; the network and block stacks are very high priority code paths
+    (as is the timer interrupt), so their code must run as soon as possible. Thus,
+    they have explicit softirqs that service these critical code paths.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Can we see the softirqs that have been fired off so far? Of course, very much
+    like how we can view hardirqs (via its `proc/interrupts` pseudofile). We have
+    the `/proc/softirqs` pseudofile for tracking softirqs. Here''s a sample screenshot
+    from my native (four-core) x86_64 Ubuntu system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/3f611395-ef6b-492d-8729-18ac25cb5dd6.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.12 – Output of /proc/softirqs on a native x86_64 system with 4 CPU
+    cores
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just like with `/proc/interrupts`, the numbers shown in the preceding screenshot
+    depict the number of times a particular softirq occurred on a particular CPU core
+    from system startup. In addition, FYI, the powerful `crash` tool has a useful
+    command, `irq`, that shows information regarding interrupts; `irq -b` displays
+    the defined softirqs on that kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding how the kernel runs softirqs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The following is the (approximate) call graph that''s used on x86 when a hardware
+    interrupt is triggered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some of the preceding code paths are arch-dependent. Note that the "marking
+    the context as an interrupt" context is really an artifact. The kernel is marked
+    as having entered this context in the `entering_irq()` function and as having
+    left it once `exiting_irq()` returns (on x86). But hang on! The `exiting_irq()` inline
+    function invokes the `kernel/softirq.c:irq_exit()` function ([https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L403)[L403](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L403)).
+    It''s within this routine that the kernel processes, and consumes, all pending
+    softirqs. The basic call graph (from `do_softirq()` onward) is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: The real work happens in the internal `__do_softirq()` routine ([https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L249](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L249)).
+    It's here that any pending softirqs are consumed in priority order. Notice that
+    softirq processing is done before context is restored to the interrupted task.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's briefly focus on some of the internal details of tasklet execution,
+    followed by how to use *ksoftirqd* kernel threads to offload softirq work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Running tasklets
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'A word on the internals of tasklet invocation: we understand that the tasklet
+    softirq runs via `tasklet_schedule()`. This API ends up invoking the kernel''s
+    internal `__tasklet_schedule_common()` function ([https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L471](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L471)),
+    which internally calls `raise_softirq_irqoff(softirq_nr)` ([https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L423](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L423)).
+    This raises the `softirq_nr` softirq; for a regular tasklet, this value is `TASKLET_SOFTIRQ`,
+    whereas when the tasklet is scheduled via the `tasklet_hi_schedule()` API, is
+    value is `HI_SOFTIRQ`, the highest priority softirq! Use it rarely, if ever.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We now know that the "schedule" functionality has set up the softirq; here,
+    the actual execution takes place when the softirqs at that priority level (`0`
+    or `6` here) actually run. The function that runs softirqs is called `do_softirq()`;
+    for the regular tasklet, it ends up calling the `tasklet_action()` softirq vector (as
+    shown in the preceding table); this calls `tasklet_action_common()` ([https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L501](https://elixir.bootlin.com/linux/v5.4/source/kernel/softirq.c#L501)), which
+    (after some list setup) enables hardware interrupts (via a `local_irq_enable()`)
+    and then loops over the per CPU tasklet list, consuming (running) the tasklet
+    function(s) on it. Did you notice that pretty much all the functions mentioned
+    here are arch-independent? - a good thing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Employing the ksoftirqd kernel threads
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Softirqs can impose an enormous load on the system when there is a flood of
+    them waiting to be processed. This has been repeatedly seen in the network (and
+    to some extent, block) layers, leading to the development of polled mode IRQ handling;
+    it''s called NAPI for the network (receive) path and simply interrupt-poll handling for
+    the block layer. But what if, even with polled mode handling, the softirq flood
+    persists? The kernel has one more trick up its sleeve: if softirq processing exceeds
+    2 milliseconds, the kernel offloads the pending softirq work onto per-CPU kernel
+    threads named `ksoftirqd/n` (where `n` represents the CPU number, starting from `0`).
+    A benefit of this approach is that because kernel threads must compete with other
+    threads for CPU resources, user space doesn''t end up getting completely starved
+    of CPU (which could happen with pure hardirq/softirq load).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This sounds like a good solution, but the real world begs to differ. In February
+    2019, a series of patches to set up softirq vector fine-grained masking looked
+    promising but ultimately seem to have fizzled out (do read the very interesting
+    details provided in the *Further reading *section). The following email from Linus
+    Torvalds clarifies the real problem nicely ([https://lore.kernel.org/lkml/CAHk-=wgOZuGZaVOOiC=drG6ykVkOGk8RRXZ_CrPBMXHKjTg0dg@mail.gmail.com/#t](https://lore.kernel.org/lkml/CAHk-=wgOZuGZaVOOiC=drG6ykVkOGk8RRXZ_CrPBMXHKjTg0dg@mail.gmail.com/#t)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: The last part of the statement hits the nail on the head.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, this begs the question: can we *measure* hardirq/softirq instances and
+    latencies? We cover this in the section *Measuring metrics and latency*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Softirqs and concurrency
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As we learned with regard to tasklets, a number of points with regard to *concurrency*
+    must be understood with respect to softirqs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As noted with tasklets (on SMP), a tasklet will never run in parallel with itself;
+    this is a feature that makes it easier to use. This isn't true of softirqs: the
+    same softirq vector can indeed run in parallel with itself on another CPU! Thus,
+    the softirq vector code has to be especially careful with the use of locking (and
+    deadlock avoidance).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A softirq can always be interrupted by a hardirq, including the IRQ that caused
+    it to be raised (this is because, as with tasklets, softirqs run with all interrupts
+    enabled on the local core).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A softirq cannot preempt another currently executing softirq, even though they
+    have priority levels; they are consumed in priority order.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The reality is that the kernel provides APIs such as `spin_lock_bh()`, which
+    allow you to disable softirq processing while the lock is held. This is required
+    to prevent deadlock when both the hardirq and the softirq handlers are working
+    on shared data. The locking implications really do matter. We'll cover this in
+    detail in the last two chapters of this book.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardirqs, tasklets, and threaded handlers – what to use when
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As you already know, the hardirq code is meant to do the bare minimum setup
+    and interrupt handling, leaving the majority of the interrupt processing to be
+    performed in a safe manner via the deferred functionality mechanisms we've been
+    talking about, the tasklet and/or softirq. This 'bottom half' as well as deferred
+    functionality handling is carried out in priority order – first, the softirq kernel
+    timers, then tasklets (both of these are just special cases of the underlying
+    softirq mechanism), then threaded interrupts, and finally workqueues (the latter
+    two use underlying kernel threads).
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, the big question is, when you're writing your driver, which one of these
+    should you use? Should you use a deferred mechanism at all? It really depends
+    on the **amount of time ****your complete interrupt processing takes** to complete.
+    If your complete interrupt processing can be consistently completed within a few
+    microseconds, then just use the top-half hardirq; nothing else is required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But what if this isn''t the case? Take a look at the following table; the first
+    column specifies the total time it takes for complete interrupt processing, while
+    the other columns provide a few suggestions regarding its use plus pros and cons:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Time: If hardware interrupt handling  consistently requires** | **What
+    to do** | **Pros/cons** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| <= 10 microseconds | Use only the hardirq (top half); nothing else is required.
+    | Best case; not typical. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Between 10 and 100 microseconds | Either only hardirq or both hardirq and
+    a tasklet (softirq). | Run stress tests/workloads to see if a tasklet is really
+    required. Its usage is mildly discouraged in favor of threaded handlers or workqueues.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 100 microseconds, non-critical device | Use a primary handler (hardirq);
+    that is, either your own handler function (if hardware-specific work is required)
+    or simply use the kernel default and a *threaded* handler. Alternatively, if acceptable,
+    simply use a *workqueue* (covered in the next chapter). | This avoids softirq
+    processing, which helps reduce system latencies but can result in slightly slower
+    handling. This is because the threaded handler competes for CPU time with other
+    threads. Workqueues are also based on kernel threads and have similar characteristics.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 100 microseconds, critical device (typically network, block, and some multimedia
+    devices) | Use a primary handler (hardirq/top half) and a tasklet (bottom half).
+    | It prioritizes the device over everything when a flood of interrupts arrive.
+    This is also a downside as this can cause "livelock" issues and long latencies
+    with a softirq "flood"! Test and ascertain. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 100 microseconds, extremely critical work/device | Use a primary handler
+    (hardirq/top half) and a hi-tasklet or (possibly) your own (new!) softirq. | This
+    is a rather extreme, unlikely case; to add your own softirq you will need to change
+    the internal (GPL-ed) kernel code. This makes it high maintenance (unless your
+    core kernel changes + driver is contributed upstream!). |'
+  prefs: []
+  type: TYPE_TB
+- en: The time in microseconds in the first column is, of course, debatable, arch-and-board-dependent,
+    and can (and will) change over time. The suggested value of 100 microseconds as
+    a baseline is merely a heuristic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we''ve already mentioned, softirq processing itself should complete within
+    a few hundred microseconds; a flood of unprocessed softirqs can again lead to
+    a livelock situation. The kernel mitigates (or de-risks) this in two broad ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Threaded interrupts or workqueues (both based on kernel threads)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Invoking the `ksoftirqd/n` kernel threads to take over softirq processing
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The preceding cases run in process context, thus alleviating the issue of starving
+    genuine (user space) threads that require the CPU via the scheduler (as the kernel
+    threads themselves have to compete for the CPU resources).
+  prefs: []
+  type: TYPE_NORMAL
+- en: With regard to the last row of the preceding table, the only way to create a
+    new softirq is to actually dive into the kernel code and modify it. By this, we
+    mean modifying the (GPL licensed) kernel code base. In terms of embedded projects,
+    modifying the kernel source is not uncommon. However, adding softirqs is considered
+    (very) uncommon and not a great idea at all since latencies may already be high
+    without more softirq processing to contend with! This hasn't happened for many
+    years now.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In terms of real time and determinism, in the companion guide *Linux Kernel
+    Programming,* *Chapter 11*, *The CPU Scheduler – Part 2*, in the *Viewing the
+    results* section, we mentioned that the *jitter* (the time variance) in interrupt
+    processing on a microprocessor running standard Linux is on the order of +/- 10
+    microseconds. With the RTL kernel, it's a lot better, yet not a hundred percent
+    deterministic. So, can you be completely deterministic with interrupt handling
+    on Linux? Well, one interesting approach is to use – if enabled and possible – **FIQs**,
+    the so-called *fast interrupt* mechanism that some processors, notably ARM, provide.
+    They work outside the Linux kernel's scope, which is precisely why writing an
+    FIQ interrupt handler would eliminate any kernel-induced jitter. Take a look at
+    this article for more information: [https://bootlin.com/blog/fiq-handlers-in-the-arm-linux-kernel/](https://bootlin.com/blog/fiq-handlers-in-the-arm-linux-kernel/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, it may be worth mentioning that (at the time of writing) a good amount
+    of rethinking is going on here: the opinion of some kernel developers is that
+    the whole top-half bottom-half mechanism isn''t required anymore. However, the
+    fact is that this mechanism is deeply embedded into the kernel fabric, making
+    it non-trivial to remove.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fully figuring out the context
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The *Interrupt context guidelines – what to do and what not to do* section made
+    this clear: when you're in any kind of interrupt (or atomic) context, do not invoke
+    any possibly blocking APIs (that end up calling `schedule()`)*;* this really boils
+    down to a few key points (as we saw). One is that you should not make any kernel
+    to user space (or vice versa) data transfers; another, if you must allocate memory,
+    do so with the `GFP_ATOMIC` flag.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This, of course, begs the question: **how do I know if my driver (or module)
+    code is currently running in process or interrupt (atomic) context?** Furthermore,
+    if it''s running in interrupt context, is it in a top or bottom half? The short
+    answer to all this is that the kernel provides several macros that you can use
+    to figure this out. These macros are defined in the `linux/preempt.h` header.
+    Instead of unnecessarily duplicating information, we''ll show the relevant kernel
+    comment header here; it clearly names and describes these macros:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: We covered a subset of this topic in the companion guide *Linux Kernel Programming,* *Chapter
+    6*, *Kernel Internals Essentials – Processes and Threads*, under the *Determining
+    the context* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, it''s quite simple; in our `convenient.h` header ([https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/blob/main/convenient.h](https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/blob/main/convenient.h)),
+    we define a convenience macro called `PRINT_CTX()` that, when invoked, will print
+    the current context to the kernel log. The message is very deliberately formatted.
+    The following is an example of the typical output it emits when invoked:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'At first, the format might look strange to you. However, I have simply followed
+    the kernel''s Ftrace (latency) output format to show the context (with the exception
+    of the `DURATION` column; we don''t have it here). The Ftrace output format is
+    well supported and understood by developers and kernel users. The following output
+    shows you how to interpret it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This can be very useful as it can help you understand and thus debug difficult
+    situations! You get to see not only what was running (its name and PID, as well
+    as on which CPU core), but also four interesting columns (highlighted in bold
+    (`.N.0`)). The preceding ASCII art view of these four columns is in fact identical
+    to what Ftraceitself generates. Let''s interpret these four columns (in our example
+    here, it''s the value `.N.0`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Column 1**: The IRQ state. It displays `.` if interrupts are enabled (usually
+    the case) and `d` if disabled.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Column 2**: The `TIF_NEED_RESCHED` bit state. If `1`, the kernel will invoke `schedule()` at
+    the next opportunity point (return from syscall or return from interrupt, whichever
+    comes first). It displays `N` if set and `.` if cleared.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Column 3**: If we''re in an interrupt context, we can employ more macros
+    to check whether we''re in a hardirq (top half) or softirq (bottom half) context.
+    It displays this as follows:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.`: Process (task) context'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Interrupt / atomic context:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`h`: Hardirq is running'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`H`: Hardirq occurred inside a softirq (that is, a hardirq occurred while a
+    softirq was executing, interrupting it)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s`: Softirq (or tasklet) context'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Column 4**: An integer value (derived from a bitmask) called `preempt_depth`.
+    Essentially, it''s incremented every time a lock is taken and decremented on every
+    unlock. So, if it''s positive, it implies the code is within a critical or atomic
+    section.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following is (part of) our code implementation for the `convenient.h:PRINT_CTX()` macro (carefully
+    study the code and do use the macro in your code to understand it):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: It basically pivots on the `if` condition and checks whether the code is in
+    a process (or task) context or not via the `in_task()` macro, and thus in an interrupt
+    (or atomic) context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You might have come across the `in_interrupt()` macro being used in situations
+    like this. If it returns `true`, your code is within an interrupt context, while
+    if it returns `false`, it isn't. However, the recommendation for modern code is
+    to *not* rely on this macro (and `in_softirq()`) due to the fact that bottom-half
+    disabling can interfere with its correct working). Hence, we use `in_task()` instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s continue looking at the code for the `PRINT_CTX()` macro:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: If the `PRINTCTX_SHOWHDR` variable is set to `1`, it prints a header line; it's `0` by
+    default. This is where the macro emits the (debug-level) printk (via `pr_debug()`),
+    which shows the context information in Ftrace (latency) format, as seen in the
+    preceding snippet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Viewing the context – examples
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As an example, in our `ch1/miscdrv_rdwr` misc driver code (and several others,
+    in fact), we used this very macro (`PRINT_CTX()`) to display the context. Here''s
+    some sample output from when our simple `rdwr_drv_secret` app read the "secret
+    message" from the driver (for clarity, I removed the `dmesg` timestamps):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: The header line shows how to interpret the output. (In fact, this header line
+    is off by default. I temporarily changed the value of the `PRINTCTX_SHOWHDR` variable to `1` to
+    show it here.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is another example from an (out of tree) driver while running
+    the code of a (bottom-half) tasklet (we covered tasklets in the *Understanding
+    and using top and bottom halves* section):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s interpret the preceding output in more detail; from left to right:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`000)`: The tasklet ran on CPU core `0`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The task that was interrupted by this is the `gnome-terminal*-*` process with
+    PID `3075`. Actually, it was probably interrupted by the hardirq that fired before
+    this tasklet ran, and will only resume execution – best case scenario – once the
+    tasklet's done.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We can infer the following from the preceding four-column output (the `.Ns1`
+    part):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`.`: All interrupts (on the local core, core `#0`) are enabled.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`N`: The `TIF_NEED_RESCHED` bit is set (implying that the scheduler code will
+    run when the next scheduling "opportunity point" is hit; realize that it will
+    very likely be run (in process context) by the `gnome-terminal-` thread).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`s`: The tasklet is an interrupt – more precisely, a softirq – context (to
+    be precise, it''s the `TASKLET_SOFTIRQ` softirq); an atomic context; this is expected
+    - we''re running a tasklet!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`1`: the value of `preempt_depth` is `1`; this implies a (spin)lock is currently
+    being held (again, this  implies that we''re currently in an atomic context).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The driver function running in the tasklet context was called `mydrv_tasklet()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Often, when viewing a capture like this, in interrupt context, the interrupted
+    task shows up as the `swapper/n` kernel thread (where `n` is the CPU core's number).
+    This typically implies that the `swapper/n`kernel thread was interrupted by the
+    hardirq, further implying that the interrupt triggered while that CPU was in an
+    idle state (since the `swapper/n` threads only run then), which is a pretty common
+    occurrence on a lightly loaded system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How Linux prioritizes activities
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that you have learned about so many areas across the gamut, we can zoom
+    out and see how the Linux kernel prioritizes things. The following (conceptual)
+    diagram - a superset of earlier similar diagrams - neatly sums this up:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/afcdef0b-492c-4afe-989d-e62aa5e74277.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.13 – Relative priorities across the full stack - user, kernel process
+    context, and kernel interrupt contexts
+  prefs: []
+  type: TYPE_NORMAL
+- en: This diagram is pretty self-explanatory, so please study it carefully.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this lengthy section, you have learned about interrupt handling via both
+    the top-half and bottom-half mechanisms, the reasons for them in the first place,
+    and how they are organized and to be used by drivers. You now understand that
+    all bottom-half mechanisms are internally implemented via softirqs; the tasklet
+    is the primary bottom-half mechanism that you, as a driver author, have easy access
+    to use. This, of course, does not imply you must use them – if you can get away
+    with simply using a top-half only, or, even better, just a threaded handler, then
+    that's great. The *Hardirqs, tasklets, and threaded handlers – what to use when* section
+    covered these considerations in detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With that, we're almost done! However, some miscellaneous areas still need to
+    be traversed. Let's take a look by jumping into it via the familiar *FAQ* format!
+  prefs: []
+  type: TYPE_NORMAL
+- en: A few remaining FAQs answered
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here are a few FAQs with regard to hardware interrupts and how they are handled.
+    We haven''t touched on these areas yet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On a multicore system, are all hardware interrupts routed to one CPU? If not,
+    how are they load balanced? Can I change this?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Does the kernel maintain a separate IRQ stack?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: How can I obtain metrics on interrupts? Can I measure interrupt latency?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The idea here is to provide brief answers; we encourage you to dig deeper and
+    try things out for yourself! At the risk of repetition, remember, the *empirical
+    approach is best!*
+  prefs: []
+  type: TYPE_NORMAL
+- en: Load balancing interrupts and IRQ affinity
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'First off, on a multicore (SMP) system, the way that hardware interrupts are
+    routed to CPU cores tends to be very board and interrupt controller-specific.
+    Having said that, the generic IRQ layer on Linux provides a very useful abstraction:
+    it allows for (and implements) interrupt load balancing so that no CPUs (of set
+    of CPUs) gets overloaded. There''s even frontend utilities, `irqbalance(1)` and `irqbalance-ui(1)`,
+    that allow the admin (or root user) to perform IRQ balancing (`irqbalance-ui` is
+    a `ncurses` frontend to `irqbalance`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Can you change the interrupts that have been sent to a processor core(s)? Yes,
+    via the `/proc/irq/IRQ/smp_affinity` pseudofile! It's a bitmask specifying the
+    CPUs that this IRQ is allowed to be routed to. **The trouble is** that the default
+    setting is to always allow all CPU cores to handle the interrupt by default. For
+    example, on a system with eight cores, the value of `smp_affinity` for IRQ lines
+    will be `0xff` (which is binary `1111 1111`). Why is this a problem? **CPU caching**.
+    In a nutshell, if multiple cores handle the same interrupt, the caches get trashed
+    and hence many cache invalidations may occur (to keep memory coherent with the
+    CPU caches), leading to all kinds of performance headaches; this is especially
+    true on high-end systems with dozens of cores and multiple NICs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We cover more on CPU caching issues in [Chapter 7](14cf1232-dfd5-428a-9c0b-30bcd84651b9.xhtml),  *Kernel
+    Synchronization - Part 2* in the section *Cache effects and false sharing*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's recommended that you keep a single important IRQ line (such as the Ethernet
+    interrupt) affined to a particular CPU core (or at most, to a physical core that
+    is hyperthreaded). Not only that, but keeping the related network application
+    processes and threads affined to the same core will (probably) result in better
+    performance (we covered process/thread CPU affinity in the companion guide *Linux
+    Kernel Programming -* *Chapter 11*, *The CPU Scheduler - Part 2* , in the *Understanding,
+    querying, and setting the CPU affinity mask* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s go over a couple more points:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The output of `/proc/interrupts` will reflect the IRQ affinity (and IRQ balancing)
+    and allow you to see exactly how many interrupts have been routed to which CPU
+    core on the system. (We covered interpreting its output in detail in the section
+    *Viewing all allocated interrupt (IRQ) lines*.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `irqbalance` service can actually cause issues as it reverts the IRQ affinity
+    settings to defaults upon startup ([https://unix.stackexchange.com/questions/68812/making-a-irq-smp-affinity-change-permanent](https://unix.stackexchange.com/questions/68812/making-a-irq-smp-affinity-change-permanent));
+    you might want to disable it if you're carefully tweaking the settings (possibly
+    at boot via an `rc.local` or equivalent `systemd` script.) The newer versions
+    of `irqbalance`allow you to ban IRQ lines and won't (re)set them.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Does the kernel maintain separate IRQ stacks?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In the companion guide *Linux Kernel Programming* in *Chapter 6*, *Kernel Internals
+    and Essentials – Processes and Threads*, in the *Organizing process, threads,
+    and their stacks – user and **kernel space* section, we covered some key points:
+    every single user space thread has two stacks: a user space stack and a kernel
+    space stack. When the thread runs in non-privileged user space, it makes use of
+    the user mode stack, while when it switches to privileged kernel space (via a
+    system call or exception), it works with its kernel-mode stack (refer back to
+    *Figure 6.3* in the companion guide *Linux Kernel Programming*). Next, the kernel-mode
+    stack is very limited and fixed in size – it''s only 2 or 4 pages long (depending
+    on whether your arch is 32- or 64-bit, respectively)!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, imagine your driver code's (let's say, the `ioctl()` method) is running
+    within a deeply nested code path. This implies that the kernel-mode stack for
+    that process context is already pretty loaded up with metadata – the stack frames
+    for each of those functions it's been invoking. Now, a hardware interrupt arrives!
+    This, ultimately, is also code that must run and thus requires a stack. We could
+    have it simply use the existing kernel-mode stack that's already in play, *but*
+    this greatly increases the chances of stack overflow (given that we're deeply
+    nested and the stack is small). A stack overflow within the kernel is disastrous
+    as the system will simply hang/die with no real clues as to the root cause (well,
+    the `CONFIG_VMAP_STACK` kernel config was introduced for mitigating precisely
+    this kind of thing and is set by default on x86_64).
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, long story short, on pretty much all modern architectures, the kernel allocates
+    a *separate kernel space stack per CPU *for hardware interrupt handling. This
+    is known as the **IRQ stack**. When a hardware interrupt arrives, the stack location
+    (via the appropriate CPU stack pointer register) is switched to the IRQ stack
+    of the CPU the interrupt is being processed on (and it's restored on IRQ exit).Some
+    arch's (PPC) have a kernel config called `CONFIG_IRQSTACKS` to enable IRQ stacks.
+    The size of the IRQ stack is fixed as the value is arch-dependent. On the x86_64,
+    it's 4 pages long (16 KB, with a typical 4K page size).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring metrics and latency
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We have already discussed, to an extent, what latencies (delays) are and how
+    to measure scheduling latency in the companion guide *Linux Kernel Programming
+    -* *Chapter 11*, *The CPU Scheduler – Part 2*, under the *Latency and its measurement*
+    section. Here, we'll look at more aspects of system latencies and their measurement.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you already know, `procfs`is a rich source of information; we've already
+    seen that both the number of hardirqs and softirqs that are generated per CPU
+    core can be viewed via the `/proc/interrupts` and `/proc/softirqs` (pseudo) files.
+    Similar information is available via `/proc/stat`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring interrupts with [e]BPF
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In the companion guide *Linux Kernel Programming* - *Chapter 1*, *Kernel Workspace
+    Setup*, in the* Modern tracing and performance analysis with [e]BPF* section,
+    we pointed out how the modern approach to tracing, performance measurement, and
+    analysis on (recent 4.x) Linux is [**e]BPF**, the **enhanced Berkeley Packet Filter**
+    (just called BPF as well). Among the plethora of tools it stocks ([https://github.com/iovisor/bcc#tools](https://github.com/iovisor/bcc#tools)),
+    two suit our immediate purpose of tracing, measuring, and analyzing interrupts
+    (both hardirqs and softirqs). (The tools are named `toolname-bpfcc` on Ubuntu,
+    where `toolname` is the name of the tool in question, such as `hardirqs-bpfcc` and `softirqs-bpfcc`).
+    These tools dynamically trace interrupts (at the time of writing, they're not
+    based on kernel tracepoints yet). You will require root access to run these [e]BPF
+    tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Important: You can install the BCC tools for your regular host Linux distro
+    by reading the installation instructions here: [https://github.com/iovisor/bcc/blob/master/INSTALL.md](https://github.com/iovisor/bcc/blob/master/INSTALL.md).
+    Why not do this on our guest Linux VM? You can do this when you''re running a
+    distro kernel (such as an Ubuntu- or Fedora-supplied kernel). The reason you can
+    do this is because the installation of the BCC toolset includes (and depends on)
+    the installation of the `linux-headers-$(uname -r)` package; this `linux-headers`
+    package exists only for distro kernels (and not for our custom 5.4 kernel, which
+    you might be running on the guest).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring time servicing individual hardirqs
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The `hardirqs[-bpfcc]` tool displays the total time spent servicing hardirqs
+    (hardware interrupts). The following screenshot shows us running the `hardirqs-bpfcc` tool.
+    Here, you can see the total time that was spent servicing hardirqs every 1 second
+    (first parameter) for 3 seconds (second parameter):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0ca71735-eed0-4f33-b301-8e25289d116e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.14 – hardirqs-bpfcc showing the time that was spent servicing hardirqs every
+    1 second for 3 seconds
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following screenshot shows us using the same tool to generate a histogram of
+    hard IRQ time distribution (via the `-d` switch):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/1e6624d8-5cb1-4b22-b1e4-9471f204f17f.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 14.15 – hardirqs-bpfcc -d showing a histogram
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice how the majority of the network hardirqs (`iwlwifi`, 48 of them) take
+    just between 4 to 7 microseconds to complete, though a few (three of them) take
+    between 16 and 31 usecs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find more examples of how to use the `hardirqs[-bpfcc]` tool at [https://github.com/iovisor/bcc/blob/master/tools/hardirqs_example.txt](https://github.com/iovisor/bcc/blob/master/tools/hardirqs_example.txt).
+    Looking up its man page would also be beneficial.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring time servicing individual softirqs
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: Similar to what we did previously with hardirqs, we will now employ the `softirqs[-bpfcc]` tool.
+    It displays the total time spent servicing softirqs (software interrupts). Again, you
+    will require root access to run these [e]BPF tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, let''s place our system (native x86_64 running Ubuntu) under some stress
+    (here, it''s performing network downloads, network uploads, and disk activity).
+    The following screenshot shows us running the `softirqs-bpfcc` tool, which provides
+    information about the total time spent servicing softirqs every 1 second (first parameter)
+    forever (no second parameter):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/6fc84cbc-b454-4a8b-b35e-3026f896669c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.16 – softirqs-bpfcc displaying the time that was spent servicing softirqs
+    every 1 second (under some I/O stress)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Notice how the tasklet softirq also comes into play.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at another example of using the same tool to generate a histogram of
+    soft IRQ time distribution (via the `-d` switch, again with the system under some
+    I/O – network and disk – stress). The following screenshot shows the output we
+    get after running the `sudo softirqs-bpfcc -d` command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/6b7e1cc9-c1bc-44d0-ba29-6f4b6604a7f8.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 4.17 – softirqs-bpfcc -d showing a histogram (under some I/O stress)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, within this small sample set, the majority of `NET_RX_SOFTIRQ` instances
+    have taken just between 4 and 7 microseconds, whereas the majority of `BLOCK_SOFTIRQ` instances
+    have taken between 16 and 31 microseconds to complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These [e]BPF tools have man pages as well (again, with examples). I recommend
+    that you install these [e]BPF on a native Linux system (see the companion guide
+    *Linux Kernel Programming -* *Chapter 1*, *Kernel Workspace Setup*, the *Modern
+    tracing and performance analysis with [e]BPF* section). Take a look and try out
+    the tools for yourself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using Ftrace to get a handle on system latencies
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Linux has a very powerful tracing engine built into the kernel itself called
+    **Ftrace***.* Just as you can trace system calls via the (oh so useful) `strace(1)` (and
+    library APIs via `ltrace(1)`) utility in user space, you can also trace pretty
+    much every function running in kernel space via Ftrace.Ftrace, though, is much more
+    than simply a function tracer – it's a framework, a linchpin of the kernel's underlying
+    tracing infrastructure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Steven Rostedt is the original author of Ftrace. His paper entitled *Finding
+    Origins of Latencies Using Ftrace* is a very good read. You can find it here: [https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf](https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this section, we don't intend to cover how to use Ftrace in an in-depth manner
+    as it's really not part of the subject matter here. Learning to use Ftrace isn't
+    difficult, and is a valuable weapon in your kernel debug armory! If you're unfamiliar
+    with it, please go through the links we've provided on Ftrace in the *Further
+    reading *section at the end of this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Latency** is the delay between the time when something is supposed to happen
+    and when it actually does happen (the tongue in cheek difference between theory
+    and practice). System latencies in an OS can be the underlying cause of performance
+    issues. Among them are interrupt and scheduling latencies. But what''s the actual
+    cause of these latencies? Borrowing from Steve Rostedt''s paper (mentioned previously),
+    four *events *cause these latencies:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Interrupts disabled**: If IRQs are off, interrupts cannot be serviced until
+    they''re turned on (here, we shall focus on measuring this one.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Preemption disabled**: If this is the case, a thread that has been woken
+    up cannot run until preemption is enabled.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Scheduling latency**: The delay between a thread being scheduled to run and
+    it actually running on a core (we covered measuring this in the companion guide
+    *Linux Kernel Programming -* *Chapter 11, The CPU Scheduler - Part 2* in the section
+    *Latency and its measurement*.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Interrupt inversion**: When an interrupt runs in preference to a task that
+    has higher priority (similar to priority inversion, this can happen in hard real-time;
+    of course, as you learned, this is exactly why threaded handlers are key).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Ftrace can record all but the last one. Here, we shall focus on learning how
+    to leverage Ftrace to find (or sample, really) the worst-case time for which hardware
+    interrupts are disabled. This is referred to as `irqsoff` latency tracing. Let's
+    go!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finding the interrupts disabled worst-case time latency with Ftrace
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'Ftrace has a number of plugins (or tracers) that it works with. First, you
+    need to ensure that the `irqsoff` latency tracer (or plugin of Ftrace) is actually
+    enabled within the kernel. You can check this in two different ways:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Check the kernel config file (`grep` for `CONFIG_IRQSOFF_TRACER` within it).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Check the available tracers (or plugins) via Ftrace infrastructure.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We''ll go with the latter option here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding output, the `irqsoff` tracer – the one we require – is missing!
+    This is usually the case and implies that you will have to configure the kernel
+    (turning it on) and (re)build your custom 5.4 kernel. (This will be provided as
+    an exercise in the *Questions* section at the end of this chapter.) We also recommend
+    that you install a very useful frontend to Ftrace known as the `trace-cmd(1)` utility
+    (we mentioned this utility in the companion guide *Linux Kernel Programming* - *Chapter
+    1*, *Kernel Workspace Setup *and used it in *Chapter 11, The CPU Scheduler - Part
+    2* in the section *Visualizing with trace-cmd*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Lockdep can cause issues here: if enabled, it''s really best to disable the
+    kernel''s lockdep feature when you''re performing latency tracing (it could add
+    too much overhead). We''ll discuss lockdep in some detail in [Chapter 7](14cf1232-dfd5-428a-9c0b-30bcd84651b9.xhtml),
+    *Kernel Synchronization - Part 2*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once you have `CONFIG_IRQSOFF_TRACER` enabled (and `trace-cmd` installed),
+    follow these steps to let Ftrace''s latency tracer figure out the **worst-case
+    *interrupts-off* latency**. Needless to say, these steps must be carried out as
+    root:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Get yourself a root shell (you will need root privileges to do this):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Reset the Ftrace framework (this can be done with the `trace-cmd(1)` frontend
+    to Ftrace):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Change directories to the one for ftrace:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: It's can usually be found here. If you have the `debugfs` pseudo filesystem
+    mounted under a different directory, then please `cd` there (and to the `tracing` directory under
+    it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Turn off all tracing using `echo 0 tracing_on` (ensure you leave a space between
+    the `0` and the > symbol).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Set the `irqsoff` tracer as the current tracer:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now, turn tracing on:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following output shows the worst-case `irqsoff latency` (this is typically
+    shown in microseconds; worry not, we''ll show a sample run shortly):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Fetch and read the full report. All Ftrace output is held within the `trace` pseudofile:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Reset the Ftrace framework:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The output we obtain will look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the worst-case `irqsoff` latency turned out to be 234 microseconds (experienced
+    while the `sshd` task with PID 25311 was executing), implying that hardware interrupts
+    were off for this period of time. For your convenience, I have provided a simple
+    wrapper Bash script (`ch4/irqsoff_latency_ftrc.sh`) that does the same job.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, we will mention a few other useful tools you can use to measure system
+    latencies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other tools
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The following are a few tools worth mentioning with regard to capturing and
+    analyzing system latencies (and more):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can learn how to set up and use the powerful **Linux Tracing Toolkit – next
+    generation** (**LTTng**) toolset to record traces of the system in action. I highly
+    recommend using the superb **Trace Compass** GUI to analyze it. In fact, in the
+    companion guide *Linux Kernel Programming -* *Chapter 1*, *Kernel Workspace Setup*,
+    in the *Linux Tracing Toolkit next generation (LTTng)* section,we showed an interesting
+    screenshot (*Figure 1.9*) of the Trace Compass GUI being used to display and analyze
+    IRQ lines 1 and 130 (the interrupt lines for the i8042 and Wi-Fi chipset on my
+    native x86_64 system, respectively).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can also try using the `latencytop` tool to determine which kernel ops what
+    user space threads are blocking on. You will have to turn on `CONFIG_LATENCYTOP` in
+    the kernel config to do this.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Besides latency metrics, you can use `dstat(1)`, `mpstat(1)`, `watch(1)`, and
+    so on to gain a "top"-like view of interrupts ([https://unix.stackexchange.com/questions/8699/is-there-a-utility-that-interprets-proc-interrupts-data-in-time](https://unix.stackexchange.com/questions/8699/is-there-a-utility-that-interprets-proc-interrupts-data-in-time)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With that, we've completed this section and this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Congratulations! This chapter has been long but worthwhile. You will have learned
+    a lot regarding how to work with hardware interrupts. We started by briefly looking
+    at how the OS handles interrupts before learning how you, as a driver author,
+    must work with them. To do so you learned how to, via several methods, allocate
+    IRQ lines (and free them) and implement the hardware interrupt routine. Here,
+    several limitations and caveats, essentially boiling down to the fact that it's
+    an atomic activity, were discussed. The hows and whys of the "threaded interrupt"
+    model were then covered; it's often regarded as the modern recommended way to
+    handle interrupts. After that, we understood and learned how to work with hardirqs/softirqs
+    and top/bottom halves. Finally, we covered, in typical FAQ style, information
+    which taught you about load balancing interrupts, IRQ stacks, and how to employ
+    some useful frameworks and tools that can measure interrupt metrics and latencies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: All of this is essential knowledge when it comes to engineering a well-written
+    driver that must work with hardware interrupts!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next chapter covers the areas of working with time: delays and timeouts
+    within the kernel space, creating and managing kernel threads, and using kernel
+    workqueues. I suggest that you diligently work on this chapter''s exercises, browse
+    the numerous resources in the *Further reading* section, and then take a break
+    (hey, all work and no play makes Jack a dull boy, right!?) before diving back
+    in! See you there!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: On an x86 system (a VM is fine), show that while the number of timer interrupts
+    (IRQ `0`) remains the same, another periodic system interrupt is actually continually
+    incrementing (hence keeping track of time on a per-CPU basis).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '*Hint:* use a `proc`pseudo-file associated with interrupts.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '***keylogger_simple ; native x86 only  [use only for ethical hacking; may not
+    work on a VM]***'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: (A bit more advanced) Write a simple keyboard logger driver using the "misc"
+    kernel framework. Trap it inside the i8042's IRQ 1 in order to "trap" it inside
+    the keyboard press/release and read the key scancode. Use a `kfifo` data structure
+    to hold the keyboard scancode in kernel space memory. Have a user mode process
+    (or thread) periodically read the data items from your driver's `kfifo` into a
+    user space buffer and write them into a log file. Write an app (or use another
+    thread) to interpret the keyboard keys.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Tips:*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Can you ensure that it runs only on x86 (as it should)? Yes; use `#ifdef CONFIG_X86` at
+    the very beginning of your code!
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Can you ensure that it runs only on a native system and not within a VM? Yes,
+    you can use the `virt-what` script within a wrapper script to load up the driver;
+    only perform `insmod` (or `modprobe`) if you're not on a VM.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Writing a driver is actually a difficult (and quite unnecessary!) way to implement
+    a key logger (here, you're just doing so as a learning exercise so that you know
+    how to work with hardware interrupts within a device driver). It's really simpler
+    and better to work at higher level abstractions – basically, by querying the kernel's
+    `events` layer for keystrokes. A simple way you can do this is by using an event
+    monitoring and capture tool – `evtest(1)` is great! (run it as root; [https://www.kernel.org/doc/html/latest/input/input_uapi.html](https://www.kernel.org/doc/html/latest/input/input_uapi.html)).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '*                  References for this assignment:*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Using the kernel kfifo*: [https://elixir.bootlin.com/linux/latest/source/samples/kfifo/bytestream-example.c](https://elixir.bootlin.com/linux/latest/source/samples/kfifo/bytestream-example.c)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*US keyboard map and interpretation*: [http://www.philipstorr.id.au/pcbook/book3/scancode.htm](http://www.philipstorr.id.au/pcbook/book3/scancode.htm); [http://www.osdever.net/bkerndev/Docs/keyboard.htm](http://www.osdever.net/bkerndev/Docs/keyboard.htm)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The kernel provides "deferred functionality" mechanisms often called ______; 
+    they''re deliberately designed to get the best of both worlds: (i) ____________ and
+    (ii) ______.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Top halves; run the hardirq as soon as possible; immediately restore the interrupted
+    context after that.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Bottom halves; to allow the driver author to do fairly lengthy interrupt processing
+    if the situation demands it. Do this in a deferred, safe manner while allowing
+    the business of the system to continue.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Better half; do more work in the interrupt context so that you don't have to
+    pay for it later.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Bottom halves; run interrupt code with interrupts disabled and let it run for
+    a long time.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Use a code browsing tool (`cscope(1)` is a good choice) to find drivers that
+    are using the `tasklet_hi_schedule()` API.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Use the Ftrace `irqsoff` latency tracer plugin to find the maximum time for
+    which interrupts have been turned off.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '*Tip*:This will involve using the `irqsoff`plugin (`CONFIG_IRQSOFF_TRACER`);
+    if it''s not turned on by default, you will have to configure the kernel so that
+    it includes it (and other tracers as required; you can find them under `make menuconfig : Kernel
+    Hacking / Tracers`). Then, you must build the kernel and turn off it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Tip*:When measuring things such as system latencies (interrupts-off, interrupts-and-preemption-off,
+    scheduling latency), it''s best to disable `lockdep`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Reference:* *Finding Origins of Latencies Using Ftrace*, Steven Rostedt, RedHat: [https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf](https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Solutions to some of the preceding questions could be found at [https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/tree/main/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/tree/main/solutions_to_assgn).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Kernel documentation: *Linux generic IRQ handling*: [https://www.kernel.org/doc/html/latest/core-api/genericirq.html#linux-generic-irq-handling](https://www.kernel.org/doc/html/latest/core-api/genericirq.html#linux-generic-irq-handling)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: LWN kernel index on interrupts: [https://lwn.net/Kernel/Index/#Interrupts](https://lwn.net/Kernel/Index/#Interrupts)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Interrupt triggering at the level/edge:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Edge Triggered versus Level Triggered interrupts*, Mar ''13: [http://venkateshabbarapu.blogspot.com/2013/03/edge-triggered-vs-level-triggered.html](http://venkateshabbarapu.blogspot.com/2013/03/edge-triggered-vs-level-triggered.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Level-triggered versus Edge-triggered Interrupts*, Nov ''08: [https://www.garystringham.com/level-triggered-vs-edge-triggered-interrupts/](https://www.garystringham.com/level-triggered-vs-edge-triggered-interrupts/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*How do I disable non-maskable interrupts programmatically?*: [https://stackoverflow.com/questions/55394608/how-do-i-disable-non-maskable-interrupts-programmatically](https://stackoverflow.com/questions/55394608/how-do-i-disable-non-maskable-interrupts-programmatically)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Threadable NAPI polling, softirqs, and proper fixes*, Jon Corbet, May 2016,
+    LWN: [https://lwn.net/Articles/687617/](https://lwn.net/Articles/687617/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Possible future directions: softirq vector fine-grained masking:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Per-vector software-interrupt masking*, Jon Corbet, Feb 2019, LWN: [https://lwn.net/Articles/779738/](https://lwn.net/Articles/779738/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Soft-interruptible softirqs (or per vector masking)*, Frederic Weisbecker,
+    SuSe: [https://linuxplumbersconf.org/event/4/contributions/420/attachments/375/609/lpc_softirq.pdf](https://linuxplumbersconf.org/event/4/contributions/420/attachments/375/609/lpc_softirq.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'IRQ balancing and affinity:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*IRQ Balancing*, ntop project: [https://www.ntop.org/pf_ring/irq-balancing/](https://www.ntop.org/pf_ring/irq-balancing/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Setting interrupt affinity systems*, RHEL8: [https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/monitoring_and_managing_system_status_and_performance/configuring-an-operating-system-to-optimize-cpu-utilization_monitoring-and-managing-system-status-and-performance#setting-interrupt-affinity-systems_configuring-an-operating-system-to-optimize-cpu-utilization](https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/8/html/monitoring_and_managing_system_status_and_performance/configuring-an-operating-system-to-optimize-cpu-utilization_monitoring-and-managing-system-status-and-performance#setting-interrupt-affinity-systems_configuring-an-operating-system-to-optimize-cpu-utilization)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The modern approach to performance measurement and analysis with eBPF:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux bcc/eBPF tracing tools*, Brendan Gregg: [https://github.com/iovisor/bcc#tools](https://github.com/iovisor/bcc#tools)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*bcc Tutorial*: [https://github.com/iovisor/bcc/blob/master/docs/tutorial.md#bcc-tutorial](https://github.com/iovisor/bcc/blob/master/docs/tutorial.md#bcc-tutorial)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Ftrace:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Kernel doc: *ftrace – Function Tracer*: [https://www.kernel.org/doc/Documentation/trace/ftrace.txt](https://www.kernel.org/doc/Documentation/trace/ftrace.txt)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The following is a collection of links to articles on Ftrace on LWN (some of
+    which are mentioned here): [https://lwn.net/Kernel/Index/#Ftrace](https://lwn.net/Kernel/Index/#Ftrace)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Debugging the kernel using ftrace - part 1*, Steven Rostedt, LWN, Dec 2009: [https://lwn.net/Articles/365835/](https://lwn.net/Articles/365835/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Secrets of the ftrace function tracer*, Steven Rostedt, LWN, Jan 2010: [https://lwn.net/Articles/370423/](https://lwn.net/Articles/370423/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*trace-cmd: a frontend for ftrace*, Steven Rostedt, LWN, Oct 2010: [https://lwn.net/Articles/410200/](https://lwn.net/Articles/410200/)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Finding Origins of Latencies Using Ftrace*, Steven Rostedt, Oct 2011: [https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf](https://static.lwn.net/images/conf/rtlws11/papers/proc/p02.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*LWN Kernel index on* *Latency*: [https://lwn.net/Kernel/Index/#Latency](https://lwn.net/Kernel/Index/#Latency)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

@@ -1,0 +1,1036 @@
+- en: Chapter 7. Process Memory Forensics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the previous chapter, we examined the key methods and ways to approach the
+    analysis of an ELF binary in Linux, especially when concerning malware, and ways
+    to detect the presence of a parasite within executable code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just as an attacker may patch a binary on disk, they may also patch a running
+    program in memory to achieve similar goals, while avoiding being detected by programs
+    that look for file modification, such as a tripwire. This sort of hot patching
+    of a process image can be used to hijack functions, inject shared libraries, execute
+    parasite shellcode, and so on. These types of infections are often the components
+    needed for memory-resident backdoors, viruses, key loggers, and hidden processes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: An attacker can run sophisticated programs that will run cloaked within an existing
+    process address space. This has been demonstrated with Saruman v0.1, which is
+    available at [http://www.bitlackeys.org/#saruman](http://www.bitlackeys.org/#saruman).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The examination of a process image when performing forensics or runtime analysis
+    is rather similar to looking at a regular ELF binary. There are more segments
+    and overall moving pieces in a process address space, and the ELF executable will
+    undergo some changes, such as runtime relocations, segment alignment, and .bss
+    expansion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, in reality, the investigation steps are very similar for an ELF executable
+    and an actual running program. The running program was initially created by the
+    ELF images that are loaded into the address space. Therefore, understanding the
+    ELF format will help understand how a process looks in memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What does a process look like?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: One important file on any Linux system is the `/proc/$pid/maps` file. This file
+    shows the entire process address space of a running program, and it is something
+    that I often parse in order to determine the location of certain files or memory
+    mappings within a process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On Linux kernels that have the Grsecurity patches, there is a kernel option
+    called **GRKERNSEC_PROC_MEMMAP** that, if enabled, will zero out the `/proc/$pid/maps`
+    file so that you cannot see the address space values. This makes parsing a process
+    from the outside a bit more difficult, and you must rely on other techniques such
+    as parsing the ELF headers and going from there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In the next chapter, we will be discussing the **ECFS** (short for **Extended
+    Core File Snapshot**) format, which is a new ELF file format that expands on regular
+    core files and contains an abundance of forensics-relevant data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of the process memory layout of `the hello_world` program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding maps file output shows the process address space of a very simple
+    `Hello World` program. Let's go over it in several chunks, explaining each part.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Executable memory mappings
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The first three lines are the memory mappings for the executable itself. This
+    is quite obvious because it shows the executable path at the end of the file mapping:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can see that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first line is the text segment, which is easy to tell because the permissions
+    are read plus execute
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second line is the first part of the data segment, which has been marked
+    as read-only due to RELRO (read-only relocation) security protection
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The third mapping is the remaining part of the data segment that is still writable
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The program heap
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The heap is typically grown right after the data segment. Before ASLR existed,
+    it was extended from the end of the data segment address. Nowadays, the heap segment
+    is randomly memory-mapped, but it can be found in the *maps* file right after
+    the end of the data segment:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: There are also anonymous memory mappings that may be created when a call to
+    `malloc()` requests a chunk of memory that exceeds `MMAP_THRESHOLD` in size. These
+    types of anonymous memory segments will not be marked with the `[heap]` label.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Shared library mappings
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The next four lines are the memory mappings for the shared library, `libc-2.19.so`.
+    Notice that there is a memory mapping marked with no permissions between the text
+    and data segments. This is simply for occupying space in that area so that no
+    other arbitrary memory mappings may be created to use the space between the text
+    and data segments:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In addition to regular shared libraries, there is the dynamic linker, which
+    is also technically a shared library. We can see that it is mapped to the address
+    space by looking at the file mappings right after the `libc` mappings:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The stack, vdso, and vsyscall
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'At the end of the maps file, you will see the stack segment, followed by **VDSO**
+    (short for **Virtual Dynamic Shared Object**) and vsyscall:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: VDSO is used by `glibc` to invoke certain system calls that are frequently called
+    and would otherwise create a performance issue. VDSO helps speed this up by executing
+    certain syscalls in userland. The vsyscall page is deprecated on x86_64, but on
+    32-bit, it accomplishes the same thing as VDSO.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The stack, vdso, and vsyscall](img/00016.jpeg)'
+  prefs: []
+  type: TYPE_IMG
+- en: What the process looks like
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process memory infection
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: There are many rootkits, viruses, backdoors, and other tools out there that
+    can be used to infect a system's userland memory. We will now name and describe
+    a few of these.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Process infection tools
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '**Azazel**: This is a simple but effective `LD_PRELOAD` injection userland
+    rootkit for Linux that is based on its predecessor rootkit named Jynx. `LD_PRELOAD`
+    rootkits will preload a shared object into the program that you want to infect.
+    Typically, such a rootkit will hijack functions such as open, read, write, and
+    so on. These hijacked functions will show up as PLT hooks (modified GOT). For
+    more information, visit [https://github.com/chokepoint/azazel](https://github.com/chokepoint/azazel).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Saruman**: This is a relatively new anti-forensics infection technique that
+    allows a user to inject a complete dynamically linked executable into an existing
+    process. Both the injected and the injectee will run concurrently within the same
+    address space. This allows stealthy and advanced remote process infection. For
+    more information, visit [https://github.com/elfmaster/saruman](https://github.com/elfmaster/saruman).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**sshd_fucker (phrack .so injection paper)**: `sshd_fucker` is the software
+    that comes with the Phrack 59 paper *Runtime process infection*. The software
+    infects the sshd process and hijacks PAM functions that usernames and passwords
+    are passed through. For more information, visit [http://phrack.org/issues/59/8.html](http://phrack.org/issues/59/8.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Process infection techniques
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: What does process infection mean? For our purposes, it means describing ways
+    of injecting code into a process, hijacking functions, hijacking control flow,
+    and anti-forensics tricks to make analysis more difficult. Many of these techniques
+    were covered in [Chapter 4](part0040_split_000.html#164MG1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 4. ELF Virus Technology – Linux/Unix Viruses"), *ELF Virus Technology
+    – Linux/Unix Viruses*, but we will recapitulate some of these here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Injection methods
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '**ET_DYN (shared object) injection**: This is accomplished using the `ptrace()`
+    system call and shellcode that uses either the `mmap()` or `__libc_dlopen_mode()`
+    function to load the shared library file. A shared object might not be a shared
+    object at all; it may be a PIE executable, as with the Saruman infection technique,
+    which is a form of anti-forensics for allowing a program to run inside of an existing
+    process address space. This technique is what I call **process cloaking**.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '`LD_PRELOAD` is another common trick for loading a malicious shared library
+    into a process address space to hijack shared library functions. This can be detected
+    by validating the PLT/GOT. The environment variables on the stack can also be
+    analyzed to find out whether `LD_PRELOAD` has been set.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**ET_REL (relocatable object) injection**: The idea here is to inject a relocatable
+    object file into a process for advanced hot patching techniques. The ptrace system
+    call (or programs that use `ptrace()`, such as GDB) can be used to inject shellcode
+    into the process, which in turn memory-maps the object file to the memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**PIC code (shellcode) injection**: Injecting shellcode into a process is typically
+    done with ptrace. Often, shellcode is the first stage in injecting more sophisticated
+    code (such as `ET_DYN` and `ET_REL` files) into the process.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Techniques for hijacking execution
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '**PLT/GOT redirection**: Hijacking shared library functions is most commonly
+    accomplished by modifying the GOT entry for the given shared library so that the
+    address reflects the location of the code injected by the attacker. This is essentially
+    the same thing as overwriting a function pointer. We will discuss methods of detecting
+    this later in this chapter.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Inline function hooking**: This method, also called **function trampolines**,
+    is common both on disk and in memory. An attacker can replace the first 5 to 7
+    bytes of code in a function with a `jmp` instruction that transfers control to
+    a malicious function. This can be detected easily by scanning the initial byte
+    code in every function.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Patching .ctors and .dtors**: The .ctors and .dtors sections in a binary
+    (which can be located in the memory) contain an array of function pointers for
+    initialization and finalization functions. These can be patched by an attacker
+    on disk and in memory so that they point to parasite code.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Hijacking VDSO for syscall interception**: The VDSO page that is mapped to
+    the process address space contains code for invoking system calls. An attacker
+    can use `ptrace(PTRACE_SYSCALL, …)` to locate this code and then replace the **%rax**
+    register with the system call number that they want to invoke. This allows a clever
+    attacker to invoke any system call that they want to in a process without having
+    to inject shellcode. Check out this paper I wrote in 2009; it describes the technique
+    in detail at [http://vxheaven.org/lib/vrn00.html](http://vxheaven.org/lib/vrn00.html).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Detecting the ET_DYN injection
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I think that the most prevalent type of process infection is DLL injection,
+    also known as `.so` injection. It is a clean and effective solution that suits
+    the needs of most attackers and runtime malware. Let's take a look at an infected
+    process, and I will highlight the ways in which we can identify parasite code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The terms **shared object**, **shared library**, **DLL**, and **ET_DYN** are
+    all used synonymously throughout this book, especially in this particular section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Azazel userland rootkit detection
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our infected process is a simple test program named `./host` that is infected
+    with the Azazel userland rootkit. Azazel is the newer version of the popular Jynx
+    rootkit. Both of these rootkits rely on `LD_PRELOAD` to load a malicious shared
+    library that hijacks various `glibc` shared library functions. We will inspect
+    the infected process using various GNU tools and the Linux environment, such as
+    the `/proc` filesystem.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mapping out the process address space
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The first step while analyzing a process is to map out the address space. The
+    most straightforward way to do this is by looking at the `/proc/<pid>/maps` file.
+    We want to take note of any strange file mappings and segments with odd permissions.
+    Also in our case, we may need to check the stack for environment variables, so
+    we will want to take note of its location in memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The `pmap <pid>` command can also be used instead of `cat /proc/<pid>/maps`.
+    I prefer looking directly at the maps file because it shows the entire address
+    range of each memory segment and the complete file path of any file mappings,
+    such as shared libraries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of memory mappings of an infected process `./host`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The areas of interest and concern are highlighted in the preceding output of
+    the maps file for the process of *./host*. In particular, notice the shared library
+    with the `/home/user/git/azazel/libselinux.so` path. This should immediately grab
+    your attention because the path is not the standard shared library path and it
+    has the name `libselinux.so`, which is traditionally stored with all other shared
+    libraries (that is, `/usr/lib`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This could indicate possible shared library injection (also known as the `ET_DYN`
+    injection), which would mean that this is not the authentic `libselinux.so` library.
+    The first thing that we might check for in this case is the `LD_PRELOAD` environment
+    variable to see whether it was used to **preload** the `libselinux.so` library.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finding LD_PRELOAD on the stack
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The environment variables for a program are stored near the bottom of the stack
+    at the beginning of a program''s runtime. The bottom of the stack is actually
+    the highest address (the beginning of the stack), since the stack grows into smaller
+    addresses on the x86 architecture. Based on the output from `/proc/<pid>/maps`,
+    we can get the location of the stack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, we want to check the stack from `0x7fff82fcf000` onward. Using GDB, we can
+    attach to the process and quickly locate the environment variables on the stack
+    by using the `x/s <address>` command, which tells GDB to view the memory in ASCII
+    format. The `x/4096s <address>` command does the same thing but reads from 4,096
+    bytes of data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We can safely presume that the environment variables will be in the first 4,096
+    bytes of the stack, but since the stack grows into lower addresses, we must start
+    reading at `<stack_bottom> - 4096`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The argv and envp pointers point to command-line arguments and environment variables
+    respectively. We are not looking for the actual pointers but rather the strings
+    that these pointers reference.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of using GDB to read environment variables on a stack:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we can see from the preceding output, we have verified that `LD_PRELOAD`
+    was used to preload `libselinux.so` into the process. This means that any glibc
+    functions within the program that have the same name as any functions in the preloaded
+    shared library will be overridden and effectively hijacked by the ones in `libselinux.so`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In other words, if the `./host` program calls the `fopen` function from glibc
+    and `libselinux.so` contains its own version of `fopen`, then that is the `fopen`
+    function that will be stored in the PLT/GOT (the `.got.plt` section) and used
+    instead of the glibc version. This leads us to the next indicated item—detecting
+    function hijacking in the PLT/GOT (the PLT's global offset table).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Detecting PLT/GOT hooks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Before checking the PLT/GOT that is in the ELF section called `.got.plt` (which
+    is in the data segment of the executable), let's see which functions in the `./host`
+    program have relocations for the PLT/GOT. Remember from the chapter on ELF internals
+    that the relocation entries for the global offset table are of the `<ARCH>_JUMP_SLOT`
+    type. Refer to the ELF(5) manual for details.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The relocation type for the PLT/GOT is called `<ARCH>_JUMP_SLOT` because they
+    are just that—jump slots. They contain function pointers that the PLT uses with
+    jmp instructions to transfer control to the destination function. The actual relocation
+    types are named `X86_64_JUMP_SLOT, i386_JUMP_SLOT`, and so on depending on the
+    architecture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of identifying shared library functions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: We can see that there are several well-known glibc functions being called. It
+    is possible that some or all of these are being hijacked by the imposture shared
+    library `libselinux.so`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Identifying incorrect GOT addresses
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'From the `readelf` output that displays the PLT/GOT entries in the `./host`
+    executable, we can see the address of each symbol. Let''s take a look at the global
+    offset table in the memory for the following symbols: `fopen`, `opendir`, and
+    `unlink`. It is possible that these have been hijacked and no longer point to
+    the `libc.so` library.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of the GDB output displaying the GOT values:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A quick look at the executable memory region of the `selinux.so` shared library
+    shows us that the addresses displayed in the GOT by GDB point to functions within
+    `selinux.so` and not `libc.so`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: With this particular malware (Azazel), the malicious shared library was preloaded
+    using `LD_PRELOAD`, which made verifying the library as suspicious an easy task.
+    This is not always the case, as many forms of malware will inject the shared library
+    via `ptrace()` or shellcode that uses either `mmap()` or `__libc_dlopen_mode()`.
+    The heuristics for determining whether or not a shared library has been injected
+    will be detailed in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As we will see in the following chapter, the ECFS technology for process memory
+    forensics has some features that make identifying injected DLLs and other types
+    of ELF objects almost simple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ET_DYN injection internals
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As we just demonstrated, detecting shared libraries that have been preloaded
+    with `LD_PRELOAD` is rather simple. What about shared libraries that were injected
+    into a remote process? Or in other words, shared objects that were inserted into
+    a pre-existing process? It is important to know whether or not a shared library
+    was maliciously injected if we want to be able to take the next step and detect
+    PLT/GOT hooks. First, we must identify all the ways in which a shared library
+    can be injected into a remote process, as we briefly discussed in section 7.2.2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's look at a concrete example of how this might be accomplished. Here is
+    some example code from Saruman that injects PIE executables into a process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: PIE executables are in the same format as shared libraries, so the same code
+    will work for the injection of either type into a process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the `readelf` utility, we can see that in the standard C library (`libc.so.6`),
+    there exists a function named `__libc_dlopen_mode`. This function actually accomplishes
+    the same thing as the `dlopen` function, which is not resident in `libc`. This
+    means that with any process that uses `libc`, we can get the dynamic linker to
+    load whatever `ET_DYN` object we want to, while also automatically handling all
+    the relocation patches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Example – finding the symbol for __libc_dlopen_mode
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'It is rather common for attackers to use this function to load `ET_DYN` objects
+    into a process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Code example – the __libc_dlopen_mode shellcode
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The following code is in C, but when compiled into machine code, it can be
+    used as shellcode that we inject into the process using `ptrace`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice that one of the arguments is `void *dlopen_addr`. Saruman locates the
+    address to the `__libc_dlopen_mode()` function, which resides in `libc.so`. This
+    is accomplished using a function for resolving symbols within the `libc` library.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code example – libc symbol resolution
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'There are many more details to the following code, and I would highly encourage
+    you to check out Saruman. It is specifically for injecting executable programs
+    that are compiled as `ET_DYN` objects, but as mentioned previously, the injection
+    method will also work for shared libraries since they are also compiled as `ET_DYN`
+    objects:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: To further demystify shared library injection, let me show you a much simpler
+    technique that uses `ptrace` injected shellcode to `open()/mmap()` the shared
+    library into the process address space. This technique is fine to use, but it
+    requires that the malware manually handle all of the hot patching of relocations.
+    The `__libc_dlopen_mode()` function handles all of this transparently with the
+    help of the dynamic linker itself, so it is actually easier in the long run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Code example – the x86_32 shellcode to mmap() an ET_DYN object
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The following shellcode can be injected into an executable segment within a
+    given process and then be executed using `ptrace`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that this is the second time I''ve used this hand-written shellcode as
+    an example in the book. I wrote it in 2008 for a 32-bit Linux system, and it was
+    convenient to use as an example. Otherwise, I''m sure I would have written something
+    new to demonstrate a more modern approach in x86_64 Linux:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: With `PTRACE_POKETEXT` to inject it and `PTRACE_SETREGS` to set `%eip` to the
+    entry point of the shellcode, once the shellcode hits the `int3` instruction,
+    it will effectively pass the control back to your program that is performing the
+    infection. This can then simply detach from the host process that is now infected
+    with the shared library (`/lib/libtest.so.1.0`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In some cases, such as on binaries that have PaX mprotect restrictions enabled
+    ([https://pax.grsecurity.net/docs/mprotect.txt](https://pax.grsecurity.net/docs/mprotect.txt)),
+    the `ptrace` system call cannot be used to inject shellcode into the text segment.
+    This is because it is read-only, and the restrictions will also prevent marking
+    the text segment writeable, so you cannot simply get around this. However, this
+    can be circumvented in several ways, such as by setting the instruction pointer
+    to `__libc_dlopen_mode` and storing the arguments to the function in registers
+    (such as `%rdi`, `%rsi`, and so on). Alternatively, in the case of a 32-bit architecture,
+    the arguments can be stored on the stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another way is by manipulating the VDSO code that is present in most processes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Manipulating VDSO to perform dirty work
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: This technique is one that is demonstrated at [http://vxheaven.org/lib/vrn00.html](http://vxheaven.org/lib/vrn00.html),
+    but the general idea is simple. The VDSO code that is mapped to the process address
+    space, as seen in the `/proc/<pid>/maps` output earlier in this chapter, contains
+    code that invokes system calls via the *syscall* (for 64-bit) and *sysenter* (for
+    32-bit) instructions. The calling convention for system calls in Linux always
+    places the system call number in the `%eax/%rax` register.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If an attacker uses `ptrace(PTRACE_SYSCALL, …)`, they can quickly locate the
+    syscall instruction in the VDSO code and replace the register values to invoke
+    whichever system call is desired. If this is done carefully and done while restoring
+    the original system call that was executing, then it will not cause the application
+    to crash. The `open` and `mmap` system calls can be used to load an executable
+    object such as `ET_DYN` or `ET_REL` into the process address space. Alternatively,
+    they can be used to simply create an anonymous memory mapping that can store shellcode.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is a code example in which the attacker takes advantage of this code on
+    a 32-bit system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: On a 64-bit system, the VDSO contains at least two locations where the syscall
+    instruction is used. The attacker can manipulate either of these.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is a code example in which the attacker takes advantage of this
+    code on a 64-bit system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Shared object loading – legitimate or not?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The dynamic linker is the only legitimate way to bring a shared library into
+    a process. Remember, however, that an attacker can use the `__libc_dlopen_mode`
+    function, which invokes the dynamic linker to load an object. So how do we tell
+    when the dynamic linker is doing legitimate work? There are three legitimate ways
+    in which a shared object is mapped to a process by the dynamic linker.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Legitimate shared object loading
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Let''s look at what we consider legitimate shared object loading:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a valid `DT_NEEDED` entry in the executable program that corresponds
+    to the shared library file.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The shared libraries that are validly loaded by the dynamic linker may in turn
+    have their own `DT_NEEDED` entries in order to load other shared libraries. This
+    can be called transitive shared library loading.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If a program is linked with `libdl.so`, then it may use the dynamic loading
+    functions to load libraries on the fly. The function for loading shared objects
+    is named `dlopen`, and the function for resolving symbols is named `dlsym`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As we have previously discussed, the `LD_PRELOAD` environment variable also
+    invokes the dynamic linker, but this method is in a gray area as it is commonly
+    used for both legitimate and illegitimate purposes. Therefore, it was not included
+    in the list of *legitimate shared object loading*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Illegitimate shared object loading
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Now, let''s take a look at the illegitimate ways in which a shared object can
+    be loaded into a process, that is to say, by an attacker or a malware instance:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `__libc_dlopen_mode` function exists within `libc.so` (not `libdl.so`) and
+    is not intended to be called by a program. It is actually marked as a `GLIBC PRIVATE`
+    function. Most processes have `libc.so`, and this is therefore a function commonly
+    used by attackers or malware to load arbitrary shared objects.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`VDSO` manipulation. As we have already demonstrated, this technique can be
+    used to execute arbitrary syscalls, and therefore it can be simple to memory-map
+    a shared object with this method.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Shellcode that directly invokes the `open` and `mmap` system calls.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `DT_NEEDED` entries can be added by an attacker by overwriting the `DT_NULL`
+    tag in the dynamic segment of an executable or shared library, thus being able
+    to tell the dynamic linker to load whatever shared object they wish. This particular
+    method was discussed in [Chapter 6](part0060_split_000.html#1P71O2-1d4163ae11644cc2802846625b2dc985
+    "Chapter 6. ELF Binary Forensics in Linux"), *ELF Binary Forensics in Linux*,
+    and it falls more into the topic of that chapter, but it may also be necessary
+    when inspecting a suspicious process.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Be sure to inspect the binary of a suspicious process, and verify that the dynamic
+    segment doesn't appear suspicious. Refer to the *Checking the dynamic segment
+    for DLL injection traces* section of [Chapter 6](part0060_split_000.html#1P71O2-1d4163ae11644cc2802846625b2dc985
+    "Chapter 6. ELF Binary Forensics in Linux"), *ELF Binary Forensics in Linux*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that we have a clear definition of legitimate versus illegitimate loading
+    of shared objects, we can get into the discussion of heuristics for detecting
+    when a shared library is legitimate or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Beforehand, it is worth noting again that `LD_PRELOAD` is commonly used for
+    good as well as bad purposes, and the only sure-fire way of knowing this is by
+    inspecting what the actual code that resides in the preloaded shared object does.
+    Therefore, we will leave `LD_PRELOAD` out of the discussion on heuristics here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Heuristics for .so injection detection
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, I will describe the general principles behind detecting whether
+    a shared library is legitimate or not. In [Chapter 8](part0074_split_000.html#26I9K1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 8. ECFS – Extended Core File Snapshot Technology"), *ECFS – Extended
+    Core File Snapshot Technology*, we will be discussing the ECFS technology, which
+    actually incorporates these heuristics into its feature set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For now, let''s look at the principles only. We want to get a list of the shared
+    libraries that are mapped to the process and then see which ones qualify for being
+    legitimately loaded by the dynamic linker:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Get a list of shared object paths from the `/proc/<pid>/maps` file.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Some maliciously injected shared libraries won't appear as file mappings because
+    the attacker created anonymous memory mappings and then memcpy'd the shared object
+    code into those memory regions. In the next chapter, we will see that ECFS can
+    weed these more stealthy entities out as well. A scan can be done of each executable
+    memory region that is anonymously mapped to see whether ELF headers exist, particularly
+    those with the `ET_DYN` file type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determine whether or not a valid `DT_NEEDED` entry exists in the executable
+    that corresponds to the shared library you are seeing. If one exists, then it
+    is a legitimate shared library. After you have verified that a given shared library
+    is legitimate, check that shared library's dynamic segment and enumerate the `DT_NEEDED`
+    entries within it. Those corresponding shared libraries can also be marked as
+    legitimate. This goes back to the concept of transitive shared object loading.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Look at the `PLT/GOT` of the process''s actual executable program. If there
+    are any `dlopen` calls being used, then analyze the code to find any calls to
+    `dlopen`. The `dlopen` calls may be passed arguments that can be inspected statically,
+    like this for instance:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: In such cases, the string will be stored as a static constant and will therefore
+    be in the `.rodata` section of the binary. So, check whether the `.rodata` section
+    (or wherever the string is stored) contains any strings that contain the shared
+    library path you are trying to validate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If any of the shared object paths found in the maps file cannot be found or
+    accounted for by a `DT_NEEDED` section and cannot be accounted for by any `dlopen`
+    calls either, then that means it was either preloaded by `LD_PRELOAD` or injected
+    by some other means. At this point, you should qualify the shared object as suspicious.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Tools for detecting PLT/GOT hooks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Currently, there are not many great tools that are specifically for process
+    memory analysis in Linux. This is the reason that I designed ECFS (discussed in
+    [Chapter 8](part0074_split_000.html#26I9K1-1d4163ae11644cc2802846625b2dc985 "Chapter 8. ECFS
+    – Extended Core File Snapshot Technology"), *ECFS – Extended Core File Snapshot
+    Technology*). There are only a few tools I know of that can detect PLT/GOT overwrites,
+    and each one of them essentially uses the same heuristics that we just discussed:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Linux VMA Voodoo**: This tool is a prototype that I designed through the
+    DARPA CFT program in 2011\. It is capable of detecting many types of process memory
+    infections, but currently only works on 32-bit systems and is not available to
+    the public. However, the new ECFS utility is open source, which was inspired by
+    VMA Voodoo. You may read about VMA Voodoo at [http://www.bitlackeys.org/#vmavudu](http://www.bitlackeys.org/#vmavudu).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**ECFS (Extended core file snapshot) technology**: This technology was originally
+    designed to work as a native snapshot format for process memory forensics tools
+    in Linux. It has evolved into something even more than that and has an entire
+    chapter dedicated to it ([Chapter 8](part0074_split_000.html#26I9K1-1d4163ae11644cc2802846625b2dc985
+    "Chapter 8. ECFS – Extended Core File Snapshot Technology"), *ECFS – Extended
+    Core File Snapshot Technology*). It can be found at [https://github.com/elfmaster/ecfs](https://github.com/elfmaster/ecfs).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Volatility plt_hook**: The Volatility software is primarily geared towards
+    full system memory analysis, but Georg Wicherski designed a plugin in 2013 that
+    is specifically for detecting PLT/GOT infections within a process. This plugin
+    uses heuristics similar to those that we previously discussed. This feature has
+    now merged with the Volatility source code at [https://github.com/volatilityfoundation/volatility](https://github.com/volatilityfoundation/volatility).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux ELF core files
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In most UNIX flavored OSes, a process can be delivered a signal so that it dumps
+    a core file. A core file is essentially a snapshot of the process and its state
+    right before it cored (crashed or dumped). A core file is a type of ELF file that
+    is primarily made up of program headers and memory segments. They also contain
+    a fair amount of notes in the `PT_NOTE` segment that describe file mappings, shared
+    library paths, and other information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A core file by itself is not especially useful for process memory forensics,
+    but it may yield some results to the more astute analyst.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: This is actually where ECFS comes into the picture; it is an extension of the
+    regular Linux ELF core format and provides features that are specifically for
+    forensic analysis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Analysis of the core file – the Azazel rootkit
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Here, we will infect a process with the azazel rootkit using the `LD_PRELOAD`
+    environment variable, and then deliver an abort signal to the process so that
+    we can capture a core dump for analysis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Starting up an Azazel infected process and getting a core dump
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Core file program headers
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In a core file, there are many program headers. All of them except one are of
+    the `PT_LOAD` type. There is a `PT_LOAD` program header for every single memory
+    segment in the process, with the exception of special devices (that is `/dev/mem`).
+    Everything from shared libraries and anonymous mappings to the stack, the heap,
+    text, and data segments is represented by a program header.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Then, there is one program header of the `PT_NOTE` type; it contains the most
+    useful and descriptive information in the entire core file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The PT_NOTE segment
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `eu-readelf -n` output that is shown next shows the parsing of the core
+    file notes segment. The reason we used `eu-readelf` here instead of the regular
+    `readelf` is that eu-readelf (the ELF Utils version) takes time to parse each
+    entry in the notes segment, whereas the more commonly used `readelf` (the binutils
+    version) only shows the `NT_FILE` entry:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: Being able to view the register state, auxiliary vector, signal information,
+    and file mappings is not bad news at all, but they are not enough by themselves
+    to analyze a process for malware infection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PT_LOAD segments and the downfalls of core files for forensics purposes
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Each memory segment contains a program header that describes the offset, address,
+    and size of the segment it represents. This would almost suggest that you can
+    access every part of a process image through the program segments, but this is
+    only partially true. The text image of the executable and every shared library
+    that is mapped to the process get only the first 4,096 bytes of themselves dumped
+    into a segment.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is for saving space and because the Linux kernel developers figured that
+    the text segment will not be modified in memory. So, it suffices to reference
+    the original executable file and shared libraries when accessing the text areas
+    from a debugger. If a core file were to dump the complete text segment for every
+    shared library, then for a large program such as Wireshark or Firefox, the output
+    core dump files would be enormous.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So for debugging reasons, it is usually okay to assume that the text segments
+    have not changed in memory, and to just reference the executable and shared library
+    files themselves to get the text. But what about runtime malware analysis and
+    process memory forensics? In many cases, the text segments have been marked as
+    writeable and contain polymorphic engines for code mutation, and in these instances,
+    core files may be useless for viewing the code segments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, what if the core file is the only artifact available for analysis and
+    the original executable and shared libraries are no longer accessible? This further
+    demonstrates why core files are not particularly good for process memory forensics;
+    nor were they ever meant to be.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In the next chapter, we will see how ECFS addresses many of the weaknesses that
+    render core files a useless artifact for forensic purposes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using a core file with GDB for forensics
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Combined with the original executable file, and assuming that no code modifications
+    were made (to the text segment), we can still use core files to some avail for
+    malware analysis. In this particular case, we are looking at a core file for the
+    Azazel rootkit, which—as we demonstrated earlier in this chapter—has PLT/GOT hooks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, let''s take a look at the function that we already know is hijacked by
+    Azazel. The `fopen` function is one of the four shared library functions in the
+    infected program, and as we can see from the preceding output, it has a GOT entry
+    at `0x601040`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If we look again at the `NT_FILE` entry in the `PT_NOTE` segment (`readelf
+    -n core`), we can see at what address range the `libc-2.19.so` file is mapped
+    to the memory, and check whether or not the GOT entry for fopen is pointing to
+    `libc-2.19.so` as it should be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `fopen@got.plt` points to `0x7ff1673a8609`. This is outside of the `libc-2.19.so`
+    text segment range displayed previously, which is `0x7ff166fe0000` to `0x7ff16719b000`.
+    Examining a core file with GDB is very similar to examining a live process with
+    GDB, and you can use the same method shown next to locate the environment variables
+    and check whether `LD_PRELOAD` has been set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here''s an example of locating environment variables in a core file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The art of process memory forensics is a very specific aspect of forensic work.
+    It obviously focuses primarily on memory pertaining to a process image, which
+    is quite complicated even on its own, as it requires intricate knowledge about
+    CPU registers, the stack, dynamic linking, and ELF as a whole.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Therefore, being proficient in inspecting a process for anomalies is truly an
+    art and a skill that builds on itself through experience. This chapter served
+    as a primer for the subject so that the beginner can get some insights into how
+    they should get started. In the next chapter, we will be discussing process forensics,
+    and you will learn how the ECFS technology can make it much easier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: After you have completed this chapter and the next, I recommend that you use
+    some of the tools cited in this chapter to infect some processes on your system
+    and experiment with the ways of detecting them.
+  prefs: []
+  type: TYPE_NORMAL

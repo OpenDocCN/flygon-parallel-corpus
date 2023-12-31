@@ -1,0 +1,2202 @@
+- en: Kernel Memory Allocation for Module Authors - Part 2
+  prefs: []
+  type: TYPE_NORMAL
+- en: The previous chapter covered the basics (and a lot more!) on using the available
+    APIs for memory allocation via both the page (BSA) and the slab allocators within
+    the kernel. In this chapter, we will delve further into this large and interesting
+    topic. We cover the creation of custom slab caches, the `vmalloc` interfaces,
+    and very importantly, given the wealth of choice, which APIs to use in which situation.
+    Internal kernel details regarding the dreaded **Out Of Memory** (**OOM**) killer and
+    demand paging help round off these important topics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These areas tend to be one of the key aspects to understand when working with
+    kernel modules, especially device drivers. A Linux system project's sudden crash
+    with merely a `Killed` message on the console requires some explanation, yes!?
+    The OOM killer's the sweet chap behind this...
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Briefly, within this chapter, these are the main areas covered:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a custom slab cache
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Debugging at the slab layer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel vmalloc() API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory allocation in the kernel – which APIs to use when
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Stayin' alive - the OOM killer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I assume that you have gone through [Chapter 1](ad75db43-a1a2-4f3f-92c7-a544f47baa23.xhtml),
+    *Kernel Workspace Setup*, and have appropriately prepared a guest VM running Ubuntu
+    18.04 LTS (or a later stable release) and installed all the required packages.
+    If not, I highly recommend you do this first.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, the last section of this chapter has you deliberately run a *very *memory-intensive
+    app; so intensive that the kernel will take some drastic action! Obviously, I
+    highly recommend you try out stuff like this on a safe, isolated system, preferably a
+    Linux test VM (with no important data on it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: To get the most out of this book, I strongly recommend you first set up the
+    workspace
+  prefs: []
+  type: TYPE_NORMAL
+- en: environment, including cloning this book's GitHub repository for the code, and
+    work on it in a hands-on fashion. The GitHub  repository can be found at [https://github.com/PacktPublishing/Linux-Kernel-Programming](https://github.com/PacktPublishing/Linux-Kernel-Programming).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a custom slab cache
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As explained in detail in the previous chapter, a key design concept behind
+    slab caches is the powerful idea of object caching. By caching frequently used
+    objects – data structures, really – performance receives a boost. So, think about
+    this: what if we''re writing a driver, and in that driver, a certain data structure
+    (an object) is very frequently allocated and freed? Normally, we would use the
+    usual `kzalloc()` (or `kmalloc()`) followed by the `kfree()` APIs to allocate
+    and free this object. The good news, though: the Linux kernel sufficiently exposes the
+    slab layer API to us as module authors, allowing us to create *our own custom
+    slab caches*. In this section, you''ll learn how you can leverage this powerful
+    feature.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating and using a custom slab cache within a kernel module
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In this section, we''re about to create, use, and subsequently destroy a custom
+    slab cache. At a broad level, we''ll be performing the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a custom slab cache of a given size with the `kmem_cache_create()` API.
+    This is often done as part of the init code path of the kernel module (or within the
+    probe method when in a driver).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Using the slab cache. Here we will do the following:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Issue the `kmem_cache_alloc()` API to allocate a single instance of the custom
+    object(s) within your slab cache.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Use the object.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Free it back to the cache with the `kmem_cache_free()` API.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Destroying the custom slab cache when done with `kmem_cache_destroy()`. This
+    is often done as part of the cleanup code path of the kernel module (or within the
+    remove/detach/disconnect method when in a driver).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Let's explore each of these APIs in a bit of detail. We start with the creation
+    of a custom (slab) cache.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a custom slab cache
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'First, of course, let''s learn how to create the custom slab cache. The signature
+    of the `kmem_cache_create()` kernel API is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter is the name of the cache - as will be revealed by `proc` (and
+    hence by other wrapper utilities over `proc`, such as `vmstat(8)`, `slabtop(1)`,
+    and so on). It usually matches the name of the data structure or object being
+    cached (but does not have to).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The second parameter, `size`, is really the key one – it''s the size in bytes
+    for each object within the new cache. Based on this object size (using a best-fit
+    algorithm), the kernel''s slab layer constructs a cache of objects. The actual
+    size of each object within the cache will be (slightly) larger than what''s requested,
+    due to three reasons:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One, we can always provide more, but never less, than the memory requested.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Two, some space for metadata (housekeeping information) is required.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Three, the kernel is limited in being able to provide a cache of the exact size
+    required. It uses the memory of the closest possible matching size (recall from
+    [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml), *Kernel Memory Allocation
+    for Module Authors – Part 1*, in the *Caveats when using the slab allocator* section,
+    where we clearly saw that more (sometimes a lot!) memory could actually be used).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Recall from [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml), *Kernel
+    Memory Allocation for Module Authors – Part 1*, that the `ksize()` API can be
+    used to query the actual size of the allocated object. There is another API with
+    which we can query the size of the individual objects within the new slab cache:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`unsigned int kmem_cache_size(struct kmem_cache *s);`. You shall see this being
+    used shortly.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The third parameter, `align`, is the *alignment* required for the objects within
+    the cache. If unimportant, just pass it as `0`. Quite often though, there are
+    very particular alignment requirements, for example, ensuring that the object
+    is aligned to the size of a word on the machine (32 or 64 bits). To do so, pass
+    the value as `sizeof(long)` (the unit for this parameter is bytes, not bits).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The fourth parameter, `flags`, can either be `0` (implying no special behavior),
+    or the bitwise-OR operator of the following flag values. For clarity, we directly
+    reproduce the information on the following flags from the comments within the
+    source file, `mm/slab_common.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s quickly check the flags out:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first of the flags, `SLAB_POISON`, provides slab poisoning, that is, initializing
+    the cache memory to a previously known value (`0xa5a5a5a5`). Doing this can help
+    during debug situations.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second flag, `SLAB_RED_ZONE`, is interesting, inserting red zones (analogous
+    to guard pages) around the allocated buffer. This is a common way of checking
+    for buffer overflow errors. It's almost always used in a debug context (typically
+    during development).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The third possible flag, `SLAB_HWCACHE_ALIGN`, is very commonly used and is
+    in fact recommended for performance. It guarantees that all the cache objects
+    are aligned to the hardware (CPU) cacheline size. This is precisely how the memory
+    allocated via the popular `k[m|z]alloc()` APIs are aligned to the hardware (CPU)
+    cacheline.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Finally, the fifth parameter to `kmem_cache_create()` is very interesting too:
+    a function pointer, `void (*ctor)(void *);`. It is modeled as a constructor function (as
+    in object orientation and OOP languages). It conveniently allows you to initialize
+    the slab object from the custom slab cache the moment it''s allocated! As one
+    example of this feature in action within the kernel, see the code of the **Linux
+    Security Module** (**LSM**) called `integrity `here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It invokes the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `init_once()` function initializes the cached object instance (that was
+    just allocated). Remember, the constructor function is called whenever new pages
+    are allocated by this cache.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Though it may seem counter-intuitive, the fact is that the modern Linux kernel
+    is quite object-oriented in design terms. The code, of course, is mostly plain
+    old C, a traditional procedural language. Nevertheless, a vast number of architecture
+    implementations within the kernel (the driver model being a big one) are quite
+    object-oriented in design: method dispatch via virtual function pointer tables
+    - the strategy design pattern, and so on. See a two-part article on LWN depicting
+    this in some detail here: *Object-oriented design patterns in the kernel, part
+    1, June 2011* ([https://lwn.net/Articles/444910/](https://lwn.net/Articles/444910/)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The return value from the `kmem_cache_create()` API is a pointer to the newly
+    created custom slab cache on success, and `NULL` on failure. This pointer is usually
+    kept global, as you will require access to it in order to actually allocate objects
+    from it (our next step).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to understand that the `kmem_cache_create()` API can only be
+    called from process context. A fair bit of kernel code (including many drivers)
+    create and use their own custom slab caches. For example, in the 5.4.0 Linux kernel,
+    there are over 350 instances of this API being invoked.
+  prefs: []
+  type: TYPE_NORMAL
+- en: All right, now that you have a custom (slab) cache available, how exactly do
+    you use it to allocate memory objects? Read on; the next section covers precisely
+    this.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the new slab cache's memory
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'So, okay, we created a custom slab cache. To make use of it, you must issue
+    the `kmem_cache_alloc()` API. Its job: given the pointer to a slab cache (which
+    you just created), it allocates a single instance of an object on that slab cache
+    (in fact, this is really how the `k[m|z]alloc()` APIs work under the hood). Its
+    signature is as follows (of course, remember to always include the `<linux/slab.h>` header
+    for all slab-based APIs):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s look at its parameters:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first parameter to `kmem_cache_alloc()` is the pointer to the (custom) cache
+    that we created in the previous step (the pointer being the return value from
+    the `kmem_cache_create()`API).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The second parameter is the usual GFP flags to pass along (remember the essential
+    rule: use `GFP_KERNEL` for normal process-context allocations, else `GFP_ATOMIC` if
+    in any kind of atomic or interrupt context).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: As with the now-familiar `k[m|z]alloc()` APIs, the return value is a pointer
+    to the newly allocated memory chunk – a kernel logical address (it's a KVA of
+    course).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Use the newly allocated memory object, and when done, do not forget to free
+    it with the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here, take note of the following with respect to the `kmem_cache_free()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first parameter to `kmem_cache_free()` is, again, the pointer to the (custom)
+    slab cache that you created in the previous step (the return value from `kmem_cache_create()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second parameter is the pointer to the memory object you wish to free – the
+    object instance that you were just allocated with `kmem_cache_alloc()` – and thus
+    have it return to the cache specified by the first parameter!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Similar to the `k[z]free()` APIs, there is no return value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Destroying the custom cache
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'When completely done (often in the cleanup or exit code path of the kernel
+    module, or your driver''s `remove` method), you must destroy the custom slab cache
+    that you created earlier using the following line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The parameter, of course, is the pointer to the (custom) cache that you created
+    in the previous step (the return value from the `kmem_cache_create()` API).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you have understood the procedure and its related APIs, let's get hands
+    on with a kernel module that creates its own custom slab cache, uses it, and then
+    destroys it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Custom slab – a demo kernel module
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Time to get our hands dirty with some code! Let's look at a simple demonstration
+    of using the preceding APIs to create our very own custom slab cache. As usual,
+    we show only relevant code here. I urge you to clone the book's GitHub repository
+    and try it out yourself! You can find the code for this file at `ch9/slab_custom/slab_custom.c`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our init code path, we first call the following function to create our custom
+    slab cache:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, we declare a (global) pointer (`gctx_cachep`) to the
+    to-be-created custom slab cache – which will hold objects; namely, our fictional
+    often allocated data structure, `myctx`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following, see the code that creates the custom slab cache:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Hey, that''s interesting: notice that our cache creation API supplies a constructor
+    function to help initialize any newly allocated object; here it is:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The comments in the preceding code are self-explanatory; do take a look. The
+    constructor routine, if set up (depending on the value of our `use_ctor` module
+    parameter; it's `1` by default), will be auto-invoked by the kernel whenever a
+    new memory object is allocated to our cache.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Within the init code path, we call a `use_our_cache()` function. It allocates
+    an instance of our `myctx` object via the `kmem_cache_alloc()` API, and if our
+    custom constructor routine is enabled, it runs, initializing the object. We then
+    dump its memory to show that it was indeed initialized as coded, freeing it when
+    done (for brevity, we''ll leave out showing the error code paths):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, in the exit code path, we destroy our custom slab cache:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following output from a sample run helps us understand how it works. The
+    following is just a partial screenshot showing the output on our x86_64 Ubuntu
+    18.04 LTS guest running the Linux 5.4 kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/2a679dea-0e4b-4978-9faf-e3dd880fa594.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.1 – Output of our slab_custom kernel module on an x86_64 VM
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Great! Hang on though, a couple of key points to take note of here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As our constructor routine is enabled by default (the value of our `use_ctor`
+    module parameter is `1`), it runs whenever a new object instance is allocated
+    by the kernel slab layer to our new cache. Here, we performed just a single `kmem_cache_alloc()`,
+    yet our constructor routine has run 21 times, implying that the kernel's slab
+    code (pre)allocated 21 objects to our brand new cache! Of course, this number
+    varies.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Two, something very important to notice! As seen in the preceding screenshot,
+    the *size* of each object is seemingly 328 bytes (as shown by all these three
+    APIs: `sizeof()`, `kmem_cache_size()`, and `ksize()`). However, again, this is
+    not really true! The actual size of the object as allocated by the kernel is larger; we
+    can see this via `vmstat(8)`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: As highlighted in the preceding code, the actual size of each allocated object
+    is not 328 bytes but 768 bytes (the exact number varies; in one case I saw it
+    as 448 bytes).Just as we saw earlier, this is important for you to realize, and
+    indeed check for. We show another way to quite easily check this in the *Debugging
+    at the slab layer *section that follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: FYI, you can always check out the man page of `vmstat(8)` for the precise meaning
+    of each column seen earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll round off the discussion on creating and using custom slab caches with
+    the slab shrinker interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding slab shrinkers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Caches are good for performance. Visualize reading the content of a large file
+    from disk as opposed to reading its content from RAM. There's no question that
+    the RAM-based I/O is much faster! As can be imagined, the Linux kernel leverages
+    these ideas and thus maintains several caches – the page cache, dentry cache,
+    inode cache, slab caches, and so on. These caches indeed greatly help performance,
+    but, thinking about it, are not actually a mandatory requirement. When memory
+    pressure reaches high levels (implying that too much memory is in use and too
+    little is free), the Linux kernel has mechanisms to intelligently free up caches
+    (aka memory reclamation - it's a continuous ongoing process; kernel threads (typically
+    named `kswapd*`) reclaim memory as part of their housekeeping chores; more on
+    this in the *Reclaiming memory – a kernel housekeeping task and* *OOM* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the case of the slab cache(s), the fact is that some kernel subsystems and
+    drivers create their own custom slab caches as we covered earlier in this chapter.
+    For the purpose of integrating well and cooperating with the kernel, best practice
+    demands that your custom slab cache code is expected to register a shrinker interface.
+    When this is done, and when memory pressure gets high enough, the kernel might
+    well invoke several slab shrinker callbacks, which are expected to ease the memory
+    pressure by freeing up (shrinking) slab objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The API to register a shrinker function with the kernel is the `register_shrinker()` API. The
+    single parameter to it (as of Linux 5.4) is a pointer to a `shrinker` structure.
+    This structure contains (among other housekeeping members) two callback routines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first routine, `count_objects()`, merely counts and returns the number of
+    objects that would be freed (when it is actually invoked). If it returns `0`,
+    this implies that the number of freeable memory objects cannot be determined now,
+    or that we should not even attempt to free any right now.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The second routine, `scan_objects()`, is invoked only if the first callback
+    routine returns a non-zero value; it's the one that, when invoked by the slab
+    cache layer, actually frees up, or shrinks, the slab cache in question. It returns
+    the actual number of objects freed up in this reclaim cycle, or `SHRINK_STOP` if
+    the reclaim attempt could not progress (due to possible deadlocks).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We'll now wrap up the discussion on the slab layer with a quick summation of
+    the pros and cons of using this layer for memory (de)allocation—very important
+    for you as a kernel/driver author to be keenly aware of!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The slab allocator – pros and cons – a summation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, we very briefly summarize things you have already learned by
+    now. This is intended as a way for you to quickly look up and recollect these
+    key points!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The pros of using the slab allocator (or slab cache) APIs to allocate and free
+    kernel memory are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: (Very) fast (as it uses pre-cached memory objects).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A physically contiguous memory chunk is guaranteed.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Hardware (CPU) cacheline-aligned memory is guaranteed when the `SLAB_HWCACHE_ALIGN` flag
+    is used when creating the cache. This is the case for `kmalloc()`, `kzalloc()`,
+    and so on.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can create your own custom slab cache for particular (frequently alloc-ed/freed)
+    objects.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The cons of using the slab allocator (or slab cache) APIs are the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A limited amount of memory can be allocated at a time; typically, just 8 KB
+    directly via the slab interfaces, or up to 4 MB indirectly via the page allocator
+    on most current platforms (of course, the precise upper limits are arch-dependent).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Using the `k[m|z]alloc()` APIs incorrectly: asking for too much memory, or
+    asking for a memory size just over a threshold value (discussed in detail in [Chapter
+    8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml), *Kernel Memory Allocation for
+    Module Authors – Part 1*, under the *Size limitations of the kmalloc API* section),
+    can certainly lead to internal fragmentation (wastage). It''s designed to only
+    really optimize for the common case – for allocations of a size less than one
+    page.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Now, let's move on to another really key aspect for the kernel/driver developer
+    – effectively debugging when things go wrong with respect to memory allocations/freeing,
+    particularly within the slab layer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Debugging at the slab layer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Memory corruption is unfortunately a very common root cause of bugs. Being able
+    to debug them is a key skill. We'll now look at a few ways to go about this. Before
+    diving into the details, remember that the following discussion is with respect
+    to the *SLUB* (the unqueued allocator) implementation of the slab layer. This
+    is the default on most Linux installations (we mentioned in [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml),
+    *Kernel Memory Allocation for Module Authors – Part 1*, under the *Slab layer
+    implementations within the kernel* section, that current Linux kernels have three
+    mutually exclusive implementations of the slab layer).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Also, our intention here is not to discuss in-depth kernel debug tools with
+    respect to memory debugging—that is a large topic by itself that unfortunately
+    lies beyond the scope of this book. Nevertheless, I will say that you would do
+    well to gain familiarity with the powerful frameworks/tools that have been mentioned,
+    particularly the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**KASAN** (the **Kernel Address Sanitizer**; available for x86_64 and AArch64,
+    4.x kernels onward)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: SLUB debug techniques (covered here)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`kmemleak` (though KASAN is superior)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`kmemcheck` (note though that `kmemcheck` was removed in Linux 4.15)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Don't forget to look for links to these in the *Further reading *section. Okay,
+    let's get down to a few useful ways to help a developer debug code at the slab
+    layer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Debugging through slab poisoning
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'One very useful feature is so-called slab poisoning. The term *poisoning* in
+    this context implies poking memory with certain signature bytes or a pattern that
+    is easily recognizable. The prerequisite to using this, though, is that the `CONFIG_SLUB_DEBUG` kernel
+    configuration option is on.How can you check? Simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `=y` seen in the preceding code indicates that it''s indeed on. Now (assuming
+    it''s turned on) if you create a slab cache with the `SLAB_POISON` flag (we covered
+    the creation of a slab cache in the *Creating a custom slab cache* section), then,
+    when the memory is allocated, it''s always initialized to the special value or
+    memory pattern `0x5a5a5a5a` – it''s poisoned (it''s quite intentional: the hex
+    value `0x5a` is the ASCII character `Z` for zero)! So, think about it, if you
+    spot this value in a kernel diagnostic message or dump, also called an *Oops,*
+    there''s a good chance that this is an (unfortunately pretty typical) uninitialized
+    memory bug or **UMR** (short for **Uninitialized Memory Read**), perhaps.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why use the word *perhaps* in the preceding sentence? Well, simply because debugging
+    deeply hidden bugs is a really difficult thing to do! The symptoms that might
+    present themselves are not necessarily *the root cause* of the issue at hand.
+    Thus, hapless developers are fairly often led down the proverbial garden path
+    by various red herrings! The reality is that debugging is both an art and a science;
+    deep knowledge of the ecosystem (here, the Linux kernel) goes a really long way
+    in helping you effectively debug difficult situations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the `SLAB_POISON` flag is unset, uninitialized slab memory is set to the `0x6b6b6b6b` memory
+    pattern (hex `0x6b` is ASCII character `k` (see Figure 9.2)). Similarly, when
+    the slab cache memory is freed up and `CONFIG_SLUB_DEBUG` is on, the kernel writes
+    the same memory pattern (`0x6b6b6b6b ; 'k'`) into it. This can be very useful
+    too, allowing us to spot (what the kernel thinks is) uninitialized or free memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The poison values are defined in `include/linux/poison.h` as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'With respect to the kernel''s SLUB implementation of the slab allocator, let''s
+    check out a summary view of **how and when** (the specific circumstances are determined
+    by the following `if` part) the *slab poisoning occurs,* along with its type in
+    the following pseudocode:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then the slab poisoning occurs as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The slab memory is set to `POISON_INUSE (0x5a = ASCII 'Z')` upon initialization;
+    the code for this is here: `mm/slub.c:setup_page_debug()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The slab object is set to `POISON_FREE (0x6b = ASCII 'k')` upon initialization
+    in `mm/slub.c:init_object()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The slab object's last byte is set to `POISON_END (0xa5)` upon initialization
+    in `mm/slub.c:init_object()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: (So, because of the way the slab layer performs these slab memory initializations,
+    we end up with the value `0x6b` (ASCII `k`) as the initial value of just-allocated
+    slab memory). Notice that for this to work, you shouldn't install a custom constructor
+    function. Also, you can ignore the `it's-type-safe-by-RCU` directive for now;
+    it's usually the case (that is, the "is type-safe-by-RCU" is true; FYI, RCU (Read
+    Copy Update) is an advanced synchronization technology that's beyond this book's
+    scope). As can be seen from how slabs are initialized when running in SLUB debug
+    mode, the memory content is effectively initialized to the value `POISON_FREE
+    (0x6b = ASCII 'k')`. Thus, if this value ever changes after the memory is freed,
+    the kernel can detect this and trigger a report (via printk). This, of course,
+    is a case of the well-known **Use After Free** (**UAF**) memory bug! Similarly,
+    writing before or after the redzone regions (these are in effect guard regions
+    and are typically initialized to `0xbb`) will trigger a write buffer under/overflow
+    bug, which the kernel reports. Useful!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trying it out – triggering a UAF bug
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'To help you understand this better, we''ll show an example via screenshots
+    in this section. Implement the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Firstly, ensure you enable the `CONFIG_SLUB_DEBUG` kernel config (it should
+    be set to `y`; this is typically the case on distro kernels)
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Next, boot the system while including the kernel command-line `slub_debug=`
+    directive (this turns on full SLUB debug; or you could pass a finer granularity
+    variant such as `slub_debug=FZPU` (see the kernel documentation here for an explanation
+    of each field: [https://www.kernel.org/doc/Documentation/vm/slub.txt](https://www.kernel.org/doc/Documentation/vm/slub.txt));
+    as a demo, on my Fedora 31 guest VM, I passed the kernel command line as follows
+    - the important thing here, the `slub_debug=FZPU` is highlighted in bold font:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: (More detail on the `slub_debug` parameter is in the next section *​SLUB debug
+    options at boot and runtime*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Write a kernel module that creates a new custom slab cache (which of course
+    has a memory bug!). Ensure no constructor function is specified (sample code is
+    here: `ch9/poison_test`; I''ll leave it as an exercise for you to browse through
+    the code and test it).'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'We try it out here: allocate some slab memory via `kmem_cache_alloc()` (or
+    equivalent). Here''s a screenshot (Figure 9.2) showing the allocated memory, and
+    the same region after performing a quick `memset()` setting the first 16 bytes
+    to `z` (`0x7a`):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](img/2a38ad65-0115-41bb-bc1c-8de17c81ead1.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.2 – Slab memory after allocation and memset() of the first 16 bytes
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, for the bug! In the cleanup method, we free the allocated slab and then
+    reuse it by attempting to do another `memset()` upon it, *thus triggering the
+    UAF bug*. Again, we show the kernel log via another screenshot (Figure 9.3):'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '![](img/3a1f3f3a-ecf0-46a2-a5c4-be69803a03b4.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.3 – The kernel reporting the UAF bug!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Notice how the kernel reports this (the first text in red in the preceding
+    figure) as a `Poison overwritten` bug. This is indeed the case: we overwrote the
+    `0x6b` poison value with `0x21 `(which, quite intentionally is the ASCII character
+    `!`). After freeing a buffer that originated from the slab cache, if the kernel
+    detects any value other than the poison value (`POISON_FREE = 0x6b = ASCII ''k''`)
+    within the payload, it triggers the bug. (Also notice, the redzone - guard - areas
+    are initialized to the value `0xbb`).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next section provides a few more details on the SLUB layer debug options
+    available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: SLUB debug options at boot and runtime
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Debugging kernel-level slab issues when using the SLUB implementation (the
+    default) is very powerful as the kernel has full debugging information available.
+    It''s just that it''s turned off by default. There are various ways (viewports)
+    via which we can turn on and look at slab debug-level information; a wealth of
+    details is available! Some of the ways to do so include the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Passing the `slub_debug=` string on the kernel command line (via the bootloader
+    of course). This turns on full SLUB kernel-level debugging.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The specific debug information to be seen can be fine-tuned via options passed
+    to the `slub_debug=` string (passing nothing after the `=` implies that all SLUB
+    debug options are enabled); for example, passing `slub_debug=FZ` turns on the
+    following options:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`F`: Sanity checks on (enables `SLAB_DEBUG_CONSISTENCY_CHECKS`); note that
+    turning this on can slow down the system.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`Z`: Red zoning.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Even if the SLUB debug feature has not been turned on via the kernel command
+    line, we can still enable/disable it by writing `1` (as root) to suitable pseudo-files
+    under `/sys/kernel/slab/<slab-name>`:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Recall our earlier demo kernel module (`ch9/slab_custom`); once loaded into
+    the kernel, see the theoretical and actual size of each allocated object like
+    this:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Several other pseudo-files are present as well; doing `ls(1)` on `/sys/kernel/slab/<name-of-slab>/`
+    will reveal them. For example, look up the constructor function to our `ch9/slab_custom` slab
+    cache by performing `cat` on the pseudo-file at `/sys/kernel/slab/our_ctx/ctor`:'
+  prefs:
+  - PREF_UL
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can find quite some relevant details in this (very useful!) document here: *Short
+    users guide for SLUB *([https://www.kernel.org/doc/Documentation/vm/slub.txt](https://www.kernel.org/doc/Documentation/vm/slub.txt)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, a quick look under the kernel source tree's `tools/vm` folder will reveal
+    some interesting programs (`slabinfo.c` being the relevant one here) and a script
+    to generate graphs (via `gnuplot(1)`). The document mentioned in the preceding
+    paragraph provides usage details on plot generation as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As an important aside, the kernel has an enormous (and useful!) number of *kernel
+    parameters* that can be optionally passed to it at boot (via the bootloader).
+    See the complete list here in the documentation: *The kernel’s command-line parameters* ([https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Well, this (finally) concludes our coverage of the slab allocator (from the
+    previous chapter continuing into this one). You have learned that it''s layered
+    above the page allocator and solves two key things: one, it allows the kernel
+    to create and maintain object caches so that the allocation and freeing of some
+    important kernel data structures can be performed very efficiently; two, this
+    includes generic memory caches allowing you to allocate small amounts of RAM -
+    fragments of a page - with very little overhead (unlike the binary buddy system
+    allocator). The fact is simply this: the slab APIs are the really commonly employed
+    ones by drivers; not only that, modern driver authors exploit the resource-managed
+    `devm_k{m,z}alloc()` APIs; we encourage you to do so. Be careful though: we examined
+    in detail how more memory than you think might actually be allocated (use `ksize()`
+    to figure out just how much). You also learned how to create a custom slab cache,
+    and, importantly, how to go about debugging at the slab layer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now let's learn what the `vmalloc()` API is, how and when to use it for kernel
+    memory allocation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using the kernel vmalloc() API
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As we have learned in the previous chapter, ultimately there is just one engine
+    for memory allocation within the kernel – the page (or buddy system) allocator.
+    Layered on top is the slab allocator (or slab cache) machinery. In addition, there
+    is another completely virtual address space within the kernel's address space
+    from where virtual pages can be allocated at will – this is called the kernel `vmalloc`
+    region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, ultimately, once a virtual page is actually used (by something in
+    the kernel or in user space via a process or thread) - it's physical page frame
+    that it's mapped to is really allocated via the page allocator (this is ultimately
+    true of all user space memory frames as well, though in an indirect fashion; more
+    on this later in the *Demand paging and OOM* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Within the kernel segment or VAS (we covered all this in some detail in [Chapter
+    7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml), *Memory Management Internals -
+    Essentials,* under the *Examining the kernel segment* section), is the *vmalloc *address
+    space, extending from `VMALLOC_START` to `VMALLOC_END-1`. It's a completely virtual
+    region to begin with, that is, its virtual pages initially are not mapped to any
+    physical page frames.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For a quick refresher, revisit the diagram of the user and kernel segments –
+    in effect, the complete VAS – by re-examining *Figure 7.12*. You will find this
+    in [Chapter 7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml), *Memory Management
+    Internals - Essentials,* under the *Trying it out – viewing kernel segment details* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this book, our purpose is not to delve into the gory internal details regarding
+    the kernel's `vmalloc` region. Instead, we present enough information for you,
+    the module or driver author, to use this region for the purpose of allocating
+    virtual memory at runtime.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning to use the vmalloc family of APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'You can allocate virtual memory (in kernel space of course) from the  kernel''s `vmalloc` region using
+    the `vmalloc()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some key points to note on the vmalloc:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `vmalloc()`API allocates contiguous virtual memory to the caller. There
+    is no guarantee that the allocated region will be physically contiguous; it may
+    or may not be (in fact, the larger the allocation, the less the chance that it's
+    physically contiguous).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The content of the virtual pages allocated is, in theory, random; in practice,
+    it appears to be arch-dependent (the x86_64, at least, seems to zero out the memory
+    region); of course, (at the risk of a slight performance hit) you're recommended
+    to ensure memory zeroing out by employing the `vzalloc()` wrapper API
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `vmalloc()` (and friends) APIs must only ever be invoked from a process
+    context (as it might cause the caller to sleep).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The return value of `vmalloc()` is the KVA (within the kernel vmalloc region)
+    on success or `NULL` on failure.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The start of the vmalloc memory just allocated is guaranteed to be on a page
+    boundary (in other words, it's always page-aligned).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The actual allocated memory (from the page allocator) might well be larger than
+    what's requested (as again, it internally allocates sufficient pages to cover
+    the size requested)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It will strike you that this API seems very similar to the familiar user space `malloc(3)`.
+    Indeed it is at first glance, except that, of course, it's a kernel space allocation
+    (and again, remember that there is no direct correlation between the two).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This being the case, how is `vmalloc()` helpful to us module or driver authors?
+    When you require a large virtually contiguous buffer of a size greater than the
+    slab APIs (that is, `k{m|z}alloc()` and friends) can provide – recall that it's
+    typically 4 MB with a single allocation on both ARM and x86[_64]) – then you should
+    use `vmalloc`!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'FYI, the kernel uses `vmalloc()` for various reasons, some of them as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allocating space for the (static) memory of kernel modules when they are loaded
+    into the kernel (in `kernel/module.c:load_module()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If `CONFIG_VMAP_STACK` is defined, then `vmalloc()` is used for the allocation
+    of the kernel-mode stack of every thread (in `kernel/fork.c:alloc_thread_stack_node()`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Internally, while servicing an operation called `ioremap()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Within the Linux socket filter (bpf) code paths, and so on.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For convenience, the kernel provides the `vzalloc()` wrapper API (analogous
+    to `kzalloc()`) to allocate and zero out the memory region – a good coding practice,
+    no doubt, but one that might hurt time-critical code paths slightly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once you are done with using the allocated virtual buffer, you must of course
+    free it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: As expected, the parameter to `vfree()` is the return address from `v[m|z]alloc()` (or
+    even the underlying `__vmalloc()` API that these invoke). Passing `NULL` causes
+    it to just harmlessly return.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the following snippet, we show some sample code from our `ch9/vmalloc_demo` kernel
+    module. As usual, I urge you to clone the book's GitHub repository and try it
+    out yourself (for brevity, we don't show the whole of the source code in the following
+    snippet; we show the primary `vmalloc_try()` function invoked by the module's
+    init code).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is the first part of the code. If the `vmalloc()` API fails by any chance,
+    we generate a warning via the kernel''s `pr_warn()` helper. Do note that the following `pr_warn()`
+    helper isn''t really required; being pedantic here, we keep it... ditto for the
+    remaining cases, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `vmalloc()` API in the preceding code block allocates a contiguous kernel
+    virtual memory region of (at least) 10,000 bytes; in reality, the memory is page-aligned!
+    We employ the kernel's `print_hex_dump_bytes()` helper routine to dump the first
+    16 bytes of this region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Moving on, see the following code employ the `vzalloc()` API to again allocate
+    another contiguous kernel virtual memory region of (at least) 10,000 bytes (it''s
+    page-aligned memory though); this time, the memory contents are set to zeroes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A couple of points regarding the following code: one, notice the error handling
+    with `goto` (at the target labels of multiple `goto` instances, where we use `vfree()` to
+    free up previously allocated memory buffers as required), typical of kernel code.
+    Two, for now, please ignore the `kvmalloc()`, `kcalloc()`, and `__vmalloc()` friend
+    routines; we''ll cover them in the *Friends of vmalloc()* section:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the cleanup code path of our kernel module, we of course free the allocated
+    memory regions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: We'll leave it to you to try out and verify this demo kernel module.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's delve briefly into another really key aspect – how exactly does a
+    user space `malloc()`, or a kernel space `vmalloc()`, memory allocation become
+    physical memory? Do read on to find out!
+  prefs: []
+  type: TYPE_NORMAL
+- en: A brief note on memory allocations and demand paging
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Without delving into deep detail regarding the internal workings of `vmalloc()` (or
+    the user space `malloc()`), we'll nevertheless cover some crucial points that
+    a competent kernel/driver developer like you must understand.
+  prefs: []
+  type: TYPE_NORMAL
+- en: First and foremost, vmalloc-ed virtual memory has to, at some point (when used),
+    become physical memory. This physical memory is allocated via the one and only
+    way that it can be in the kernel – via the page (or buddy system) allocator. How
+    this happens is a bit indirect and is briefly explained as follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When using `vmalloc()`, a key point should be understood: `vmalloc()` only
+    causes virtual memory pages to be allocated (they are merely marked as reserved
+    by the OS). No physical memory is actually allocated at this time. The actual
+    physical page frames corresponding to the virtual ones only get allocated – that
+    too on a page-by-page basis – when these virtual pages are touched in any manner,
+    such as for reads, writes, or executions. This key principle of not actually allocating
+    physical memory until the program or process actually attempts to use it is referred
+    to by various names – *demand paging, lazy allocation, on-demand allocation*,
+    and so on. In fact, the documentation states this very fact:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '"vmalloc space is lazily synchronized into the different PML4/PML5 pages of
+    the processes using the page fault handler ..."'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It''s quite enlightening to clearly understand how memory allocation really
+    works for `vmalloc()` and friends, and indeed, for the user space glibc `malloc()` family
+    of routines – it''s all via demand paging! Meaning, the successful return of these
+    APIs really does not mean anything in terms of *physical* memory allocation. When
+    `vmalloc()`, or indeed a user space `malloc()`, returns success, all that has
+    really happened so far is that a virtual memory region has been reserved; no physical
+    memory has actually been allocated yet! *The actual allocation of a physical page
+    frame only happens on a per-page basis as and when the virtual page is accessed
+    (for anything: reading, writing, or execution)*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But how does this happen internally? The answer, in brief: whenever the kernel
+    or a process accesses a virtual address, the virtual address is interpreted by
+    the **Memory Management Unit** (**MMU**), which is a part of the silicon on the
+    CPU core. The MMU''s **Translation Lookaside Buffer** (**TLB**) *(*we don''t have
+    the luxury of being able to delve into all of this here, sorry!*)* will now be
+    checked for a *hit*. If so, the memory translation (virtual-to-physical address)
+    is already available; if not, we have a TLB-miss. If so, the MMU will now *walk*
+    the paging tables of the process, effectively translating the virtual address
+    and thus obtaining the *physical address. *It puts this on the address bus, and
+    the CPU goes on its merry way.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: But, think on this, what if the MMU cannot find a matching physical address?
+    This can happen for a number of reasons, one of them being our case here – we
+    don't (yet) *have *a physical page frame, only a virtual page. At this point,
+    the MMU essentially gives up as it cannot handle it. Instead, it *invokes the
+    OS's page fault handler code* – an exception or fault handler that runs in the
+    process's context – in the context of `current`. This page fault handler actually
+    resolves the situation; in our case, with `vmalloc()` (or indeed even the user
+    space `malloc()`!), it requests the page allocator for a single physical page
+    frame (at order `0`) and maps it to the virtual page.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's equally important to realize that this demand paging (or lazy allocation)
+    is *not the case for kernel memory allocations* carried out via the page (buddy
+    system) and the slab allocator. There, when memory is allocated, understand that
+    actual physical page frames are allocated *immediately*. (In reality on Linux,
+    it's all very fast because, recall, the buddy system freelists have already mapped all
+    system physical RAM into the kernel *lowmem* region and can therefore use it at
+    will.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Recall what we did in an earlier program, `ch8/lowlevel_mem`; there, we used
+    our `show_phy_pages()` library routine to display the virtual address, the physical
+    address, and **Page Frame Number** (**PFN**) for a given memory range, thereby
+    verifying that the low-level page allocator routines really do allocate physically
+    contiguous memory chunks. Now, you might think, why not call this same function
+    in this `vmalloc_demo` kernel module? If the PFNs of the allocated (virtual) pages
+    are not consecutive, we again prove that, indeed, it's only virtually contiguous.
+    It sounds tempting to try, but it doesn't work!Why? Simply because, as stated
+    earlier (in [Chapter 8](e78245d1-5a99-4b9e-a98c-cb16b15f3bee.xhtml), *Kernel Memory
+    Allocation for Module Authors – Part 1*): do not attempt to translate from virtual
+    to physical any addresses other than direct-mapped (identity-mapped / lowmem region)
+    ones – the ones the page or slab allocators supply. It just doesn't work with
+    `vmalloc`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A few more points on `vmalloc` and some associated information follow; do read
+    on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Friends of vmalloc()
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In many cases, the precise API (or memory layer) used to perform a memory allocation
+    does not really matter to the caller. So, a pattern of usage that emerged in a
+    lot of in-kernel code paths went something like the following pseudocode:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The cleaner alternative to this kind of code is the `kvmalloc()` API. Internally,
+    it attempts to allocate the requested `n` bytes of memory like this: first, via
+    the more efficient `kmalloc()`; if it succeeds, fine, we have quickly obtained
+    physically contiguous memory and are done; if not, it falls back to allocating
+    the memory via the slower but surer `vmalloc()` (thus obtaining  virtually contiguous
+    memory). Its signature is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: '(Remember to include the header file.) Note that for the (internal) `vmalloc()` to
+    go through (if it comes to that), only the `GFP_KERNEL` flag must be supplied.
+    As usual, the return value is a pointer (a kernel virtual address) to the allocated
+    memory, or `NULL` on failure. Free the memory obtained with `kvfree`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, the parameter of course is the return address from `kvmalloc()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Similarly, and analogous to the `{k|v}zalloc()` APIs, we also have the `kvzalloc()` API,
+    which of course *z*eroes the memory content. I''d suggest you use it in preference
+    to the `kvmalloc()` API (with the usual caveat: it''s safer but a bit slower).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Further, you can use the `kvmalloc_array()` API to allocate virtual contiguous
+    memory for an array of items. It allocates `n` elements of `size` bytes each.
+    Its implementation is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A key point here: notice how a validity check for the dangerous **integer overflow**
+    (**IoF**) bug is made; that''s important and interesting; do write robust code
+    by performing similar validity checks in your code where required.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, the `kvcalloc()` API is functionally equivalent to the `calloc(3)` user
+    space API, and is just a simple wrapper over the `kvmalloc_array()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We also mention that for code requiring *NUMA awareness *(we covered NUMA and
+    associated topics in [Chapter 7](06ee05b5-3e71-482d-93b8-235c27ce23bc.xhtml), *Memory
+    Management Internals – Essentials*, under the *Physical RAM organization *section),
+    the following APIs are available, with which we can specify the particular NUMA
+    node to allocate the memory from as a parameter (this being the point to NUMA
+    systems; do see the information box that follows shortly):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Similarly, we have the `kzalloc_node()` API as well, which sets the memory content
+    to zero.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In fact, generically, most of the kernel-space memory APIs we have seen ultimately
+    boil down to one *that takes a NUMA node as a parameter*. For example, take the
+    call chain for one of the primary page allocator APIs, the `__get_free_page()` API:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`__get_free_page() -> __get_free_pages() -> alloc_pages() -> alloc_pages_current()'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '-> __alloc_pages_nodemask() `. The **`__alloc_pages_nodemask()`** API is considered
+    to be the *heart* of the zoned buddy allocator; notice its fourth parameter, the
+    (NUMA) nodemask:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`mm/page_alloc.c:struct page *`'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`__alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,'
+  prefs: []
+  type: TYPE_NORMAL
+- en: int preferred_nid, nodemask_t *nodemask);`
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, you must free the memory you take; for the preceding `kv*()` APIs
+    (and the `kcalloc()` API), free the memory obtained with `kvfree()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another internal detail worth knowing about, and a reason the `k[v|z]malloc[_array]()`APIs
+    are useful: with a regular `kmalloc()`, the kernel will indefinitely retry allocating
+    the memory requested if it''s small enough (this number currently being defined
+    as `CONFIG_PAGE_ALLOC_COSTLY_ORDER`, which is `3`, implying 8 pages or less);
+    this can actually hurt performance! With the `kvmalloc()` API, this indefinite
+    retrying is not done (this behavior is specified via the GFP flags `__GFP_NORETRY|__GFP_NOWARN`),
+    thus speeding things up. An LWN article goes into detail regarding the rather
+    weird indefinite-retry semantics of the slab allocator: *The "too small to fail"
+    memory-allocation rule, Jon Corbet, December 2014* ([https://lwn.net/Articles/627419/](https://lwn.net/Articles/627419/)).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'With regard to the `vmalloc_demo` kernel module we saw in this section, take
+    a quick look at the code again (`ch9/vmalloc_demo/vmalloc_demo.c`). We use `kvmalloc()` as
+    well as `kcalloc()` (*steps 3* and *4* in the comments). Let''s run it on an x86_64
+    Fedora 31 guest system and see the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/71b63bcd-29aa-476e-bcb1-052ffead0f5c.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.4 – Output on loading our vmalloc_demo.ko kernel module
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can see the actual return (kernel virtual) address from the APIs in the
+    preceding output - note that they all belong within the kernel''s vmalloc region.
+    Notice the return address of `kvmalloc()`(step 3 in Figure 9.4); let''s search
+    for it under `proc`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: There it is! We can clearly see how using the `kvmalloc()` API for a large quantity
+    of memory (5 MB) resulted in the `vmalloc()` API being internally invoked (the
+    `kmalloc()` API would have failed and would not have emitted a warning, nor retried)
+    and thus, as you can see, the hit under `/proc/vmallocinfo`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To interpret the preceding fields of `/proc/vmallocinfo`, refer to the kernel
+    documentation here: [https://www.kernel.org/doc/Documentation/filesystems/proc.txt](https://www.kernel.org/doc/Documentation/filesystems/proc.txt).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Something for you to try out here: in our `ch9/vmalloc_demo` kernel module,
+    change the amount of memory to be allocated via `kvmalloc()` by passing `kvnum=<#
+    bytes to alloc>` as a module parameter.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: FYI, the kernel provides an internal helper API, the `vmalloc_exec()` - it's
+    (again) a wrapper over the `vmalloc()` API, and is used to allocate a virtually
+    contiguous memory region that has execute permissions set upon it. An interesting
+    user is the kernel module allocation code path (`kernel/module.c:module_alloc()`);
+    the space for the kernel module's (executable section) memory is allocated via
+    this routine. This routine isn't exported though.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other helper routine we mention is `vmalloc_user()`; it's (yet again) a
+    wrapper over  the `vmalloc()` API, and is used to allocate a zeroed-out virtually
+    contiguous memory region suitable for mapping into user VAS. This routine is exported; it's
+    used, for example, by several device drivers as well as the kernel's performance
+    events ring buffer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Specifying the memory protections
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'What if you intend to specify certain specific memory protections (a combination
+    of read, write, and execute protections) for the memory pages you allocate? In
+    this case, use the underlying `__vmalloc()` API (it is exported). Consider the
+    following comment in the kernel source (`mm/vmalloc.c`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The signature of the `__vmalloc()` API shows how we can achieve this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: FYI, from the 5.8 kernel, the `__vmalloc()` function's third parameter -  `pgprot_t
+    prot` - has been removed (as there weren't any users for page permissions besides
+    the usual ones; [https://github.com/torvalds/linux/commit/88dca4ca5a93d2c09e5bbc6a62fbfc3af83c4fca](https://github.com/torvalds/linux/commit/88dca4ca5a93d2c09e5bbc6a62fbfc3af83c4fca)).
+    Tells us another thing regarding the kernel community - if a feature isn't being
+    used by anyone, it's simply removed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first two parameters are the usual suspects – the size of the memory required
+    in bytes and the GFP flags for the allocation. The third parameter is the one
+    of interest here: `prot`represents the memory protection bitmask that we can specify
+    for the memory pages. For example, to allocate 42 pages that are set to be read-only
+    (`r--`), we could do the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: And subsequently, of course, call `vfree()` to free the memory back to the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing it – a quick **Proof of Concept**
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We'll try a quick Proof of Concept in our `vmalloc_demo` kernel module. We allocate
+    a region of memory specifying the page protection to be read-only (or *RO*) via
+    the `__vmalloc()` kernel API. We then test it by reading *and writing *to the
+    read-only memory region. A code snippet from it is seen as follows.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that we have kept the (silly) `WR2ROMEM_BUG` macro in the following code
+    undefined by default, so that you, innocent reader, don''t have our evil `vmalloc_demo` kernel
+    module simply crash on you. So in order to try this PoC, please un-comment the
+    define statement (as shown here), thus allowing the buggy code to execute:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Upon running, at the point where we attempt to write to the read-only memory,
+    it crashes! See the following partial screenshot (Figure 9.5; from running it
+    on our x86_64 Fedora guest):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/bfbfd566-9506-4aa4-b538-05d438fed559.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.5 – The kernel Oops that occurs when we try and write to a read-only
+    memory region!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This proves that, indeed, the `__vmalloc()` API we performed had successfully
+    set the memory region to read-only. Again, the details on the interpretation of
+    the preceding (partially seen) kernel diagnostics or *Oops* messagelie beyond
+    this book''s scope. Nevertheless, it''s quite easy to see the root cause of the
+    issue highlighted in the preceding figure: the following lines literally pinpoint
+    the reason for this bug:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: In user space applications, performing a similar memory protection setting upon
+    an arbitrary memory region can be done via the `mprotect(2)` system call; do look
+    up its man page for usage details (it even kindly provides example code!).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why make memory read-only?
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Specifying memory protections at allocation time to, say, read-only may appear
+    to be a pretty useless thing to do: how would you then initialize that memory
+    to some meaningful content? Well, think about it – **guard pages** are the perfect
+    use case for this scenario (similar to the redzone pages that the SLUB layer keeps
+    when in debug mode); it is useful indeed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What if we wanted read-only pages for some purpose other than guard pages?
+    Well, instead of using `__vmalloc()`, we might avail of some alternate means:
+    perhaps memory mapping some kernel memory into user space via an `mmap()` method,
+    and using the `mprotect(2)` system call from a user space app to set up appropriate
+    protections (or even setting up protections through well-known and tested LSM
+    frameworks, such as SELinux, AppArmor, Integrity, and so on).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We conclude this section with a quick comparison between the typical kernel
+    memory allocator APIs: `kmalloc()` and `vmalloc()`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The kmalloc() and vmalloc() APIs – a quick comparison
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A quick comparison between the `kmalloc()` (or `kzalloc()`) and `vmalloc()` (or
+    `vzalloc()`) APIs is presented in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Characteristic** | **`kmalloc()` or `kzalloc()`** | **`vmalloc()` or `vzalloc()`**
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Memory allocated is ** | Physically contiguous | Virtually (logically)
+    contiguous |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Memory alignment** | Aligned to hardware (CPU) cacheline | Page-aligned
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Minimum granularity** | Arch-dependent; as low as 8 bytes on x86[_64] |
+    1 page |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Performance** | Much faster (physical RAM allocated) for small memory allocations
+    (the typical case); ideal for allocations < 1 page | Slower, demand-paged (only
+    virtual memory allocated; lazy allocation of RAM involving the page fault handler);
+    can service large (virtual) allocations |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Size limitation** | Limited (to typically 4 MB) | Very large (the kernel
+    vmalloc region can even be several terabytes on 64-bit systems, though much less
+    on 32-bit) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Suitability** | Suitable for almost all use cases where performance matters,
+    the memory required is small, including DMA (still, use the DMA API); can work
+    in atomic/interrupt contexts | Suitable for large software (virtually) contiguous
+    buffers; slower, cannot be allocated in atomic/interrupt contexts |'
+  prefs: []
+  type: TYPE_TB
+- en: 'This does not imply that one is superior to the other. Their usage depends
+    upon the circumstances. This leads us into our next – indeed very important –
+    topic: how do you decide which memory allocation API to use when? Making the right
+    decision is actually critical for the best possible system performance and stability
+    – do read on to find out how to make that choice!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory allocation in the kernel – which APIs to use when
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'A really quick summation of what we have learned so far: the kernel''s underlying
+    engine for memory allocation (and freeing) is called the page (or buddy system)
+    allocator. Ultimately, every single memory allocation (and subsequent free) goes
+    through this layer. It has its share of problems though, the chief one being internal
+    fragmentation or wastage (due to its minimum granularity being a page). Thus we
+    have the slab allocator (or slab cache) layered above it, providing the power
+    of object caching and caching fragments of a page (helping alleviate the page
+    allocator''s wastage issues). Also, don''t forget that you can create your own
+    custom slab caches, and, as we have just seen, the kernel has a `vmalloc` region and
+    APIs to allocate *virtual* pages from within it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this information in mind, let's move along. To understand which API to
+    use when, let's first look at the kernel memory allocation API set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualizing the kernel memory allocation API set
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The following conceptual diagram shows us the Linux kernel''s memory allocation
+    layers as well as the prominent APIs within them; note the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here we only show the (typically used) APIs exposed by the kernel to module/driver
+    authors (with the exception being the one that ultimately performs the allocations
+    – the `__alloc_pages_nodemask()` API right at the bottom!).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For brevity, we haven't shown the corresponding memory-freeing APIs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The following is a diagram showing several of the (exposed to module / driver
+    authors) kernel memory allocation APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/60fd6661-248f-4bc6-824a-4271596f2180.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.6 – Conceptual diagram showing the kernel's memory allocation API set
+    (for module / driver authors)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now that you have seen the wealth of (exposed) memory allocation APIs available,
+    the following sections delve into helping you make the right decision as to which
+    to use under what circumstances.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Selecting an appropriate API for kernel memory allocation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'With all this choice of APIs, how do we choose? Though we have already talked
+    about this very case in this chapter as well as the previous one, we''ll again
+    summarize it as it''s very important. Broadly speaking, there are two ways to
+    look at it – the API to use depends upon the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The amount of memory required
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The type of memory required
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We will illustrate both cases in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, to decide which API to use by the type, amount, and contiguity of the
+    memory to be allocated, scan through the following flowchart (starting at the
+    upper right from the label Start here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/0a9000d5-5341-4715-80e7-746aa1d675e7.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.7 – Decision flowchart for which kernel memory allocation API(s) to
+    use for a module/driver
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Of course, it''s not trivial; not only that, I''d like to remind you to recall
+    the detailed discussions we covered earlier in this chapter, including the GFP
+    flags to use (and the *do not sleep in atomic context* rule); in effect, the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When in any atomic context, including interrupt contexts, ensure you only use
+    the `GFP_ATOMIC` flag.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Else (process context), you decide whether to use the `GFP_ATOMIC` or `GFP_KERNEL`
+    flag; use `GFP_KERNEL` when it's safe to sleep
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Then, as covered under the *Caveats when using the slab allocator* section: when
+    using the `k[m|z]alloc()` API and friends, make sure to check the actual allocated
+    memory with `ksize()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Next, to decide which API to use by the type of memory to be allocated, scan
+    through the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Type of memory required** | **Allocation method** | **APIs** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Kernel modules, typical case: regular usage for small amounts (less than
+    one page), physically contiguous | Slab allocator | `k[m&#124;z]alloc()`, `kcalloc()`,
+    and  `krealloc()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Device drivers: regular usage for small amounts (< 1 page), physically contiguous; suitable
+    for driver `probe()` or init methods; recommended for drivers | Resource-managed
+    APIs | `devm_kzalloc()` and `devm_kmalloc()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Physically contiguous, general-purpose usage | Page allocator | `__get_free_page[s]()`,
+    `get_zeroed_page()`, and'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`alloc_page[s][_exact]()` |'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Physically contiguous, for **Direct Memory Access** (**DMA**) | Purpose-built
+    DMA API layer, with CMA (or slab/page allocator) | (not covered here: `dma_alloc_coherent(),
+    dma_map_[single&#124;sg]()`, Linux DMA Engine APIs, and so on) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Virtually contiguous (for large software-only buffers) | Indirect via page
+    allocator | `v[m&#124;z]alloc()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Virtually or physically contiguous, when unsure of runtime size | Either
+    slab or vmalloc region | `kvmalloc[_array]()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Custom data structures (objects) | Creates and uses a custom slab cache |
+    `kmem_cache_[create&#124;destroy]()` and `   kmem_cache_[alloc&#124;free]()` |'
+  prefs: []
+  type: TYPE_TB
+- en: (Of course, there is some overlap with this table and the flowchart in *Figure
+    9.7*). As a generic rule of thumb, your first choice should be the slab allocator
+    APIs, that is via `kzalloc()` or `kmalloc()`; these are the most efficient for
+    typical allocations of less than a page in size. Also, recall that when unsure
+    of the runtime size required, you could use the `kvmalloc()` API. Again, if the
+    size required happens to be a perfectly rounded power-of-2 number of pages (2⁰,
+    2¹, ..., 2^(MAX_ORDER-1) *pages*), then using the page allocator APIs will be
+    optimal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A word on DMA and CMA
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: On the topic of DMA, though its study and usage is beyond the scope of this
+    book, I would nevertheless like to mention that Linux has a purpose-built set
+    of APIs for DMA christened the *DMA Engine.* Driver authors performing DMA operations
+    are very much expected to use these APIs and *not* directly use the slab or page
+    allocator APIs (subtle hardware issues do turn up).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further, several years back, Samsung engineers successfully merged a patch into
+    the mainline kernel calledthe **Contiguous Memory Allocator** (**CMA**). Essentially,
+    it allows the allocation of *large physically contiguous memory* chunks (of a
+    size over the typical 4 MB limit!). This is required for DMA on some memory-hungry
+    devices (you want to stream that ultra-HD quality movie on a big-screen tablet
+    or TV?). The cool thing is that the CMA code is transparently built into the DMA
+    Engine and DMA APIs. Thus, as usual, driver authors performing DMA operations
+    should just stick to using the Linux DMA Engine layer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are interested in learning more about DMA and CMA, see the links provided
+    in the Further reading section for this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, realize that our discussion has mostly been with regard to the typical
+    kernel module or device driver author. Within the OS itself, the demand for single
+    pages tends to be quite high (due to the OS servicing demand paging via the page
+    fault handler – what are called *minor* faults). Thus, under the hood, the memory
+    management subsystem tends to issue the `__get_free_page[s]()` APIs quite frequently.
+    Also, to service the memory demand for the *page cache *(and other internal caches),
+    the page allocator plays an important role.
+  prefs: []
+  type: TYPE_NORMAL
+- en: All right, well done, with this you have (almost!) completed our two chapters
+    of coverage on the various kernel memory allocation layers and APIs (for module/driver
+    authors)! Let's finish off this large topic with a remaining important area –
+    the Linux kernel's (fairly controversial) OOM killer; do read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Stayin' alive – the OOM killer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's first cover a few background details regarding kernel memory management,
+    particularly the reclaiming of free memory. This will put you in a position to
+    understand what the kernel *OOM killer *component is, how to work with it, and
+    even how to deliberately invoke it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reclaiming memory – a kernel housekeeping task and OOM
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As you will be aware, the kernel tries, for optimal performance, to keep the
+    working set of memory pages as high up as possible in the memory pyramid (or hierarchy).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The so-called memory pyramid (or memory hierarchy) on a system consists of
+    (in order, from smallest size but fastest speed to largest size but slowest):
+    CPU registers, CPU caches (LI, L2, L3, ...), RAM, and swap (raw disk/flash/SSD
+    partition). In our following discussion, we ignore CPU registers as their size
+    is minuscule.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, the processor uses its hardware caches (L1, L2, and so on) to hold the working
+    set of pages. But of course, CPU cache memory is very limited, thus it will soon
+    run out, causing the memory to spill over into the next hierarchical level – RAM.
+    On modern systems, even many embedded ones, there's quite a bit of RAM; still,
+    if and when the OS does run low on RAM, it spills over the memory pages that can
+    no longer fit in RAM into a raw disk partition – *swap*. Thus the system continues
+    to work well, albeit at a significant performance cost once swap is (often) used.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Linux kernel, in an effort to ensure that a given minimum amount of free
+    memory pages are available at all times within RAM, continually performs background
+    page reclamation work – indeed, you can think of this as routine housekeeping.
+    Who actually performs this work? The `kswapd`kernel thread(s) are continually
+    monitoring memory usage on the system and invoke a page reclaim mechanism when
+    they sense that memory is running low.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This page reclamation work is done on a per *node:zone* basis. The kernel uses
+    so-called *watermark levels* – min, low, and high – per *node:zone* to determine
+    when to reclaim memory pages in an intelligent fashion. You can always look up `/proc/zoneinfo` to
+    see the current watermark levels. (Note that the unit of watermark levels is pages.)
+    Also, as we mentioned earlier, caches are typically the first victims and are
+    shrunk down as memory pressure increases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'But let''s play devil''s advocate: what if all of this memory reclamation work
+    doesn''t help, and memory pressure keeps increasing to the point where the complete
+    memory pyramid is exhausted, where a kernel allocation of even a few pages fails
+    (or infinitely retries, which, frankly, is just as useless, perhaps worse)? What
+    if all CPU caches, RAM, and swap are (almost completely) full!? Well, most systems
+    just die at this point (actually, they don''t die, they just become so slow that
+    it appears as though they''re permanently hung). The Linux kernel, though, being
+    Linux, tends to be aggressive in these situations; it invokes a component aptly
+    named the OOM killer*. *The OOM killer''s job – you guessed it! – is to identify
+    and summarily kill the memory-hogger process (by sending it the fatal `SIGKILL` signal;
+    it could even end up killing a whole bunch of processes).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you might imagine, it has had its fair share of controversy. Early versions
+    of the OOM killer have been (quite rightly) criticized. Recent versions use superior
+    heuristics that work quite well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find more information on the improved OOM killer work (the kick-in strategy
+    and the OOM reaper thread) in this LWN article (December 2015): *Toward more predictable
+    and reliable out-of-memory handling:* [https://lwn.net/Articles/668126/](https://lwn.net/Articles/668126/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deliberately invoking the OOM killer
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To test the kernel OOM killer, we shall have to put enormous memory pressure
+    on the system. Thus, the kernel will unleash its weapon – the OOM killer, which,
+    once invoked, will identify and kill some process (or processes). Hence, obviously,
+    I highly recommend you try out stuff like this on a safe isolated system, preferably
+    a test Linux VM (with no important data on it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Invoking the OOM killer via Magic SysRq
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The kernel provides an interesting feature dubbed *Magic SysRq*:essentially,
+    certain keyboard key combinations (or accelerators) result in a callback to some
+    kernel code. For example, assuming it's enabled, pressing the `Alt-SysRq-b` key
+    combination on an x86[_64] system results in a cold reboot! Take care, don't just
+    type anything, do read the relevant documentation here: [https://www.kernel.org/doc/Documentation/admin-guide/sysrq.rst](https://www.kernel.org/doc/Documentation/admin-guide/sysrq.rst).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s try some interesting things; we run the following on our Fedora Linux
+    VM:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This shows that the Magic SysRq feature is partially enabled (the kernel documentation
+    mentioned at the start of this section gives the details). To fully enable it,
+    we run the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Okay, so to get to the point here: you can use Magic SysRq to invoke the OOM
+    killer!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Careful! Invoking the OOM killer, via Magic SysRq or otherwise, *will* cause
+    some process – typically the *heavy* one(s) – to unconditionally die!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How? As root, just type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: Look up the kernel log to see whether anything interesting occurred!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Invoking the OOM killer with a crazy allocator program
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: We'll also demonstrate in the following section a more hands-on and interesting
+    way by which you can (most probably) invite the OOM killer in. Write a simple
+    user space C program that behaves as a crazy allocator, performing (typically)
+    tens of thousands of memory allocations, writing something to each page, and,
+    of course, never freeing up the memory, thus putting tremendous pressure on memory
+    resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As usual, we show only the most relevant parts of the source code in the following
+    snippet; please refer to and clone the book''s GitHub repo for the full code;
+    remember, this is a user-mode app not a kernel module:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the following code block, we show some output obtained when running our
+    *crazy allocator* program on an x86_64 Fedora 31 VM running our custom 5.4.0 Linux
+    kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `Killed` message is the giveaway! The user mode process has been killed
+    by the kernel. The reason becomes obvious once we glance at the kernel log – it's
+    the OOM killer, of course (we show the kernel log in the *Demand paging and OOM* section).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the rationale behind the OOM killer
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Glance at the preceding output of our `oom_killer_try` app: (in this particular
+    run) 33 periods (`.`) appear before the dreaded `Killed` message. In our code,
+    we emit a `.` (via `printf`) every 5,000 times we make an allocation (of 2 pages
+    or 8 KB). Thus, here, we have 33 times 5 periods, meaning 33 * 5 = 165 times =>
+    165 * 5000 * 8K ~= 6,445 MB. Thus, we can conclude that, after our process (virtually)
+    allocated approximately 6,445 MB (~ 6.29 GB) of memory, the OOM killer terminated
+    our process! You now need to understand why this occurred at this particular number.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: On this particular Fedora Linux VM, the RAM is 2 GB *and the* *swap space *is
+    2 GB; thus, the total available memory in the *memory* *pyramid* = (CPU caches
+    +) RAM + swap.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is 4 GB (to keep it simple, let''s just ignore the fairly insignificant
+    amount of memory within the CPU caches). But then, it begs the question, why didn''t
+    the kernel invoke the OOM killer at the 4 GB point (or lower)? Why only at around
+    6 GB?  This is an interesting point: the Linux kernel follows a **VM overcommit** policy,
+    deliberately over-committing memory (to a certain extent). To understand this,
+    see the current `vm.overcommit` setting:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is indeed the default (`0`). The permissible values (settable only by
+    root) are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`0`: Allow memory overcommitting using a heuristic algorithm (see more in the
+    following section); *the default.*'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`1`: Always overcommit; in other words, never refuse any `malloc(3)`; useful
+    for some types of scientific apps that use sparse memory.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`2`: The following notes are direct quotes from the kernel documentation ([https://www.kernel.org/doc/html/v4.18/vm/overcommit-accounting.html#overcommit-accounting](https://www.kernel.org/doc/html/v4.18/vm/overcommit-accounting.html#overcommit-accounting)):'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*"Don''t overcommit. The total address space commit for the system is not permitted
+    to exceed swap plus a configurable amount (default is 50%) of physical RAM. Depending
+    on the amount you use, in most situations this means a process will not be killed
+    while accessing pages but will receive errors on memory allocation as appropriate.
+    Useful for applications that want to guarantee their memory allocations will be
+    available in the future without having to initialize every page"*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The overcommit extent is determined by the overcommit ratio:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: We'll examine two cases in the following sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Case 1 – vm.overcommit set to 2, overcommit turned off
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Firstly, remember, this is *not *the default. With the `overcommit_memory` tunable
+    set to `2`, the formula used to calculate the total (possibly overcommitted) available
+    memory is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Total available memory = (RAM + swap) * (overcommit_ratio/100);   *'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This formula only applies when `vm.overcommit == 2`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On our Fedora 31 VM, with `vm.overcommit == 2` and 2 GB each of RAM and swap,
+    this yields the following (in gigabytes):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Total available memory = (2 + 2) * (50/100) = 4 * 0.5 = 2 GB*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This value – the (over)commit limit – is also seen in `/proc/meminfo` as the `CommitLimit` field.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Case 2 – vm.overcommit set to 0, overcommit on, the default
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'This *is* the default. `vm.overcommit` is set to `0` (not `2`): with this,
+    the kernel effectively calculates the total (over)committed memory size as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Total available memory = (RAM + swap) * (overcommit_ratio + 100)%;   *'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This formula only applies when `vm.overcommit == 0`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On our Fedora 31 VM, with `vm.overcommit == 0` and 2 GB each of RAM and swap,
+    this formula yields the following (in gigabytes):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Total available memory = (2 + 2) * (50+100)% = 4 * 150% = 6 GB*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So the system effectively pretends that there is a grand total of 6 GB of memory
+    available. So now we understand: when our `oom_killer_try` process allocated huge
+    amounts of memory and this limit (6 GB) was exceeded, the OOM killer jumped in!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We now understand that the kernel provides several VM overcommit tunables under `/proc/sys/vm`,
+    allowing the system administrator (or root) to fine-tune it (including switching
+    it off by setting `vm.overcommit` to the value `2`). At first glance, it may appear
+    tempting to do so, to simply turn it off. Do pause though and think it through;
+    leaving the VM overcommit at the kernel defaults is best on most workloads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: (For example, setting the `vm.overcommit` value to `2` on my Fedora 31 guest
+    VM caused the effective available memory to change to just 2 GB. The typical memory
+    usage, especially with the GUI running, far exceeded this, causing the system
+    to be unable to even log in the user in GUI mode!) The following links help throw
+    more light on the subject: Linux kernel documentation: [https://www.kernel.org/doc/Documenta](https://www.kernel.org/doc/Documentation/vm/overcommit-accounting)[tion/vm/overcommit-accounting](https://www.kernel.org/doc/Documentation/vm/overcommit-accounting) and
+    *What are the disadvantages of disabling memory overcommit in Linux?* : [https://www.quora.com/What-are-the-disadvantages-of-disabling-memory-overcommit-in-Linux](https://www.quora.com/What-are-the-disadvantages-of-disabling-memory-overcommit-in-Linux) . (Do
+    see the *Further reading *section for more.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Demand paging and OOM
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Recall the really important fact we learned earlier in the chapter, in the
+    *A brief note on memory allocations and demand paging *section: because of the demand
+    paging (or lazy allocation) policy that the OS uses, when a memory page is allocated
+    by `malloc(3)`(and friends), it only actually causes virtual memory space to be
+    reserved in a region of the process VAS; no physical memory is allocated at this
+    time. Only when you perform some action on any byte(s) of the virtual page – a
+    read, write, or execute – does the MMU raise a page fault (a minor fault) and
+    the OS''s page fault handler runs as a result. If it deems that this memory access
+    is legal, it allocates a physical frame (via the page allocator).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our simple `oom_killer_try` app, we manipulate this very idea via it''s
+    third parameter, `force_page_fault`: when set as `1`, we emulate precisely this
+    situation by writing something, anything really, into a byte - any byte - of each
+    of the two pages allocated per loop iteration (peek at the code again if you need
+    to).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, now that you know this, let''s re-run our app with the third parameter, `force_page_fault`,
+    set to `1`, to indeed force page faults! Here''s the output that resulted when
+    I ran this on my Fedora 31 VM (on our custom 5.4.0 kernel):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: This time, you can literally feel the system struggle as it fights for memory.
+    This time, it runs out of memory much sooner *as actual physical memory was allocated*. (From
+    the preceding output, we see in this particular case 15 x 5 + 1 dots (`. `or periods);
+    that is, 15 times 5 dots + 1 dot => = 76 times => 76 * 5000 loop iterations *
+    8K per iteration ~= 2969 MB virtually *and physically* allocated!)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Apparently, at this point, one of two things occurred:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The system ran out of both RAM and swap, thus failing to allocate a page and
+    thus inviting the OOM killer in.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The calculated (artificial) kernel VM commit limit was exceeded.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We can easily look up this kernel VM commit value (again on the Fedora 31 VM
+    where I ran this):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: This works out to about 3,108 MB (well over our calculation of 2,969 MB). So
+    here, it's likely that with all the RAM and swap space being used to run the GUI
+    and existing apps, the first case came into play.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also notice how, before running our program, the amount of memory used by the
+    larger system caches (the page and buffer caches) is significant. The column entitled
+    `buff/cache` in the output of the `free(1)` utility shows this. Before running
+    our crazy allocator app, 866 MB out of 2 GB was being used for the page cache.
+    Once our program runs, though, it applies so much memory pressure on the OS that
+    tremendous amounts of swapping – the paging out of RAM pages to the raw disk partition
+    called "swap" – is performed and literally all caches are freed up. Inevitably
+    (as we refuse to free any memory), the OOM killer jumps in and kills us, causing
+    large amounts of memory to be reclaimed. The free memory and the cache usage right
+    after the OOM killer cleans up are 1.5 GB and 192 MB respectively. (The cache
+    usage right now is low; it will increase as the system runs.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Looking up the kernel log reveals that indeed, the OOM killer has paid us a
+    visit! Note that the following partial screenshot shows only the stack dump on
+    the x86_64 Fedora 31 VM running the 5.4.0 kernel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/f228f9f4-25a4-498f-af3d-fb4ae0d50eca.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9.8 – The kernel log after the OOM killer, showing the kernel call stack
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Read the kernel-mode stack in *Figure 9.8* in a bottom-up fashion (ignoring
+    the frames that start with `?`): clearly, a page fault occurred; you can see the
+    call frames: `page_fault()` | `do_page_fault()` | `[ ... ]` | `__hande_mm_fault()` | `__do_fault()` | `[
+    ... ]` | `__alloc_pages_nodemask()` .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Think about it, this is completely normal: the fault was raised by the MMU as
+    it was trying to service a virtual page with no physical counterpart. The OS's
+    fault handling code runs (in process context, implying that `current` runs its
+    code!); it ultimately leads to the OS invoking the page allocator routine's `__alloc_pages_nodemask()` function,
+    which as we learned earlier is literally the heart of the zoned buddy system (or
+    page) allocator – the engine of memory allocation!
+  prefs: []
+  type: TYPE_NORMAL
+- en: What isn't normal, is that this time it (the `__alloc_pages_nodemask()` function) failed!
+    This is deemed a critical issue and  caused the OS to invoke the OOM killer (you
+    can see the `out_of_memory` call frame in the preceding figure).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Toward the latter part of its diagnostic dump, the kernel tries hard to justify
+    its reason for killing a given process. It shows a table of all threads, their
+    memory usage (and various other statistics). Actually, these statistics being
+    displayed occurs due to `sysctl : /proc/sys/vm/oom_dump_tasks`being on (`1`) by
+    default. Here''s a sampling (in the following output, we have eliminated the leftmost
+    timestamp column of `dmesg` to make the data more readable):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding output, we have highlighted in bold the `rss` (*Resident Set
+    Size*) column as it's a good indication of physical memory usage by the process
+    in question (the unit is KB). Clearly, our `oom_killer_try` process is using an
+    enormous amount of physical memory. Also, notice how its number of swap entries
+    (`swapents`) is very high. Modern kernels (4.6 onward) use a specialized `oom_reaper` kernel
+    thread to perform the work of reaping (killing) the victim process (the last line
+    of the preceding output shows that this kernel thread reaped our wonderful `oom_killer_try`
+    process!). Interestingly, the Linux kernel's OOM can be thought of as a (last)
+    defense against fork bombs and similar **(Distributed) Denial of Service** (**(D)DoS**)
+    attacks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the OOM score
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In order to speed up the discovery of what the memory-hogging process is at
+    crunch time (when the OOM killer is invoked), the kernel assigns and maintains
+    an *OOM score* on a per-process basis (you can always look up the value in the `/proc/<pid>/oom_score` pseudo-file).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The OOM score range is `0` to `1000`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An OOM score of `0` implies that the process is not using any memory available
+    to it
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An OOM score of `1000` implies the process is using 100 percent of the memory
+    available to it
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Obviously, the process with the highest OOM score wins. Its reward – it is
+    instantly killed by the OOM killer (talk about dry humor). Not so fast though:
+    the kernel has heuristics to protect important tasks. For example, the baked-in
+    heuristics imply that the OOM killer will not select as its victim any root-owned
+    process, a kernel thread, or a task that has a hardware device open.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What if we would like to ensure that a certain process will *never be killed*
+    by the OOM killer? It''s quite possible to do so, though it does require root
+    access. The kernel provides a tunable, `/proc/<pid>/oom_score_adj`, an OOM adjustment
+    value (with the default being `0`). The *net *OOM score is the sum of the `oom_score` value and
+    the adjustment value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: Thus, setting the `oom_score_adj` value of a process to `1000` pretty much guarantees
+    that it will be killed, whereas setting it to `-1000` has exactly the opposite
+    effect – it will never be selected as a victim.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A quick way to query (and even set) a process''s OOM score (as well as it''s
+    OOM adjustment value) is via the `choom(1)` utility. For example, to query the
+    OOM score and OOM adjustment value of the systemd process, just do `choom -p 1`.
+    We did the obvious thing - wrote a simple script (that internally uses `choom(1)`)
+    to query the OOM score of all processes currently alive on the system (it''s here:
+    `ch9/query_process_oom.sh`; do try it out on your box). Quick tip: the (ten) processes
+    with the highest OOM score on the system can quickly be seen with (the third column
+    is the net OOM score):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: With this, we conclude this section and indeed this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we continued where we left off in the previous chapter. We
+    covered, in a good amount of detail, how you can create and use your own custom
+    slab caches (useful when your driver or module very frequently allocates and frees
+    a certain data structure), and how to use some kernel infrastructure to help you
+    debug slab (SLUB) memory issues. We then learned about and used the kernel `vmalloc`
+    APIs (and friends), including how to set up given memory protections on memory
+    pages. With the wealth of memory APIs and strategies available to you, how do
+    you select which one to use in a given situation? We covered this important concern
+    with a useful *decision chart* and table. Finally, we delved into understanding
+    what exactly the kernel's *OOM killer *component is and how to work with it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As I have mentioned before, sufficiently deep knowledge of the Linux memory
+    management internals and exported API set will go a long way in helping you as
+    a kernel module and/or device driver author. The reality, as we well know, is
+    that a significant amount of time is spent by developers on troubleshooting and
+    debugging code; the intricate knowledge and skills gained here will help you better
+    navigate these mazes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This completes the explicit coverage of Linux kernel memory management in this
+    book. Though we have covered many areas, we have also left out or only skimmed
+    over some of them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fact is that Linux memory management is a huge and complex topic, well worth
+    understanding for the purposes of learning, writing more efficient code, and debugging
+    complex situations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning the (basic) usage of the powerful `crash(1)` utility (used to look
+    deep within the kernel, via either a live session or a kernel dumpfile), and then
+    re-looking at this and the previous chapter's content armed with this knowledge
+    is indeed a powerful way to learn!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Great job on having covered Linux memory management! The next two chapters will
+    have you learning about another core OS topic – how *CPU scheduling* is performed
+    on the Linux OS. Take a breather, work on the following assignments and questions,
+    and browse through the *Further reading *materials that capture your interest.
+    Then, revitalized, jump into the next exciting area with me!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we conclude, here is a list of questions for you to test your knowledge
+    regarding this chapter''s material: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/questions).
+    You will find some of the questions answered in the book''s GitHub repo: [https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming/tree/master/solutions_to_assgn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To help you delve deeper into the subject with useful materials, we provide
+    a rather detailed list of online references and links (and at times, even books)
+    in a Further reading document in this book's GitHub repository. The *Further reading*
+    document is available here: [https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md](https://github.com/PacktPublishing/Linux-Kernel-Programming/blob/master/Further_Reading.md).
+  prefs: []
+  type: TYPE_NORMAL

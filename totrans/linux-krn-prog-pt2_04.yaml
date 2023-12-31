@@ -1,0 +1,1250 @@
+- en: Working with Hardware I/O Memory
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will focus on an important hardware-related aspect of writing
+    a device driver: how exactly to access and perform I/O (input/output, reads and
+    writes) to hardware (or peripheral) I/O memory – the peripheral hardware chip
+    that you are writing the driver for.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The motivation behind the knowledge you will gain in this chapter is straightforward:
+    without this, how will you actually control the device? Most devices are driven
+    by carefully calibrated writes and reads to their hardware registers and/or peripheral
+    memory, also called hardware I/O memory. Linux, being a virtual memory-based OS,
+    requires some abstraction in the way it works with peripheral I/O memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accessing hardware I/O memory from the kernel
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using memory-mapped I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Understanding and using port-mapped I/O
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Let's get started!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'I assume that you have gone through the *Preface* section *To get the most
+    out of this book* and have appropriately prepared a guest VM running Ubuntu 18.04
+    LTS (or a later stable release) and installed all the required packages. If not,
+    I highly recommend you do this first. To get the most out of this book, I strongly
+    recommend you first set up the workspace environment, including cloning this book''s
+    GitHub repository for the code, and work on it in a hands-on fashion. The repository
+    can be found here: [https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2](https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Accessing hardware I/O memory from the kernel
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'An interesting issue that you, as a device driver author, will likely face
+    is this: you need to be able to access and work on the I/O memory, the hardware
+    registers, and/or hardware memory of a peripheral chip. This is, in fact, typically
+    the way in which the driver programs the hardware at the level of the "metal":
+    by issuing commands to it via its registers and/or peripheral memory. However,
+    there is an issue to be faced with directly accessing hardware I/O memory on Linux.
+    In this first section, we''ll take a look at this issue and provide a solution
+    for it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the issue with direct access
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, of course, this hardware memory on the chip, the so-called I/O memory, is
+    not RAM. The Linux kernel refuses the module or driver author direct access to
+    such hardware I/O memory locations. We already know why: on a modern VM-based
+    OS, all memory access has to be via the **Memory Management Unit** (**MMU**) and
+    paging tables.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s quickly summarize the key aspect of what was seen in the companion guide
+    *Linux Kernel Programming* in *Chapter 7,* *Memory Management Internals – Essentials*:
+    by default, memory is virtualized, which means that all addresses are virtual
+    and not physical (this includes the addresses within the kernel segment or VAS).
+    Think of it this way: once a virtual address is accessed by a process (or the
+    kernel) for reading or writing or execution, the system has to fetch the memory
+    content at the corresponding physical address. This involves translating the virtual
+    address to the physical address at runtime; hardware optimizations (the CPU caches, **Translation
+    Lookaside Buffers** (**TLBs**), and so on) can speed this up. The process that
+    is carried out is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, the CPU caches (L1-D/L1-I, L2, and so on) are checked to see whether
+    the memory referred to by this virtual address is already onboard the CPU cache(s) silicon.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If the memory is already onboard, we have a cache hit and the work is done.
+    If not (it's a **Last Level Cache**—**LLC **miss - expensive!), the virtual address
+    is fed to the microprocessor MMU.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The MMU now looks for the corresponding physical address within the processor
+    TLB(s). If it's there, we have a TLB hit and the work is done; if not, we have
+    a TLB miss (this is expensive!).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The MMU now walks the paging tables of the user space process that made the
+    access; or, if the kernel made the access, it walks the kernel paging tables,
+    translating the virtual address into the corresponding physical one. At this point,
+    the physical address is placed on the bus and the work is done.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Please refer to TI's *Technical Reference Manual* for the OMAP35x at [https://www.ti.com/lit/ug/spruf98y/spruf98y.pdf?ts=1594376085647](https://www.ti.com/lit/ug/spruf98y/spruf98y.pdf?ts=1594376085647) for
+    more information on this; the *MMU Functional Description* topic (page 946) is
+    illustrated with excellent diagrams (for our purpose, see *Figures 8.4*, *8.6*,
+    and *8.7* – the latter is a flowchart depicting the preceding procedures).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, we mention the fact that the actual address translation procedure is of
+    course very arch-dependent. On some systems, the order is as shown here; on others
+    (often on ARM), the MMU (including TLB lookups) is performed first, and then the
+    CPU caches are checked.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, think about this: even normal RAM locations aren't really directly accessed
+    by software running on a modern OS; this is because its memory is virtualized.
+    In such cases, the paging tables (of every process, as well as the kernel itself)
+    enable the OS to be able to runtime translate the virtual address to its physical
+    counterpart. (We have covered these areas in some detail in our companion book, *Linux
+    Kernel Programming*, in *Chapter 7*,* Memory Management Internals – Essentials*,
+    in the *Virtual addressing and address translation* section; do glance back at
+    it to refresh these key points if you need to.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, if we have a hardware peripheral or chip containing I/O memory, the issue
+    seems even more complicated if we consider the fact that this memory isn't RAM.
+    So, is this memory not being mapped by paging tables? Or is it? In the next section,
+    we'll look at two common solutions to this issue, so read on!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The solution – mapping via I/O memory or I/O port
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In order to solve this issue, we must understand that modern processors provide
+    two broad ways by which they can access and work with hardware I/O (peripheral
+    chip) memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: By reserving some region(s) of the processor's address space for these peripheral
+    devices; that is, by using **memory-mapped I/O** (**MMIO**) as a mapping type
+    for I/O.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: By providing distinct assembly (and the corresponding machine) CPU instructions
+    to directly access the I/O memory. Using such a mapping type for I/O is called**port-mapped
+    I/O** (**PMIO** or simply **PIO**).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We shall consider both of these techniques in the *Understanding and using memory-mapped
+    I/O* and *Understanding and using port-mapped I/O* sections, respectively. Before
+    we do that, though, we need to learn how to politely ask the kernel for permission
+    to use these I/O resources!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Asking the kernel's permission
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Think about this for a moment: even if you know which API(s) to use to map
+    or work upon I/O memory in some manner, first, you need to request permission
+    from the OS*. *After all, the OS is the system''s overall resource manager and
+    you must ask it nicely before using its resources. Well, there''s more to this,
+    of course – when you ask it, what you''re really doing is asking it to set up
+    some internal data structures that allow the kernel to understand which driver
+    or subsystem is using what I/O memory region or port.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before performing any peripheral I/O, you are expected to ask the kernel for
+    permission to do so, and assuming you get it, you perform the I/O. After this,
+    you are expected to release the I/O region back to the kernel. The following steps
+    are involved in this process:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Before I/O**: Request access to the memory or port region.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**Having received the green light from the kernel core, perform the actual
+    I/O**: You use either MMIO or PMIO to do this (details are provided in the following
+    table).'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '**After I/O**: Release the memory or port region back to the OS.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'So, how do you perform these request, I/O, and release operations? There are
+    APIs that can do this, and the ones you should use depend on whether you are using
+    MMIO or PMIO. The following table summarizes the APIs you should use before performing
+    I/O and then releasing the region after this work has been done (the actual APIs
+    that perform I/O will be covered later):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Method of access to I/O memory ** | **MMIO** | **PMIO** |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Before performing any I/O, request access to the I/O memory/port region.
+    |  `request_mem_region()` |  `request_region()` |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Perform the I/O operation. | (See the *MMIO – performing the actual I/O* section)
+    | (See the *PMIO – performing the actual I/O* section) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| After performing the I/O operation, release the region. |  `release_mem_region()`
+    |  `release_region()` |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The functions shown in the preceding table are defined as macros in the `linux/ioport.h` header;
+    their signatures are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All these macros are essentially wrappers over the `__request_region()` and `__release_region()` internal
+    APIs. The parameters for these macros are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`start` is the beginning of the I/O memory region or port; for MMIO, it''s
+    a physical (or bus) address, while for PMIO, it''s a port number.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`n` is the length of the region that''s being requested.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`name` is any name you''d like to associate the mapped region or port range
+    with. It''s usually the name of the driver that performs the I/O operation (you
+    can see it within the proc filesystem; we''ll look at this in more detail when
+    we cover how to use MMIO and PMIO).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The return value from the `request_[mem_]region()` APIs/macros is a pointer
+    to a `struct resource` (again, more on this in the *Obtaining the device resources*
+    section). If `NULL` is returned, this implies that the resource failed to be reserved;
+    the driver typically returns `-EBUSY`, signaling that the resource is now busy
+    or unavailable (possibly because another component/driver has already requested
+    and is currently using it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will provide some actual examples of using these APIs/macros in the coming
+    sections. Now, let's learn how to actually map and work with I/O memory. We will
+    begin with the common approach that pretty much all modern processors support;
+    that is, MMIO.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using memory-mapped I/O
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the MMIO approach, the CPU understands that a certain region (or several)
+    of its address space is reserved for I/O peripheral memory. You can actually look
+    up the region(s) by referring to the physical memory map of a given processor's
+    (or SoC's) datasheet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To help make this clearer, let''s take a look at a real example: the Raspberry
+    Pi. As you''ll be aware, this popular board uses a Broadcom BCM2835 (or later)
+    SoC. The *BCM2835 ARM Peripherals* document at [https://github.com/raspberrypi/documentation/blob/master/hardware/raspberrypi/bcm2835/BCM2835-ARM-Peripherals.pdf](https://github.com/raspberrypi/documentation/blob/master/hardware/raspberrypi/bcm2835/BCM2835-ARM-Peripherals.pdf),
+    on *page 90*, provides a screenshot of a small portion of its physical memory
+    map. The mapping of the SoC''s **General Purpose Input/Output** (**GPIO**) registers
+    shows a portion of the hardware I/O memory in the processor''s address space:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/7722610d-9047-4246-a6c8-0584fd0b363e.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 3.1 – Physical memory map on the BCM2835 showing the GPIO register bank
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Well, the reality is more complex; the BCM2835 SoC has multiple MMUs: one –
+    the VC/ARM MMU (**VC** stands for **VideoCore** here) – translates the ARM bus
+    address into the ARM physical address, after which the regular ARM MMU translates
+    the physical address into a virtual address. Take a look at the diagram on *page
+    5* of the aforementioned *BCM2835 ARM Peripherals* document to see this.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As we can see, this is a register block (or bank), a collection of 32-bit registers
+    serving a similar purpose (here, GPIO). In the preceding figure, the crucial column
+    for our current purpose is the first one, which is the **Address** column: this
+    is the physical or bus address and is the location in the ARM processor''s physical
+    address space where it sees the GPIO registers. It begins at `0x7e20 0000` (as
+    that''s the very first address in the preceding screenshot) and has a finite length
+    (here, it''s documented as having 41 registers of 32 bits each, so we''ll take
+    the length of the region as *41 * 4* bytes).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the ioremap*() APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, as we saw in the *Understanding the issue with direct access* section,
+    attempting to perform I/O directly on these physical or bus addresses simply won''t
+    work. The way we should do this is by telling Linux to **map** these bus addresses
+    into the kernel''s VAS so that we can access it through **kernel virtual addresses**
+    (**KVAs**)! How do we do this? The kernel provides APIs for this express purpose;
+    a very common one that driver authors use is the `ioremap()` API. Its signature
+    is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `asm/io.h` header becomes an arch-specific header file as required. Notice
+    how the first parameter to `ioremap()` is a physical (or bus) address (it's data
+    type is `phys_addr_t`). This is one of the rare cases in Linux where you, as a
+    driver author, have to supply a physical – not a virtual – address (the other
+    typical case being when performing **Direct Memory Access** (**DMA**) operations).
+    The second parameter is obvious; this is the size or length of the memory I/O
+    region we must map. When invoked, the `ioremap()` routine will map the I/O chip
+    or peripheral memory starting from `offset` for a length of `size` bytes into
+    the kernel's VAS! This is necessary - running with kernel privilege, your driver
+    can now access this I/O memory region via the return pointer and thus perform
+    I/O on the memory region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Think about it! Just like the `mmap()` system call allows you to memory map
+    a region of KVA space to a user space process, the `[devm_]ioremap*()` (and friends)
+    APIs allow you to map a region of peripheral I/O memory to the KVA space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `ioremap()` API returns a KVA of the `void *` type (since it's an address
+    location). So, what's the peculiar-looking `__iomem` directive here (`void __iomem
+    *`)? It's simply a compiler attribute that is wiped away at build time; it's merely there
+    to remind us humans (as well as to perform sanity checking or look at static analysis
+    code) that this is an I/O address and not your regular RAM address!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, for the preceding example, on a Raspberry Pi device, you can map the GPIO
+    register bank to a KVA by doing the following (this isn''t the actual code, but
+    an example to show you how `ioremap()` API can be invoked):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `iobase` variable now holds the return value from `ioremap()`; it's a KVA,
+    a kernel virtual address. You can now use it, as long as it's non-NULL (you are
+    expected to verify this!). So, in this example, the return value from the `ioremap()`
+    is the place in kernel VAS where the GPIO registers (the peripheral I/O memory)
+    of the Raspberry Pi is now mapped and available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once done, you''re expected to unmap the mapping (as can be seen in the preceding
+    code fragment) using the `iounmap()` API; the parameter to the `iounmap()` API
+    is obvious - the start of the I/O mapping (the value returned by the `ioremap()`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'So, when we map the (GPIO registers) I/O memory into kernel VAS, we get a KVA
+    so that we can work with it. Interestingly, the return value from the `ioremap()`
+    API is typically an address within the *vmalloc* region of the kernel VAS (refer
+    back to the companion guide *Linux Kernel Programming* - Chapter 7, *Memory Management
+    Internals – Essentials*, for these details). This is because `ioremap`usually
+    allocates and uses the required virtual memory for mapping from the kernel''s
+    vmalloc region (this is not always the case though; variants such as `ioremap_cache()`
+    can use a region outside the vmalloc one). Here, let''s say the return value –
+    our `iobase` address – is `0xbbed 8000` (refer to Figure 3.2: with a 2:2 GB VM
+    split here, you can see that the `iobase` return address is indeed a KVA within
+    the kernel''s vmalloc region).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is a conceptual diagram showing this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![](img/ca8067d9-46ef-4063-9399-b711a79e04ac.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 3.2 – The physical-to-virtual mapping of I/O peripheral memory
+  prefs: []
+  type: TYPE_NORMAL
+- en: Comparing the preceding diagram (*Figure 3.2*) with our detailed diagram of
+    kernel VAS on the Raspberry Pi, which we covered in the companion guide *Linux
+    Kernel Programming* in *Chapter 7,* *Memory Management Internals - Essentials* (*Figure
+    7.12*), is something interesting to do.
+  prefs: []
+  type: TYPE_NORMAL
+- en: (It's also educative to see a similar diagram showing the physical/virtual mapping
+    of the memory on the Aarch64 or ARM64 processor; you can look it up in the official
+    ARM documentation; that is, *ARM Cortex-A Series Programmer's Guide for ARMv8-A*,
+    under the *The Memory Management Unit* section – check out *Figure 12.2:*[https://developer.arm.com/documentation/den0024/a/The-Memory-Management-Unit](https://developer.arm.com/documentation/den0024/a/The-Memory-Management-Unit).)
+  prefs: []
+  type: TYPE_NORMAL
+- en: The newer breed – the devm_* managed APIs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that you understand how to use the `request_mem_region()` and the just-seen
+    `ioremap*()` APIs, guess what? The reality is that both these APIs are now considered
+    deprecated; as a modern driver author, you're expected to use the better resource-managed
+    `devm_*` APIs. (We covered the older ones for a few reasons, including the fact
+    that many older drivers still very much use them, for understanding the basics of
+    using the `ioremap()` resource management APIs, and for completeness.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, let''s check out the new resource-managed ioremap, known as `devm_ioremap()`,
+    in `lib/devres.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Just as we learned with regard to the very common `kmalloc`*/*`kzalloc` APIs
+    (refer to the companion guide *Linux Kernel Programming,* *Chapter 8*, *Kernel
+    Memory Allocation for Module Authors – Part 1*), the `devm_kmalloc()` and the `devm_kzalloc()` APIs
+    simplify life for us as they guarantee that they'll free the memory that's been
+    allocated on device detach or driver removal. In a similar fashion, using `devm_ioremap()`
+    implies that you don't need to explicitly invoke the `iounmap()` API since the
+    kernel's *devres* framework will handle it upon driver detach!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Again, since this book is not primarily focused on writing device drivers, we
+    shall mention bit not delve into deep details of using the modern **Linux Device
+    Model** (**LDM**) with the `probe()` and `remove()`/`disconnect()` hooks. Other
+    literature dedicated to this subject can be found in the *Further reading *section,
+    at the end of this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note that the first parameter of any `devm_*()` API is the pointer to `struct
+    device` (we showed you how to obtain this in [Chapter 1](239d8da6-0342-441a-823e-d3766f0d97b6.xhtml),
+    *Writing a Simple misc Character Device Driver*, when we covered how to write
+    a simple `misc` driver).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Obtaining the device resources
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The second parameter of the `devm_ioremap()` API (see its signature in the preceding
+    section) is `resource_size_t offset`. The formal parameter name `offset` is a
+    bit misleading – it's really the physical or bus address of the peripheral I/O
+    memory region that's used to remap to kernel VAS (in fact, the `resource_size_t` data
+    type is nothing but a `typedef` for `phys_addr_t`, a physical address).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This and the following section's coverage is **important for Linux device driver
+    authors** since it introduces some key ideas (the **Device Tree** (**DT**), the
+    platform and `devres` APIs, and so on) and encompasses some very common strategies
+    that are employed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But how will you obtain this first parameter to the `devm_ioremap()` API - the
+    bus or physical address? An FAQ indeed! Well, of course, this is very device-specific.
+    Having said that, the starting bus or physical address is just one of several
+    I/O resources that the driver author can – and at times, must – specify. The Linux
+    kernel provides a powerful framework – the **I/O resource management** framework
+    – for exactly this purpose in that it allows you to get/set hardware resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are several kinds of resources available; it includes device MMIO ranges,
+    I/O port ranges, **interrupt request** (**IRQ**) lines, register offsets, DMAs,
+    and bus values.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, in order for all this to work, the I/O resources have to be specified
+    on a per-device basis. There are two broad ways in which this is done:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**The traditional approach**: By hard-coding them (the I/O resources) into
+    the kernel source tree in what''s often called board-specific files. (For example,
+    for the popular ARM CPU, these are typically found at `arch/arm/mach->foo/...`,
+    where `foo` is the machine (`mach`) or platform/board name. As a further example,
+    the number of platform devices defined within these board-specific files was 1,670
+    with Linux 3.10.6; migrating to the modern DT approach has had this number reduce
+    to 885 for the 5.4.0 kernel source tree.)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**The modern approach**: By placing them (the I/O resources) in a way that
+    they can be discovered at boot by the OS; this is usually done for embedded systems,
+    such as ARM-32, AArch64, and PPC, by describing the hardware topology of a board
+    or platform (all the hardware stuff on it, such as the SoC, CPUs, peripherals,
+    disks, flash chips, sensor chips, and so on) via a hardware-specific language
+    called the DT (analogous to VHDL). The **Device Tree Source** (**DTS**) files
+    live under the kernel source tree (for ARM, in `arch/arm/boot/dts/`) and are compiled
+    at kernel build time (via the DT compiler; that is, `dtc`) into a binary format
+    called the **Device Tree Blob** (**DTB**). The DTB is typically passed along at
+    boot by the bootloader to the kernel. During early boot, the kernel reads in,
+    flattens, and interprets the DTB, creating platform (and other) devices as required,
+    and then binds them to their appropriate drivers.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The DT isn't present for x86[_64] systems. The closest equivalent is perhaps
+    the ACPI tables. Also, note that the DT isn't a Linux-specific technology; it
+    was designed to be OS-agnostic, and the generic org is called **Open Firmware**
+    (**OF**).
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we mentioned previously, with this modern model, the kernel and/or the device
+    driver must obtain the resource information (which is populated inside a `include/linux/ioport.h:struct
+    resource`) from the DTB. How? One common way in which a platform driver usually
+    does this is via the `platform_get_*()` APIs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We hope to make this clear with an example from a **Video For Linux** (**V4L**) media
+    controller driver within the kernel source. This driver is for the SP5 TV mixer
+    on the Samsung Exynos 4 SoC (used in some Galaxy S2 models). There's even some
+    kernel documentation on this, under the *V4L driver-specific documentation* section: [https://www.kernel.org/doc/html/v5.4/media/v4l-drivers/fimc.html#the-samsung-s5p-exynos4-fimc-driver](https://www.kernel.org/doc/html/v5.4/media/v4l-drivers/fimc.html#the-samsung-s5p-exynos4-fimc-driver).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following code can be found at `drivers/gpu/drm/exynos/exynos_mixer.c`.
+    Here, the driver exploits the `platform_get_resource()` API to obtain the value
+    of the I/O memory resource; that is, the start physical address of the I/O memory
+    for that peripheral chip:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code snippet, the driver issues the `platform_get_resource()`
+    API to fetch the pointer to the resource structure for the `IORESOURCE_MEM` type
+    resource (MMIO memory!). It then issues the `devm_ioremap()` API to map this MMIO
+    region into kernel VAS (as explained in some detail in the previous section).
+    Using the `devm` version alleviates the need for manually unmapping the I/O memory
+    when this is done (or due to an error), thus reducing the chance of leaks!
+  prefs: []
+  type: TYPE_NORMAL
+- en: All in one with the devm_ioremap_resource() API
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'As a driver author, you should become aware of and employ this useful routine:
+    the `devm_ioremap_resource()` managed API performs the job of (validity) checking
+    the requested I/O memory region, requesting it from the kernel (internally via
+    the `devm_request_mem_region()` API), and remapping it (internally via `devm_ioremap()`)!
+    This makes it a useful wrapper for driver authors like you, and its usage is pretty
+    common (in the 5.4.0 kernel code base, it''s employed over 1,400 times). Its signature
+    is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here''s a usage example from `drivers/char/hw_random/bcm2835-rng.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, as is typical with the modern LDM, this code is executed as part of the probe routine
+    of the driver. Also (again, this is very common), the `platform_get_resource()`
+    API is employed first in order to fetch and place the value of the physical (or
+    bus) address in a `resource` structure, whose address is passed as the second
+    parameter to `devm_ioremap_resource()`. The I/O memory, using MMIO, is now checked,
+    requested, and remapped to kernel VAS, ready for the driver to use!
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may have come across the `devm_request_and_ioremap()` API which was commonly
+    used for similar purposes; back in 2013, it was replaced with the `devm_ioremap_resource()`
+    API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, there are several variants of `ioremap()`. The `[devm_]ioremap_nocache()`
+    and `ioremap_cache()` APIs are such examples and affect the CPU's caching modes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Driver authors would do well to carefully read the (arch-specific) comments
+    in the kernel source where these routines are; for example, on the x86 at `arch/x86/mm/ioremap.c:ioremap_nocache()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, having covered this important section on how to get resource information
+    and use the modern `devm_*()` managed APIs, let's learn how to interpret the output
+    from `/proc` with regard to MMIO.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking up the new mapping via /proc/iomem
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Once you have performed a mapping (via one of the just-covered `[devm_]ioremap*()`APIs),
+    it can actually be seen via the read-only pseudo-file; that is, `/proc/iomem`. The
+    reality is that a new entry under `/proc/iomem` is generated when you successfully
+    call `request_mem_region()`. Viewing it requires root access (more correctly,
+    you can view it as non-root but will only see all the addresses as `0`; this is
+    for security purposes). So, let''s take a look at this on our trusty x86_64 Ubuntu
+    guest VM. In the following output, due to lack of space and for clarity, we''ll
+    show it partially truncated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The really important thing to realize is that the address ranges shown in the
+    left hand-side column are not virtual – **they are physical (or bus) addresses**. You
+    can see where the system (or platform) RAM is mapped. Also, within it, you can
+    see where exactly the kernel code, data, and bss sections are (in terms of physical
+    addresses). In fact, my `procmap` utility ([https://github.com/kaiwan/procmap](https://github.com/kaiwan/procmap))
+    uses precisely this information (converting the physical addresses to virtual).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For some contrast, let''s run the same command on our Raspberry Pi 3 device
+    (the B+ model sports a Broadcom BCM2837 SoC with a quad-core ARM Cortex A53).
+    Again, due to space restrictions and for clarity, we''ll show a partially truncated
+    part of the output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice how the GPIO register bank shows up as `gpio@7e200000`, which, as we
+    saw in *Figure 3.1*, is the physical address. You may be wondering why the format
+    on ARM looks different from that of the x86_64\. What does the left column now
+    mean? Here, the kernel allows the BSP/platform team to decide on how exactly they
+    construct and set up (via `/proc/iomem`) the I/O memory regions for display, which
+    makes sense! They know the hardware platform best. We mentioned this previously,
+    but the fact is that the BCM2835 SoC (which the Raspberry Pi uses) has multiple
+    MMUs. One such MMU is the coarse granularity VC/ARM MMU, which translates the
+    ARM bus address into an ARM physical address, after which the regular ARM MMU
+    translates the physical address into a virtual address. Hence, here, the ARM bus
+    address `start-end` values show up in the left column and the ARM physical address
+    shows as suffixed to the `@` symbol (`gpio@xxx`). So, for the preceding GPIO registers
+    being mapped, the ARM bus addresses are `3f200000`-`3f2000b3` and the ARM physical
+    address is `0x7e200000`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s finish this section by mentioning a few more points regarding the `/proc/iomem`
+    pseudo-file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`/proc/iomem` displays the physical (and/or bus) addresses currently being
+    mapped by the kernel and/or various device drivers. However, the exact display
+    format is very arch- and device-dependent.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An entry is generated for `/proc/iomem` whenever the `request_mem_region()`
+    API runs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The entry is removed when the corresponding `release_mem_region()` API runs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can find the relevant kernel code at `kernel/resource.c:ioresources_init()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: So, now that you have the I/O memory region successfully mapped to kernel VAS,
+    how will you actually read/write this I/O memory? What are the APIs for MMIO?
+    The next section delves into this topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: MMIO – performing the actual I/O
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'When working with the MMIO approach, the peripheral I/O memory is mapped to
+    the kernel VAS, and thus appears to you – the driver author – as plain old memory,
+    just like RAM. We need to be careful here: there are caveats and cautions to be
+    observed. You are *not *expected to treat the region as plain old RAM and access
+    it directly via the usual C routines!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the upcoming sections, we'll show you how to perform I/O (reads and writes)
+    for any peripheral I/O region that's been remapped via the MMIO approach. We'll
+    begin with the very common case of performing small (1- to 8-byte) I/O, then move
+    on to repeating I/O, before looking at how to `memset` and `memcpy` an MMIO region.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Performing 1- to 8-byte reads and writes on MMIO memory regions
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'So, how exactly can you access and perform I/O (reads and writes) on peripheral
+    I/O memory via the MMIO approach? The kernel provides APIs allowing you to both
+    read and write chip memory. By using these APIs (or macros/inline functions),
+    you can perform I/O, such as reads and writes, in four possible bit-widths; that
+    is, 8-bit, 16-bit, 32-bit, and, on 64-bit systems, 64-bit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'MMIO reads: `ioread8()`, `ioread16()`, `ioread32()`, and `ioread64()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: MMIO writes: `iowrite8()`, `iowrite16()`, `iowrite32()`, and `iowrite64()`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The signatures of the **I/O read routines** are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: The single parameter for the `ioreadN()` APIs is the address of the I/O memory
+    location that must be read from. Typically, it's the return value that's obtained
+    from one of the `*ioremap*()` APIs we have seen, plus an offset (the offset could
+    be `0`). Adding an offset to the base (`__iomem`) address is a very common thing
+    since hardware designers deliberately lay out registers in such a way that they
+    can be easily sequentially accessed, as an array (or register bank), by software!
+    Driver authors take advantage of this. Of course, there's no shortcut for this
+    as you cannot assume anything – you have to carefully study the datasheet for
+    the particular I/O peripheral you're writing the driver for; the devil lies in
+    the details!
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `u8` return type is a `typedef` specifying an unsigned 8-bit data type (conversely,
+    the `s` prefix denotes a signed data type). The same goes for the other data types
+    (there's `s8`, `u8`, `s16`, `u16`, `s32`, `u32`, `s64`, and `u64`, all very useful
+    and unambiguous).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signatures of the **I/O write routines** are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The first parameter for the `iowriteN()` APIs is the value to write (of the
+    appropriate bit-width), while the second parameter specifies the location to write
+    it to; that is, the MMIO address (again, this is obtained via one of the `*ioremap*()`
+    APIs). Notice that there''s no return value. This is because these I/O routines
+    literally work on the hardware, so there''s no question of them failing: they
+    always succeed! Now, of course, your driver may still not work, but this could
+    be due to any number of reasons (resource unavailable, wrongly mapped, using the
+    wrong offset, timing or synchronization issues, and so on). However, the I/O routines
+    will still work.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A common test that driver authors use to fundamentally test the driver's/hardware's
+    sanity is that they write a value, `n`, into a register and read it back; you
+    should get the same value (`n`). (Of course, this only holds true if the register/hardware
+    won't immediately change or consume it.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Performing repeating I/O on MMIO memory regions
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The `ioread[8|16|32|64]()` and `iowrite[8|16|32|64]()` APIs can work upon small
+    data quantums ranging from 1 to 8 bytes only. But what if we''d like to read or
+    write a few dozen or a few hundred bytes? You can always encode these APIs in
+    a loop. However, the kernel, anticipating exactly this, provides helper routines
+    that are more efficient, that internally use a tight assembly loop. These are
+    the so-called repeating versions of the MMIO APIs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For reading, we have the `ioread[8|16|32|64]_rep()` set of APIs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For writing, we have the `iowrite[8|16|32|64]_rep()` set of APIs.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s look at the signature for one of them; that is, an 8-bit repeating read.
+    The remaining reads are completely analogous:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This will read `count` bytes from the source address, `addr` (an MMIO location),
+    into the (kernel-space) destination buffer specified by `buffer`. Similarly, the
+    following is the signature for the repeating 8-bit write:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: This will write `count` bytes from the source (kernel-space) buffer ( `buffer`)
+    into the destination address, `addr` (an MMIO location).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Besides these APIs, the kernel does have a few helpers that are variations of
+    this; for example, for endianness, it provides `ioread32be()`, where `be` is big-endian.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting and copying on MMIO memory regions
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The kernel also provides helper routines for the `memset()` and `memcpy()` operations
+    when using MMIO. Note that you must use the following helpers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: This will set the I/O memory from the start address, `addr` (an MMIO location),
+    to the value specified by the `value` parameter for `size` bytes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the purpose of copying memory, two helper routines are available, depending
+    on the direction of the memory transfer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first copies memory from the MMIO location `addr` to the (kernel-space)
+    destination buffer (`buffer`) for `size` bytes; the second routine copies memory
+    from the (kernel-space) source buffer (`buffer`) to the destination MMIO location
+    `addr` for `size` bytes. Again, for all these helpers, notice that there is no
+    return value; they always succeed. Also, for all the preceding routines, ensure
+    you include the `linux/io.h` header.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Originally, the `asm/io.h` header was typically included. However, now, the
+    `linux/io.h` header is an abstraction layer above it and internally includes the
+    `asm/io.h` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Something to be aware of is that the kernel has older helper routines for performing
+    MMIO; these are the `read[b|w|l|q]()` and `write[b|w|l|q]()` API helpers. Here,
+    the letter that''s suffixed to the read/write specifies the bit width; it''s really
+    very simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`b`: Byte-wide (8 bits)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`w`: Word-wide (16 bits)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`l`: Long-wide (32 bits)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`q`: Quad-word-wide (64 bits); only available on 64-bit machines'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note that with modern kernels, you are *not* expected to use these routines,
+    but rather the aforementioned `ioread/iowrite[8|16|32|64]()` API helpers. The
+    only reason we're mentioning them here is that there are still several drivers
+    using these older helper routines. The syntax and semantics are completely analogous
+    to the newer helpers, so I'll leave it to you to look them up if required.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s end this section by summarizing (without paying too much attention to
+    all the details we''ve covered so far) the **typical sequence that drivers follow
+    when performing MMIO**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Request the memory region from the kernel via `request_mem_region()` (generates
+    an entry in `*/*proc/iomem`).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Remap the peripheral I/O memory to kernel VAS via `[devm_]ioremap[_resource|[no]cache()`;
+    modern drivers typically use the managed `devm_ioremap()` (or the `devm_ioremap_resource()`
+    API) to do so
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Perform the actual I/O via one or more of the modern helper routines:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '`ioread[8|16|32|64]()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`iowrite[8|16|32|64]()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`memset_io() / memcpy_fromio() / memcpy_toio()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: (Older helper routines: `read[b|w|l|q]()` and `write[b|w|l|q]()`)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When done, unmap the MMIO region; that is, `iounmap()`. This is only done if
+    required (when using the managed `devm_ioremap*()` APIs, this is unnecessary).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Release the MMIO region back to the kernel via `release_mem_region()` (clears
+    the entry in `/proc/iomem`).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: With MMIO being a powerful means to communicate with peripheral chips, you might
+    imagine that all drivers (including the so-called bus drivers) are designed and
+    written to use it (and/or port I/O) but this isn't true. This is due to performance
+    issues. After all is said and done, performing MMIO (or PMIO) on a peripheral
+    requires the processor's continuous interaction and attention. This, on many classes
+    of devices (think about streaming high-definition media content on your smartphone
+    or tablet!), is just far too slow. So, what's the high-performance way of communicating
+    with a peripheral device? The answer is DMA*,* a topic that's unfortunately beyond
+    the scope of this book (do look at the *Further reading *section for suggestions
+    on useful driver books and resources on DMA). So, where is MMIO used? Realistically,
+    it's used for plenty of lower speed peripherals, including for status and control
+    operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While MMIO is the most common way of performing I/O on peripherals, port I/O is
+    another. So, let's learn how to work with it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding and using port-mapped I/O
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'As we mentioned earlier in the *The solution – mapping via I/O memory or I/O
+    port* section, besides MMIO, there is another way to perform I/O on peripheral
+    device memory called PMIO,or often simply **PIO**. It works quite differently
+    from MMIO. Here, the CPU has distinct assembly (and corresponding machine) instructions
+    to enable it to directly read and write I/O memory locations. Not only that, but
+    this I/O memory range is a separate address space altogether, distinct from RAM.
+    These memory locations are called ports. Don''t confuse the term **port** that''s
+    being used here with the same term that''s used in networking technology; think
+    of this port as an **hardware register** in that it closely approximates the meaning.
+    (While it''s usually 8-bit, peripheral chip registers can actually be of three
+    bit widths: 8, 16, or 32 bits.)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The reality is that most modern processors, even if they do support PMIO with
+    a separate I/O port address space, tend to mostly use the MMIO approach for peripheral
+    I/O mapping. The mainstream processor family that does support PMIO and employs
+    it often – in addition to MMIO – is the x86. On these processors, as documented
+    in their **physical memory map**, is a range of address locations reserved for
+    this purpose. This is called the **port address range** and typically - on the
+    x86 - spans from physical address `0x0` to `0xffff`; that is, 64 kilobytes in
+    length. What registers does this region contain? Typically, on the x86, there
+    are registers (usually data/status/control) for various I/O peripherals. Some
+    common ones include the i8042 keyboard/mouse controller chip, **DMA controller**
+    (**DMAC**), timers, RTC, and so on. We'll look at these in more detail in the *Looking
+    up the* *ports via /proc/ioports* section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PMIO – performing the actual I/O
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Port I/O is pretty simple compared to all the hoopla we saw with MMIO. This
+    is because the processor provides machine instructions to directly perform the
+    work. Of course, just like MMIO, you are expected to politely ask the kernel for
+    permission to access a PIO region (we covered this in the *Asking the kernel's
+    permission* section). The APIs for doing this are `request_region()` and `release_region()`
+    (their parameters are identical to their MMIO counterpart APIs).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, how can you access and perform I/O (reads and writes) upon the *I/O* *port(s)*?
+    Again, the kernel provides API wrappers over the underlying assembly/machine instructions
+    to do so for both reading and writing. Using them, you can perform I/O reads and
+    writes in three possible bit-widths; that is, 8-bit, 16-bit, and 32-bit:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'PMIO reads: `inb()`, `inw()`, and `inl()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'PMIO writes: `outb()`, `outw()`, and `outl()`'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Quite intuitively, `b` implies byte-wide (8 bits), `w` implies word-wide (16
+    bits), and `l` implies long-wide (32 bits).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signatures of the **port I/O read routines** are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The single parameter for the `in[b|w|l]()` wrappers is the port address of
+    the port I/O memory location that will be read from. We covered this in the *Obtaining
+    the device resources* section (a really key section for driver developers like
+    you!). A **port** is also a resource, which means it can be obtained in the usual
+    manner: on modern embedded systems, this is done by parsing the *device tree*
+    (or ACPI tables); the older way was to hard-code the values within board-specific
+    source files. Actually, for many common peripherals, the port number or port address
+    range is a well-known one, which means it can be hard-coded into the driver (this
+    often occurs in the driver''s header files). Again, it''s best to not simply assume
+    anything, ensure you refer to the datasheet for the peripheral in question.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's get back to the APIs. The return value is an unsigned integer (with
+    the bit-width varying, depending on the helper routine being used). It's the current
+    value on that port (register) at the instant the read was issued.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The signatures of the **port I/O write routines** are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter is the value to be written to the hardware (port), while
+    the second parameter is the port address of the port I/O memory to write to. Again,
+    as with MMIO, there's no question of failure since these helper I/O routines always
+    succeed. On the x86 at least, a write to an I/O port is guaranteed to be completed
+    before the next instruction is executed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A PIO example – the i8042
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: To help make things clearer, let's look at a few code snippets from the device
+    driver for the i8042 keyboard and mouse controller, which, though nowadays considered
+    quite old, is still very common on x86 systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find a basic schematic of the 8042 controller here: [https://wiki.osdev.org/File:Ps2-kbc.png](https://wiki.osdev.org/File:Ps2-kbc.png).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The interesting bits (for us, at least) are in the driver''s header file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code snippet, we can see the I/O ports or hardware registers that
+    this driver works with. How come the status and data registers resolve to the
+    same I/O port (`0x64`) address? The *direction* matters: reading it has I/O port
+    `0x64` behave as the status register, while writing to it has it behave as the
+    command register! Furthermore, the datasheet will show you that these are 8-bit
+    registers; so, here, the actual I/O is performed via the `inb()` and `outb()`
+    helpers. The driver abstracts these further in small inline routines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Of course, the reality is that there's far more that this driver does (than
+    what we've shown here), including handling hardware interrupts, initializing and
+    working with multiple ports, blocking reads and writes, flushing buffers, blinking
+    the keyboard LEDs on kernel panic, and more. We won't look into this any further
+    here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking up the port(s) via /proc/ioports
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The kernel provides a viewport into the port address space via the `/proc/ioports` pseudo-file.
+    Let''s check it out on our x86_64 guest VM (again, we''re only showing part of
+    the output):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: We've highlighted the keyboard ports in bold. Notice how the port numbers match
+    what the i8042 driver code we saw previously specifies. Interestingly, running
+    the same command on the Raspberry Pi yields nothing; this is because no driver
+    or subsystem is using any I/O ports. Analogous with MMIO, an entry in `/proc/ioports` is
+    generated when the `request_region()` API runs, and, conversely, is removed when
+    the corresponding `release_region()` API runs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, let's quickly mention a few things with respect to port I/O.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Port I/O – a few remaining points to note
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A few more or less miscellaneous points remain on PIO that you as a driver
+    author should take note of:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just like MMIO provides the repeating I/O routines (recall the `ioread|iowrite[8|16|32|64]_rep()`
+    helpers), PMIO (or PIO) provides somewhat similar repeating functionality for
+    those cases where you''d like to read or write the same I/O port multiple times.
+    These are the so-called *string versions* of the regular port helper routines;
+    they have an `s` in their name to remind you of this. The kernel source contains
+    a comment that neatly sums this up:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, for example, the `insw()` helper routine will read a total of `count` times
+    (that is, *count*2* bytes since it's 2-byte or 16-bit reads each) from the starting
+    `addr`, which is an I/O port address, into the successive locations of the destination
+    buffer at `buffer` (the `readsw()` inline function is the internal implementation).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similarly, the `outsw()` helper routine writes a total of `count` times (that
+    is, *count*2* bytes since it's 2-byte or 16-bit reads each), data from the source
+    buffer at `buffer` to the I/O port at `address` (the `writesw()` inline function
+    is the internal implementation).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, the kernel seems to provide helper APIs equivalent to the `in|out[b|w|l]()`
+    ones; that is, `in|out[b|w|l]_p()`. Here, the `_p` suffix implies that a *pause*
+    or delay was introduced into the I/O. Originally, this was meant for slow peripherals;
+    nowadays, though, this seems to have become a backward-compatible moot point:
+    the "delayed I/O" routines are nothing but simple wrappers over the regular routines
+    (in effect there is no delaying).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are also user space equivalents of the PIO APIs (you can use one these
+    to, for example, write a user space driver). Of course, successfully issuing the
+    `in|out[b|w|l]()` APIs in user mode requires the issuing process to successfully
+    invoke the `iopl(2)`/`ioperm(2)` system calls, which, in turn, requires root access
+    (or you require to have the `CAP_SYS_RAWIO` capability bit set; this can also
+    be done for security purposes.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With that, we have concluded our discussion of port I/O, as well as this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, you learned why we can''t just work directly with peripheral
+    I/O memory. Next, we covered how, within the Linux device driver framework, to
+    access and perform I/O (reads and writes) on hardware (or peripheral) I/O memory.
+    You learned that there are two broad ways to do this: via MMIO (the common approach)
+    and P(M)IO.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We learned that systems such as the x86 often employ both approaches as that's
+    how the peripherals are designed. MMIO and/or PMIO access is a key task for any
+    driver – after all, this is how we talk to and control hardware! Not only that,
+    but many of the underlying bus drivers (for various buses on Linux, such as I2C,
+    USB, SPI, PCI, and more) internally use MMIO/PMIO for performing peripheral I/O.
+    So, good job on completing this chapter!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the next chapter, we''ll look at another critical hardware-related area
+    of importance: understanding, dealing with, and working with hardware interrupts.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Imagine that you have mapped an 8-bit register bank to a peripheral chip (via
+    the `devm_ioremap_resource()` API in your driver''s `xxx_probe()` method; assume
+    it succeeds). Now, you want to read the current content in the third 8-bit register.
+    The following is some (pseudo)code that you can use to do this. Study it and spot
+    the bug inside it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Can you suggest a fix?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Possible solution to this exercise can be found at [https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/tree/main/solutions_to_assgn](https://github.com/PacktPublishing/Linux-Kernel-Programming-Part-2/tree/main/solutions_to_assgn).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Further reading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Modern (and older) *Linux device drivers* books: Working with the LDM:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux Device Drivers Development, Madieu*, Packt, October 2017 – This is an
+    excellent resource that provides modern and wide coverage.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux Driver Development for Embedded Processors*, Alberto Liberal de los
+    Ríos, second edition, 2018.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Essential Linux Device Drivers*, Sreekrishnan Venkateswaran, Pearson, March
+    2008 – This is an older book but provides superb coverage on literally all types
+    of Linux drivers!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux Device Drivers*, Rubini, Corbet, GK-Hartman, O''Reilly, February 2005
+    – This is the old Linux drivers bible; how can it possibly be left out?'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Device tree:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Device tree specification: [https://www.devicetree.org/](https://www.devicetree.org/).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Device Tree Reference*, eLinux: [https://elinux.org/Device_Tree_Reference](https://elinux.org/Device_Tree_Reference).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Generate and compile the device tree to config the hardware setup of your [Arietta](http://www.acmesystems.it/arietta)
+    G25 board*: [http://linux.tanzilli.com/](http://linux.tanzilli.com/) – This provides
+    a very interesting and interactive configuration that can be performed for a device
+    tree!'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'DMA:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Article:* Introduction to direct memory access*, October 2003: [https://www.embedded.com/introduction-to-direct-memory-access/](https://www.embedded.com/introduction-to-direct-memory-access/)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'LWN kernel index: articles on DMA: [https://lwn.net/Kernel/Index/#Direct_memory_access](https://lwn.net/Kernel/Index/#Direct_memory_access)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Linux kernel documentation: *DMAEngine documentation*: [https://www.kernel.org/doc/html/latest/driver-api/dmaengine/index.html](https://www.kernel.org/doc/html/latest/driver-api/dmaengine/index.html)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Linux kernel has a "DMA test" kernel module*; documentation: [https://www.kernel.org/doc/html/latest/driver-api/dmaengine/dmatest.html](https://www.kernel.org/doc/html/latest/driver-api/dmaengine/dmatest.html)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Stack Overflow: From the kernel to the user space (DMA)*: [https://stackoverflow.com/questions/11137058/from-the-kernel-to-the-user-space-dma](https://stackoverflow.com/questions/11137058/from-the-kernel-to-the-user-space-dma)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Laurent Pinchart – *mastering the dma and iommu apis | ELC 2014*: [https://www.youtube.com/watch?v=n07zPcbdX_w](https://www.youtube.com/watch?v=n07zPcbdX_w)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Hardware/CPU:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Intel x86 architecture, Min: [https://www.slideshare.net/multics69/intel-x86-architecture](https://www.slideshare.net/multics69/intel-x86-architecture)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

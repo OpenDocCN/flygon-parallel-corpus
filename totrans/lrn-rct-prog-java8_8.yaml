@@ -1,0 +1,467 @@
+- en: Chapter 8. Resource Management and Extending RxJava
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Through the previous chapters, we've learned how to use RxJava's observables.
+    We've been using many different operators and `factory` methods. The `factory`
+    methods were the source of various `Observable` instances with different behavior
+    and origin of their emissions. Using the operators, on the other hand, we've been
+    building complex logic around these observables.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we'll learn how to create our own `factory` methods, which
+    will be capable of managing their source resources. In order to do that, we'll
+    need a way to manage and dispose of the resources. We've created and used multiple
+    methods like this with source files, HTTP requests, folders, or data in the memory.
+    But some of them don't clean up their resources. For example, the HTTP request
+    observable needs a `CloseableHttpAsyncClient` instance; we created a method that
+    receives it and left the management of it to the user. The time has come to learn
+    how to manage and clean up our source data automatically, encapsulated in our
+    `factory` methods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We'll learn how to write our own operators, too. Java is not a dynamic language,
+    and that's why we won't be adding operators as methods of the `Observable` class.
+    There is a way to insert them in the observable chain of actions and we will see
+    that in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The topics covered in this chapter are:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Resource management with the `using()` method
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating custom operators using the *higher-order* `lift()` operator
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Creating compositions of operators with `compose`
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Resource management
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'If we look back at the HTTP request method that we used in [Chapter 6](ch06.html
+    "Chapter 6. Using Concurrency and Parallelism with Schedulers"), *Using Concurrency
+    and Parallelism with Schedulers* and [Chapter 5](ch05.html "Chapter 5. Combinators,
+    Conditionals, and Error Handling"), *Combinators, Conditionals, and Error Handling*,
+    it has this signature: `Observable<Map> requestJson(HttpAsyncClient client, String
+    url)`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Instead of just calling a method that makes a request to a URL and returns
+    the response as JSON, we create a `HttpAsyncClient` instance, have to start the
+    it and pass it to the `requestJson()` method. But there is more: we need to close
+    the *client* after we read the result, and because the observable is *asynchronous*,
+    we need to wait for its `OnCompleted` notification and then to do the closing.
+    This is very complex and should be changed. The `Observable`, which read from
+    files, need to create streams/readers/channels and close them when all the subscribers
+    are *unsubscribed*. The `Observable`, emitting data from a database should set
+    up and then close all the connections, statements, and result sets that are used
+    after reading is done. And that is true for the `HttpAsyncClient` object, too.
+    It is the resource that we use to open a connection to a remote server; our observable
+    should clean it up after everything is read and all the subscribers are no longer
+    subscribed.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s answer this one question: Why does the `requestJson()` method need this
+    `HttpAsyncClient` object? The answer is that we used a RxJava module for the HTTP
+    request. The code for this is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This code creates the request and the code needs the client, so we need the
+    client to create our `Observable` instance. We can''t change this code, because
+    changing it means to write the HTTP request by ourselves, and that''s not good.
+    There is already a library that does it for us. We''ll have to use something that
+    provides the `HttpAsyncClient` instance on *subscribing* and disposes from it
+    on *unsubscribing*. There is something that does just this: the `using()` factory
+    method.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing the Observable.using method
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The signature of the `Observable.using` method is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This looks quite complex, but after a second glance it is not so hard to understand.
+    Let''s take a look at the following description:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Its first parameter is `Func0<Resource> resourceFactory`, a function that creates
+    a `Resource` object (here `Resource` is an arbitrary object; it is not interface
+    or class but the name of a type parameter). It is our job to implement the resource
+    creation.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `Func1<? super Resource, ? extends Observable<? extends T>> observableFactory`
+    parameter, the second argument, is a function that receives a `Resource` object
+    and returns an `Observable` instance. This function will be called with the `Resource`
+    object that we already created by the first parameter. We can use this resource
+    to create our `Observable` instance.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `Action1<? super Resource> disposeAction` parameter is called when the `Resource`
+    object should be disposed of. It receives the `Resource` object that was created
+    by the `resourceFactory` parameter (and used to create an `Observable` instance),
+    and it is our job to dispose of it. This is called on *unsubscribing*.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'We are able to create a function, making an HTTP request, without passing it
+    the `HttpAsyncClient` object now. We have utilities that will create and dispose
+    of it on demand. Let''s implement the function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The method is not so hard to understand. Let''s break it down:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The signature of the method is simple; it has only one parameter, `URL`. The
+    callers of the method won't need to create and manage the life cycle of a `CloseableHttpAsyncClient`
+    instance. It returns an `Observable` instance capable of emitting a `ObservableHttpResponse`
+    response and *completing*. The `getJson()` method can use that to transform the
+    `ObservableHttpResponse` response into the `Map` instance representing the JSON,
+    again without the need of passing the *client*.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `resourceFactory` lambda is simple; it creates a default `CloseableHttpAsyncClient`
+    instance and starts it. When called, it will return an initialized HTTP *client*
+    capable of requesting remote server data. We output that the *client* is ready
+    for debugging purposes.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `observableFactory` function has access to the `CloseableHttpAsyncClient`
+    instance that was created by the `resourceFactory` function, so it uses it and
+    the passed `URL` to construct the resulting `Observable` instance. This is done
+    through RxJava's `rxjava-apache-http` module API ([https://github.com/ReactiveX/RxApacheHttp](https://github.com/ReactiveX/RxApacheHttp)).
+    We output what we are doing.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The `disposeAction` function receives the `CloseableHttpAsyncClient` object
+    that was used for the creation of the `Observable` instance and *closes* it. Again,
+    we print a message to the standard output that we are about to do that.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: With the help of the `using()` factory method, we return our HTTP *request*
+    `Observable` instance. This won't trigger any of the three lambdas yet. *Subscribing*
+    to the returned `Observable` instance will call the `resourceFactory` function,
+    and then the `observableFactory` function.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'This is how we implemented an `Observable` instance capable of managing its
+    own resources. Let''s see how it is used:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: We use the new `request()` method to list the repositories of the *ReactiveX*
+    *orgranisation*. We just pass the URL to it and we get an `Observable` response.
+    Until we subscribe to it, no resources will be allocated and no requests will
+    be executed, so we print that you are not yet subscribed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `stringResponse` observable contains logic and converts the raw `ObservableHttpResponse`
+    object to `String`. Still, no resources are allocated and no request is sent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We use the `BlockingObservable` class' `first()` method to subscribe to the
+    `Observable` instance and wait for its result. We retrieve the response as `String`
+    and output it. Now, a resource is allocated and a request is made. After the data
+    is fetched, the `subscriber` encapsulated by the `BlockingObservable` instance
+    is automatically unsubscribed, so the resource used (the HTTP client) is disposed
+    of. We make a second subscription in order to see what happens next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at the output of this program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: So, when we subscribe to the website, the HTTP client and the `Observable` instances
+    are created, using our factory lambdas. The creation is executed on the current
+    main thread. The request is made and printed (cropped here). The client is disposed
+    of on an IO thread and the request is executed when the `Observable` instance
+    completes the execution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When subscribing for the second time, we go through the same process from the
+    beginning; we allocate the resource, create `Observable` instance and dispose
+    of the resource. This is because the `using()` method works that way—it allocates
+    one resource per subscription. We can use different techniques to reuse the same
+    result on the next subscription instead of making a new request and allocating
+    resource for it. For example, we can reuse the `CompositeSubscription` method
+    for multiple subscribers or a `Subject` instance. However, there is one easier
+    way to reuse the fetched response of the next subscription.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Caching data with Observable.cache
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We can use caching to cache the response in the memory and then, on the next
+    subscription, instead of requesting the remote server again, to use the cached
+    data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s change the code to look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `cache()` operator called at the end of the `stringResponse` chain will
+    cache the response represented by a `string` for all the following `subscribers`.
+    So, the output this time will be:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, we can reuse our `stringResponse` `Observable` instance through our programs
+    without making additional resource allocation and request.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The demo source code can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At last, the `requestJson()` method can be implemented like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Simpler and with resource auto management (the resource, a http client is created
+    and destroyed automatically ), the method implements its own caching functionality
+    too (we implemented it back in [Chapter 5](ch05.html "Chapter 5. Combinators,
+    Conditionals, and Error Handling"), *Combinators, Conditionals, and Error Handling*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: All the methods, which create `Observable` instances, developed through the
+    book can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java
+    class](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java
+    class) contained in the source code. There is also a cache-in-files implementation
+    for the `requestJson()` method that you can find there.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this, we are able to extend RxJava, creating our own factory methods to
+    make `Observable` instances dependent on arbitrary data sources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next section of the chapter will show how to put our own logic into the
+    `Observable` chain of operators.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating custom operators with lift
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: After learning about and using so many various operators, we are ready to write
+    our own operators. The `Observable` class has an operator called `lift`. It receives
+    an instance of the `Operator` interface. This interface is just an empty one that
+    extends the `Func1<Subscriber<? super R>, Subscriber<? super T>>` interface. This
+    means that we can pass even lambdas as operators.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The best way of learning how to use the `lift` operator is to write an example
+    of it. Let''s create an operator that adds a sequential index to every item emitted
+    (of course, this is doable without a dedicated operator). This way, we will be
+    able to produce indexed items. For this purpose, we need a class that stores an
+    item and its index. Let''s create a more general class called `Pair`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The instances of this class are very simple *immutable* objects that contain
+    two arbitrary objects. In our case, the *left* field will be the index of type
+    `Long` and the *right* field will be the emitted item. The `Pair` class, as with
+    any *immutable* class, contains implementations of the `hashCode()` and `equals()`
+    methods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here is the code for the operator:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `call()` method of the `Operator` interface has one parameter, a `Subscriber`
+    instance. This instance will subscribe to the observable that will be returned
+    by the `lift()` operator. The method returns a new `Subscriber` instance, which
+    will subscribe to the observable upon which the `lift()` operator was called.
+    We can change the data of all the notifications in it and that is how we will
+    be writing our own operator's logic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `Indexed` class has a state—`index`. By default, its initial value is `0`,
+    but there is a *constructor* that can create an `Indexed` instance with arbitrary
+    initial value. Our operator delegates the `OnError` and `OnCompleted` notifications
+    to the subscribers unchanged. The interesting method is `onNext()`. It modifies
+    the incoming item by creating a `Pair` instance of it and the current value of
+    `index` field. After that, the `index` is incremented. That way, the next item
+    will use the incremented `index` and increment it again.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'And now, we have our first operator. Let''s write an unit test to showcase
+    its behavior:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: The test emits the letters from `'a'` to `'e'` and uses the `lift()` operator
+    to insert our `Indexed` operator implementation into the observable chain. We
+    expect a list of five `Pair` instances of sequential numbers starting from zero—the
+    *indexes* and the letters. We use the `toList().toBlocking().single()` technique
+    to retrieve the actual list of emitted items and to assert that they are equal
+    to the expected emissions. Because `Pair` instances have the `hashCode()` and
+    `equals()` methods defined, we can compare `Pair` instances, so the test passes.
+    If we *subscribe* for the second time, the `Indexed` operator should provide indexing
+    from the initial index, `0`. Using a `TestSubscriber` instance, we do that and
+    assert that the letters are indexed, starting with `0`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The code for the `Indexed` operator can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java)
+    and the unit test testing its behavior at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using the `lift()` operator and different `Operator` implementations, we can
+    write our own operators, which operate on every single item of the emitted sequence.
+    But in most cases, we will be able to implement our logic without creating new
+    operators. For example, the indexed behavior can be implemented in many different
+    ways, one of which is by *zipping* with `Observable.range` method, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Implementing a new operator has many traps, such as chaining the subscriptions,
+    supporting *backpressure*, and reusing variables. If possible, we should try to
+    compose the existing operators, which are written by experienced RxJava contributors.
+    So, in some cases, an operator that transforms the `Observable` itself is a better
+    idea, for example, applying multiple operators on it as one. For this, we can
+    use the *composing* operator, `compose()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Composing multiple operators with the Observable.compose operator
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The `compose()` operator has one parameter of type `Transformer`. The `Transformer`
+    interface, like the `Operator` one, is an *empty* interface that extends `Func1`
+    (this approach hides the type complexities that are involved by using `Func1`).
+    The difference is that it extends the `Func1<Observable<T>, Observable<R>>` method,
+    so that it transforms an `Observable` and not a `Subscriber`. This means that,
+    instead of operating on each individual item emitted by the *source* observable,
+    it operates directly on the source.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can illustrate the use of this operator and the `Transformer` interface
+    through an example. First, we will create a `Transformer` implementation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: The idea of this implementation is to filter the emissions of an observable,
+    depending on the order in which they are incoming. It operates on the whole sequence,
+    using our `Indexed` operator to add an index to every item. After that, it filters
+    the `Pair` instances that have odd indexes and retrieves the original items from
+    the filtered `Pair` instances. That way, only the members of the emitted sequence
+    that are placed at odd positions reach the subscribers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Again let''s write a *unit test*, ensuring that the new `OddFilter` transformer
+    behaves in the right way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, an instance of our `OddFilter` class is passed to the `compose()`
+    operator, and that way, it is applied to the observable that was created by the
+    `range()` factory method. The observable emits seven strings. If the `OddFilter`
+    implementation works right, it should filter out the strings emitted at odd positions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The source code of the `OddFilter` class can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java).
+    The unit test testing it can be viewed/downloaded at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'More about implementing custom operators can be found here: [https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators](https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators).
+    If you use RxJava in dynamic languages such Groovy, you''ll be able to extend
+    the `Observable` class with new methods, or you can use RxJava with Xtend, a flexible
+    dialect of Java. Refer to [http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html](http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Creating our own operators and resource-dependent `Observable` instances gives
+    us unlimited possibilities when it comes to creating logic around the `Observable`
+    class. We are able to turn each data source into an `Observable` instance and
+    transform the incoming data in many different ways.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'I wanted this book to cover the most interesting and important parts of RxJava.
+    If I have missed something important, the documentation at [https://github.com/ReactiveX/RxJava/wiki](https://github.com/ReactiveX/RxJava/wiki)
+    is one of the best on the web.. Refer especially to this section for further reading:
+    [https://github.com/ReactiveX/RxJava/wiki/Additional-Reading](https://github.com/ReactiveX/RxJava/wiki/Additional-Reading).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: I have tried to structure the code and the ideas and to provide them in small
+    iterations over the chapters. The first and second chapters are more ideological;
+    they introduce the reader to the basic ideas of the functional programming and
+    the reactive programming and the second chapter tries to establish the the origins
+    of the `Observable` class. The third chapter provides the reader with the means
+    to create a variety of different `Observable` instances. The fourth and fifth
+    chapters teach us how to write logic around those `Observable` instances and the
+    sixth adds multi-threading to this logic. The seventh chapter comes with *unit
+    testing* the logic that the reader has learned to write and the eight tries to
+    extend the capabilities of this logic even further.
+  prefs: []
+  type: TYPE_NORMAL
+- en: I hope you, the reader, found this book useful. Don't forget, RxJava is just
+    a tool. The important things are your knowledge and your thinking.
+  prefs: []
+  type: TYPE_NORMAL

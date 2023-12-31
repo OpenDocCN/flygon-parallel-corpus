@@ -1,0 +1,1149 @@
+- en: '*Chapter 15*: Rendering Instanced Crowds'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This final chapter explores how to render large crowds using instancing. Crowd
+    rendering is an interesting topic because it moves pose generation (sampling)
+    and blending onto the GPU, making the entire animation pipeline run in a vertex
+    shader.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To move pose generation to the vertex shader, animation information needs to
+    be encoded in a texture. The focus of this chapter will be encoding animation
+    data into textures and using that texture to create an animated pose.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Without instancing, drawing a large crowd would mean making lots of draw calls,
+    which would hurt the frame rate. Using instancing, one mesh can be drawn many
+    times. If there is only one draw call, the animated poses for each character in
+    the crowd will need to be generated differently.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, you will explore moving animation sampling into the vertex
+    shader in order to draw large crowds. The following topics will be covered in
+    this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Storing arbitrary data in textures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Retrieving arbitrary data from textures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Baking animations into a texture
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sampling animation textures in a vertex shader
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Optimizing the crowd system
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Storing data in textures
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Sampling animations is not a trivial task. There are a lot of loops and functions,
+    which makes animation sampling on the GPU a difficult problem. One way to address
+    this problem is to simplify it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead of sampling an animation in real-time, it could be sampled at set time
+    intervals. The process of sampling an animation at set intervals and writing the
+    resulting data to a file is called baking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the animation data is baked, the shader no longer has to sample an actual
+    animation clip. Instead, it can look up the nearest sampled pose based on time.
+    So, where does this animation data get baked to? Animation can be baked into textures.
+    Textures can be used as data buffers, and there is already an easy way to read
+    texture data in shaders.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Normally, the storage type and information in a texture is abstracted away by
+    the sampling function in the shader. For example, the `texture2D` function in
+    GLSL takes normalized `uv` coordinates as an argument and returns a four-component
+    vector with values ranging from `0` to `1`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But none of that information is what's in the texture. When a texture is created
+    with `glTexImage2D`, it takes an internal texture format (`GL_RGBA`), a source
+    format (usually `GL_RGBA` again), and a data type (usually `GL_UNSIGNED_BYTE`).
+    These parameters are used to convert whatever the underlying data type is into
+    the normalized values that `texture2D` returns.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are two problems with this when it comes to storing arbitrary data in
+    textures. The first is the granularity of the data. In the case of `GL_RGBA`,
+    each sampled floating-point component only has 256 unique values. Second, what
+    if a value needs to be stored that is not normalized to the `0` to `1` range?
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is where floating-point textures come in. You can create a four-component
+    floating-point texture that has a `GL_RGBA32F` format. This texture will be much
+    larger than other textures because each pixel will store four full 32-bit floating-point
+    numbers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A floating-point texture can store arbitrary data. In the following section,
+    you will learn how to retrieve the arbitrary data from a floating-point texture.
+    After that, you will explore how a shader can read data from a floating-point
+    texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading data from textures
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This section explores how animation data stored in textures can be retrieved
+    in a shader. In this section, you will learn how to sample the texture and what
+    sampler states should be used when sampling the texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the data is in the right format, sampling it becomes the next challenge.
+    The `glTexImage2D` function expects normalized `uv` coordinates and returns a
+    normalized value. On the other hand, the `texelFetch` function can be used to
+    sample a texture using pixel coordinates and return the raw data at those coordinates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `texelFetch` glsl takes three arguments: a sampler, an `ivec2`, and an
+    integer. `ivec2` is the *x* and *y* coordinates of the pixel being sampled, in
+    pixel space. The last integer is the mip level to use, which, for this chapter,
+    will always be `0`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A mipmap is a chain of progressively lower resolution versions of the same image.
+    When a mip level is scaled down, data is lost. This data loss alters the contents
+    of the animation. Avoid generating mips for animation textures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Because the data needs to be read in exactly the same way it was written out,
+    any interpolation would ruin the animation data as well. Make sure that animation
+    textures are sampled using nearest neighbor sampling.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using `texelFetch` instead of `glTexImage2D` to sample a texture should return
+    the correct data. Textures can be sampled in either the vertex or the fragment
+    shader. In the next section, you will explore what animation data should be stored
+    in these floating-point textures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encoding animation data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that you know how to read and write data to a texture, the next question
+    is, what data needs to be written in the texture? You will be encoding animation
+    data into textures. Each animation clip will be sampled at set intervals. The
+    resulting poses from all those samples will be stored in a texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To encode this data, the *x* axis of the texture will represent time. The *y*
+    axis of the texture will represent a bone in the skeleton being animated. Each
+    bone will take up three rows: one for the position, one for the rotation, and
+    one for the scale.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The animation clip will be sampled at set intervals to make sure that there
+    are as many samples as the texture is wide. For example, for a *256x256* animation
+    texture, the animation clip will need to be sampled 256 times.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When sampling the animation clip to encode it into a texture, for each sample,
+    you will find the world space transform of each bone and write it into the texture.
+    The *y* coordinate is going to be `joint_index * 3 + component`, where the valid
+    components are `position = 0`, `rotation = 1`, and `scale = 3`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once these values have been written to the texture, upload the texture to the
+    GPU and use it. In the next section, you will explore how a shader evaluates this
+    animation texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploring per-instance data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When rendering a large crowd, each actor in the crowd has certain properties.
+    In this section, you will explore what that per-instance data is and how to pass
+    it to the shader. This will greatly reduce the amount of data that is uploaded
+    to the GPU as uniform arrays every frame.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Moving the skinning pipeline to a vertex shader does not completely remove needing
+    to pass crowd-related uniform to the shader. Every actor in a crowd will need
+    some data uploaded to the GPU. The per-instance data is much smaller than what
+    would be uploaded if pose palette matrices were being used.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each actor in the crowd will need a position, rotation, and scale to build a
+    model matrix. Actors will need to know the current frame to sample and the time
+    between the current and next frames to blend.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The total size of each actor's instance data is 11 floats and 2 integers. That's
+    only 52 bytes per instance. Per-instance data will always be passed using uniform
+    arrays. The size of each array is the number of actors the crowd contains. Each
+    element of the array represents a unique actor.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The shader will be responsible for building the appropriate matrices out of
+    the per-instance data and the animation texture. Blending between the current
+    and next frame is optional; the blend will not be 100% correct, but it should
+    still look good.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, you will implement an `AnimationTexture` class, which will
+    let you work with animated textures in code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating an animation texture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this section, you will implement all the code needed to work with floating-point
+    textures in a `AnimTexture` class. Each `AnimTexture` object will contain a 32-bit
+    floating point RGBA texture. There will be two copies of this data: one on the
+    CPU and one uploaded to the GPU.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CPU buffer is kept around to easily modify the contents of the texture in
+    bulk before saving it to disk, or uploading it to OpenGL. It keeps the API simple
+    at the cost of some additional memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is no standard 32-bit texture format, so saving and writing to disk will
+    simply dump the binary contents of the `AnimTexture` class to disk. In the next
+    section, you will begin to implement the `AnimTexture` class. This class will
+    provide an easy-to-use interface for implementing 32-bit floating-point textures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Declaring the AnimTexture class
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Animation textures are assumed to always be square; the width and height don't
+    need to be tracked separately. It should be enough to use a single size variable.
+    The `AnimTexture` class will always have two copies of the texture in memory at
+    a time, one on the CPU and one on the GPU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `AnimTexture.h` and declare the `AnimTexture` class
+    in this file. Follow these steps to declare the `AnimTexture` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Declare the `AnimTexture` class. It has three member variables: a floating-point
+    array, an integer for the size of the texture, and a handle to the OpenGL texture
+    object:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare `AnimTexture` with a default constructor, copy constructor, assignment
+    operator, and destructor:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare functions in order to save `AnimTexture` to disk and to load it up
+    again:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare a function to upload the data from the `mData` variable to an OpenGL
+    texture:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare getters and setter functions for the CPU side data that `AnimTexture`
+    contains:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare `GetTexel`, which takes the *x* and *y* coordinates and returns a `vec4`,
+    as well as a `SetTexel` function to set `vec3` or `quat` objects. These functions
+    will write to the texture''s data:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare functions to bind and unbind the texture for rendering. This will be
+    done the same way as the `Set` and `Unset` functions of the `Texture` class:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `AnimTexture` class is a convenient way to work with floating-point textures.
+    The `get` and `SetTexel` methods can read and write to the texture using an intuitive
+    API. In the next section, you will begin to implement the `AnimTexture` class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the AnimTexture class
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In this section, you will implement the `AnimTexture` class, which contains
+    OpenGL code for working with floating-point textures and provides an easy-to-use
+    API. If you want to use a graphics API other than OpenGL, this class will need
+    to be rewritten using that API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When an `AnimTexture` is saved to disk, the entire `mData` array is written
+    to the file as a large binary blob. This large texture data takes up quite a bit
+    of memory; for example, a *512x512* texture takes up about 4 MB. Texture compression
+    is not a good fit, since the animation data needs to be precise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `SetTexel` functions are the main way we will be writing data to the animation
+    texture. These functions take *x* and *y* coordinates, as well as a `vec3` or
+    quaternion value. The function needs to figure out the right index into the `mData`
+    array based on the given *x* and *y* coordinates, then set the pixel values accordingly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `AnimTexture.cpp`. Implement the `AnimTexture` class
+    in this new file. Now, follow these steps to implement the `AnimTexture` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Implement the default constructor. It should set data and size to zero and
+    generate a new OpenGL shader handle:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the copy constructor. It should do the same thing that the default
+    constructor does and use the assignment operator to copy the actual texture data:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the assignment operator. It only needs to copy the CPU side data;
+    the OpenGL handle can be left alone:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the destructor of the `AnimTexture` class. It should delete the internal
+    floating-point array and free the OpenGL handle that the class is holding onto:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `Save` function. It should write the size of `AnimTexture` to
+    the file and write the contents of `mData` as a large binary blob:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `Load` function to load serialized animation data back into memory:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `UploadDataToGPU` function. Its implementation is very similar
+    to `Texture::Load` but uses `GL_RGBA32F` instead of `GL_FLOAT`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the size, OpenGL handle, and floating-point data getter functions:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `resize` function, which should set the size of the `mData` array.
+    The argument this function takes is the width or height of the animation texture:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `Set` function. It works similar to `Texture::Set`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `UnSet` function. It works similar to `Texture::UnSet`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `SetTexel` function, which takes a vector, `3`, as an argument.
+    This function should set the unused A component of the pixel to `0`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `SetTexel` function, which takes a quaternion as an argument:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `GetTexel` function. This function will always return a `vec4`,
+    which contains every component of the pixel:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this section, you learned how to create a 32-bit floating-point texture and
+    manage the data inside it. The `AnimTexture` class should let you work with floating-point
+    textures using an intuitive API, without you having to worry about any OpenGL
+    functions. In the next section, you will create a function that will sample an
+    animation clip and write the resulting animation data to a texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Animation baker
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section, you will learn how to take an animation clip and encode it
+    into an animation texture. This process is called baking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Texture baking is implemented using a helper function that bakes the animation
+    into a texture. This `Bake` function will sample the animation at set intervals
+    and write the skeleton hierarchy for each sample into a floating-point texture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For arguments, the `Bake` function needs a skeleton, an animation clip, and
+    a reference to an `AnimTexture` to write to. The skeleton is important as it provides
+    the rest pose, which will be used for any joint that isn''t present in the animation
+    clip. Every joint of the skeleton will get baked into the texture. Let''s get
+    started:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `AnimBaker.h` and add the declaration of the `BakeAnimationToTexture`
+    function to it:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Create a new file called `AnimBaker.cpp`. Begin implementing the `BakeAnimationToTexture`
+    function in this file:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To bake an animation into a texture, first, create a pose that the animation
+    will be sampled into. Then, loop across the *x* dimension of the texture, which
+    is time:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For each iteration, find the normalized value of the iterator (`iterator index
+    / (size - 1)`). Multiply the normalized time by the duration of the clip, then
+    add the start time of the clip. Sample the clip at this time for the current pixel:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Once the clip has been sampled, loop through all the joints in the bind pose.
+    Find the global transform of the current joint and write the data into the texture
+    using `SetTexel`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Before the `Bake` function returns, call the `UploadTextureDataToGPU` function
+    on the provided animation texture. This will make the texture usable immediately
+    after it has been baked:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: At a high level, the animation texture is used as a timeline where the *x* axis
+    is time and the *y* axis is the transform of an animated joint at that time. In
+    the next section, you will create the crowd shader. The crowd shader uses the
+    date baked into a texture by `BakeAnimationToTexture` to sample an animation's
+    current pose.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a crowd shader
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To render a crowd, you will need to create a new shader. The crowd shader will
+    have projection and view uniforms, but no model uniform. This is because all actors
+    are drawn with the same projection and view matrices but require a unique model
+    matrix. Instead of model matrices, the shader will have three uniform arrays:
+    one for position, one for rotation, and one for scale.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The value that will be placed into these arrays will be an instance index –
+    the index of the current mesh being rendered. Each vertex gets a copy of its mesh
+    instance through a built-in `glsl` variable, `gl_InstanceID`. Each vertex will
+    construct a model matrix using the position, rotation, and scale uniform arrays.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The inverse bind pose is like a matrix uniform array with regular skinning,
+    but the animated pose is not. To find the animated pose, the shader will have
+    to sample the animation texture. Since each vertex is skinned to four vertices,
+    the animated pose has to be found four times for every vertex.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `crowd.vert`. The crowd shader will be implemented
+    in this file. Follow these steps to implement the crowd shader:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Begin implementing the shader by defining two constants: one for the maximum
+    number of bones and one for the maximum number of supported instances:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare the uniforms that are shared by all actors in the crowd. This includes
+    the view and projection matrices, inverse bind pose palette, and animation texture:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare the uniforms that are unique to each actor in the crowd. This includes
+    the transformation of the actor, the current and next frame, and the blend time:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare the vertex structure. Per-vertex data is the same as for any skinned
+    mesh:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare the output values for the crowd shader:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement a function that multiplies a vector and a quaternion. This function
+    will have the same implementation as the `transformVector` function you built
+    in [*Chapter 4*](B16191_04_Final_JC_ePub.xhtml#_idTextAnchor069)*, Implementing
+    Quaternions*, except it''s running in a shader:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `GetModel` function. Given an instance index, this function should
+    sample the animation texture and return a *4x4* transformation matrix:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `GetPose` function with a joint and an instance where this function
+    should return the animated world matrix of the joint. Begin the implementation
+    by finding the x and y positions to sample the animation texture with:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Sample the current frame''s position, rotation, and scale from the animation
+    texture:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Sample the next frame''s position, rotation, and scale from the animation texture:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Interpolate between the transforms of both frames:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Use the interpolated position, rotation, and scale to return a 4x4 matrix:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Begin implementing the main function of the shader by finding all four of the
+    animated pose matrices, as well as the model matrix for the current actor in the
+    crowd. Use `gl_InstanceID` to get the ID of the currently drawn actor:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Continue implementing the main function by finding the `skin` matrix for the
+    vertex:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finish implementing the main function by putting the position and normal through
+    the skinned vertex''s transformation pipeline:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this section, you implemented the crowd shader. This vertex shader uses an
+    animation texture to construct the animated pose of each vertex being rendered.
+    It moves the pose generation part of the skinning pipeline to the GPU. The shader
+    is meant to render instanced meshes; it uses `gl_InstanceID` to determine which
+    instance is currently being rendered.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This shader is a good place to start, but there is always room for improvement.
+    The shader is currently using a lot of uniform indices. Some lower-end machines
+    might not provide enough uniforms. Several optimization strategies will be covered
+    near the end of this chapter. In the next section, you will implement a `Crowd`
+    class to help manage all the data that the Crowd shader needs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the Crowd utility class
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this section, you will be building the `Crowd` class. This is a utility class
+    that will render large crowds with an easy-to-use API. The `Crowd` class encapsulates
+    the state of a crowd.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `Crowd` class must maintain the instance data of each actor in the class.
+    To accommodate this, you will need to declare a maximum number of actors. Then,
+    all the actor-specific information can be stored in arrays of structures where
+    the index is the actor ID.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Actor-specific data includes the actor's world transform, as well as data related
+    to its animation playback. The animation data is what frames are being interpolated,
+    the interpolation value, and the key times for the current and next frames.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `Crowd.h`. The `Crowd` class will be declared in this
+    file. Follow these steps to declare the `Crowd` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Define the maximum number of crowd actors as `80`:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Start declaring the `Crowd` class by creating vectors for all instance data.
+    This includes data for each actor''s transformation, animation frame, and time,
+    as well as frame interpolation information:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare the `AdjustTime`, `UpdatePlaybackTimes`, `UpdateFrameIndices`, and
+    `UpdateInterpolationTimes` functions. The `AdjustTime` function is similar to
+    `Clip::AdjustTimeToFitRange`; it makes sure that a given time is valid:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Declare getter and setter functions for the size of the crowd and for the `Transform`
+    property of each actor:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, declare the `Update` and `SetUniforms` functions. These are the functions
+    that will advance the current animation and update the per-instance shader uniforms:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `Crowd` class provides an intuitive interface for managing the per-instance
+    information of every actor in a crowd. In the next section, you will begin to
+    implement the `Crowd` class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the Crowd class
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The `Crowd` class provides a convenient way for you to manage all the actors
+    in a crowd. Most of the complexity of this class is in calculating the correct
+    playback information. This work is done in the `Update` function. The `Update`
+    function uses three helper functions, that is, `UpdatePlaybackTimes`, `UpdateFrameIndices`,
+    and `UpdateInterpolateionTimes`, to work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The current animation playback time for each actor in the crowd will be stored
+    in the `mCurrentPlayTimes` vector. The `mNextPlayTimes` vector is the estimated
+    next time in the animation, which allows the two sampled frames to interpolate.
+    The `UpdatePlaybackTimes` function will be updating both these vectors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It's important to guess the playback time of the next frame because the sample
+    rate of the animation texture is unknown. If an animation is encoded at 240 FPS
+    and is played back at 60 FPS, for example, then the next frame is going to be
+    four samples away.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `mFrames` vector contains two component integer vectors. The first component
+    is the `u` texture coordinate of the current animation frame. The second component
+    is the `v` texture coordinate of the animation frame that would be shown in the
+    next frame. The `v` texture coordinate is the joint index.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `UpdateFrameIndex` function is responsible for updating this vector. To
+    find the *x* coordinate of the current frame, normalize the frame time and then
+    multiply the normalized frame time by the size of the texture. You can normalize
+    a frame's time by subtracting the start time from the frame time and dividing
+    the result by the duration of the clip.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The shader will need to interpolate between the current animated pose and the
+    next animated pose. To do this, it needs to know the current normalized time between
+    the frames of the two poses. This is stored in the `mTimes` variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `mTimes` variable is updated by the `UpdateInterpolationTimes` function.
+    This function finds the duration of the current frame, then normalizes the playback
+    time relative to the current frame to that duration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To update the `Crowd` class, you have to call the `UpdatePlaybackTimes`, `UpdateFrameIndices`,
+    and `UpdateInterpolateionTimes` functions, in that order. After this is done,
+    the `Crowd` class can set its uniform values with the `SetUniforms` function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Create a new file called `Crowd.cpp`. The `Crowd` class will be implemented
+    in this file. Follow these steps to implement the `Crowd` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Implement the size getter and setter functions. The setter function needs to
+    set the `size` of all the vectors contained in the `Crowd` class:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the getter and setter functions for actor transformation. Position,
+    rotation, and scale are kept in separate vectors; the actor getter and setter
+    functions hide that implementation in favor of using `Transform` objects:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `AdjustTime` function; it''s similar to the `Clip::AdjustTimeToFitRange`
+    function:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `UpdatePlaybackTimes` helper function. This function will advance
+    the play time for all actors by delta time:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `UpdateFrameIndices` function. This function will convert the
+    current play time into pixel coordinates along the animation texture''s *x* axis:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `UpdateInterpolationTimes` function. This function should find
+    the interpolation time between the current and next animated frames:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `Update` method. This method relies on the `UpdatePlaybackTimes`,
+    `UpdateFrameIndices`, and `UpdateInterpolationTimes` helper functions:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Implement the `SetUniforms` function, which passes the vectors contained in
+    the `Crowd` class to the crowd shader as uniform arrays:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Using the `Crowd` class should be intuitive: create a crowd, set the playback
+    times and model transforms of its actors, and draw the crowd. In the next section,
+    you will explore an example of how the `Crowd` class can be used to draw a large
+    crowd.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using the Crowd class
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Using the `Crowd` class should be intuitive, but the rendering code might not
+    be immediately obvious. The non-instance uniforms of the crowd shader, such as
+    the view or projection matrices, still need to be set manually. The only uniforms
+    that the `Set` function of the `Crowd` class sets are the per-actor uniforms.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Instead of rendering with the `Draw` method of the `Mesh` class, render using
+    the `DrawInstanced` method. For the number of instances argument, pass the size
+    of the crowd. The following code snippet shows a minimal example of how a crowd
+    can be drawn:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: For the most part, the code looks similar to a regular skinned mesh. That is
+    because the instance-specific uniforms are set by the `SetUniforms` function of
+    the `Crowd` class. Every other uniform is set the same way as before. In the next
+    section, you will explore how two animations can be blended in the vertex shader.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this section, you created a `Crowd` class, which provides an easy-to-use
+    interface so that you can set the uniforms required by the `Crowd` shader. A demonstration
+    of how the `Crowd` class can be used to render a large crowd was also covered.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Blending animations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: It is possible to blend between two animations in a vertex shader. There are
+    two reasons why you may would want to avoid blending between animations in a vertex
+    shader. First, doing so will double the amount of texel fetches, which will make
+    the shader more expensive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This explosion of texel fetches happens because you would have to retrieve
+    two copies of the pose matrices – one for each animation – and then blend between
+    them. The shader code for doing so might look like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: The other reason is that the blend isn't technically correct. The shader is
+    doing linear blending in world space. The resulting blended skeleton will look
+    good but won't be the same as if the joints were interpolated in local space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you're cross-fading between two poses, the blend is short and is only meant
+    to hide the transition. In most cases, whether or not the transition is technically
+    correct won't matter as much as the transition looking smooth. In the next section,
+    you will explore using alternate texture formats.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exploring texture formats
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Animation textures are currently stored in the 32-bit floating-point texture
+    format. This is an easy format to store animation textures in because it's the
+    same format as the source data. This method won't work well on mobile hardware.
+    The memory bandwidth from main memory to tiler memory is a scarce resource.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To target mobile platforms, consider changing from `GL_RGBA32F` to `GL_RGBA`
+    with a `GL_UNSIGNED_BYTE` storage type. Switching to a standard texture format
+    does mean losing some data. With a `GL_UNSIGNED_BYTE` storage type, each component
+    of a color is limited to 256 unique values. These values are normalized when sampling
+    and will be returned in a 0 to 1 range.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If any of the animation information stores values are not in the 0 to 1 range,
+    the data will need to be normalized. The normalization scale factor will need
+    to be passed to the shader as a uniform. If you are targeting mobile hardware,
+    you probably only want to store rotation information anyway, which is already
+    in the 0 to 1 range.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, you will explore how multiple animation textures can be
+    combined into a single texture. This reduces the number of textures that need
+    to be bound for a crowd to play multiple animations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Combining animation textures
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The act of combining many smaller textures into one larger texture is called
+    atlasing. A large texture that contains multiple smaller textures is often called
+    a texture atlas. The benefit of atlasing textures is needing to use fewer texture
+    samplers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The crowd rendering system presented in this chapter has one major drawback:
+    while the crowd can play animations at different time offsets, they can only play
+    the same animation. There is an easy way to work around this: atlas multiple animation
+    textures onto one large texture.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A *1024x1024* texture, for example, can contain 16 smaller *256x256* textures.
+    This means any member of the crowd could play 1 of 16 animations. An additional
+    "offset" uniform has to be added to the per-instance data of the shader. This
+    offset uniform would be an array of `MAX_INSTANCES` size.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For each character being rendered, the `GetPose` function would have to apply
+    the offset before retrieving the animation texels. In the next section, you will
+    explore different techniques that you can use to optimize the crowd shader by
+    minimizing texel fetches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimizing texel fetches
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Even on a gaming PC, rendering over 200 crowd characters will take more than
+    4 milliseconds, which is a pretty long time, assuming you have a 16.6 ms frame
+    time. So, why is crowd rendering so expensive?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Every time the `GetPose` helper function is called, the shader performs 6 texel
+    fetches. Since each vertex is skinned to four influences, that's 24 texel fetches
+    per vertex! Even with a low poly model, that is a lot of texel fetches. Optimizing
+    this shader will boil down to minimizing the number of texel fetches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The following sections present different strategies you can use to minimize
+    the number of texel fetches per vertex.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Limiting influences
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A naive way to optimize texel fetches would be to add a branch to the shader
+    code. After all, if the weight of the matrix is 0, why bother getting the pose?
+    This optimization could be implemented as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the best-case scenario, this might save a little bit of time. In the worst-case
+    scenario (where every bone has exactly four influences), this will actually add
+    an extra cost to the shader since now, every influence comes with a conditional
+    branch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A better way to limit texel fetches would be to limit bone influences. 3DCC
+    tools such as Blender, 3DS Max, or Maya have export options to limit the maximum
+    number of bone influences per vertex. You should limit the maximum number of bone
+    influences to 1 or 2.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generally, in a large crowd, it's hard to make out the fine details on individual
+    actors. Because of this, lowering the bone influences to 1, effectively rigid
+    skinning the crowd, is often doable. In the next section, you will explore how
+    limiting the number of animated components can help reduce the number of texel
+    fetches per vertex.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Limiting animated components
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Consider an animated human character. Human joints only rotate; they never translate
+    or scale. If you know that an animation is only animating one or two components
+    per joint, the `GetPose` function can be edited to sample less data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is an added benefit here: the number of bones that can be encoded into
+    an animation texture increases. If you''re encoding the position, rotation, and
+    scale, the maximum number of joints is `texture size / 3`. If you are encoding
+    just one component, the number of joints that can be encoded is the size of the
+    texture.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This optimization will make a *256x256* texture able to encode 256 rotations
+    instead of 85 transforms. In the next section, you will explore whether interpolation
+    between frames is needed or not.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Not interpolating
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Consider the animation texture. It samples the animation in set increments to
+    fill out every column of the texture. At 256 samples, you can encode 3.6 seconds
+    of animation at 60 FPS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Whether or not interpolation is needed will depend on the size of the animation
+    texture and the length of the animation being encoded. For most in-game character
+    animations such as run, walk, attach, or die, interpolation doesn't need frame
+    interpolation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With this optimization, the amount of data that's sent to the GPU is greatly
+    reduced. The frames uniform can change from an `ivec2` to an `int`, cutting the
+    size of the data in half. This means that the time uniform can go away completely.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, you will explore what the combined effect of the three
+    optimizations that you just learned about is.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Combining these optimizations
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let''s explore the impact that these optimizations can have, assuming all three
+    of the following optimizations are implemented:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Limit the number of bone influences to 2.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Only animate the rotation component of the transform.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Do not interpolate between frames.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: This will have reduced the number of texel fetches from 24 per vertex to just
+    2 per vertex. The number of joints that can be encoded into an animation texture
+    will increase, and the amount of data that is transferred to the GPU each frame
+    will be reduced considerably.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned how to encode animation data to textures, as well
+    as how to interpret the data in a vertex shader. Several strategies for improving
+    performance by changing how the animation data is encoded were also covered. This
+    technique of writing data into a texture can be used to bake any kind of sampled
+    data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To bake an animation, you need to clip out into a texture. This clip was sampled
+    at set intervals. The global position of every bone was recorded at each interval
+    and written to a texture. In this animation texture, every joint takes up three
+    rows: one for position, one for rotation, and one for scale.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You rendered the crowd mesh using instancing and created a shader that can read
+    per-instance data from uniform arrays. Per instance-data for actors of the crowd,
+    such as position, rotation, and scale, were passed to the shader as uniform arrays
+    and interpreted using the instance ID as an index into those arrays.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, you created the `Crowd` class. This utility class provides an easy-to-use
+    interface for managing actors in a crowd. This class will automatically populate
+    the per-instance uniform of the crowd shader. Using this class, you can easily
+    create large, interesting crowds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are two samples for this chapter in the downloadable content of this book.
+    `Sample00` is all the code we wrote in this chapter. `Sample01`, on the other
+    hand, demonstrates how to use this code to render large crowds in practice.
+  prefs: []
+  type: TYPE_NORMAL

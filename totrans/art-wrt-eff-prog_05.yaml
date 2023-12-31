@@ -1,0 +1,1709 @@
+- en: '*Chapter 4*: Memory Architecture and Performance'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: After the CPU, the memory is often the hardware component that is limiting the
+    overall program performance. In this chapter, we begin by learning about modern
+    memory architectures, their inherent weaknesses, and the ways to counter or at
+    least hide these weaknesses. For many programs, the performance is entirely dependent
+    on whether the programmer takes advantage of the hardware features designed to
+    improve memory performance, and this chapter teaches the necessary skills.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we''re going to cover the following main topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Overview of the memory subsystem
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Performance of memory accesses
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Access patterns and impact on algorithms and data structure design
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Memory bandwidth and latency
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Again, you will need a C++ compiler and a micro-benchmarking tool, such as
+    the Google Benchmark library we used in the previous chapter (found at [https://github.com/google/benchmark](https://github.com/google/benchmark)).
+    We will also use the **LLVM Machine Code Analyzer** (**LLVM-MCA**), found at [https://llvm.org/docs/CommandGuide/llvm-mca.html](https://llvm.org/docs/CommandGuide/llvm-mca.html).
+    If you want to use the MCA, your choice of compilers is more limited: you need
+    an LLVM-based compiler such as Clang.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code for the chapter can be found here: [https://github.com/PacktPublishing/The-Art-of-Writing-Efficient-Programs/tree/master/Chapter04](https://github.com/PacktPublishing/The-Art-of-Writing-Efficient-Programs/tree/master/Chapter04)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The performance begins with the CPU but does not end there
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the previous chapter, we studied the CPU resources and the ways to use them
+    for optimal performance. In particular, we observed that CPUs have the ability
+    to do quite a lot of computation in parallel (instruction-level parallelism).
+    We demonstrated it on multiple benchmarks, which show that the CPU can do many
+    operations per cycle without any performance penalty: adding and subtracting two
+    numbers, for example, takes just as much time as only adding them.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You might have noticed, however, that these benchmarks and examples have one
+    rather unusual property. Consider the following example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: We have already used this fragment of code to demonstrate that the CPU can do
+    eight operations on the two values, `p1[i]` and `p2[i]`, at almost no extra cost
+    compared to just one operation. But we were always very careful to add more operations
+    without adding more inputs; on several occasions, we mentioned, in passing, that
+    the CPU's internal parallelism applies *as long as the values are already in the
+    registers*. In the earlier example, while adding the second, third, and so on
+    until the eighth operation, we were careful to stay with just two inputs. This
+    results in some unusual and unrealistic code. In real life, how many things do
+    you usually need to compute on a given set of inputs? Less than eight, most of
+    the time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This doesn't mean that the entire computational potential of the CPU is wasted
+    unless you happen to run exotic code like the earlier example. The instruction-level
+    parallelism is the computational foundation for pipelining, where we execute operations
+    from different iterations of the loop simultaneously. Branchless computing is
+    all about trading conditional instructions for unconditional computations and,
+    therefore, relies almost entirely on the fact that we can usually get a few more
+    computations for free.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The question remains, however: why did we limit our CPU benchmarks in this
+    manner? After all, it would have been so much easier to come up with eight different
+    things to do in the earlier example if we just added more inputs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This is the same code as we saw earlier, only now it operates on four different
+    input values per iteration instead of two. It does inherit all the awkwardness
+    of the previous example, but only because we want to change as little as possible
+    when measuring the impact of some change on performance. And the impact is significant:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Image86710.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.1
+  prefs: []
+  type: TYPE_NORMAL
+- en: The same computations done on four input values take about 36% longer. The computations
+    are delayed, somehow, when we need to access more data in memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It should be noted that there is another reason why adding more independent
+    variables, inputs, or outputs, could impact the performance: the CPU could be
+    running out of registers in which to store these variables for computations. While
+    this is a significant concern in many real programs, it is not the case here.
+    The code isn''t complex enough to use up all the registers of a modern CPU (the
+    easiest way to confirm this is by examining the machine code, unfortunately).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Clearly, accessing more data seems to reduce the speed of the code. But why?
+    At a very high level, the reason is that the memory simply cannot keep up with
+    the CPU. There are several ways to estimate the size of this *memory gap*. The
+    simplest way is evident in the specs of a modern CPU. CPUs today operate at clock
+    frequencies between 3 GHz and 4 GHz, which means that one cycle is about 0.3 nanoseconds.
+    As we have seen, under the right circumstances, the CPU can do several operations
+    per second, so executing ten operations per nanosecond is not out of the question
+    (although hard to achieve in practice and is a sure sign of a very efficient program).
+    On the other hand, the memories are much slower: the DDR4 memory clock, for example,
+    operates at 400 MHz. You can also find the values as high as 3200 MHz; however,
+    this is not the memory clock but the *data rate*, and to convert it to something
+    resembling *memory speed,* you also have to take into account the **Column Access
+    Strobe Latency**, usually known as **CAS Latency** or **CL**. Roughly, this is
+    the number of cycles it takes for the RAM to receive a request for data, process
+    it, and return the value. There is no single definition of memory speed that makes
+    sense under all circumstances (later in this chapter, we will see some of the
+    reasons why), but, to the first approximation, the memory speed of a DDR4 module
+    with the data rate of 3.2 GHz and CAS Latency 15 is about 107 MHz or 9.4 nanoseconds
+    per access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Whichever way you look at it, the CPU can do a lot more operations per second
+    than the memory can supply the input values for these operations or store the
+    results. All programs need to use memory in some way, and the details of how the
+    memory is accessed are going to have a significant impact on performance, sometimes
+    to the point of limiting it. The details, however, are extremely important: the
+    effects of the *memory gap* on performance can vary from insignificant to memory
+    becoming the bottleneck of the program. We have to understand how the memory impacts
+    the program performance under different conditions and why, so we can use this
+    knowledge to design and implement our code for the best performance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring memory access speed
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have good evidence to assume that CPUs can operate much faster on the data
+    already in registers compared to the data in memory. The specifications of the
+    processor and memory speeds alone suggest at least an order of magnitude difference.
+    However, we have learned by now not to make any guesses or assumptions about performance
+    without verifying them through direct measurements. This does not mean that any
+    prior knowledge about the system architecture and any assumptions we can make
+    based on that knowledge are not useful. Such assumptions can be used to guide
+    the experiments and devise the right measurements. We will see in this chapter
+    that the process of discovery *by accident* can take you only so far and can even
+    lead you into error. The measurements can be correct in and of themselves, but
+    it is often hard to determine what exactly is being measured and what conclusions
+    we can derive from the results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It would seem that measuring memory access speed should be fairly trivial.
+    All we need is some memory to read from and a way to time the reads, like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This benchmark runs and measures … something. You can expect to get the time
+    of one iteration reported as 0 nanoseconds. This could be the result of an unwanted
+    compiler optimization: if the compiler figures out that the whole program has
+    no observable effects, it may indeed optimize it to nothing. We did take precautions
+    against such an event, though: the memory we read is `volatile`, and accessing
+    `volatile` memory is considered an observable effect and cannot be optimized away.
+    Instead, the 0 nanoseconds result is partly a deficiency in the benchmark itself:
+    it suggests that the single read is faster than 1 nanosecond. While this is not
+    quite what we expected based on the memory speed, we can''t learn anything, including
+    our own mistakes, from a number we do not know. To fix the measurement aspect
+    of the benchmark, all we have to do is perform multiple reads in one benchmark
+    iteration, like so:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, we perform `32` reads per iteration. While we could figure
+    out the time of the individual read from the reported iteration time, it is convenient
+    to make the Google Benchmark library do the calculation for us and report the
+    number of reads per second; this is accomplished by setting the number of items
+    processed at the end of the benchmark.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This benchmark should report the iteration time around 5 nanoseconds on a mid-range
+    CPU, confirming that a single read is 1/32 of this time and well below 1 nanosecond
+    (so our guess about the reason why 0 is reported for a single read per iteration
+    is validated). On the other hand, this measured value does not match our expectations
+    for the memory being slow. It is possible that our earlier assumptions about what
+    makes the performance bottleneck are incorrect; it would not be the first time.
+    Or, we could be measuring something other than the memory speed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory architecture
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To understand how to measure memory performance correctly, we have to learn
+    more about the memory architecture of a modern processor. The most important feature
+    of the memory system, for our purposes, is that it is hierarchical. The CPU does
+    not access the main memory directly but through a hierarchy of caches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.2 – Memory hierarchy diagram'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.2_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.2 – Memory hierarchy diagram
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The **RAM** in *Figure 4.2* is the main memory, the DRAM on the motherboard.
+    When the system specifications say that the machine has so many gigabytes of memory,
+    that''s the capacity of the DRAM. As you can see, the CPU does not access the
+    main memory directly but instead through several levels of a hierarchy of caches.
+    These caches are also memory circuits, but they are located on the CPU die itself,
+    and they use different technology to store the data: they are all SRAMs of different
+    speeds. The key difference between the DRAM and the SRAM, from our point of view,
+    is that the SRAM is much faster to access, but it draws significantly more power
+    than the DRAM. The speed of the memory access increases as we move closer to the
+    CPU through the memory hierarchy: the level-1 (**L1**) cache has almost the same
+    access time as the CPU registers, but it uses so much power that we can have only
+    a few kilobytes of such memory, most commonly 32 KB per CPU core. The next level,
+    **L2** cache, is larger but slower, the third level (**L3**) cache is even larger
+    but also slower (and usually shared between multiple cores of a CPU), and the
+    last level of the hierarchy is the main memory itself.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When the CPU reads a data value from the main memory for the first time, the
+    value is propagated through all the cache levels, and a copy of it remains in
+    the cache. When the CPU reads the same value again, it does not need to wait for
+    the value to be fetched from the main memory because a copy of the same value
+    is already available in the fast L1 cache.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As long as the data we want to read fits into the L1 cache, that is all that
+    needs to happen: all the data will be loaded into the cache the first time it''s
+    accessed, after that, the CPU only ever needs to access the L1 cache. However,
+    if we try to access a value that is not currently in the cache and the cache is
+    already full, something has to be evicted from the cache to make room for the
+    new value. This process is controlled entirely by the hardware, which has some
+    heuristics to determine which value we are least likely to need again, based on
+    the values we have accessed recently (to the first approximation, the data that
+    wasn''t used for the longest time is probably not going to be needed again soon).
+    The next-level caches are larger, but they are used in the same way: as long as
+    the data is in the cache, it is accessed there (the closer to the CPU, the better).
+    Otherwise, it has to be fetched from the next level cache or, for the L3 cache,
+    from the main memory, and, if the cache is full, some other piece of data has
+    to be evicted from the cache (that is, forgotten by the cache, since the original
+    remains in the main memory).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now we can better understand what we measured earlier: since we were reading
+    the same value over and over, tens of thousands of times, the cost of the initial
+    read was completely lost, and the average read time was that of the L1 cache read.
+    The L1 cache indeed appears to be quite fast, so if your entire data fits into
+    the 32 KB, you do not need to worry about the memory gap. Otherwise, you have
+    to learn how to measure memory performance correctly, so you can draw conclusions
+    that will be applicable to your program.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Measuring memory and cache speeds
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now that we understand that the memory speed is more complex than just the
+    time of a single read, we can devise a more appropriate benchmark. We can expect
+    the cache sizes to affect the results significantly, so we have to access data
+    of different sizes, from several kilobytes (fits into the 32 KB L1 cache) to tens
+    of megabytes or more (L3 cache sizes vary but are usually around 8 MB to 12 MB).
+    Since, for large data volumes, the memory system will have to evict the *old*
+    data from the cache, we can expect the performance to depend on how well that
+    prediction works or, more generally, on the access patterns. Sequential access,
+    such as copying a range of memory, may end up performing very differently than
+    accessing the same range in random order. Finally, the results may depend on the
+    granularity of the memory access: is accessing a 64-bit `long` value slower than
+    accessing a single `char`?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A simple benchmark for sequentially reading a large array can look like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The benchmark for writing looks very similar, with a one-line change in the
+    main loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The value we write into the array should not matter; if you are concerned that
+    zero is somehow *special*, you can initialize the `fill` variable with any other
+    value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The macro `REPEAT` is used to avoid manually copying the benchmarked code many
+    times. We still want to perform several memory reads per iteration: while avoiding
+    the *0 nanoseconds per iteration* report is less critical once we start reporting
+    the number of reads per second, the overhead of the loop itself is non-trivial
+    for a very cheap iteration like ours, so it is better to unroll this loop manually.
+    Our `REPEAT` macro unrolls the loop 32 times:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Of course, we have to make sure that the memory size we request is large enough
+    for the 32 values of the `Word` type and that the total array size is divisible
+    by 32; neither is a significant restriction on our benchmark code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Speaking of the `Word` type, this is the first time we used a `TEMPLATE` benchmark.
+    It is used to generate the benchmarks for several types without copying the code.
+    There is a slight difference in invoking such a benchmark:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the CPU supports it, we can read and write the data in even larger chunks,
+    for example, using SSE and AVX instructions to move 16 or 32 bytes at a time on
+    an x86 CPU. In GCC or Clang, there are library headers for these larger types:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The types `__m128i` and `__m256i` are not built into the language (at least
+    not C/C++), but C++ lets us declare new types easily: these are value-type classes
+    (classes that represent a single value), and they have a set of arithmetic operations
+    defined for them, such as addition and multiplication, which the compiler implements
+    using the appropriate SIMD instructions.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The preceding benchmark accesses the memory range sequentially, from the beginning
+    to the end, in order, one word at a time. The size of the memory varies, as specified
+    by the benchmark arguments (in the example, from 1 KB to 1 GB, doubling every
+    time). After the memory range is copied, the benchmark does it again, from the
+    beginning, until enough measurements are accumulated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'More care must be taken when measuring the speed of accessing the memory in
+    random order. The *naïve* implementation would see us benchmarking the code that
+    looks something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Unfortunately, this benchmark measures the time it takes to call the `rand()`
+    function: it is so much more computationally expensive than reading a single integer
+    that you''ll never notice the cost of the latter. Even the modulo operator `%`
+    is significantly more expensive than a single read or write. The only way to get
+    something remotely accurate is to precompute the random indices and store them
+    in another array. Of course, we have to contend with the fact that we''re now
+    reading both the index values and the indexed data, so the measured cost is that
+    of two reads (or a read and a write).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The additional code for writing memory in random order can be as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here we use the STL algorithm `random_shuffle` to generate a random order of
+    indices (we could have used random numbers instead; it''s not exactly the same
+    since some indices would have appeared more than once and others never, but it
+    should not affect the results much). The value we write should not really matter:
+    writing any number takes the same time, but the compiler can sometimes do special
+    optimizations if it can figure out that the code is writing a lot of zeroes, so
+    it''s best to avoid that and write something else. Note also that the longer AVX
+    types cannot be initialized with an integer, so we write an arbitrary bit pattern
+    into the writing value using `memset()`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The benchmark for reading is, of course, very similar, just the inner loop
+    has to change:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: We have the benchmarking code that measures mostly the cost of the memory access.
+    The arithmetic operations necessary to advance the indices are unavoidable, but
+    the additions take a single cycle at most, and we have already seen that the CPU
+    can do several at once, so the math is not going to be the bottleneck (and, in
+    any case, any program that accesses memory in an array would have to do the same
+    computations, so this is the access speed that matters in practice). Now let us
+    see the results of our efforts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The speed of memory: the numbers'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now that we have our benchmarking code to measure the speed of reading and writing
+    into memory, we can collect the results and see how we can get the best performance
+    when accessing data in memory. We begin with random access, where the location
+    of each value we read or write is unpredictable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The speed of random memory access
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The measurements are likely to be fairly noisy unless you run this benchmark
+    many times and average the results (the benchmark library can do that for you).
+    For a *reasonable* run time (minutes), you will likely see the results that look
+    something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.3 – Random read speed as a function of memory size'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.3_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.3 – Random read speed as a function of memory size
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The benchmark results in *Figure 4.3* show the number of words read from memory
+    per second (in billions, on any reasonable PC or workstation you can find today),
+    where the *word* is a 64-bit integer or a 265-bit integer (`long` or `__m256i`,
+    respectively). The same measurements can be alternatively presented as the time
+    it takes to read a single word of the chosen size:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.4 – Read time for one array element versus array size'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.4_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.4 – Read time for one array element versus array size
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The graphs have several interesting features we can observe at once. First
+    of all, as we expected, there is no single memory speed. The time it takes to
+    read a single 64-bit integer varies from 0.3 nanoseconds to 7 nanoseconds on the
+    machine I have used. Reading small amounts of data is significantly faster, per
+    value, than reading large amounts of data. We can see the cache sizes in these
+    graphs: the L1 cache of 32 KB is fast, and the read speed does not depend on the
+    data volume as long as it all fits into the L1 cache. As soon as we exceed 32
+    KB of data, the read speed starts to drop. The data now fits into the L2 cache,
+    which is larger (256 KB) but slower. The larger the array, the smaller is the
+    portion of it that fits into the fast L1 cache at any time, and the slower is
+    the access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The read time increases even more if the data spills out of the L2 cache, and
+    we have to use the L3 cache, which is even slower. The L3 cache is much larger,
+    though, so nothing happens until the data size exceeds 8 MB. Only at that point
+    do we actually start reading from the main memory: until now, the data was moved
+    from the memory into caches the first time we touched it, and all subsequent read
+    operations used the caches only. But if we need to access more than 8 MB of data
+    at once, some of it will have to be read from the main memory (on this machine,
+    anyway—cache sizes vary between CPU models). We don''t lose the benefit of caches
+    right away, of course: as long as most data fits in the cache, it is at least
+    somewhat effective. But once the volume of data exceeds the cache size by several
+    times, the read time is almost completely determined by the time it takes to retrieve
+    the data from the memory.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Whenever we need to read or write some variable, and we find it in a cache,
+    we call it a *cache hit*. However, if it's not found, then we register a *cache
+    miss*. Of course, an L1 cache miss can be an L2 hit. An L3 cache miss means that
+    we have to go all the way to the main memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The second property of note is the value itself: 7 nanoseconds to read a single
+    integer from memory. By processor standards, this is a very long time: in the
+    previous chapter, we have seen that the same CPU can do several operations per
+    nanosecond. Let this sink in: the CPU can do about 50 arithmetic operations in
+    the time it takes to read a single integer value from memory unless the value
+    happens to be in the cache already. Very few programs need to do 50 operations
+    on each value, which means that the CPU will likely be underutilized unless we
+    can figure out something to speed up memory access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, we see that the read speed in words per second does not depend on
+    the size of the word. From a practical point of view, the most relevant implication
+    is that we can read four times as much data if we use 256-bit instructions to
+    read the memory. Of course, it''s not that simple: SSE and AVX load instructions
+    read values into different registers than the regular loads, so we also have to
+    use the SSE or AVX SIMD instructions to do the computations. One simpler case
+    is when we just need to copy a large amount of data from one location in memory
+    to another; our measurements suggest that copying 256-bit words does the job four
+    times faster than using 64-bit words. Of course, there is already a library function
+    that copies memory, `memcpy()` or `std::memcpy()`, and it is optimized for best
+    efficiency.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is another implication from the fact that the speed does not depend on
+    the word size: it implies that the read speed is limited by latency and not by
+    bandwidth. Latency is the delay between the time the request for data is issued
+    and the time the data is retrieved. Bandwidth is the total amount of data the
+    memory bus can transmit in a given time. Going from a 64-bit word to a 256-bit
+    word transmits four times as much data in the same time; this implies that we
+    haven''t hit the bandwidth limit yet. While this may seem like a purely theoretical
+    distinction, it does have important consequences for writing efficient programs
+    that we will learn about later in this chapter.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, we can measure the speed of writing the memory:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.5 – Write time for one array element versus array size'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.5_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.5 – Write time for one array element versus array size
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our case, the random reads and writes have very similar performance, but
+    this can vary for different hardware: sometimes reads are faster. Everything we
+    observed earlier about the speed of reading memory also applies to writing: we
+    see the cache size effects in *Figure 4.5*, the overall wait time for a write
+    is very long if the main memory is involved, and writing large words is more efficient.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'What can we conclude about the impact of memory access on performance? On the
+    one hand, if we need to access a small amount of data (less than 32 KB) repeatedly,
+    we don''t have to worry much about it. Of course, *repeatedly* is the key here:
+    the first access to any memory location will have to touch the main memory regardless
+    of how much memory we plan to access (the computer doesn''t know that your array
+    is small until you read the entire array and go back to the beginning—reading
+    the first element of a small array for the first time looks exactly the same as
+    reading the first element of a large array). On the other hand, if we have to
+    access large amounts of data, the memory speed is likely to become our first concern:
+    at 7 nanoseconds per number, you can''t get very far.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are several techniques for improving memory performance that we will see
+    throughout this chapter. Before we study how to improve our code, let us see what
+    help we can get from the hardware itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The speed of sequential memory access
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: So far, we have measured the speed of accessing memory at random locations.
+    When we do this, every memory access is effectively new. The entire array we are
+    reading is loaded into the smallest cache it can fit into, and then our reads
+    and writes randomly access different locations in that cache. If the array does
+    not fit into any cache, then we randomly access different locations in memory
+    and incur the 7 nanoseconds latency on every access (for the hardware we use).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Random memory accesses happen quite often in our programs, but just as often,
+    we have a large array that we need to process from the first element to the last.
+    It is important to point out that *random* and *sequential* access here is determined
+    by the order of memory addresses. There is a potential for misunderstanding: a
+    list is a data structure that does not support random access (meaning you cannot
+    jump into the middle of the list) and must be accessed sequentially, starting
+    from the head element. However, traversing the list sequentially is likely to
+    access the memory in random order if each list element was allocated separately
+    and at different times. An array, on the other hand, is a random access data structure
+    (meaning you can access any element without accessing the ones before it). However,
+    reading the array from the beginning to the end accesses memory sequentially,
+    in order of monotonically increasing addresses. In this entire chapter, unless
+    otherwise stated, we are concerned with the order of accessing memory addresses
+    when we talk about sequential or random access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The performance of sequential memory accesses is quite different. Here are
+    the results for sequential writes:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.6 – Write time for one array element versus array size, sequential
+    access'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.6_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.6 – Write time for one array element versus array size, sequential
+    access
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The overall shape of the graphs is the same as before, but the differences
+    are just as important as the similarities. The first difference we should note
+    is the scale of the vertical axis: the time values are much smaller than the ones
+    we saw in *Figure 4.5*. It takes only 2.5 nanoseconds to write a 256-bit value
+    and just 0.8 nanoseconds for the 64-bit integer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The second difference is that the curves for different word sizes are no longer
+    the same. An important caveat here is that this result is highly hardware-dependent:
+    on many systems, you will see the results more similar to the ones from the previous
+    section. On the hardware I used, sequential write times for different word sizes
+    are the same for the L1 cache but different for other caches and the main memory.
+    Looking at the main memory values, we can observe that the time to write a 64-bit
+    integer is not quite twice the time it takes to write a 32-bit integer, and for
+    the larger sizes, the write times double every time the word size doubles. This
+    means that the limit is not how many words per second we can write, but how many
+    bytes per second: the speed in bytes per second will be the same for all word
+    sizes (except the smallest one). This implies that the speed is now limited not
+    by latency but by bandwidth: we''re pushing the bits into memory as fast as the
+    bus can transmit them, and it doesn''t matter whether we group them into 64-bit
+    chunks or 256-bit chunks that we call *words*, we''ve hit the bandwidth limit
+    of the memory. Again, this outcome is much more hardware-dependent than any other
+    observation we make in this chapter: on many machines, the memory is fast enough,
+    and a single CPU cannot saturate its bandwidth.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The last observation we can make is that while the steps in the curves corresponding
+    to the cache sizes are still visible, they are much less pronounced and not nearly
+    as steep. We have the results, we have the observations. What does this all mean?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory performance optimizations in hardware
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The three observations, combined, point to some sort of latency-hiding technique
+    employed by the hardware itself (other than changing the memory access order,
+    we have not done anything to improve the performance of our code, so the gains
+    are all thanks to the hardware doing something different). When accessing the
+    main memory randomly, each access takes 7 nanoseconds on our machine. That''s
+    how long it takes from the time the data at a particular address is requested
+    until it''s delivered into a CPU register, and this delay is entirely determined
+    by latency (it doesn''t matter how many bytes we requested, we have to wait for
+    7 nanoseconds to get anything). When accessing memory sequentially, the hardware
+    can begin transferring the next element of the array right away: the very first
+    element still takes 7 nanoseconds to access, but after that, the hardware can
+    start streaming the entire array from or to memory as fast as the CPU and the
+    memory bus can handle it. The transfer of the second and the later elements of
+    the array begins even before the CPU has issued the request for the data. Thus,
+    the latency is no longer the limiting factor, the bandwidth is.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, this assumes that the hardware knows that we want to access the entire
+    array sequentially and how large the array is. In reality, the hardware knows
+    nothing of the sort, but, just like it did with the conditional instructions we
+    studied in the last chapter, there are learning circuits in the memory system
+    that make educated guesses. In our case, we have encountered the hardware technique
+    known as the **prefetch**. Once the memory controller notices that the CPU has
+    accessed several addresses sequentially, it makes the assumption that the pattern
+    will continue and prepares for the access of the next memory location by transferring
+    the data into the L1 cache (for reads) or vacating space in the L1 cache (for
+    writes). Ideally, the prefetch technique would allow the CPU always to access
+    memory at the L1 cache speeds because, by the time the CPU needs each array element,
+    it is already in the L1 cache. Whether the reality matches this ideal case or
+    not depends on how much work the CPU needs to do between accessing the adjacent
+    elements. In our benchmark, the CPU does almost no work at all, and the prefetch
+    falls behind. Even anticipating the linear sequential access, there is no way
+    it can transfer the data between the main memory and the L1 cache fast enough.
+    However, the prefetch is very effective at hiding the latency of memory access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The prefetch is not based on any prescience or prior knowledge about how the
+    memory is going to be accessed (there are some platform-specific system calls
+    that allow the program to notify the hardware that a range of memory is about
+    to be accessed sequentially, but they are not portable and, in practice, rarely
+    useful). Instead, the prefetch tries to detect a pattern in accessing memory.
+    The effectiveness of the prefetch is, thus, determined by how effectively it can
+    determine the pattern and guess the location of the next access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a lot of information, much of it is outdated, about what the limitations
+    of the prefetch pattern detection are. For example, in the older literature, you
+    can read that accessing memory in the *forward* order (for an array `a`, going
+    from `a[0]` to `a[N-1]`) is more efficient than going *backward*. This is no longer
+    true for any modern CPU and hasn't been true for years. This book risks falling
+    into the same trap if I start describing exactly which patterns are and aren't
+    efficient in terms of prefetch. Ultimately, if your algorithm requires a particular
+    memory access pattern and you want to find out whether your prefetch can handle
+    it, the most reliable way is to measure it using the benchmark code similar to
+    what we used in this chapter for random memory access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general terms, I can tell you that the prefetch is equally effective for
+    accessing memory in increasing and decreasing orders. However, reversing the direction
+    will incur some penalty until the prefetch adjusts to the new pattern. Accessing
+    memory with stride, such as accessing every fourth element in an array, will be
+    detected and predicted just as efficiently as a dense sequential access. The prefetch
+    can detect multiple concurrent strides (that is, accessing every third and every
+    seventh element), but here we're getting into the territory where you have to
+    gather your own data as the hardware capabilities change from one processor to
+    another.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another performance optimization technique that the hardware employs very successfully
+    is the familiar one: **pipelining** or **hardware loop unrolling**. We have already
+    seen it in the last chapter, where it was used to hide the delay caused by the
+    conditional instructions. Similarly, pipelining is used to hide the latency of
+    memory accesses. Consider this loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'On every iteration, we read a value `a[i]` from the array, do some computations,
+    and store the result, `b[i]`, in another array. Since both reading and writing
+    takes time, we can expect the timeline of the execution of the loop to look like
+    this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.7 – Timeline of a non-pipelined loop'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.7_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.7 – Timeline of a non-pipelined loop
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This sequence of operations would leave the CPU waiting for memory operations
+    to complete most of the time. Instead, the hardware will read ahead into the instruction
+    stream and overlay the instruction sequences that do not depend on each other:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.8 – Timeline of a pipelined (unrolled) loop'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.8_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.8 – Timeline of a pipelined (unrolled) loop
+  prefs: []
+  type: TYPE_NORMAL
+- en: The load of the second array element can start as soon as the first one is read,
+    assuming there are enough registers. For simplicity, we are assuming that the
+    CPU cannot load two values at a time; most real CPUs can do more than one memory
+    access at the same time, which just means that the pipeline can be even wider,
+    but it doesn't change the main idea. The second set of computations begin as soon
+    as the input value is available. After the first few steps, the pipeline is loaded,
+    and the CPU spends most of the time computing (if the computing steps from different
+    iterations overlap, the CPU may even be executing several iterations at once,
+    provided it has enough compute units to do so).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The pipelining can hide the latency of memory accesses, but, obviously, there
+    is a limit. If it takes 7 nanoseconds to read one value and we need to read a
+    million of them, it is going to take 7 milliseconds at best, there is no getting
+    around that (again, assuming the CPU can read only one value at a time). The pipelining
+    can help us by overlaying the computations with the memory operations, so, in
+    the ideal case, all the computing is done during these 7 milliseconds. The prefetch
+    can start reading the next value before we need it and thus cut down the average
+    read time, but only if it guesses correctly what that value is. Either way, the
+    measurements done in this chapter show the best-case scenarios for accessing memory
+    in different ways.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In terms of measuring memory speed and presenting the results, we have covered
+    the basics and learned about the general properties of the memory system. Any
+    more detailed or specific measurements are left as an exercise for the reader,
+    and you should be well-equipped to gather the data you need to make informed decisions
+    about the performance of your particular applications. We now turn our attention
+    to the next step: we know how the memory works and what performance we can expect
+    from it, but what can we do to improve the performance of a concrete program?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimizing memory performance
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The first reaction many programmers have when they learn the material from
+    the previous section is often this: *"Thanks, I understand now why my program
+    is slow, but I have to process the amount of data I have, not the ideal 32 KB,
+    and the algorithm is what it is, including the complex data access pattern, so
+    there is nothing I can do about it."* This chapter would not be worth much if
+    we didn''t learn how to get better memory performance for the problems we need
+    to solve. In this section, we will learn the techniques that can be used to improve
+    memory performance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Memory-efficient data structures
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The choice of data structures, or, more generally, data organization, is usually
+    the most important decision the programmer makes as far as memory performance
+    is concerned. It is important to understand what you can and cannot do: the memory
+    performance shown in *Figure 4.5* and *Figure 4.6* is really all there is, and
+    you can''t get around it (strictly speaking, this is only 99% true; there are
+    some exotic memory access techniques that, rarely, can exceed the limits shown
+    in these figures). But, you can choose where on these graphs is the point corresponding
+    to your program. Let us consider first a simple example: we have 1 M 64-bit integers
+    that we need to store and process in order. We can store these values in an array;
+    the size of the array will be 8 MB, and, according to our measurements, the access
+    time is about 0.6 nanoseconds per value, as shown in *Figure 4.6*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.9 – Write time for one array (A) versus list (L) element'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.9_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.9 – Write time for one array (A) versus list (L) element
+  prefs: []
+  type: TYPE_NORMAL
+- en: Alternatively, we could use a list to store the same numbers. The `std::list`
+    is a collection of nodes, and each node has the value and two pointers to the
+    next and the previous node. The entire list, therefore, uses 24 MB of memory.
+    Furthermore, each node is allocated through a separate call to `operator new`,
+    so different nodes are likely to be at very different addresses, especially if
+    the program is doing other memory allocations and deallocations at the same time.
+    There isn't going to be any pattern in the addresses we need to access when traversing
+    the list, so to find the performance of the list, all we need to do is find the
+    point corresponding to the 24 MB memory range on the curve for random memory accesses.
+    This gives us just over 5 nanoseconds per value or almost an order of magnitude
+    slower than accessing the same data in an array.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Those of you who, at this point, demanded proof, have learned something valuable
+    from the previous chapter. We can easily construct a micro-benchmark to compare
+    writing data into a list and a vector of the same size. Here is the benchmark
+    for the vector:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Change `std::vector` to `std::list` to create a list benchmark. Note that the
+    meaning of the size has changed, compared to the earlier benchmarks: now it is
+    the number of the elements in the container, so the memory size will depend on
+    the element type and the container itself, just as was shown in *Figure 4.6*.
+    The results, for 1 M elements, are exactly as promised:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.10 – List versus vector benchmark'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.10_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.10 – List versus vector benchmark
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Why would anyone choose the list over the array (or `std::vector`)? The most
+    common reason is that at the time of creation, we did not know how much data we
+    were going to have, and growing a vector is extremely inefficient because of the
+    copying involved. There are several ways around this problem. Sometimes it is
+    possible to precompute the final size of the data relatively inexpensively. For
+    example, it may cost us a single scan of the input data to determine how much
+    space to allocate for the results. If the inputs are efficiently organized, it
+    may be worth it to do two passes over the inputs: first, to count, and second,
+    to process.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If it is not possible to know the final data size in advance, we may need a
+    smarter data structure that combines the memory efficiency of a vector with the
+    resizing efficiency of a list. This can be achieved using a block-allocated array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.11 – A block-allocated array (deque) can be grown in place'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.11_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.11 – A block-allocated array (deque) can be grown in place
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This data structure allocates memory in blocks of a fixed amount, usually small
+    enough that they fit into the L1 cache (anywhere between 2 KB and 16 KB is commonly
+    used). Each block is used as an array, so, within each block, the elements are
+    accessed sequentially. The blocks themselves are organized in a list. If we need
+    to grow this data structure, we just allocate another block and add it to the
+    list. Accessing the first element of each block is likely to incur a cache miss,
+    but the rest of the elements in the block can be accessed efficiently once the
+    prefetch detects the pattern of sequential access. Amortized over the number of
+    elements in each block, the cost of the random access can be made very small,
+    and the resulting data structure can perform almost identically to the array or
+    vector. In STL, we have such a data structure: `std::deque` (unfortunately, the
+    implementation in most STL versions is not particularly efficient, and sequential
+    accesses to the deque are usually somewhat slower than to the vector of the same
+    size).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Yet another reason to prefer a list over an array, monolithic or block-allocated,
+    is that the list allows fast insertions at any point, not just at the ends. If
+    you need this, then you have to use a list or another node-allocated container.
+    In such cases, often the best solution is to not attempt to select a single data
+    structure that works for all requirements but to migrate the data from one data
+    structure to another. For example, if we want to use the list to store data elements,
+    one at a time while maintaining sorted order, one question to ask is, do we need
+    the order to be sorted at all times, only after all elements are inserted, or
+    a few times in the middle of the construction process but not all the time?
+  prefs: []
+  type: TYPE_NORMAL
+- en: If there is a point in the algorithm where the data access patterns change,
+    it is often advantageous to change the data structure at that point, even at the
+    cost of some copying of memory. For example, we may construct a list and, after
+    the last element is added, copy it into an array for faster sequential access
+    (assuming we won't need to add any more elements). If we can be sure that some
+    part of the data is complete, we may convert that part to an array, perhaps one
+    or more blocks in a block-allocated array, and leave the still mutable data in
+    a list or a tree data structure. On the other hand, if we rarely need to process
+    the data in the sorted order, or need to process it in multiple orders, then separating
+    the order from the storage is often the best solution. The data is stored in a
+    vector or a deque, and the order is imposed on top of it by an array of pointers
+    sorted in the desired order. Since all ordered data accesses are now indirect
+    (through an intermediate pointer), this is efficient only if such accesses are
+    rare, and most of the time, we can process the data in the order in which it's
+    stored in the array.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The bottom line is, if we access some data a lot, we should choose a data structure
+    that makes that particular access pattern optimal. If the access pattern changes
+    in time, the data structure should change as well. On the other hand, if we don''t
+    spend much time accessing the data, the overhead of converting from one arrangement
+    of the data to another likely cannot be justified. However, in this case, inefficient
+    data access should not be a problem in the first place. This brings us to the
+    next question: how do we figure out which data is accessed inefficiently and,
+    more generally, which data is expensive to access?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Profiling memory performance
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Often, the efficiency of a particular data structure or data organization is
+    fairly obvious. For example, if we have a class containing an array or a vector,
+    and the interface of this class allows only one mode of access to the data, with
+    sequential iteration from the beginning to the end (forward iterator, in the STL
+    language), then we can be quite certain that the data is accessed as efficiently
+    as possible, at the memory level anyway. We can''t be sure about the efficiency
+    of the algorithm: for example, a linear search of a particular element in an array
+    is very inefficient (each memory read is efficient, of course, but there are a
+    lot of them; we know better ways to organize data for searching).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Simply knowing which data structures are memory-efficient is not enough: we
+    also need to know how much time the program spends working on a particular set
+    of data. Sometimes, this is self-evident, especially with good encapsulation.
+    If we have a function that, according to the profile or the timing report, takes
+    a lot of time, and the code inside the function is not particularly heavy on computations
+    but moves a lot of data, the odds are good that making access to this data more
+    efficient will improve the overall performance.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Unfortunately, that is the easy case, and so it gets optimized first. Then
+    we get to the point where no single function or code fragment stands out in terms
+    of execution time, but the program is still inefficient. When you have no *hot*
+    code, very often you have *hot* data: one or more data structures that are accessed
+    throughout the program; the cumulative time spent on this data is large, but it''s
+    not localized to any function or loop. Conventional profiling does not help us:
+    it will show that the runtime is spread evenly across the entire program, and
+    optimizing any one fragment of code will yield very little improvement. What we
+    need is a way to find the data that is accessed inefficiently throughout the program,
+    and it adds up.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It is very hard to collect this information with just time-measuring tools.
+    However, it can be collected fairly easily using a profiler that utilizes the
+    hardware event counters. Most CPUs can count memory accesses and, more specifically,
+    cache hits and misses. In this chapter, we again use the `perf` profiler; with
+    it, we can measure how effective the L1 cache is used with this command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: The cache measurement counters are not part of the default counter set and must
+    be specified explicitly. The exact set of available counters varies from one CPU
+    to another but can always be viewed by running the `perf list` command. In our
+    example, we measure L1 cache misses when reading data. The term **dcache** stands
+    for **data cache** (pronounced *dee-cache*); the CPUs also have a separate **instruction
+    cache** or **icache** (pronounced *ay-cache*) that is used to load the instructions
+    from memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can use this command line to profile our memory benchmarks for reading the
+    memory at random addresses. When the memory range is small, say, 16 KB, the entire
+    array fits into the L1 cache, and there are almost no cache misses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.12 – Profile of a program with good use of the L1 cache'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Image86899.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.12 – Profile of a program with good use of the L1 cache
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Increasing the memory size to 128 MB means that cache misses are very frequent:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.13 – Profile of a program with poor use of the L1 cache'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Image86907.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.13 – Profile of a program with poor use of the L1 cache
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Note that `perf stat` collects the overall values for the entire program, where
+    some memory accesses are cache-efficient, and others aren''t. Once we know that
+    somebody, somewhere, is handling memory accesses badly, we can get a detailed
+    profile using `perf record` and `perf report`, as was shown in [*Chapter 2*](B16229_02_Epub_AM.xhtml#_idTextAnchor026),
+    *Performance Measurements* (we used a different counter there, but the process
+    is the same for any counter we choose to collect). Of course, if our original
+    timing profile failed to detect any hot code, the cache profile will show the
+    same. There will be many locations in the code where the fraction of cache misses
+    is large. Each location contributes only a small amount of time to the overall
+    execution time, but it adds up. It is now up to us to notice that many of these
+    code locations have one thing in common: the memory they operate on. For example,
+    if we see that there are dozens of different functions that, between them all,
+    account for the 15% cache miss rate, but they all operate on the same list, then
+    the list is the problematic data structure, and we have to organize our data in
+    some other way.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have now learned how to detect and identify the data structures whose inefficient
+    memory access patterns negatively impact performance and what are some of the
+    alternatives. Unfortunately, the alternative data structures usually don''t have
+    the same features or performance: a list cannot be replaced with a vector if elements
+    must be inserted at arbitrary locations throughout the life of the data structure.
+    Often, it is not the data structure but the algorithm itself that calls for inefficient
+    memory accesses. In such cases, we may have to change the algorithms.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimizing algorithms for memory performance
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The memory performance of algorithms is an often overlooked subject. Algorithms
+    are most commonly chosen for their **algorithmic performance** or the number of
+    operations or steps they perform. Memory optimizations often call for a counter-intuitive
+    choice: do more work, even do unnecessary work, to improve memory performance.
+    The game here is to trade some computing for faster memory operations. The memory
+    operations are slow, so our *budget* for extra work is quite large.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One way to use memory faster is to use less of it. This approach often results
+    in recomputing some values that could have been stored and retrieved from memory.
+    In the worst-case scenario, if this retrieval results in random accesses, reading
+    each value will take several nanoseconds (7 nanoseconds in our measurements).
+    If recomputing the value takes less than that, and 7 nanoseconds is a fairly long
+    time when converted to the number of operations the CPU can do, then we are better
+    off not storing the values. This is the conventional tradeoff of space versus
+    memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is an interesting variant of this optimization: instead of simply using
+    less memory, we try to use less memory at any given time. The idea here is to
+    try to fit the current working data set into one of the caches, say, the L2 cache,
+    and do as much work on it as possible before moving to the next section of the
+    data. Loading a new data set into the cache incurs a cache miss on every memory
+    address, by definition. But it is better to accept that cache miss once and then
+    operate on the data efficiently for some time, rather than process all the data
+    at once and risk a cache miss every time we need this data element.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, I will show you a more interesting technique, where we do
+    more memory accesses to save a few other memory accesses. The tradeoff here is
+    different: we want to reduce the number of slow, random accesses, but we pay for
+    it in an increased number of fast, sequential accesses. Since sequential memory
+    streaming is about an order of magnitude faster than random access, we again have
+    a sizeable *budget* to pay for the extra work we have to do to reduce the slow
+    memory accesses.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The demonstration requires a more elaborate example. Let us say that we have
+    a collection of data records, such as strings, and the program needs to apply
+    a set of changes to some of these records. Then we get another set of changes,
+    and so on. Each set will have changes to some records, while other records remain
+    unchanged. The changes do, in general, change the size of the record as well as
+    its content. The subset of records that are changed in each set is completely
+    random and unpredictable. Here is a diagram showing just that:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.14 – The record editing problem. In each change set, the records
+    marked by * are edited,'
+  prefs: []
+  type: TYPE_NORMAL
+- en: the rest remains unchanged
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.14_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.14 – The record editing problem. In each change set, the records marked
+    by * are edited, the rest remains unchanged
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The most straightforward way to solve this problem is to store records in their
+    own memory allocation and organize them in some data structure that allows each
+    record to be replaced by a new one (the old record is deallocated, since the new
+    one is, generally, of a different size). The data structure can be a tree (set
+    in C++) or a list. To make the example more concrete, let us use strings for records.
+    We also must be more specific about the way the change set is specified. Let us
+    say that it does not point to a specific record that needs to be changed; instead,
+    for any record, we can say whether it needs to be changed or not. The simplest
+    example of such a change set for strings is a set of find and replace patterns.
+    Now we can sketch our implementation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: In every change set, we iterate over the entire collection of records, determine
+    if the record needs to be changed, and, if needed, do so (the change set is hidden
+    inside the functions `must_change()` and `change()`). The code shows just one
+    change set, so we run this loop as many times as needed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The weakness of this algorithm is that we are using a list, and, to make it
+    even worse, we keep moving the strings in memory. Every access to a new string
+    is a cache miss. Now, if the strings are very long, then the initial cache miss
+    doesn't matter, and the rest of the string is read using fast sequential access.
+    The result is similar to the block-allocated array we saw earlier, and the memory
+    performance is fine. But if the strings are short, the entire string may well
+    be read in a single load operation, and every load is done at a random address.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our entire algorithm does nothing but loads and stores at random addresses.
+    As we have seen, this is pretty much the worst way to access memory. But what
+    else can we do? We can''t store the strings in one huge array: if one string in
+    the middle of the array needs to grow, where would the memory come from? Right
+    after that string is the next string, so there is no room to grow.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Coming up with an alternative requires a paradigm shift. The algorithm that
+    performs the required operations literally as specified also imposes restrictions
+    on the memory organization: changing records requires moving them in memory, and,
+    as long as we want to be able to change any one record without affecting anything
+    else, we cannot avoid random distribution of records in memory. We have to come
+    at the problem sideways and start with the restrictions. We really want to access
+    all records sequentially. What can we do under this constraint? We can read all
+    records very fast. We can decide whether the record must be changed; this step
+    is the same as before. But what do we do if the record must grow? We have to move
+    it somewhere else, there is no room to grow in place. But we agreed that the records
+    would remain allocated in sequence, one after the other. Then the previous record
+    and the next record have to be moved too, so they remain stored before and after
+    our new record. This is the key to the alternative algorithm: all records are
+    moved with each change set, whether they are changed or not. Now we can store
+    all records in one huge contiguous buffer (assuming we know the upper limit on
+    the total record size):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.15 – Processing all records sequentially'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.15_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.15 – Processing all records sequentially
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The algorithm requires allocating the second buffer of equal size during the
+    copying, so the peak memory consumption is twice the size of the data:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: In every change set, we copy every string (record) from the old buffer to the
+    new one. If the record needs to be changed, the new version is written into the
+    new buffer. Otherwise, the original is simply copied. With every new change set,
+    we will create a new buffer and, at the end of the operation, release the old
+    one (a practical implementation would avoid repeated calls to allocate and deallocate
+    memory and simply swap two buffers).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The obvious downside to this implementation is the use of the huge buffer:
+    we have to be pessimistic in choosing its size to allocate enough memory for the
+    largest possible records we might encounter. Doubling of the peak memory size
+    is also concerning. We can solve this problem by combining this approach with
+    the **growable array** data structure we saw earlier. Instead of allocating one
+    contiguous buffer, we can store the records in a series of fixed-size blocks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.16 – Using a block buffer to edit records'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.16_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.16 – Using a block buffer to edit records
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To simplify the diagram, we draw all records of the same size, but this restriction
+    is not necessary: the records can span multiple blocks (we treat the blocks as
+    a contiguous sequence of bytes, nothing more). When editing a record, we need
+    to allocate a new block for the edited record. As soon as the editing is done,
+    the block (or blocks) that contained the old record can be released; we don''t
+    have to wait for the entire buffer to be read. But we can do even better than
+    that: instead of returning the recently freed block to the operating system, we
+    can put it on the list of empty blocks. We are about to edit the next record,
+    and we will need an empty new block for the result. We just happened to have one:
+    it''s the block that used to contain the last record we edited; it is at the head
+    of our list of recently released blocks, and, best of all, that block is the last
+    memory we accessed, so it is probably still in the cache!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At first glance, this algorithm seems a really bad idea: we are going to copy
+    all the records every time. But let us analyze the two algorithms more carefully.
+    First of all, the amount of reading is the same: both algorithms must read each
+    string to determine whether it must be changed. The second algorithm is already
+    ahead in performance: it reads all data in a single sequential sweep, while the
+    first algorithm jumps around the memory. If the string is edited, then both algorithms
+    must write a new one into a new area of memory. The second algorithm again comes
+    out ahead due to its sequential memory access pattern (also, it does not need
+    to do a memory allocation for every string). The tradeoff comes when the string
+    is not edited. The first algorithm does nothing; the second one makes a copy.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: From this analysis, we can define the good and bad cases for each algorithm.
+    The sequential access algorithm wins if the strings are short, and a large fraction
+    of them are changed in every change set. The random access algorithm wins if the
+    strings are long or if very few of them are changed. However, the only way to
+    determine what is *long* and how many are *a large fraction* is to measure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The fact that we must measure the performance does not necessarily mean that
+    you have to always write two versions of the complete program. Very often, we
+    can simulate the particular aspect of the behavior in a small *mock* program that
+    operates on the simplified data. We just need to know the approximate size of
+    the records, how many are changed, and we need the code that does the change to
+    a single record so we can measure the impact of the memory accesses on performance
+    (if each change is very computationally expensive, it won't matter how long it
+    takes to read or write the record). With such mock or prototype implementation,
+    we can do the approximate measurements and make the right design decision.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So, in real life, is the sequential string-copying algorithm ever worth it?
+    We have done the tests for editing medium-length strings (128 bytes) using a regular
+    expression pattern. If 99% of all strings are edited in each change set, the sequential
+    algorithm is approximately four times faster than random (the results will be
+    somewhat specific to a machine, so the measurements must be done on the hardware
+    similar to what you expect to use). If 50% of all records are edited, the sequential
+    access is still faster, but only by about 12% (this is likely to be within the
+    variation between different models of CPU and types of memory, so let''s call
+    it a tie). The more surprising result is that if only 1% of all records are changed,
+    the two algorithms are almost tied for speed: the time saved by not doing a random
+    read pays for the cost of the almost entirely unnecessary copying.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For longer strings, the random-access algorithm wins handily if few strings
+    are changed, and for very long strings, it''s a tie even if all strings are changed:
+    both algorithms read and write all strings sequentially (the random access to
+    the beginning of a long string adds negligible time).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We now have everything we need to determine the better algorithm for our application.
+    This is the way the design for performance often goes: we identify the root of
+    the performance problem, we come up with a way to eliminate the issue, at the
+    cost of doing something else, and then we have to hack together a prototype that
+    lets us measure whether the clever trick actually pays off.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before we end this chapter, I would like to show you an entirely different "use"
+    of the performance improvements provided by the caches and other hardware.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The ghost in the machine
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In the last two chapters, we have learned how complex the path from the initial
+    data to the final result can be on a modern computer. Sometimes the machine does
+    precisely what the code prescribes: read the data from memory, do the computations
+    as written, save the results back to memory. More often than not, however, it
+    goes through some strange intermediate states we don''t even know about. *Read
+    from memory* does not always read from memory: instead of executing instructions
+    as written, the CPU may decide to execute something else, speculatively, because
+    it thinks you will need it, and so on. We have tried to confirm by direct performance
+    measurements that all of those things really do exist. By necessity, these measurements
+    are always indirect: the hardware optimizations and transformations of the code
+    are designed to deliver the correct result, after all, only faster.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this section, we show yet more observable evidence of the hardware operations
+    that were supposed to remain hidden. This is a big one: its discovery in 2018
+    triggered a brief cybersecurity panic and a flood of patches from hardware and
+    software vendors. We are talking about the Spectre and Meltdown family of security
+    vulnerabilities, of course.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is Spectre?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In this section, we will demonstrate, in detail, the early version of the Spectre
+    attack, known as Spectre version 1\. This isn''t a book on cybersecurity; however,
+    the Spectre attack is carried out by carefully measuring the performance of the
+    program, and it relies on the two performance-enhancing hardware techniques we
+    have studied in this book: speculative execution and memory caching. This makes
+    the attack educational in a work dedicated to software performance as well.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The idea behind Spectre is as follows. We have learned earlier that when a
+    CPU encounters a conditional jump instruction, it attempts to predict the result
+    and proceeds to execute the instructions in the assumption that the prediction
+    is correct. This is known as speculative execution, and without it, we would not
+    have pipelining in any practically useful code. The tricky part of the speculative
+    execution is the error handling: errors frequently occur in the speculatively
+    executed code, but until the prediction is proven correct, these errors must remain
+    invisible. The most obvious example is the null pointer dereference: if the processor
+    predicts that a pointer is not null and executes the corresponding branch, a fatal
+    error will occur every time the branch is mispredicted, and the pointer is, in
+    fact, null. Since the code is written correctly to avoid dereferencing the null
+    pointer, it must execute correctly as well: the potential error must remain potential.
+    Another common speculative error is array boundary read or write:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the index `i` is usually less than the array size `N`, then that will become
+    the prediction, and the read from `a[i]` will be executed, speculatively, every
+    time. What happens if the prediction is wrong? The result is discarded, so no
+    harm was done, right? Not so fast: the memory location `a[i]` is not in the original
+    array. It doesn''t even have to be the element right after the array. The index
+    could be arbitrarily large, so the indexed memory location could belong to a different
+    program or even to the operating system. We do not have the access privileges
+    to read this memory. The OS does enforce access control, so normally trying to
+    read some memory from another program would trigger an error. But this time, we
+    do not know for sure that the error is real: the execution is still in the speculative
+    phase, and the branch prediction could have been wrong. The error remains a *speculative
+    error* until we know whether the prediction was correct. There is nothing new
+    here so far; we have seen it all earlier.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'However, there is a subtle side effect to the potentially illegal read operation:
+    the value `a[i]` is loaded into the cache. The next time we try to read from the
+    same location, the read will be faster. This is true whether the read is real
+    or speculative: memory operations during speculative execution work just like
+    the *real* ones. Reading from the main memory takes longer while reading from
+    the cache is faster. The speed of memory load is something we can observe and
+    measure. It is not the intended result of the program but a measurable side effect
+    nonetheless. In effect, the program has an additional output mechanism through
+    means other than its intended output; this is called a **side-channel**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The Spectre attack exploits this side-channel:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.17 – Setting up the Spectre attack'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.17_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.17 – Setting up the Spectre attack
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'It uses the value at the location `a[i]`, obtained during the speculative execution,
+    to index into another array, `t`. After this is done, one array element, `t[a[i]]`,
+    will be loaded into the cache. The rest of the array `t` was never accessed and
+    is still in memory. Note that, unlike the element `a[i]`, which is not really
+    an element of the array `a` but some value at the memory location we can''t get
+    to by any legitimate means, the array `t` is entirely within our control. It is
+    crucial for the success of the attack that the branch remains unpredicted long
+    enough while we read the value `a[i]` and then the value `t[a[i]]`. Otherwise,
+    the speculative execution will end as soon as the CPU detects that the branch
+    is mispredicted and none of these memory accesses are, in fact, needed. After
+    the speculative execution is carried out, the misprediction is eventually detected,
+    and all the consequences of the speculative operations are rolled back, including
+    the would-be memory access error. All consequences but one, that is: the value
+    of the array `t[a[i]]` is still in the cache. There is nothing wrong with it,
+    per se: accessing this value is legal, we can do it any time, and, in any case,
+    the hardware moves data from and to the caches all the time; it never changes
+    the result or lets you access any memory you weren''t supposed to.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is, however, an observable after-effect of this entire series of events:
+    one element of the array `t` is much faster to access than the rest of them:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 4.18 – Memory and cache state after the Spectre attack'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_4.18_B16229.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 4.18 – Memory and cache state after the Spectre attack
+  prefs: []
+  type: TYPE_NORMAL
+- en: If we can measure how long it takes to read each element of the array `t`, we
+    can find out the one that was indexed by the value `a[i]`; that is the secret
+    value we were not supposed to know!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Spectre by example
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The Spectre attack takes several pieces to put together; we will go through
+    them one by one since, overall, it is quite a large coding example for a book
+    (this particular implementation is a variation on the example given by Chandler
+    Carruth at CPPCon in 2018).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One component we will need is an accurate timer. We can try to use the C++
+    high-resolution timer:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The overhead and the resolution of this timer depend on the implementation;
+    the standard does not require any particular performance guarantees. On the x86
+    CPU, we can try to use the **time-stamp counter** (**TSC**), which is a hardware
+    counter that counts the number of cycles since some point in the past. Using the
+    cycle count as a timer typically results in noisier measurements, but the timer
+    itself is faster, which is important here, considering that we are going to try
+    to measure how long it takes to load a single value from memory. GCC, Clang, and
+    many other compilers have a built-in function for accessing this counter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Either way, we now have a fast timer. The next step is the timing array. In
+    practice, it''s not quite as simple as an array of integers, which we implied
+    in our figures: integers are too close to each other in memory; loading one into
+    the cache affects the time it takes to access its neighbors. We need to space
+    the values far apart:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here we are going to use only the first byte of the `timing_element`; the rest
+    are there to enforce the distance in memory. There is nothing magical about the
+    distance of 1024 bytes; it just has to be *large enough*, but what that is for
+    you is something that you have to determine experimentally: the attack becomes
+    unreliable if the distance is too small. There are 256 elements in the timing
+    array. This is because we are going to read the *secret memory* one byte at a
+    time. So, in our earlier example, the array `a[i]` will be an array of characters
+    (even if the real data type is not `char`, we can still read it byte by byte).
+    Initializing the timing array is not, strictly speaking, necessary; nothing depends
+    on the content of this array.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We are now ready to see the *heart* of the code. What follows is a simplified
+    implementation: it is missing a few necessary twists that we are going to add
+    later, but it''s easier to explain the code by focusing on the key parts first.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We need the array that we are going to read out-of-bounds:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here `size` is the real size of the `data`, and `evil_index` is larger than
+    `size`: it is the index of the secret value outside of the proper data array.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, we are going to *train* the branch predictor: we need it to learn that
+    the more likely branch is the one that does access the array. To that end, we
+    generate a valid index that always points into the array (we will see exactly
+    how in a moment). This is our `ok_index`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we read the memory at the location `timing_array + data[i]`, where `i`
+    is either the `ok` index or the `evil` index, but the former happens much more
+    often than the latter (we try to read the secret data only once out of 16 attempts,
+    to keep the branch predictor trained for a successful read). Note that the actual
+    memory access is guarded by a valid bounds check; this is of utmost importance:
+    we never actually read the memory we are not supposed to read; this code is 100%
+    correct.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The function to access memory is, conceptually, just a memory read. In practice,
+    we have to contend with the clever optimizing compiler, which will try to eliminate
+    redundant or unnecessary memory operations. Here is one way, it uses intrinsic
+    assembly (the read instruction is actually generated by the compiler because the
+    location `*p` is flagged as input):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We run the prediction-misprediction loop a number of times (`100`, in our example).
+    Now we expect one element of the `timing_array` to be in the cache, so we just
+    have to measure how long it takes to access each element. The one caveat here
+    is that sequentially accessing the whole array will not work: the prefetch will
+    quickly kick in and move the element we are about to access into the cache. Very
+    effective most of the time, but not what we need now. We have to access the elements
+    of the array in random order instead and store the time it took to access each
+    element in the array of memory access latencies:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You may wonder, why not simply look for the one fast access? Two reasons: first,
+    we don''t know what *fast* really means for any particular hardware; we just know
+    that it''s faster than *normal*. So we have to measure what is *normal* too. Second,
+    any individual measurement is not going to be 100% reliable: sometimes, the computation
+    is interrupted by another process or the OS; the exact timing of the whole sequence
+    of operations depends on what else the CPU is doing at the time, and so on. It''s
+    only very likely that this process will reveal the value at the secret memory
+    location, but not 100% guaranteed, so we have to try several times and average
+    the results.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Before we do that, there are several omissions in the code we saw. First of
+    all, it assumes that the timing array values are not in the cache already. Even
+    if it was true when we started, it wouldn''t be after we successfully peek at
+    the first secret byte. We have to purge the timing array from the cache every
+    time before we start the attack on the next byte we want to read:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, we use a GCC/Clang built-in function; most compilers have something similar,
+    but the function name could vary.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Second, the attack works only if the speculative execution lasts long enough
+    for the two memory accesses (data and timing array) to happen before the CPU figures
+    out which branch it was supposed to take. In practice, the code as written does
+    not spend enough time in the speculative execution context, so we have to make
+    it harder to compute what the correct branch is. There is more than one way to
+    do it; here, we make the branch condition dependent on reading some value from
+    memory. We will copy the array size into another variable that is slow to access:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we have to make sure this value is evicted from the cache before we need
+    to read it and use the array size value stored in `*data_size` instead of the
+    original `size` value:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There is also a magical *delay* in the preceding code, some useless computation
+    that separates the cache flush from the access to the data size (it defeats the
+    possible instruction reordering that would let the CPU access the array size faster).
+    Now the condition `i < *data_size` takes some time to compute: the CPU needs to
+    read the value from memory before it knows the result. The branch is predicted
+    according to the more likely outcome, which is a valid index, so the array is
+    accessed speculatively.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Spectre, unleashed
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The final step is to put it all together and run the procedure many times to
+    accumulate statistically reliable measurements (timing measurements of a single
+    instruction are very noisy given that the timer itself takes about as long as
+    what we are trying to measure).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following function attacks a single byte outside of the data array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For each element of the timing array, we will compute a score, which is the
+    number of times this element was the fastest one to access. We also track the
+    second-fastest element, which should be just one of the regular, slow to access,
+    array elements. We keep doing it for many iterations: ideally, until we get the
+    result, but, in practice, we have to give up at some point.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once a large enough gap opens between the best score and the second-best score,
+    we know that we have reliably detected the *fast* element of the timing array,
+    which is the one indexed by the value of the *secret* byte (if we reach the maximum
+    number of iterations without getting a reliable answer, the attack has failed,
+    although we can try to use the best guess we have so far).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have two utility functions to compute the average scores for the latencies
+    and find the two best scores; these can be implemented any way you want as long
+    as they give the correct results. The first function computes the average latency
+    and increments the scores for the timing elements that have latencies somewhat
+    below average (the threshold for *somewhat* has to be adjusted experimentally
+    but is not very sensitive). Note that we expect one array element to be significantly
+    faster to access, so we can skip it when computing the average latency (ideally,
+    that one element would have much lower latency than the rest, and the rest would
+    all be the same):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second function simply finds the two best scores in the array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we have a function that returns the value of a single byte outside of the
+    specified array without ever reading this byte directly. We are ready to use it
+    to get access to some secret data! For demonstration, we are going to allocate
+    a very large array but designate most of it *off-limits* by specifying a small
+    value as the array size. This is, in practice, the only way you can demonstrate
+    this attack today: since its discovery, most computers have been patched against
+    the Spectre vulnerability, so, unless you have a machine that was hidden in a
+    cave and not updated for a few years, the attack will not work against any memory
+    that you are really not allowed to access. The patches do not prevent you from
+    using Spectre against any data that you are allowed to access, but you have to
+    examine the code and prove that it really does return the values without accessing
+    the memory directly. That is what we are going to do: our `spectre_attack` function
+    does not read any memory outside of the data array of the specified size, so we
+    can create an array that is twice as large as specified and hide a secret message
+    in the upper half:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Examine again the values we give to the `spectre_attack` function: the array
+    *size* is just the length of the string stored in the array; no other memory is
+    accessed by the code except in the speculative execution context. All memory accesses
+    are guarded by the correct bound checks. And yet, byte by byte, this program reveals
+    the content of the second string, the one that is never read directly.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To conclude, we used the speculative execution context to peek at the memory
+    that we are not allowed to access. Because the branch condition for accessing
+    this memory is correct, the invalid access error remains a *potential error*;
+    it never actually happens. All the results of the mispredicted branch are undone,
+    except one: the accessed value remains in the cache, so the next access to the
+    same value is faster. By measuring the memory access times carefully, we can figure
+    out what that value was! Why did we do this when we are interested in performance,
+    not hacking? Mostly to confirm that the processor and the memory really behave
+    the way we described: the speculative execution really happens, and the caches
+    really work and make data accesses faster.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we have learned how the memory system works: in a word, slowly.
+    The difference in the performance of the CPUs and the memory creates the memory
+    gap, where the fast CPU is held back by the low performance of the memory. But
+    the memory gap also contains within it the seeds of the potential solution: we
+    can trade many CPU operations for one memory access.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have further learned that the memory system is very complex and hierarchical
+    and that it does not have a single speed. This can hurt your program''s performance
+    really badly if you end up in the worst-case scenario. But again, the trick is
+    to look at it as an opportunity rather than a burden: the gains from optimizing
+    memory accesses can be so large that they more than pay for the overhead.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we have seen, the hardware itself provides several tools to improve memory
+    performance. Beyond that, we have to choose memory-efficient data structures and,
+    if that alone does not suffice, memory-efficient algorithms to improve performance.
+    As usual, all performance decisions must be guided and backed up by measurements.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So far, everything we have done and measured used a single CPU. In fact, since
+    the first few pages in the introduction, we hardly even mentioned that almost
+    every computer you can find today has multiple CPU cores and often multiple physical
+    processors. The reason for this is very simple: we have to learn to use the single
+    CPU efficiently before we can move on to the more complex multi-CPU problems.
+    Starting with the next chapter, we turn our attention to the problems of concurrency
+    and using large multi-core and multi-processor systems efficiently.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What is the memory gap?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What factors affect the observed memory speed?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: How can we find the places in the program where accessing memory is the main
+    cause of poor performance?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: What are the main ways to optimize the program for better memory performance?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL

@@ -1,0 +1,1484 @@
+- en: '*Chapter 7*: Advanced IR Generation'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: With the **intermediate representation** (**IR**) generation introduced in the
+    previous chapters, you can already implement most of the functionality required
+    in a compiler. In this chapter, we will look at some advanced topics that often
+    arise in terms of real-world compilers. For example, many modern languages make
+    use of exception handling, and we look at how to translate this to **low-level
+    virtual machine** (**LLVM**) IR.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To support the LLVM optimizer in producing better code in certain situations,
+    we add additional type metadata to the IR code, and attaching debug metadata enables
+    the compiler's user to take advantage of source-level debug tools.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, you will learn about the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In *Throwing and catching exceptions*, you will learn how to implement exception
+    handling in your compiler.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In *Generating metadata for type-based alias analysis*, you attach additional
+    metadata to LLVM IR, which helps LLVM to better optimize the code.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In *Adding debug metadata*, you implement the support classes needed to add
+    debug information to the generated IR code.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: By the end of the chapter, you will acquire knowledge about exception handling
+    and about metadata for type-based alias analysis and debug information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The code files for this chapter is available at [https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07)
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find the code in action videos at [https://bit.ly/3nllhED](https://bit.ly/3nllhED).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Throwing and catching exceptions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Exception handling in LLVM IR is closely tied to the platform''s support. Here,
+    we will look at the most common type of exception handling using `libunwind`.
+    Its full potential is used by C++, so we will look at an example in C++ first,
+    where the `bar()` function can throw an `int` or a `double` value, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `foo()` function calls `bar()`, but only handles a thrown `int` value.
+    It also declares that it only throws `int` values, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Throwing an exception requires two calls into the runtime library. First, memory
+    for the exception is allocated with a call to `__cxa_allocate_exception()`. This
+    function takes the number of bytes to allocate as a parameter. The exception payload
+    (the `int` or the `double` value in the example) is copied to the allocated memory.
+    The exception is then raised with a call to `__cxa_throw()`. This function takes
+    three arguments: a pointer to the allocated exception; type information about
+    the payload; and a pointer to a destructor, if the exception payload has one.
+    The `__cxa_throw()` function initiates the stack-unwinding process and never returns.
+    In LLVM IR, this is done for the `int` value, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`_ZTIi` is the type information describing an `int` type. For a double type,
+    it would be `_ZTId`. The call to `__cxa_throw()` is marked as a tail call because
+    it is the final call in this function, possibly enabling reuse of the current
+    stack frame.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So far, nothing LLVM-specific has been done. This changes in the `foo()` function,
+    because the call to `bar()` could possibly raise an exception. If it is an `int`-type
+    exception, then the control flow must be transferred to the IR code of the `catch`
+    clause. To accomplish this, an `invoke` instruction must be used instead of a
+    `call` instruction, as illustrated in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The difference between both instructions is that `invoke` has two labels associated.
+    The first label is where execution continues if the called function ended normally,
+    usually with a `ret` instruction. In the preceding code example, this label is
+    called `%next`. If an exception occurs, then execution continues at a so-called
+    *landing pad*, with a `%lpad` label.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The landing pad is a basic block that must begin with a `landingpad` instruction.
+    The `landingpad` instruction gives LLVM information about the handled exception
+    types. For the `foo()` functions, it gives the following information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are three possible types of action here, outlined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`cleanup`: This denotes that code to clean up the current state is present.
+    Usually, this is used to call destructors of local objects. If this marker is
+    present, then the landing pad is always called during stack unwinding.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`catch`: This is a list of type-value pairs and denotes the exception types
+    that can be handled. The landing pad is called if the thrown exception type is
+    found in this list. In the case of the `foo()` function, the value is a pointer
+    to the C++ runtime type information for the `int` type, similar to the parameter
+    of the `__cxa_throw()` function.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`filter`: This specifies an array of exception types. The landing pad is called
+    if the exception type of the current exception is not found in the array. This
+    is used to implement the `throw()` specification. For the `foo()` function, the
+    array has only one member—the type information for the `int` type.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The result type of the `landingpad` instruction is a `{ i8*, i32 }` structure.
+    The first element is a pointer to the thrown exception, while the second element
+    is a type selector. Let''s extract both elements from the structure, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: A *type selector* is a number that helps us to identify the cause of *why the
+    landing pad is called*. It has a positive value if the current exception type
+    matches one of the exception types given in the `catch` part of the `landingpad`
+    instruction. If the current exception type does not match any of the values given
+    in the `filter` part, then the value is negative, and it is `0` if the cleanup
+    code should be called.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Basically, the type selector is offset into a type information table, constructed
+    from the values given in the `catch` and `filter` parts of the `landingpad` instruction.
+    During optimization, multiple landing pads can be combined into one, which means
+    that the structure of this table is not known at the IR level. To retrieve the
+    type selector for a given type, we need to call the `@llvm.eh.typeid.for` intrinsic
+    function. We need this to check if the type selector value corresponds to the
+    type information for `int`, to be able to execute the code in the `catch (int
+    e) {}` block, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The handing of an exception is framed by calls to `__cxa_begin_catch()` and
+    `__cxa_end_catch()`. The `__cxa_begin_catch()` function needs one argument: the
+    current exception. That is one of the values returned by the `landingpad` instruction.
+    It returns a pointer to the exception payload—an `int` value, in our case. The
+    `__cxa_end_catch()` function marks the end of exception handling and deallocates
+    the memory allocated with `__cxa_allocate_exception()`. Please note that the runtime
+    behavior is much more complicated if another exception is thrown inside the `catch`
+    block. The handling of the exception is done like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the type of the current exception does not match the list in the `throws()`
+    declaration, the unexpected exception handler is called. First, we need to check
+    the type selector again, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the value of the type selector is lower than `0` we then call the handler,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, the handler is not expected to come back.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is no cleanup work needed in this case, so all the cleanup code does
+    is resume the execution of the stack unwinder, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'One piece is still missing: `libunwind` drives the stack unwinding, but it
+    is not tied to a single language. Language-dependent handling is done in the `personality`
+    function. For C++ on Linux, the `personality` function is called `__gxx_personality_v0()`.
+    Depending on the platform or compiler, this name can vary. Each function that
+    needs to take part in stack unwinding has a `personality` function attached. The
+    `personality` function analyzes if the function catches an exception, has a non-matching
+    filter list, or needs a cleanup call. It gives this information back to the unwinder,
+    which acts accordingly. In LLVM IR, the pointer to the `personality` function
+    is given as part of the function definition, as illustrated in the following code
+    snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: With this, the exception-handling facility is complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To use exception handling in the compiler for your programming language, the
+    simplest strategy is to piggyback onto the existing C++ runtime functions. This
+    has also the advantage that your exceptions are interoperable with C++. A disadvantage
+    is that you tie some of the C++ runtime into the runtime of your language—most
+    notably, memory management. If you want to avoid this, then you need to create
+    your own equivalents of the `_cxa_` functions. Still, you will want to use `libunwind`,
+    which provides the stack-unwinding mechanism.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at how to create this IR. We created the `calc` expression compiler
+    in [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048), *The Structure of
+    a Compiler*. We will now extend the code generator of the expression compiler
+    to raise and handle an exception if a division by `0` is performed. The generated
+    IR will check if the divisor of a division is `0`. If `true`, then an exception
+    will be raised. We will also add a landing pad to the function, which catches
+    the exception, prints `Divide by zero!` to the console, and ends the calculation.
+    Using exception handling is not really necessary in this simple case, but it allows
+    us to concentrate on the code generation. We add all code to the `CodeGenerator.cpp`
+    file. We begin by adding required new fields and some helper methods. We need
+    to store the LLVM declaration of the `__cxa_allocate_exception()` and `__cxa_throw()`
+    functions, consisting of the function type and the function itself. A `GlobalVariable`
+    instance is needed to hold the type information. We also need references to the
+    basic blocks holding the landing pad and a basic block containing just an `unreachable`
+    instruction, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We also add a new helper function to create the IR for comparing two values.
+    The `createICmpEq()` function takes the `Left` and `Right` value to compare as
+    parameters. It creates a `compare` instruction, testing for equality of the values,
+    and a branch instruction to two basic blocks, for the equal and unequal cases.
+    The two basic blocks are returned via references in the `TrueDest` and `FalseDest`
+    parameters. A label for the new basic blocks can be given in the `TrueLabel` and
+    `FalseLabel` parameters. The code is shown in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To use the functions from the runtime, we need to create several function declarations.
+    In LLVM, a function type giving the signature—as well as the function itself—must
+    be constructed. We use the `createFunc()` method to create both objects. The functions
+    need references to `FunctionType` and `Function` pointers, the name of the newly
+    declared function, and the result type. The parameter-type list is optional, and
+    the flag to indicate a variable parameter list is set to `false`, indicating that
+    there is no variable part in the parameter list. The code can be seen in the following
+    snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: With these preparations done, we continue to generate the IR to raise an exception.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Raising an exception
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To generate the IR code to raise an exception, we add an `addThrow()` method.
+    This new method needs to initialize the new fields, and then generates the IR
+    to raise an exception via the `__cxa_throw` function. The payload of the raised
+    exception is of an `int` type and can be set to an arbitrary value. Here is what
+    we need to code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The new `addThrow()` method begins with checking if the `TypeInfo` field has
+    been initialized. If not, then a global external constant of an `i8*` type and
+    a `_ZTIi` name is created. This represents the C++ metadata describing the C++
+    `int` type. The code is illustrated in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The initialization continues with creating the IR declaration for `__cxa_allocate_exception()`
+    and `__cxa_throw functions()` using our `createFunc()` helper method, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A function using exception handling needs a `personality` function, which helps
+    with the stack unwinding. We add the IR code to declare a `__gxx_personality_v0()`
+    `personality` function from the C++ library, and set it as the `personality` routine
+    of the current function. The current function is not stored as a field but we
+    can use a `Builder` instance to query the current basic block, which has the function
+    stored as a `parent` field, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we create and populate the basic block for the landing pad. First, we
+    need to save the pointer to the current basic block. Then, we create a new basic
+    block, set it inside the builder to use as the basic block to insert instructions,
+    and call the `addLandingPad()` method. This method generates the IR code for handling
+    an exception and is described in the next section, *Catching an exception*. The
+    following code populates the basic block for the landing pad:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The initialization part has finished with creating the basic block holding
+    an `unreachable` instruction. Again, we create a basic block and set it as an
+    insertion point at the builder. Then, we add an `unreachable` instruction to it.
+    Lastly, we set the insertion point of the builder back to the saved `SaveBB` instance
+    so that the following IR is added to the right basic block. The code is illustrated
+    in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To raise an exception, we need to allocate memory for the exception and the
+    payload via a call to the `__cxa_allocate_exception()` function. Our payload is
+    of a C++ `int` type, which usually has a size of 4 bytes. We create a constant
+    unsigned value for the size, and call the function with it as a parameter. The
+    function type and the function declaration are already initialized, so we only
+    need to create a `call` instruction, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we store the `PayloadVal` value into the allocated memory. To do so,
+    we need to create an LLVM IR constant with a call to the `ConstantInt::get()`
+    function. The pointer to the allocated memory is of an `i8*` type, but to store
+    a value of an `i32` type we need to create a `bitcast` instruction to cast the
+    type, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Finally, we raise an exception with a call to the `__cxa_throw` function. Because
+    this function actually raises an exception that is also handled in the same function,
+    we need to use an `invoke` instruction instead of a `call` instruction. Unlike
+    with a `call` instruction, an `invoke` instruction ends a basic block because
+    it has two successor basic blocks. Here, these are the `UnreachableBB` and `LPadBB`
+    basic blocks. If the function raises no exception, the control flow is transferred
+    to the `UnreachableBB` basic block. Due to the design of the `__cxa_throw()` function,
+    this will never happen. The control flow is transferred to the `LPadBB` basic
+    block to handle the exception. This finishes the implementation of the `addThrow()`
+    method, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Next, we add the code to generate the IR for handling an exception.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Catching an exception
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To generate the IR code to catch an exception, we add an `addLandingPad()`
+    method. The generated IR extracts the type information from the exception. If
+    it matches the C++ `int` type, then the exception is handled by printing `Divide
+    by zero!` to the console and returning from the function. If the type does not
+    match, we simply execute a `resume` instruction, which transfers control back
+    to the runtime. Because there are no other functions in the call hierarchy to
+    handle this exception, the runtime will terminate the application. These are the
+    steps we need to take to generate the IR to catch an exception:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the generated IR, we need to call the `__cxa_begin_catch()` and `_cxa_end_catch()`
+    functions from the C++ runtime library. To print an error message, we will generate
+    a call to the `puts()` function from the C runtime library, and to get the type
+    information from the exception, we must generate a call to the `llvm.eh.typeid.for`
+    instrinsic. We need `FunctionType` and `Function` instances for all of them, and
+    we take advantage of our `createFunc()` method to create them, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `landingpad` instruction is the first instruction we generate. The result
+    type is a structure containing fields of `i8*` and `i32` types. This structure
+    is generated with a call to the `StructType::get()` function. We handle an exception
+    of a C++ `int` type, and we must add this as a clause to the `landingpad` instruction.
+    The clause must be a constant of the `i8*` type, therefore we need to generate
+    a `bitcast` instruction to convert the `TypeInfo` value to this type. We store
+    the value returned from the instruction for later use in an `Exc` variable, as
+    follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we extract the type selector from the returned value. With a call to
+    the `llvm.eh.typeid.for` intrinsic, we retrieve the type ID for the `TypeInfo`
+    field, representing the C++ `int` type. With this IR, we now have generated the
+    two values we need to compare to decide if we can handle the exception, as illustrated
+    in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To generate the IR for the comparison, we call our `createICmpEq()` function.
+    This function also generates two basic blocks, which we store in the `TrueDest`
+    and `FalseDest` variables, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the two values do not match, the control flow continues at the `FalseDest`
+    basic block. This basic block only contains a `resume` instruction, to give control
+    back to the C++ runtime. This is illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the two values are equal, the control flow continues at the `TrueDest` basic
+    block. We first generate the IR code to extract the pointer to the exception from
+    the return value of the `landingpad` instruction, stored in the `Exc` variable.
+    Then, we generate a call to the `__cxa_begin_catch ()` function, passing the pointer
+    to the exception as a parameter. This indicates the start of the exception being
+    handled to the runtime, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We handle the exception by calling the `puts()` function, to print a message
+    to the console. For this, we first generate a pointer to the string with a call
+    to the `CreateGlobalStringPtr()` function, and then pass this pointer as a parameter
+    in the generated call to the `puts()` function, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This finishes the handling of the exception, and we generate a call to the
+    `__cxa_end_catch()` function to inform the runtime about it. Lastly, we return
+    from the function with a `ret` instruction, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: With the `addThrow()` and `addLandingPad()` functions, we can generate the IR
+    to raise an exception and to handle an exception. We still need to add the IR
+    to check if the divisor is `0`, which is the topic of the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Integrating the exception-handling code into the application
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The IR for the division is generated inside the `visit(BinaryOp&)` method.
+    Instead of just generating a `sdiv` instruction, we first generate the IR to compare
+    the divisor with `0`. If the divisor is `0`, then the control flow continues in
+    a basic block raising the exception. Otherwise, the control flow continues in
+    a basic block with the `sdiv` instruction. With the help of the `createICmpEq()`
+    and `addThrow()` functions, we can code this very easily, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The code-generation part is now complete. To build the application, you change
+    into the `build` directory and run the `ninja` tool, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After the build is finished, you can check the generated IR—for example, with
+    the `with a: 3/a` expression, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: You will see the additional IR needed to raise and catch the exception.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The generated IR now depends on the C++ runtime. The easiest way to link against
+    the required libraries is to use the clang++ compiler. Rename the `rtcalc.c` file
+    with the runtime functions for the expression calculator as `rtcalc.cpp`, and
+    add `extern "C"` in front of each function inside the file. Then we can use the
+    `llc` tool to turn the generated IR into an object file and use the clang++ compiler
+    to create an executable, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, we can run the generated application with different values, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the second run the input is `0`, and this raises an exception. It works as
+    expected!
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have learned how to raise and catch exceptions. The code to generate the
+    IR can be used as a blueprint for other compilers. Of course, the used type information
+    and the number of `catch` clauses depends on the input to the compiler, but the
+    IR we need to generate still follows the pattern presented in this section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding metadata is a way to provide further information to LLVM. In the next
+    section, we add type metadata to support the LLVM optimizer in certain situations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generating metadata for type-based alias analysis
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Two pointers may point to the same memory cell, and they then alias each other.
+    Memory is not typed in the LLVM model, which makes it difficult for the optimizer
+    to decide if two pointers alias each other or not. If the compiler can prove that
+    two pointers do not alias each other, then more optimizations are possible. In
+    the next section, we will have a closer look at the problem and investigate how
+    adding additional metadata will help, before we implement this approach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the need for additional metadata
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To demonstrate the problem, let''s look at the following function:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: The optimizer cannot decide if the `p` and `q` pointers point to the same memory
+    cell or not. During optimization this is an important analysis, called an `p`
+    and `q` point to the same memory cell, then they are aliases. If the optimizer
+    can prove that both pointers never alias each other, this enables additional optimization
+    opportunities. For example, in the `soSomething()` function, the stores can be
+    reordered without altering the result in this case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It depends on the definition of the source language as to whether a variable
+    of one type can be an alias of another variable of a different type. Please note
+    that languages may also contain expressions that break the type-based alias assumption—for
+    example, typecasts between unrelated types.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The solution chosen by the LLVM developers is to add metadata to `load` and
+    `store` instructions. The metadata has two purposes, outlined as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, it defines the type hierarchy based on which type may alias another type
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Secondly, it describes the memory access in a `load` or `store` instruction
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let''s have a look at the type hierarchy in C. Each type of hierarchy starts
+    with a root node, either **named** or **anonymous**. LLVM assumes that root nodes
+    with the same name describe the same type of hierarchy. You can use different
+    type hierarchies in the same LLVM modules, and LLVM makes the safe assumption
+    that these types may alias. Beneath the root node, there are nodes for scalar
+    types. Nodes for aggregate types are not attached to the root node, but they refer
+    to scalar types and other aggregate types. Clang defines the hierarchy for C as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The root node is called `Simple C/C++ TBAA`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Beneath the root node is the node for `char` types. This is a special type in
+    C because all pointers can be converted to a pointer to `char`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Beneath the `char` node are nodes for the other scalar types and a type for
+    all pointers, called `any pointer`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Aggregate types are defined as a sequence of member types and offsets.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These metadata definitions are used in access tags attached to the `load` and
+    `store` instructions. An access tag is made up of three parts: a base type, an
+    access type, and an offset. Depending on the base type, there are two possible
+    ways the access tag describes memory access, outlined here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the base type is an aggregate type, then the access tag describes the memory
+    access of a `struct` member, having the access type and being located at a given
+    offset.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: If the base type is a scalar type, then the access type must be the same as
+    the base type and the offset must be `0`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'With these definitions, we can now define a relation on the access tags, which
+    is used to evaluate if two pointers may alias each other or not. The immediate
+    parent of a tuple (base type, offset) is determined by the base type and the offset,
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If the base type is a scalar type and the offset is 0, then the immediate parent
+    is (parent type, 0), with parent type being the type of the parent node as defined
+    in the type hierarchy. If the offset is not 0, then the immediate parent is undefined.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If the base type is an aggregate type, then the immediate parent of tuple (base
+    type, offset) is the tuple (new type, new offset), with the new type being the
+    type of the member at the offset. The new offset is the offset of the new type,
+    adjusted to its new start.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The transitive closure of this relation is the parent relation. Two-memory access
+    types—for example, (base type 1, access type 1, offset 1) and (base type 2, access
+    type 2, offset 2) —may alias if (base type 1, offset 1) and (base type 2, offset
+    2) or vice versa are related in the parent relation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s illustrate this in an example, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the preceding memory-access tag definition for scalar types, the access
+    tag for parameter `i` is (`int`, `int`, `0`), and for parameter `c` it is (`char`,
+    `char`, `0`). In the type hierarchy, the parent of the node for the `int` type
+    is the `char` node, therefore the immediate parent of (`int`, `0`) is (`char`,
+    `0`), and both pointers can alias. The same is true for parameter `x` and parameter
+    `c`. But parameter `x` and `i` are not related, and hence they do not alias each
+    other. The access for the `y` member of `struct Point` is (`Point`, `float`, `4`),
+    with 4 being the offset of the `y` member in the struct. The immediate parent
+    of (`Point`, `4`) is (`float`, `0`), therefore access to `p->y` and `x` may alias,
+    and—with the same reasoning—also with parameter `c`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To create the metadata, we use the `llvm::MDBuilder` class, which is declared
+    in the `llvm/IR/MDBuilder.h` header file. The data itself is stored in instances
+    of the `llvm::MDNode` and `llvm::MDString` classes. Using the builder class shields
+    us from the internal details of the construction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A root node is created with a call to the `createTBAARoot()` method, which expects
+    the name of the type hierarchy as a parameter and returns the root node. An anonymous
+    unique root node can be created with the `createAnonymousTBAARoot()` method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A scalar type is added to the hierarchy with the `createTBAAScalarTypeNode()`
+    method, which takes the name of the type and the parent node as a parameter. Adding
+    a type node for an aggregate type is slightly more complex. The `createTBAAStructTypeNode()`
+    method takes the name of the type and a list of the fields as parameters. The
+    fields are given as a `std::pair<llvm::MDNode*, uint64_t>` instance. The first
+    element indicates the type of the member and the second element indicates the
+    offset in the `struct` type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An access tag is created with the `createTBAAStructTagNode()` method, which
+    takes the base type, the access type, and the offset as parameters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lastly, the metadata must be attached to a `load` or `store` instruction. The
+    `llvm::Instruction` class has a `setMetadata()` method, which is used to add various
+    metadata. The first parameter must be `llvm::LLVMContext::MD_tbaa` and the second
+    must be the access tag.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Equipped with this knowledge, we will add metadata for `tinylang` in the next
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding TBAA metadata to tinylang
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To support TBAA, we add a new `CGTBAA` class. This class is responsible for
+    generating the metadata nodes. We make it a member of the `CGModule` class, calling
+    it `TBAA`. Every `load` and `store` instruction could be possibly annotated, and
+    we place a new function for this purpose in the `CGModule` class too. The function
+    tries to create the tag-access information. If this is successful, the metadata
+    is attached to the instruction. This design also allows us to turn off the metadata
+    generation if we do not need it—for example, in builds with the optimization turned
+    off. The code is illustrated in the following snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We put the declaration of the new `CGTBAA` class into the `include/tinylang/CodeGen/CGTBAA.h`
+    header file and put the definition into the `lib/CodeGen/CGTBAA.cpp` file. Besides
+    the **abstract syntax tree** (**AST**) definitions, the header file needs to include
+    the files defining the metadata nodes and builder, as illustrated in the following
+    code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `CGTBAA` class needs to store some data members. So, let''s see how to
+    do this step by step, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First of all, we need to cache the root of the type hierarchy, like this:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To construct the metadata nodes, we need an instance of the `MDBuilder` class,
+    as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Lastly, we store the metadata generated for a type to reuse, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After defining the variables required for the construction, we now add the
+    methods required to create the metadata, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The constructor initializes the data members, like this:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We lazily instantiate the root of the type hierarchy, which we name `Simple
+    tinylang TBAA`, as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For a scalar type, we create a metadata node with the help of the `MDBuilder`
+    class based on the name of the type. The new metadata node is stored in the cache,
+    as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The method to create the metadata for a record is more complicated, as we have
+    to enumerate all the fields of the record. The code is shown in the following
+    snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To return the metadata for a `tinylang` type, we need to create the type hierarchy.
+    Because the type system of `tinylang` is very restricted, we can use a simple
+    approach. Each scalar type is mapped to a unique type attached to the root node,
+    and we map all pointers to a single type. Structured types then refer to these
+    nodes. If we cannot map a type we then return `nullptr`, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A general method to get the metadata is `getAccessTagInfo()`. As we only need
+    to look for a pointer type, we check for it. Otherwise, we return a `nullptr`,
+    as illustrated in the following code snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To enable the generation of TBAA metadata, we now simply need to attach the
+    metadata to the `load` and `store` instructions we generate. For example, in `CGProcedure::writeVariable()`,
+    a store to a global variable, use a `store` instruction, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To decorate the instruction, we need to replace the preceding line with the
+    following lines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: With these changes in place, we have finished the generation of TBAA metadata.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the next section, we look at a very similar topic: the generation of debug
+    metadata.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding debug metadata
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To allow source-level debugging, we have to add debug information. Support for
+    debug information in LLVM uses debug metadata to describe the types of the source
+    language and other static information, and an intrinsic to track variable values.
+    The LLVM core libraries generate debug information in DWARF format on Unix systems
+    and in **Protein Data Bank** (**PDB**) format for Windows. We take a look at the
+    general structure in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the general structure of debug metadata
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To describe the static structure, LLVM uses metadata in a similar way to the
+    metadata for type-based analysis. The static structure describes the file, the
+    compilation unit, functions, lexical blocks, and the used data types.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The main class we use is `llvm::DIBuilder`, and we need to use the `llvm/IR/DIBuilder`
+    include file to get the class declaration. This builder class provides an easy-to-use
+    interface to create the debug metadata. The metadata is later either added to
+    LLVM objects such as global variables or is used in calls to debug intrinsics.
+    Important metadata that the builder class can create is listed here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`lvm::DIFile`: This describes a file using the filename and the absolute path
+    of the directory containing the file. You use the `createFile()` method to create
+    it. A file can contain the main compilation unit or it could contain imported
+    declarations.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`llvm::DICompileUnit`: This is used to describe the current compilation unit.
+    Among other things, you specify the source language, a compiler-specific producer
+    string, whether optimizations are enabled or not, and—of course—the `DIFile` in
+    which the compilation unit resides. You create it with a call to `createCompileUnit()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`llvm::DISubprogram`: This describes a function. Important information is the
+    scope (usually a `DICompileUnit` or a `DISubprogram` for a nested function), the
+    name of the function, the mangled name of the function, and the function type.
+    It is created with a call to `createFunction()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`llvm::DILexicalBlock`: This describes a lexical block that models the block
+    scoping found in many high-level languages. You create this with a call to `createLexicalBlock()`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'LLVM makes no assumptions about the language your compiler translates. As a
+    consequence, it has no information about the data types of the language. To support
+    source-level debugging, especially displaying variable values in a debugger, type
+    information must be added too. Important constructs are listed here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `createBasicType()` function, returning a pointer to the `llvm::DIBasicType`
+    class, creates the metadata to describe a basic type such as `INTEGER` in `tinylang`
+    or `int` in C++. Besides the name of the type, the required parameters are the
+    size in bits and the encoding—for example, whether it is a signed or unsigned
+    type.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are several ways to construct the metadata for composite data types, represented
+    by the `llvm::DIComposite` class. You use `createArrayType()`, `createStructType()`,
+    `createUnionType()`, and `createVectorType()` functions to instantiate the metadata
+    for `array`, `struct`, `union`, and `vector` data types. The functions require
+    the parameter you expect—for example, the base type and the number of subscriptions
+    for an array type, or a list of the field members of a `struct` type.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are also methods to support enumerations, templates, classes, and so on.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The list of functions shows you that you have to add every detail of the source
+    language to the debug information. Let''s assume your instance of the `llvm::DIBuilder`
+    class is called `DBuilder`. Assume further that you have some `tinylang` source
+    in a file called `File.mod` in the `/home/llvmuser` folder. Inside the file is
+    a `Func():INTEGER` function at *line 5*, which contains a `VAR i:INTEGER` local
+    declaration at *line 7*. Let''s create the metadata for this, beginning with the
+    information for the file. You need to specify the filename and the absolute path
+    of the folder in which the file resides, as illustrated in the following code
+    snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The file is a module in `tinylang` and therefore is the compilation unit for
+    LLVM. This carries a lot of information, as can be seen in the following code
+    snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: The debugger needs to know the source language. The DWARF standard defines an
+    enumeration with all the common values. A disadvantage is that you cannot simply
+    add a new source language. To do that, you have to create a request through the
+    DWARF committee. Be aware that the debugger and other debug tools also need support
+    for a new language—just adding a new member to the enumeration is not enough.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In many cases, it is sufficient to choose a language that is close to your source
+    language. In the case of `tinylang` this is Modula-2, and we use `DW_LANG_Modula2`
+    for language identification. A compilation unit resides in a file, which is identified
+    by the `DbgFile` variable we created before. The debug information can carry information
+    about the producer. This can be the name of the compiler and the version information.
+    Here, we just pass a `tinylang` string. If you do not want to add this information,
+    then you can simply use an empty string as a parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next set of information includes an `IsOptimized` flag, which should indicate
+    if the compiler has turned optimization on or not. Usually, this flag is derived
+    from the `–O` command-line switch. You can pass additional parameter settings
+    to the debugger with the `CUFlags` parameter. This is not used here, and we pass
+    an empty string. We do not use Objective-C, so we pass `0` as the Objective-C
+    runtime version. Normally, debug information is embedded in the object file we
+    are creating. If we want to write the debug information into a separate file,
+    then the `SplitName` parameter must contain the name of this file; otherwise,
+    just pass an empty string. And lastly, you can define the level of debug information
+    that should be emitted. The default setting is full debug information, indicated
+    by the use of the `FullDebug` enum value. You can also choose the `LineTablesOnly`
+    value if you want to emit only line numbers, or the `NoDebug` value for no debug
+    information at all. For the latter, it is better to not create debug information
+    in the first place.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our minimalistic source uses only the `INTEGER` data type, which is a signed
+    32-bit value. Creating the metadata for this type is straightforward, as can be
+    seen in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To create the debug metadata for the function, we have to create a type for
+    the signature first, and then the metadata for the function itself. This is similar
+    to the creation of IR for a function. The signature of the function is an array
+    with all the types of the parameters in source order and the return type of the
+    function as the first element at index `0`. Usually, this array is constructed
+    dynamically. In our case, we can also construct the metadata statically. This
+    is useful for internal functions—for example, for module initializing. Typically,
+    the parameters of these functions are always known, and the compiler writer can
+    hardcode them. The code is shown in the following snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: Our function has an `INTEGER` return type and no further parameters, so the
+    `DbgSigTy` array contains only the pointer to the metadata for this type. This
+    static array is turned into a type array, which is then used to create the type
+    for the function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The function itself requires more data, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: A function belongs to a compilation unit, in our case stored in the `DbgCU`
+    variable. We need to specify the name of the function in the source file, which
+    is `Func`, and the mangled name is stored in the object file. This information
+    helps the debugger to locate the machine code of the function later on. The mangled
+    name, based on the rules of `tinylang`, is `_t4File4Func`. We also have to specify
+    the file that contains the function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This may sound surprising at first, but think of the include mechanism in C
+    and C++: a function can be stored in a different file, which is then included
+    with `#include` in the main compilation unit. Here, this is not the case, and
+    we use the same file as the one the compilation unit uses. Next, the line number
+    of the function and the function type are passed. The line number of the function
+    may not be the line number where the lexical scope of the function begins. In
+    this case, you can specify a different `ScopeLine`. A function also has protection,
+    which we specify here with the `FlagPrivate` value to indicate a private function.
+    Other possible values are `FlagPublic` and `FlagProtected`, for public and protected
+    functions.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Besides the protection level, there are other flags that can be specified here.
+    For example, `FlagVirtual` indicates a virtual function, and `FlagNoReturn` indicates
+    that the function does not return to the caller. You can find a complete list
+    of possible values in the `llvm/include/llvm/IR/DebugInfoFlags.def` LLVM include
+    file. And lastly, flags specific to a function can be specified. The most used
+    one is the `SPFlagLocalToUnit` value, which indicates that the function is local
+    to this compilation unit. Also often used is the `MainSubprogram` value, indicating
+    that this function is the main function of the application. You can also find
+    all possible values in the LLVM include file mentioned previously.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So far, we only created the metadata referring to static data. Variables are
+    dynamic in nature, and we explore how to attach the static metadata to the IR
+    code for accessing variables in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tracking variables and their values
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: To be useful, the type metadata described in the last section needs to be associated
+    with the variables of the source program. For a global variable, this is pretty
+    easy. The `createGlobalVariableExpression()` function of the `llvm::DIBuilder`
+    class creates the metadata to describe a global variable. This includes the name
+    of the variable in the source, the mangled name, the source file, and so on. A
+    global variable in LLVM IR is represented by an instance of the `GlobalVariable`
+    class. This class has an `addDebugInfo()` method, which associates the metadata
+    node returned from `createGlobalVariableExpression()` with the global variable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For local variables, we need to take another approach. LLVM IR does not know
+    a class representing a local variable; it knows only about values. The solution
+    the LLVM community developed is to insert calls to intrinsic functions into the
+    IR code of a function. An intrinsic function is a function that LLVM knows about
+    and therefore can do some magic with it. In most cases, intrinsic functions do
+    not result in a subroutine call at the machine level. Here, the function call
+    is a convenient vehicle to associate the metadata with a value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The most important intrinsic functions for debug metadata are `llvm.dbg.declare`
+    and `llvm.dbg.value`. The former is called once to declare the address of a local
+    variable, while the latter is called whenever a local variable is set to a new
+    value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Future LLVM versions will replace llvm.dbg.declare with the llvm.dbg.addr intrinsic
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `llvm.dbg.declare` intrinsic function makes a very strong assumption: the
+    address of the variable described in the call to the intrinsic is valid throughout
+    the lifetime of the function. This assumption makes it very hard to preserve debug
+    metadata during optimization because the real storage address can change. To solve
+    this, a new intrinsic called `llvm.dbg.addr` was designed. This intrinsic takes
+    the same parameters as `llvm.dbg.declare`, but it has less strict semantics. It
+    still describes the address of a local variable, and a frontend should generate
+    exactly one call to it.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: During optimization, passes can replace this intrinsic with (possibly multiple)
+    calls to `llvm.dbg.value` and/or `llvm.dbg.addr` in order to preserve the debug
+    information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `llvm.dbg.declare` intrinsic will be deprecated and later removed when work
+    on `llvm.dbg.addr` is finished.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How does it work? The LLVM IR representation and the programmatic creation
+    via the `llvm::DIBuilder` class differ a bit, so we look at both. Continuing our
+    example from the previous section, we allocate local storage for the `i` variable
+    inside the `Func` function with the `alloca` instruction, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'After that, we add a call to the `llvm.dbg.declare` intrinsic, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first parameter is the address to the local variable. The second parameter
+    is the metadata describing the local variable, created by a call to either `createAutoVariable()`
+    for a local variable or `createParameterVariable()` for a parameter of the `llvm::DIBuilder`
+    class. The third parameter describes an address expression, which I explain later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s implement the IR creation. You allocate the storage for the `@i` local
+    variable with a call to the `CreateAlloca()` method of the `llvm::IRBuilder<>`
+    class, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE58]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `LLVMCtx` variable is the used context class, and `Builder` is the used
+    instance of the `llvm::IRBuilder<>` class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A local variable also needs to be described by metadata, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE59]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using the values from the previous section, we specify that the variable is
+    part of the `DbgFunc` function, has the name `i`, is defined in the file named
+    by `DbgFile` at *line 7*, and has a `DbgIntTy` type.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, we associate the debug metadata with the address of the variable using
+    the `llvm.dbg.declare` intrinsic. Using `llvm::DIBuilder` shields you from all
+    of the details of adding a call. The code is shown in the following snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE60]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, we have to specify a source location for the variable. An instance of
+    `llvm::DILocation` is a container to hold the line and column of a location associated
+    with a scope. The `insertDeclare()` method adds a call to the intrinsic function
+    to the LLVM IR. As parameters it requires the address of the variable, stored
+    in `Val`, and the debug metadata for the variable, stored in `DbgValVar`. We also
+    pass an empty address expression and the debug location created before. As with
+    a normal instruction, we need to specify into which basic block the call is inserted.
+    If we specify a basic block, then the call is inserted at the end. Alternatively,
+    we can specify an instruction, and the call is inserted before that instruction.
+    We have the pointer to the `alloca` instruction, which is the last one that we
+    inserted into the underlying basic block. So, we use this basic block, and the
+    call gets appended after the `alloca` instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If a value of a local variable changes, then a call to `llvm.dbg.value` must
+    be added to the IR. You use the `insertValue()` method of `llvm::DIBuilder` to
+    do so. This works similarly for `llvm.dbg.addr`. The difference is that instead
+    of the address of the variable, now the new value is specified.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When we implemented the IR generation for functions, we used an advanced algorithm
+    that mainly used values and avoided allocating storage for local variables. For
+    adding debug information, this only means that we use `llvm.dbg.value` much more
+    often than you see in Clang-generated IR.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What can we do if the variable does not have dedicated storage space but is
+    part of a larger aggregate type? One situation where this can arise is with the
+    use of nested functions. To implement access to the stack frame of the caller,
+    you collect all used variables in a structure and pass a pointer to this record
+    to the called function. Inside the called function, you can refer to the variables
+    of the caller as if they were local to the function. What is different is that
+    these variables are now part of an aggregate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the call to `llvm.dbg.declare`, you use an empty expression if the debug
+    metadata describes the whole memory the first parameter is pointing to. If it
+    instead describes only a part of the memory, then you need to add an expression
+    indicating which part of the memory the metadata applies to. In the case of the
+    nested frame, you need to calculate the offset into the frame. You need access
+    to a `DataLayout` instance, which you can get from the LLVM module into which
+    you are creating the IR code. If the `llvm::Module` instance is named `Mod`, the
+    variable holding the nested frame structure is named `Frame`, being of type `llvm::StructType`,
+    and you access the third member of the frame. This then gives you the offset of
+    the member, as illustrated in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE61]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The expression is created from a sequence of operations. To access the third
+    member of the frame, the debugger needs to add the offset to the base pointer.
+    You need to create an array and this information—for example, in this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE62]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'From this array, you can create an expression that you then pass to `llvm.dbg.declare`
+    instead of the empty expression, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE63]'
+  prefs: []
+  type: TYPE_PRE
+- en: You are not limited to this offset operation. DWARF knows many different operators,
+    and you can create fairly complex expressions. You can find a complete list of
+    operators in the `llvm/include/llvm/BinaryFormat/Dwarf.def` LLVM include file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You are now able to create debug information for variables. To enable the debugger
+    to follow the control flow in the source, you also need to provide line-number
+    information, which is the topic of the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding line numbers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A debugger allows a programmer to step line by line through an application.
+    For this, the debugger needs to know which machine instructions belong to which
+    line in the source code. LLVM allows a source location to be added to each instruction.
+    In the previous section, we created location information of the `llvm::DILocation`
+    type. A debug location has more information than just the line, column, and scope.
+    If needed, the scope into which this line is inlined can be specified. It is also
+    possible to indicate that this debug location belongs to implicit code—that is,
+    code that the frontend has generated but that is not in the source code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before it can be attached to an instruction, we must wrap the debug location
+    in an `llvm::DebugLoc` object. To do so, you simply pass the location information
+    obtained from the `llvm::DILocation` class to the `llvm::DebugLoc` constructor.
+    With this wrapping, it is possible for LLVM to track the location information.
+    While the location in the source obviously does not change, the generated machine
+    code for a source-level statement or expression can be dropped during optimization.
+    Encapsulation helps to deal with these possible changes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding line-number information mostly boils down to retrieving the line-number
+    information from the AST and adding it to the generated instructions. The `llvm::Instruction`
+    class has the `setDebugLoc()` method, which attaches the location information
+    to the instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next section, we add the generation of debug information to our `tinylang`
+    compiler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Adding debug support to tinylang
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We encapsulate the generation of debug metadata in the new `CGDebugInfo` class.
+    We put the declaration into the `tinylang/CodeGen/CGDebugInfo.h` header file and
+    the definition into the `tinylang/CodeGen/CGDebugInfo.cpp` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `CGDebugInfo` class has five important members. We need a reference to the
+    code generator for the module, `CGM`, because we need to convert types from AST
+    representation to LLVM types. Of course, we also need an instance of the `llvm::DIBuilder`
+    class, called `DBuilder`, as in the previous sections. A pointer to the instance
+    of the compile unit is also needed, and we store it in a member called `CU`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To avoid repeated creation of the debug metadata for types, we also add a map
+    to cache this information. The member is called `TypeCache`. And lastly, we need
+    a way to manage the scope information, for which we create a stack based on the
+    `llvm::SmallVector<>` class, called `ScopeStack`. Thus we have the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE64]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following methods of the `CGDebugInfo` class all make use of these members:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'First, we need to create the compile unit, which we do in the constructor.
+    We also create a file containing the compile unit here. Later, we can refer to
+    the file through the `CU` member. The code for the constructor is shown in the
+    following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE65]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Very often, we need to provide a line number. This can be derived from the
+    source manager location, which is available is most AST nodes. The source manager
+    can convert this into a line number, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE66]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Information about a scope is held on a stack. We need methods to open and close
+    a scope and to retrieve the current scope. The compilation unit is the global
+    scope, which we add automatically, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE67]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We create a method for each category of the type we need to transform. The
+    `getPervasiveType()` method creates the debug metadata for basic types. Note in
+    the following code snippet the use of the encoding parameter, declaring the `INTEGER`
+    type as a signed type and the `BOOLEAN` type encoded as a Boolean type:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE68]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If the type name is simply renamed, then we map this to a type definition.
+    Here, we need to make the first use of the scope and line-number information,
+    as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE69]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Creating the debug information for an array requires specification about the
+    size and the alignment. We retrieve this data from the `DataLayout` class. We
+    also need to specify the index range of the array. We can do this with the following
+    code:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE70]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Using all these single methods, we create a central method to create the metadata
+    for a type. This metadata is also responsible for caching the data. The code can
+    be seen in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE71]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We also need to add a method to emit metadata for global variables, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE72]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To emit the debug information for procedures, we first need to create the metadata
+    for the procedure type. For this, we need a list of the types of the parameter,
+    with the return type being the first entry. If the procedure has no return type,
+    then we use an unspecified type called `void`, as in C. If a parameter is a reference,
+    then we need to add the reference type; otherwise, we add the type to the list.
+    The code is illustrated in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE73]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For the procedure itself, we can now create the debug information using the
+    procedure type created in the last step. A procedure also opens a new scope, so
+    we push the procedure onto the scope stack. We also associate the LLVM function
+    object with the new debug information, as follows:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE74]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'When the end of a procedure is reached, we must inform the builder to finalize
+    the construction of debug information for this procedure. We also need to remove
+    the procedure from the scope stack. We can do this with the following code:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE75]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Lastly, when we are finished with adding the debug information, we need to
+    add the `finalize()` method onto the builder. The generated debug information
+    is then validated. This is an important step during development as it helps you
+    to find wrongly generated metadata. The code can be seen in the following snippet:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE76]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Debug information should only be generated if the user requested it. We will
+    need a new command-line switch for this. We will add this to the file of the `CGModule`
+    class, and we will also use it inside this class, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE77]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `CGModule` class holds an instance of the `std::unique_ptr<CGDebugInfo>`
+    class. The pointer is initialized in the constructor, regarding the setting of
+    the command-line switch, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE78]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the getter method we return the pointer, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE79]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A common pattern when generating the debug metadata is to retrieve the pointer
+    and check if it is valid. For example, after we have created a global variable,
+    we add the debug information in this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE80]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In order to add line-number information, we need to add a `getDebugLoc()` conversion
+    method into the `CGDebugInfo` class, which turns the location information from
+    the AST into the debug metadata, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE81]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A utility function in the `CGModule` class can then be called to add the line-number
+    information to an instruction, as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE82]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this way, you can add the debug information for your own compiler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned how throwing and catching exceptions works in LLVM
+    and about which IR code you need to generate to exploit this feature. To enhance
+    the scope of IR, you learned how you can attach various metadata to instructions.
+    Metadata for type-based aliases provides additional information to the LLVM optimizer
+    and helps with certain optimizations to produce better machine code. Users always
+    appreciate the possibility of using a source-level debugger, and through adding
+    debug information to the IR code you are able to provide this important feature
+    of a compiler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimizing the IR code is a core task of LLVM. In the next chapter, we will
+    learn how the pass manager works and how we can influence the optimization pipeline
+    the pass manager governs.
+  prefs: []
+  type: TYPE_NORMAL

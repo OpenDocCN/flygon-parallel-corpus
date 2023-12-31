@@ -1,0 +1,1494 @@
+- en: Chapter 3. Memory Management and Exception Safety
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: C++ has a great deal of compatibility with the C programming language. C++ retains
+    pointers for representing and accessing specific memory addresses and provides
+    manual memory management primitives via the `new` and `delete` operators. You
+    can also seamlessly access from C++, the C Standard Library functions and C system
+    calls or platform APIs of most major operating systems. Naturally, C++ code often
+    deals with *handles* to various OS resources, like heap memory, open files, sockets,
+    threads, and shared memory. Acquiring such resources and failing to release them
+    could have undesirable consequences for your programs, showing up as insidious
+    bugs, including memory leaks and deadlocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we look at ways of encapsulating pointers to dynamically-allocated
+    objects using **smart pointers** to ensure that they are automatically deallocated
+    when they are no longer needed. We then extend these techniques to non-memory
+    resources. In the process, we develop an understanding of what is meant by exception-safe
+    code and use smart pointers to write such code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'These topics are divided into the following sections:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dynamic memory allocation and exception safety
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Smart pointers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Unique ownership semantics
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Shared ownership semantics
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For some sections of this chapter, you will need access to a compiler with C++11
+    support. This will be called out with additional instructions in individual sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Dynamic memory allocation and exception safety
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Imagine that you have to write a program to rotate images. Your program takes
+    the name of the file and the angle of rotation as input, reads the contents of
+    the file, performs the processing, and returns the output. Here is some sample
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The actual work of rotating the image is done by an imaginary C++ API called
+    `img_rotate` (line 20). The `img_rotate` function takes three parameters: the
+    contents of the image as an array of bytes, the size of the array in a non-const
+    reference, and the angle of rotation. It returns the contents of the rotated image
+    as a dynamically-allocated byte array. The size of this array is returned via
+    the reference passed as the third parameter. This is an imperfect code, more reminiscent
+    of C. Code like this is surprisingly common "in the wild" and that''s why it is
+    important to know its pitfalls. So, let us dissect the problem.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In order to read the contents of the image file, we first determine the size
+    of the file (lines 12-13), and then allocate a byte array `img` just big enough
+    to hold the entire data in the file (line 16). We read the image contents (line
+    18), and after performing rotation of the image through a call to `img_rotate`,
+    we delete the buffer `img` containing the original image (line 22). Finally, we
+    return the byte array with the rotated image (line 24). For simplicity, we do
+    not check for read errors (line 18).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are two glaring issues in the preceding code. If the rotation of the image
+    failed (line 19) and `img_rotate` threw an exception, then the function `rotateImage`
+    would return without deallocating the byte buffer `img`, which would thus be *leaked*.
+    This is a definitive example of code that is not well-behaved in the face of exceptions,
+    that is, it is not *exception-safe*. Moreover, even if everything went right,
+    the function would return the rotated buffer (line 24), which itself was dynamically-allocated.
+    So we leave its deallocation entirely at the caller's mercy with no guarantees
+    whatsoever. We ought to do better.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is a third less obvious problem. The `img_rotate` function ought to have
+    documented how it allocates memory for us to know how to free it—by calling the
+    array delete (`delete []`) operator (line 22). But what if there was a more efficient
+    custom memory management scheme that the developers of `img_rotate` found and
+    wanted to use in the next version? They would avoid doing so; otherwise all of
+    their client code would break as the `delete []` operator may no longer be the
+    correct way to deallocate that memory. Ideally, this is one detail that the clients
+    of the `img_rotate` API should never have had to bother about.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exception safety and RAII
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In the previous example, we looked informally at the concept of exception safety.
+    We saw that a potential exception thrown from the `img_rotate` API could leak
+    resources in the `rotateImage` function. It turns out that you can reason about
+    the behavior of your code in the face of exceptions in terms of a set of criteria
+    called **The Abrahams Exception Safety Guarantees**. They are named after Dave
+    Abrahams, the Boost cofounder and an eminent C++ Standards Committee member, who
+    formalized these guarantees in 1996\. They have since been refined further by
+    others, including notably Herb Sutter, and are listed below:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Basic guarantee**: An operation terminated midway preserves invariants and
+    does not leak resources'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Strong guarantee**: An operation terminated midway will not have any effect,
+    that is, the operation is atomic'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**No-throw guarantee**: An operation that cannot fail'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An operation that does not satisfy any of these criteria is said to be "not
+    exception-safe" or more colloquially, exception-unsafe. The appropriate level
+    of exception safety for an operation is the programmer's prerogative but exception-unsafe
+    code is rarely acceptable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The most fundamental and effective C++ technique for making code exception-safe
+    goes by the curious name **Resource Acquisition is Initialization** (**RAII**).
+    The RAII idiom proposes the following model for encapsulating resources that require
+    manual management:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encapsulate resource acquisition in the constructor of a wrapper object.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Encapsulate resource release in the destructor of the wrapper object.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Additionally, define consistent copy and move semantics for the wrapper object
+    or disable them.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'If the wrapper object is created on the stack, its destructor is called for
+    normal scope exit as well as exit due to exceptions. Otherwise, the wrapper object
+    itself should be managed by the RAII idiom. Loosely speaking, you either create
+    your objects on the stack or manage them using RAII. At this point, some examples
+    are in order, and we can go straight back to the image rotation example and fix
+    it using RAII:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code is a modest attempt that makes the `rotateImage` function
+    exception-safe, provided the `img_rotate` function itself is exception-safe. First
+    up we define a `struct` called `ScopeGuard` (lines 1-9) for encapsulating character
+    arrays allocated by the array `new operator`. It takes a pointer to an allocated
+    array as its constructor argument and sets the data member `data_` to this pointer
+    (line 3). Its destructor deallocates the array pointed to by its `data_` member
+    using the array `delete` operator (line 4). The `get` member function (line 6)
+    provides a way to get the underlying pointer from a `ScopeGuard` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Inside the `rotateImage` function, we instantiate a `ScopeGuard` object called
+    `img`, wrapping the byte array allocated using array `new` operator (line 23).
+    We call `read` on the open file stream and pass to it the raw byte array obtained
+    by calling the `get` method on `img` (line 25). We assume read always succeeds
+    but, in production code, we should always have proper error checks in place. Finally,
+    we call the `img_rotate` API and return the rotated image it returns (line 27).
+    As we exit the scope, the `ScopeGuard` destructor is called and automatically
+    deallocates the encapsulated byte array (line 28). Even if `img_rotate` threw
+    an exception, the `ScopeGuard` destructor would still be called as part of stack
+    unwinding. Through the use of RAII via the `ScopeGuard` class, we are able to
+    claim that the `rotateImage` function can never leak the buffer containing the
+    image data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, the buffer containing the rotated image returned by `rotateImage`
+    *could* be leaked, unless the caller takes care to assign it to a pointer and
+    then duly release it in an exception-safe way. The `ScopeGuard` class in its current
+    form is no good there. It turns out that Boost ships different kinds of smart
+    pointer templates to address various use cases like these, and it is worthwhile
+    to understand these smart pointers and the patterns of resource acquisition, and
+    the exception safety problems they help solve.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Smart pointers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: A smart pointer, definitively, is a class that encapsulates access to a pointer
+    and often manages memory associated with the pointer. If you paid attention, you
+    would have noticed the similarity smart pointers have with pineapples—smart pointers
+    are classes, not pointers, just as pineapples aren't really apples. Moving away
+    from fruit analogies, different types of smart pointers often have additional
+    features like bounds-checking, null-checking, and access control, among others.
+    In C++, smart pointers usually overload the dereference operator (`operator->`),
+    which allows any method calls invoked on the smart pointer using `operator->`
+    to be bound to the underlying pointer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Boost includes a set of four different smart pointers with differing semantics.
+    Also, because C++ often uses pointers to identify and manipulate arrays of objects,
+    Boost provides two different smart array templates that encapsulate array access
+    via pointers. In the following sections, we study the different classes of smart
+    pointers from Boost and their semantics. We will also look at `std::unique_ptr`,
+    a C++11 smart pointer class that supersedes one of the Boost smart pointers and
+    supports semantics not readily available from Boost.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unique ownership semantics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Consider the following code snippet for instantiating an object and calling
+    a method on it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: As we saw in the previous section, the preceding code is not exception-safe.
+    Exceptions thrown from operations after the `Widget` object is constructed on
+    dynamic memory (line 7) and before the `Widget` object is destroyed (line 11),
+    can cause the dynamically-allocated memory for the `Widget` object to leak. To
+    fix this, we need something akin to the `ScopeGuard` class we wrote in the previous
+    section, and Boost obliges with the `boost::scoped_ptr` template.
+  prefs: []
+  type: TYPE_NORMAL
+- en: boost::scoped_ptr
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Here is the preceding example fixed using `scoped_ptr`. The `scoped_ptr` template
+    is available from the header file `boost/scoped_ptr.hpp`. It is a header-only
+    library, and you don''t need to link your program against any other libraries:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.1: Using scoped_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, `wgt` is an object of type `scoped_ptr<Widget>`, which
+    is a drop-in replacement for the `Widget*` pointer. We initialize it with a dynamically-allocated
+    `Widget` object (line 8) and drop the call to `delete`. These are the only two
+    changes needed to make this code exception-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Smart pointers like `scoped_ptr` and others from Boost, take care of calling
+    `delete` on the encapsulated pointer in their destructor. When `useWidget` completes
+    or if an exception terminates it midway, the destructor of the `scoped_ptr` instance
+    `wgt` will be invoked and will destroy the `Widget` object and release its memory.
+    The overloaded dereference operator (`operator->`) in `scoped_ptr` allows `Widget`
+    members to be accessed via the `wgt` smart pointer (lines 9-11).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The destructor of `boost::scoped_ptr` template uses `boost::checked_delete`
+    to release the dynamically-allocated memory that the encapsulated pointer points
+    to. Thus, the type of the object pointed to by the encapsulated pointer must be
+    completely defined at the point the `boost::scoped_ptr` instance goes out of scope;
+    otherwise, the code will fail to compile.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `boost::scoped_ptr` is the simplest of Boost's smart pointers. It takes
+    ownership of the dynamically-allocated pointer passed and calls `delete` on it
+    inside its own destructor. This binds the life of the underlying object to the
+    scope in which the encapsulating `scoped_ptr` operates—hence, the name `scoped_ptr`.
+    Essentially, it implements RAII on the encapsulated pointer. Moreover, `scoped_ptr`
+    cannot be copied. This means that a dynamically-allocated object can only be wrapped
+    by one `scoped_ptr` instance at any given point in time. Thus, `scoped_ptr` is
+    said to exhibit *unique ownership semantics*. Note that `scoped_ptr` instances
+    cannot be stored in Standard Library containers because they can neither be copied
+    nor moved from in the C++11 sense.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following example, we explore some more features of `scoped_ptr`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.2: scoped_ptr in detail**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, we first construct an object of type `scoped_ptr<Widget>` using
+    its default constructor (line 9). This creates a `scoped_ptr` containing a null
+    pointer. Any attempts to dereference such a smart pointer will result in undefined
+    behavior typically leading to a crash. `scoped_ptr` supports implicit conversion
+    to a Boolean value; so we can use a `scoped_ptr` object like `wgt` in Boolean
+    contexts to check whether the encapsulated pointer is null or not. In this case,
+    we know that it should be null because it is default-constructed; hence, we assert
+    on `wgt` being null (line 10).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are two ways to change the pointer contained inside a `scoped_ptr` and
+    one of them is to use the `reset` member method of `scoped_ptr`. When we call
+    `reset` on a `scoped_ptr`, the encapsulated pointer is deallocated and `scoped_ptr`
+    takes ownership of the newly passed pointer in its place. Thus, we can use `reset`
+    to change the pointer owned by a `scoped_ptr` instance (line 12). Following this,
+    `scoped_ptr` contains a non-null pointer, and we assert as much using the ability
+    to implicitly convert `scoped_ptr` to a Boolean value (line 13). Next, we call
+    `reset` again to store a new pointer in `wgt` (line 15). In this case, the earlier
+    stored pointer is deallocated, and the underlying object is destroyed before the
+    new pointer is stored.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We can get at the underlying pointer by calling the `get` member function of
+    `scoped_ptr` (line 18). We can also get a reference to the object pointed to by
+    the smart pointer by dereferencing the smart pointer (line 19). We assert the
+    fact that this reference and the pointer returned by `get` both point to the same
+    object (line 20).
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is of course a second way to change the pointer contained inside a `scoped_ptr`.
+    By swapping two `scoped_ptr` objects, their encapsulated pointers are swapped
+    (lines 24-26). This is the only way to change the owning `scoped_ptr` of a dynamically-allocated
+    object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In summary, we can say that once you have wrapped an object in a `scoped_ptr`,
+    it can never be detached from a `scoped_ptr`. The `scoped_ptr` could destroy the
+    object and take on a new object (using the `reset` member function), or it could
+    swap its pointer with that in another `scoped_ptr`. In that sense, `scoped_ptr`
+    exhibits unique, transferrable ownership semantics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Uses of scoped_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: '`scoped_ptr` is a lightweight and versatile smart pointer that is capable of
+    more than just acting as a scope guard. Here is a look at how it can be used in
+    code.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating exception-safe scopes
+  prefs:
+  - PREF_H5
+  type: TYPE_NORMAL
+- en: '`scoped_ptr` is useful in creating exception-safe scopes, when objects are
+    dynamically-allocated in some scope. C++ allows objects to be created on the stack
+    and often that is the route you would take to create objects instead of allocating
+    them dynamically. But, in some cases, you would need to instantiate an object
+    by calling factory functions that return pointers to the dynamically-allocated
+    objects. This could be from some legacy library and `scoped_ptr` can be a handy
+    wrapper for such pointers. In the following example, `makeWidget` is one such
+    factory function that returns a dynamically-allocated `Widget`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: In general, `useWidget` in the preceding form would be exception-safe, provided
+    the function `makeWidget` called from within `useWidget` also is exception-safe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Transferring object ownership across functions
+  prefs:
+  - PREF_H5
+  type: TYPE_NORMAL
+- en: As non-copyable objects, `scoped_ptr` objects cannot be passed or returned by
+    value from functions. One may pass a non-const reference to a `scoped_ptr` as
+    an argument to a function, which resets its contents and puts a new pointer into
+    the `scoped_ptr` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.3: Ownership transfer using scoped_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `makeNewWidget` function uses the `scoped_ptr<Widget>` reference passed
+    to it as an out parameter using it to return the dynamically-allocated object
+    (line 5). Each call to `makeNewWidget` (line 12, 15) replaces its previous content
+    with a new `Widget` object allocated dynamically and deletes the previous object.
+    This is one way to transfer ownership of an object allocated dynamically inside
+    a function to a scope outside the function. It is not frequently used, and there
+    are more idiomatic ways of achieving the same effect in C++11 using `std::unique_ptr`,
+    as discussed in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a class member
+  prefs:
+  - PREF_H5
+  type: TYPE_NORMAL
+- en: Among the smart pointers from Boost, `scoped_ptr` is often used only as a local
+    scope guard in functions, when in fact, it can be a useful tool for ensuring exception
+    safety as a class member as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Consider the following code in which the class `DatabaseHandler` creates two
+    dynamically-allocated objects of the imaginary types `FileLogger` and `DBConnection`
+    for logging to a file and connecting to a database. `FileLogger` and `DBConnection`
+    as well as their constructor parameters are imaginary classes that are used for
+    illustrative purposes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code is the listing for the `DatabaseHandler` class definition
+    in the header file `DatabaseHandler.h`. `FileLogger` and `DBConnection` are incomplete
+    types having only been forward-declared. We only declare pointers to them, and
+    since the size of pointers is not dependent on the size of the underlying types,
+    the compiler does not need to know the definitions of `FileHandler` and `DBConnection`
+    to determine the total size of the `DatabaseHandler` class in terms of its pointer
+    constituents.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is an advantage to designing classes like this. The clients of `DatabaseHandler`
+    include the `DatabaseHandler.h` file listed earlier but do not depend on the actual
+    definitions of `FileLogger` or `DBConnection`. If their definitions change, the
+    clients remain unaffected and do not need to recompile. This, in essence, is the
+    idiom that Herb Sutter popularized as the **Pimpl Idiom**. The actual implementation
+    of the class is abstracted in a separate source file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this source file, we have access to the concrete definitions of `FileLogger`
+    and `DBConnection`. Even if these definitions and other parts of our implementation
+    change, the clients of `DatabaseHandler` need not change or recompile as long
+    as `DatabaseHandler`'s public methods and the class layout do not change.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But this code is very brittle and can potentially leak memory and other resources.
+    Consider what happens if the `FileLogger` constructor throws an exception (line
+    26). The memory allocated for the `logger_` pointer is freed automatically and
+    no further damage is done. The exception propagates from the `DatabaseHandler`
+    constructor to the calling context and no object of `DatabaseHandler` is instantiated;
+    so far so good.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now consider if the `FileLogger` object was constructed successfully and then
+    the `DBConnection` constructor threw an exception (line 27). In this case, upon
+    the exception the memory allocated for the `dbconn_` pointer would be automatically
+    freed, but not the memory allocated for the `logger_` pointer. When an exception
+    occurs destructors of any fully constructed members of non-POD types would be
+    called. But `logger_` is a raw pointer, which is a POD-type and therefore it does
+    not have a destructor. Thus, the memory pointed to by `logger_` is leaked.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In general, if your class has multiple pointers pointing to dynamically-allocated
+    objects, ensuring exception safety becomes a challenge, and most procedural solutions
+    around using try/catch blocks scale quite badly. A smart pointer is the perfect
+    ingredient to fix these kinds of problems with very little code that scales. We
+    use a `scoped_ptr` below to fix the preceding example. Here is the header file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.4: Using scoped_ptr as class members**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `logger_` and `dbconn_` are now `scoped_ptr` instances rather than raw
+    pointers (lines 19 and 20). On the flip side, `scoped_ptr` being non-copyable,
+    the compiler cannot generate the default copy constructor and copy assignment
+    operator. We could either disable them like we have done here (line 22 and 23)
+    or define them ourselves. In general, defining copy semantics for `scoped_ptr`
+    would make sense only when the encapsulated type is copyable. On the other hand,
+    move semantics might be easier to define using the `swap` member function of `scoped_ptr`.
+    Let us now look at the changes to the source file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: We initialize the two `scoped_ptr` instances in the constructor initializer
+    lists (lines 26 and 27). If the `DBConnection` constructor throws (line 27), the
+    destructor of `logger_`, which is a `scoped_ptr`, is invoked, and it cleanly deallocates
+    the dynamically-allocated `FileLogger` object it encapsulated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `DatabaseHandler` destructor is empty (line 31) because there are no POD-type
+    members, and the destructors of the `scoped_ptr` members are automatically invoked.
+    But we still have to define the destructor. Can you guess why? If we left it to
+    the compiler to generate a definition, it would have generated the destructor
+    definition in the scope of the class definition in the header file. In that scope,
+    `FileLogger` and `DBConnection` were not completely defined, and the `scoped_ptr`
+    destructors would have failed to compile, as they use `boost::checked_delete`
+    ([Chapter 2](ch02.html "Chapter 2. The First Brush with Boost's Utilities"), *The
+    First Brush with Boost's Utilities*)
+  prefs: []
+  type: TYPE_NORMAL
+- en: boost::scoped_array
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The `scoped_ptr` class template works great for single, dynamically-allocated
+    objects. Now if you remember our motivating example of writing an image rotation
+    utility, we needed to wrap a dynamic array in our custom `ScopeGuard` class to
+    make the `rotateImage` function exception-safe. Boost provides the `boost::scoped_array`
+    template as an array analogue for `boost::scoped_ptr`. The semantics of `boost::scoped_array`
+    are identical to those of `boost::scoped_ptr`, except that this one has an overloaded
+    subscript operator (`operator[]`) to access individual elements of the wrapped
+    array and does not provide overloaded operators for other forms of indirection
+    (`operator*` and `operator->`). Rewriting the `rotateImage` function using `scoped_array`
+    will be instructive at this point.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.5: Using scoped_array**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: We now use `boost::scoped_array` template in place of our `ScopeGuard` class
+    to wrap the dynamically-allocated array (line 16). Upon scope exit, due to normal
+    execution or exception, the destructor of `scoped_array` will invoke the array
+    delete operator (`delete[]`) on the contained dynamic array and deallocate it
+    in an exception-safe way. To highlight the ability to access array elements from
+    the `scoped_array` interface, we access the first byte using the overloaded `operator[]`
+    of `scoped_array` (line 20).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `scoped_array` template is mainly useful while dealing with legacy code
+    with lots of dynamic arrays. Thanks to the overloaded subscript operator, `scoped_array`s
+    are a drop-in replacement for dynamically-allocated arrays. Boxing up the dynamic
+    arrays in `scoped_array`s is thus a fast path to exception safety. C++ advocates
+    using `std::vector`s over dynamic arrays and that might be your eventual goal.
+    Yet as wrappers with hardly any space overhead compared to vectors, `scoped_array`s
+    could help transition faster to exception-safe code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: std::unique_ptr
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: C++ 11 introduces the `std::unique_ptr` smart pointer template, which supersedes
+    the deprecated `std::auto_ptr`, supports the functionality of `boost::scoped_ptr`
+    and `boost::scoped_array`, and can be stored in Standard Library containers. It
+    is defined in the standard header file `memory` along with other smart pointers
+    introduced in C++11.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The member functions of `std::unique_ptr` are easily mapped to those of `boost::scoped_ptr`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A default-constructed `unique_ptr` contains a null pointer (`nullptr`) just
+    like a default-constructed `scoped_ptr`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can call the `get` member function to access the contained pointer.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `reset` member function frees the older pointer and takes ownership of a
+    new pointer (which could be null).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The `swap` member function swaps contents of two `unique_ptr` instances and
+    always succeeds.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can dereference non-null `unique_ptr` instances with `operator*` and access
+    members using `operator->`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can use `unique_ptr` instances in Boolean contexts to check for nullness
+    just like `scoped_ptr` instances.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: However, `std::unique_ptr` is more versatile than `boost::scoped_ptr` in certain
+    matters.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A `unique_ptr` is movable, unlike `scoped_ptr`. Thus, it can be stored in C++11
+    Standard Library containers and returned from functions.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: You can detach the pointer owned by a `std::unique_ptr` and manage it manually
+    if you have to.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There is a `unique_ptr` partial specialization available for dynamically-allocated
+    arrays. `scoped_ptr` does not support arrays, and you have to use the `boost::scoped_array`
+    template for this purpose.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Ownership transfer using unique_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: The `std::unique_ptr` smart pointer can be used as a scope guard just like the
+    `boost::scoped_ptr`. Like `boost::scoped_ptr`, the type of the object pointed
+    to by the encapsulated pointer must be completely known at the point where `unique_ptr`
+    goes out of scope. However, unlike `boost::scoped_ptr`, `a unique_ptr instance`
+    need not be bound to a single scope and can be moved from one scope to another.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `std::unique_ptr` smart pointer template cannot be copied but does support
+    move semantics. Support for move semantics makes it possible to use `std::unique_ptr`
+    as a function return value that transfers ownership of dynamically-allocated objects
+    across functions. Here is such an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.6a: Using unique_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `make_logger` function is a factory function that returns a new instance
+    of `Logger`, wrapped in a `unique_ptr` (line 14). A function could use `make_logger`
+    this way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.6b: Using unique_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: In function `doLogging`, the local variable `logger` is move-initialized by
+    the `unique_ptr` returned from `make_logger` (line 6). So the contents of the
+    `unique_ptr` instance created inside `make_logger` are moved into the variable
+    `logger`. When `logger` goes out of scope as `doLogging` returns (line 8), its
+    destructor destroys the underlying `Logger` instance and deallocates its memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrapping arrays in unique_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'To illustrate the use of `unique_ptr` for wrapping dynamic arrays, we will
+    rewrite the image rotation example (listing 3.5) yet again, replacing `scoped_ptr`
+    with `unique_ptr`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.7: Using unique_ptr to wrap arrays**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: Apart from including a different header file (`memory` in place of `boost/scoped_ptr.hpp`),
+    there is only one other line of code that needed an edit. In place of `boost::scoped_array<byte>`,
+    the declared type of `img` is changed to `std::unique_ptr<byte[]>` (line 16)—a
+    definitive drop-in replacement. The overloaded `operator[]` is available only
+    for the array-specialization of `unique_ptr` and is used to refer to elements
+    of the array.
+  prefs: []
+  type: TYPE_NORMAL
+- en: make_unique in C++14
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'The C++14 Standard Library contains a function template `std::make_unique`,
+    which is a factory function for creating an instance of an object on dynamic memory
+    and wrap it in `std::unique_ptr`. The following example is a rewrite of listing
+    3.6b that illustrates the use of `make_unique`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.8: Using make unique**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `std::make_unique` function template takes the type of the underlying object
+    to construct as a template argument and the arguments to the object''s constructor
+    as function arguments. We directly pass to `make_unique`, the filename argument,
+    which it forwards to the constructor of `Logger` (line 7). `make_unique` is a
+    variadic template; it takes a variable number of arguments that match the constructor
+    parameters of the type instantiated, in number and type. If there was a two-parameter
+    constructor of `Logger`, say one that took a filename and a default log level,
+    we would pass two arguments to `make_unique`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Assuming `loglevel_t` describes the type used to represent log levels, and `DEBUG`
+    describes a valid value for that type, the preceding snippet illustrates the use
+    of `make_unique` with multiple constructor arguments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you have moved your codebase to C++11, you should prefer using `std::unique_ptr`
+    to `boost::scoped_ptr`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Shared ownership semantics
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Unique ownership semantics with the ability to transfer ownership is good enough
+    for most purposes that you would use a smart pointer for. But in some real-world
+    applications, you will need to share resources across multiple contexts without
+    any of these contexts being a clear owner. Such a resource can be released only
+    when all of the contexts holding references to the shared resource release them.
+    When and where this happens cannot be determined in advance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let us understand this with a concrete example. Two threads in a single process
+    read data from different sections of the same dynamically-allocated region in
+    memory. Each thread does some processing on the data and then reads more data.
+    We need to ensure that the dynamically-allocated memory region is cleanly deallocated
+    when the last thread terminates. Either thread could terminate before the other;
+    so who deallocates the buffer?
+  prefs: []
+  type: TYPE_NORMAL
+- en: By encapsulating the buffer in a smart wrapper that can keep a count of the
+    number of contexts referring to it, and deallocating the buffer only when the
+    count goes to zero, we can encapsulate the logic of deallocation completely. The
+    users of the buffer should switch to using a smart wrapper, which they can freely
+    copy, and when all copies go out of scope, the reference count goes to zero and
+    the buffer is deallocated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: boost::shared_ptr and std::shared_ptr
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: The `boost::shared_ptr` smart pointer template provides reference-counted shared
+    ownership semantics. It keeps track of the number of references to it using a
+    shared reference count that it maintains alongside the wrapped, dynamically-allocated
+    object. Like other smart pointer templates we have seen so far, it implements
+    the RAII idiom, taking responsibility of destroying and deallocating the wrapped
+    object in its destructor, but it does so only when all references to it are destroyed,
+    that is, the reference count goes to zero. It is a header-only library made available
+    by including `boost/shared_ptr.hpp`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`shared_ptr` was included in C++ Standards Committee Technical Report in 2007
+    (colloquially TR1), which was a precursor to the C++11 standard and was made available
+    as `std::tr1::shared_ptr`. It is now part of the C++11 Standard Library as `std::shared_ptr`
+    available through the standard C++ header file `memory`. If you have moved your
+    codebase to C++11, you should use `std::shared_ptr`. Much of the discussion in
+    this section applies to both versions; differences, if any, are called out.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You create `shared_ptr` instances to take ownership of a dynamically-allocated
+    object. Unlike `boost::scoped_ptr` and `std::unique_ptr`, you can copy `shared_ptr`
+    instances. `std::shared_ptr` also supports move semantics. It stores the dynamically-allocated
+    pointer and a shared reference count object. Each time `shared_ptr` is copied
+    via copy construction, the pointer and the reference count object are shallow-copied.
+    Copying `shared_ptr` instances causes reference counts to be bumped up. `shared_ptr`
+    instances going out of scope causes reference counts to be decremented. The `use_count`
+    member function can be used to get the current reference counts. Here is an example
+    that shows `shared_ptr` in action:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.9: shared_ptr in action**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, we define a class `Foo` with a default constructor and
+    a destructor that prints some message (lines 5-9). We include `boost/shared_ptr.hpp`
+    (line 1), which provides the `boost::shared_ptr` template.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the main function, we define two `shared_ptr<Foo>` instances `f1` (line 15)
+    and `f3` (line 25), initialized with two different dynamically-allocated instances
+    of class `Foo`. Note that the `shared_ptr` constructor is explicit and thus, you
+    cannot use an assignment expression to copy-initialize `shared_ptr` using implicit
+    conversion (line 16). The reference count of each `shared_ptr<Foo>` instance after
+    construction is 1 (lines 17 and 25). Next, we create `f2` as a copy of `f1` (line
+    20) and `f4` as a copy of `f3` (line 26). The copying causes the reference counts
+    to bump up. The `get` member function of `shared_ptr` returns the encapsulated
+    pointer, and the `use_count` member function of `shared_ptr` returns the current
+    reference count. Using `use_count`, we assert that `f1` and `f2` have the same
+    reference count, and using `get`, we assert that they contain the same pointer
+    (lines 21-22). Similar assertions hold true for `f3` and `f4` (line 27).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, we copy-assign `f1` to `f4` (line 31). As a result, `f4` now contains
+    the same pointer as `f1` and `f2`, and no longer shares a pointer with `f3`. Now
+    `f1`, `f2`, and `f4` are three `shared_ptr<Foo>` instances pointing to the same
+    pointer and their shared reference count goes to 3 (lines 32-33). `f3` no longer
+    shares its pointer with another instance, so its reference count goes to 1 (line
+    34).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Running the preceding code, you can expect the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: The reference counts duly go to zero at the end of the `main` function, and
+    both the dynamically created instances of `Foo` are destroyed by the `shared_ptr`
+    destructors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Uses of shared_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: In pre-C++11 code, `boost::shared_ptr` or `std::tr1::shared_ptr` tends to be
+    the default choice for a smart pointer owing to its flexibility and ease of use,
+    compared to `boost::scoped_ptr`. It is used for purposes beyond pure shared-ownership
+    semantics and this makes it the best-known smart pointer template. In C++11, such
+    pervasive use should be curbed in favor of `std::unique_ptr`, and `shared_ptr`
+    should only be used to model true shared-ownership semantics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a class member
+  prefs:
+  - PREF_H5
+  type: TYPE_NORMAL
+- en: 'Consider a scenario where multiple components of an application may share a
+    single database connection for better performance. Such a connection could be
+    created the first time it is requested and cached as long as there is some component
+    using it. When all components are done using it, the connection ought to be closed.
+    This is definitive of shared-ownership semantics and `shared_ptr` is useful in
+    this scenario. Let us see how an application component might use `shared_ptr`
+    to encapsulate a shared database connection:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.10: Using shared_ptr as class members**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `AppComponent` is a component of the application that uses a database connection
+    wrapped in a `shared_ptr` (line 20). The default-constructed `AppComponent` creates
+    a new database connection (line 4), but you can always create an `AppComponent`
+    instance by passing it an existing database connection wrapped in a `shared_ptr`
+    (lines 7-9). The `getConnection` member function retrieves the shared pointer-wrapped
+    `DatabaseConnection` object wrapped in a shared_ptr (line 16). Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, we create two `AppComponent` instances `c1` and `c2` that share
+    the same database connection. The second instance is created using the `shared_ptr`-wrapped
+    database connection cached by the first instance, obtained using the `getConnection`
+    method. Irrespective of the order in which `c1` and `c2` are destroyed, the shared
+    connection is destroyed only when the last of the two is destroyed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Storing dynamically-allocated objects in Standard Library containers
+  prefs:
+  - PREF_H5
+  type: TYPE_NORMAL
+- en: Objects stored by Standard Library containers are copied or moved into the container
+    and are destroyed with the container. Objects are retrieved too by copying or
+    moving. Prior to C++11, there was no support for move semantics and copying was
+    the sole mechanism for storing objects in containers. Standard Library containers
+    do not support reference semantics. You may store pointers to dynamically-allocated
+    objects in containers but, at the end of its life cycle, the container not attempt
+    to destroy and deallocate these objects via their pointers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can wrap dynamically-allocated objects in `shared_ptr` or `unique_ptr`
+    and store them in containers. Assuming that you can use C++11, `std::unique_ptr`
+    is good enough if storing them in a single container is all you are ever going
+    to need. But if you need to store the same dynamically-allocated object across
+    multiple containers, `shared_ptr` is the best choice for the wrapper. When the
+    container is destroyed, the destructor of each `shared_ptr` instance is called
+    and the reference count of that `shared_ptr` is decremented. If the reference
+    count goes to zero for any `shared_ptr`, the underlying dynamic object stored
+    in it is deallocated. The following example illustrates how objects wrapped in
+    `shared_ptr` can be stored in multiple STL containers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.11: Storing shared_ptr in containers**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding example, let us assume that there is a class called `Person`
+    (line 1). Now, given a list of objects of type `Person`, we would like to create
+    a mapping of names to `Person` objects. Assume that `Person` objects cannot be
+    copied, and so they need to be stored in containers as pointers. We define a type
+    alias called `PersonPtr` for `shared_ptr<Person>` (line 2). We also define the
+    data structures for storing a list of `Person` objects, (`std::vector<PersonPtr>`
+    (line 3)) and the mapping of `Person` names to `Person` objects (`std::multimap<std::string,
+    PersonPtr>` (line 4)). Finally, we construct the mapping from the list (lines
+    7-9).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each entry into the `personNameMap` container is created as a `std::pair` of
+    the name of a person and the `PersonPtr` object (using `std::make_pair`). Each
+    such entry is inserted into the `multimap` using its `insert` member function
+    (line 9). We assume that there is a member function in `Person` called `name`.
+    The `PersonPtr` object being a `shared_ptr` is shared across the `vector` and
+    the `multimap` containers. The `Person` objects are destroyed when the last of
+    the two containers is destroyed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Besides `shared_ptr`, Boost's Pointer Containers provide an alternative means
+    of storing dynamically-allocated objects in containers. We cover Pointer Containers
+    in [Chapter 5](ch05.html "Chapter 5. Effective Data Structures beyond STL"), *Effective
+    Data Structures beyond STL*. In [Chapter 9](ch09.html "Chapter 9. Files, Directories,
+    and IOStreams"), *Files, Directories, and IOStreams*, which deals with Boost Threads,
+    we will see how `shared_ptr` instances can be shared across threads.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nonowning aliases – boost::weak_ptr and std::weak_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: In the last section, one of the examples we looked at was that of a database
+    connection shared among multiple application components. This form of use has
+    certain shortcomings. While instantiating application components that are meant
+    to reuse the open database connection, you need to refer to another existing component
+    that uses the connection and pass that connection to the constructor of the new
+    object. A more scalable approach is to decouple the connection creation and application
+    component creation so that application components are not even aware of whether
+    they got a new connection or an existing reusable connection. But the requirement
+    still remains that the connection must be shared across all clients, and it must
+    be closed when the last reference to it has gone.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One approach to building such a mechanism is to use a database connection factory,
+    which creates connections to a specific database instance based on connection
+    parameters passed by the caller. It then passes the connection back to the caller
+    wrapped in a `shared_ptr` and also stores it in a map that can be looked up. When
+    a new client requests a connection to the same instance for the same database
+    user, the factory can simply look up the existing connection from the map and
+    return it wrapped in a `shared_ptr`. The following and illustrative code implements
+    this logic. It assumes that all information needed to connect to a database instance
+    is encapsulated in a `DBCredentials` object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, `DBConnectionFactory` provides a static method called
+    `connect` that takes a `DBCredentials` object and returns a `shared_ptr`-wrapped
+    `DatabaseConnection` (`DBConnectionPtr`) (lines 8-19). We call `DBConnectionFactory::connect`
+    twice, passing the same credentials. The first call (line 28) should result in
+    the creation of a new connection (line 15), while the second call should just
+    look up and return the same connection (lines 10-13).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is one major problem with this code: `DBConnectionFactory` stores the
+    connection wrapped in a `shared_ptr` inside a static `std::map` called `conn_map_`
+    (line 21). As a result, its reference count goes to 0 only at the end of the program,
+    when the `conn_map_` is destroyed. Otherwise, even when there are no contexts
+    using the connection, the reference count remains at 1\. We require that, when
+    all contexts using the shared connection exit or expire, the connection should
+    be destroyed. This is clearly not met.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Storing the raw pointer (`DatabaseConnection*`) instead of the `shared_ptr`
+    (`DBConnectionPtr`) in the map would be no good because, we need the first `shared_ptr`
+    instance we gave out for the connection, to be able to create more `shared_ptr`
+    instances for that connection. Even with ways to get around this problem (as we
+    will see later with `enable_shared_from_this`), by just looking up the raw pointer
+    in the connection map we would not know whether it is still in use or has already
+    been deallocated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `boost::weak_ptr` template, also available in C++11 as `std::weak_ptr`,
+    is the right tool to fix this problem. You can refer to a `shared_ptr` instance
+    using one or more `weak_ptr` instances, without contributing to the reference
+    count that determines its lifetime. Using the `weak_ptr` instances, you can safely
+    determine whether the `shared_ptr` it refers to is still active or expired. If
+    not expired, you can use the `weak_ptr` instance to also create another `shared_ptr`
+    instance referring to the same object. We will now rewrite the preceding example
+    using `weak_ptr`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.12: Using weak_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, we alter the definition of `ConnectionMap` to store `weak_ptr<DatabaseConnection>`
+    instead of `shared_ptr<DatabaseConnection>` (line 6-7). When the `DBConnectionFactory::connect`
+    function is called with appropriate credentials, the code looks up the entry (line
+    10), and on failure, creates a new database connection, wraps it in a `shared_ptr`
+    (line 17), and stores it as a `weak_ptr` in the map (line 18). Note that we assign
+    a `shared_ptr` to a `weak_ptr` using the copy assignment operator. The newly constructed
+    `shared_ptr` is returned (line 19). If the lookup succeeded, it calls the `lock`
+    method on the retrieved `weak_ptr` in an attempt to construct a `shared_ptr` from
+    it (line 12). If the retrieved `weak_ptr` represented by `it->second` refers to
+    a valid `shared_ptr`, the `lock` call will automatically return another `shared_ptr`
+    referring to the same object and this would be assigned to the `connptr` variable
+    and returned (line 15). Otherwise, the `lock` call will return a null `shared_ptr`,
+    and we will create a new connection in the `else` block, as described earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you just wanted to check whether the `weak_ptr` instance refers to a valid
+    `shared_ptr` or not without creating a new `shared_ptr` referent, just call the
+    `expired` method on the `weak_ptr`. It will return `false` only if at least one
+    `shared_ptr` instance is still around.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'How does the `weak_ptr` achieve this? Actually, `shared_ptr` and `weak_ptr`
+    are designed to work with each other. Each `shared_ptr` instance has two pieces
+    of memory: the dynamically-allocated object it encapsulates and a chunk of memory
+    called the shared counter, which contains not one but two atomic reference counts.
+    Both chunks of memory are shared between all related `shared_ptr` instances. The
+    shared counter chunk is also shared with all `weak_ptr` instances that refer to
+    these `shared_ptr` instances.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The first reference count in the shared counter, the *use count*, keeps a count
+    of the number of references to the `shared_ptr`. When this count goes to zero,
+    the encapsulated, dynamically-allocated object is deleted and the `shared_ptr`
+    expires. The second reference count, the *weak count*, is the number of `weak_ptr`
+    references, plus one if and only if there are `shared_ptr` instances around. The
+    shared counter chunk is deleted only when the weak count goes to zero, that is,
+    when all `shared_ptr` and `weak_ptr` instances have expired. Thus, any remaining
+    `weak_ptr` instance is able to tell whether the `shared_ptr` has expired by checking
+    the use count, which is still accessible to it, and seeing if it is 0\. The `lock`
+    method of `weak_ptr` atomically checks the use count and increments it only if
+    it is non-zero, returning a valid `shared_ptr` wrapping the encapsulated pointer.
+    If the use count was already zero, lock returns an empty `shared_ptr`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A shared_ptr critique – make_shared and enable_shared_from_this
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: '`shared_ptr` has been used widely, beyond its appropriate use case for shared-ownership
+    semantics. This is partly due to its availability as part of the C++ **Technical
+    Report 1** (**TR1**) release in 2007, whereas other viable options like Boost''s
+    Pointer Containers (see [Chapter 5](ch05.html "Chapter 5. Effective Data Structures
+    beyond STL"), *Effective Data Structures beyond STL*) were not part of the TR1\.
+    But `shared_ptr` requires an extra allocation for the shared counter, because
+    of which construction and destruction is slower than it is for `unique_ptr` and
+    `scoped_ptr`. The shared counter itself is an object containing two atomic integers.
+    If you never need shared-ownership semantics but use `shared_ptr`, you pay for
+    one extra allocation of the shared counter and for the increment and decrement
+    operations on atomic counters, which make copying `shared_ptr` slower. If you
+    need shared-ownership semantics but don''t care about `weak_ptr` observers, you
+    pay for the extra space occupied by the weak reference counter that you would
+    not need.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'One way to mitigate this problem is to somehow coalesce the two allocations—one
+    for the object and one for the shared counter—into one. The `boost::make_shared`
+    function template (also `std::make_shared` in C++11) is a variadic function template
+    that does exactly this. Here is how you would use it:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.13: Using make_shared**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `boost::make_shared` function template takes the type of object as a template
+    argument and the arguments to the object's constructor as function arguments.
+    We call `make_shared<Foo>`, passing it the arguments we want to construct the
+    `Foo` object with (lines 8-9). The function then allocates a single block of memory
+    in which it lays out the object and also appends the two atomic counts, in one
+    fell swoop. Note that you need to include the header file `boost/make_shared.hpp`
+    to use `make_shared`. This is not as perfect as it seems but might be a good enough
+    trade-off. It is not perfect because now it is a single block of memory not two,
+    and is shared between all `shared_ptr` and `weak_ptr` referents.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Even when all the `shared_ptr` referents are gone and the object destructed,
+    its memory is reclaimed only when the last `weak_ptr` is gone. Again, this is
+    a problem only if you use lingering `weak_ptr` instances and your object size
+    is large enough to be a worry.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is yet another problem with `shared_ptr` that we briefly looked at earlier.
+    If we create two independent `shared_ptr` instances from the same raw pointer,
+    then they have independent reference counts and both try to delete the encapsulated
+    object in due course. The first will succeed, but the destructor of the second
+    instance will most likely crash, trying to delete an already deleted entity. Also,
+    any attempts to dereference the object through the second `shared_ptr` after the
+    first goes out of scope would be equally disastrous. The general solution to this
+    problem is to not use `shared_ptr` at all but rather use `boost::intrusive_ptr`—something
+    that we explore in the next section. An alternate way to get around the problem
+    is to equip an instance method of the wrapped class to return a `shared_ptr` using
+    the `this` pointer. For this, your class must derive from the `boost::enable_shared_from_this`
+    class template. Here is an example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.14: Using enable_shared_from_this**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the preceding code, the class `CanBeShared` derives from `boost:: enable_shared_from_this<CanBeShared>`
+    (line 7). If you are wondering how come `CanBeShared` inherits from a class template
+    instantiation, which takes `CanBeShared` itself as a template argument, let me
+    refer you to the Curiously Recurring Template Pattern, a C++ idiom you can read
+    more about on the Web. Now, `CanBeShared` defines a member function called `share`
+    that returns the `this` pointer wrapped in a `shared_ptr` (line 13). It does so
+    using the member function `shared_from_this` (line 15), which it inherits from
+    its base class.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the `main` function, we create an instance `cbs` of `CanBeSharedPtr` (which
+    is a `typedef` for `boost::shared_ptr<CanBeShared>`) from a dynamically-allocated
+    object of type `CanBeShared` (line 31). Next, we call the function `doWork` passing
+    it the raw pointer inside `cbs` (line 32). The `doWork` function is passed a reference
+    (`obj`) to `CanBeShared`, and calls the `share` method on it to get a `shared_ptr`
+    wrapper of the same object (line 23). The reference count of this `shared_ptr`
+    goes to 2 now (line 25), and the pointer it contains points to `obj` (line 26).
+    Once `doWork` returns, the usage count on `cbs` goes back to 1 (line 34).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `shared_ptr` instance that is returned from the call to `shared_from_this`
+    is constructed from a `weak_ptr` member instance in the `enable_shared_from_this<>`
+    base and is only constructed at the end of the constructor of the wrapped object.
+    Thus, if you called `shared_from_this` inside the constructor of your class, you
+    would encounter a runtime error. You should also avoid calling it on raw pointers
+    that are not already wrapped in a `shared_ptr` object or objects that are not
+    dynamically constructed to start with. The C++11 Standard standardizes this facility
+    as `std::enable_shared_from_this` available through the standard header file `memory`.
+    We use `enable_shared_from_this` extensively while writing asynchronous TCP servers
+    in [Chapter 11](ch11.html "Chapter 11. Network Programming Using Boost Asio"),
+    *Network Programming Using Boost Asio*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you are eagle-eyed, you would have noticed that we included just a single
+    header file `boost/smart_ptr.hpp`. This is a convenient header file that brings
+    together all the available smart pointer functionality into a single header file
+    so that you don't have to remember to include multiple headers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you can use C++11, then you should use `std::unique_ptr` in the majority
+    of cases, and use `shared_ptr` only when you need shared ownership. If you are
+    still on C++03 for some reason, you should look to leverage `boost::scoped_ptr`
+    wherever possible, or use `boost::shared_ptr` with `boost::make_shared` for better
+    performance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Intrusive smart pointers – boost::intrusive_ptr
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Consider what happens when you wrap the same pointer in two different `shared_ptr`
+    instances that are not copies of each other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, we created a `shared_ptr<Foo>` instance (line 5) and
+    a second independent instance of `shared_ptr<Foo>`, using the same pointer as
+    for the first one (line 6). The net effect is that two `shared_ptr<Foo>` instances
+    both have a reference count of 1 (asserts on line 8) and both contain the same
+    pointer (asserts on line 9). At the end of the scope, reference counts of both
+    `f1` and `f2` go to zero and both try to call `delete` on the same pointer (line
+    10). The code almost certainly crashes as a result of the double delete. The code
+    is well-formed in the sense that it compiles, but hardly well-behaved. You need
+    to guard against such usage of `shared_ptr<Foo>` but it also points to a limitation
+    of `shared_ptr`. The limitation is due to the fact that there is no mechanism,
+    given just the raw pointer, to tell whether it is already referenced by some smart
+    pointer. The shared reference count is outside the `Foo` object and not part of
+    it. `shared_ptr` is said to be nonintrusive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An alternative is to maintain the reference count as part of the object itself.
+    This may not be feasible in some cases but will be perfectly acceptable in others.
+    There may even be existing objects that actually maintain such reference counts.
+    If you have ever used Microsoft's Component Object Model, you have used such objects.
+    The `boost::intrusive_ptr` template is an intrusive alternative to `shared_ptr`
+    that puts the onus of maintaining reference counts on the user, and uses user-provided
+    hooks to increment and decrement the reference counts. If the user so wishes,
+    the reference count could be part of the class layout. This has two advantages.
+    The object and the reference count are located next to each other in memory, so
+    there is better cache performance. Secondly, all instances of `boost::intrusive_ptr`
+    use the same reference count to manage the life cycle of the object. Thus, independent
+    `boost::intrusive_ptr` instances don't create any problems of double deletion.
+    In fact, you can potentially use multiple different smart pointer wrappers for
+    the same object at the same time as long as they use the same intrusive reference
+    count.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using intrusive_ptr
+  prefs:
+  - PREF_H4
+  type: TYPE_NORMAL
+- en: 'To manage dynamically-allocated instances of type `X`, you create `boost::intrusive_ptr<X>`
+    instances just as you would create other smart pointer instances. You just need
+    to make sure that two global functions `intrusive_ptr_add_ref(X*)` and `intrusive_ptr_release(X*)`
+    are available that take care of incrementing and decrementing the reference counts,
+    and calling `delete` on the dynamically-allocated object if the reference count
+    goes to zero. If `X` be part of a namespace, the two global functions too should
+    ideally be defined in the same namespace to facilitate Argument Dependent Lookup.
+    Thus, the reference counting and deletion mechanisms are both in control of the
+    user, and `boost::intrusive_ptr` provides an RAII framework, which they are hooked
+    into. Do note how the reference count is maintained is the user''s prerogative
+    and incorrect implementations could cause leaks, crashes, or at the very least,
+    inefficient code. Finally, here is some sample code that uses `boost::intrusive_ptr`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.15: Using intrusive_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: We use `boost::intrusive_ptr` to wrap dynamically-allocated objects of class
+    `Bar` (line 31). We can also copy one `intrusive_ptr<NS::Bar>` instance into another
+    (line 32). The class `Bar` maintains its reference count in a member variable
+    `refcount_` of type `unsigned long` (line 14). The `intrusive_ptr_add_ref` and
+    `intrusive_ptr_release` functions are declared as friends of the class `Bar` (lines
+    10 and 11) and are in the same namespace `NS` as `Bar` (lines 3-26). `intrusive_ptr_add_ref`
+    increments `refcount_` each time it is called. `intrusive_ptr_release` decrements
+    `refcount_` and calls `delete` on the pointer argument passed to it once `refcount_`
+    goes to zero.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The class `Bar` initializes the variable `refcount_` to zero. We pass `true`
+    for the Boolean second argument to the `intrusive_ptr` constructor so that the
+    constructor increments `Bar`'s `refcount_` through a call to `intrusive_ptr_add_ref(NS::Bar*)`
+    (line 31). This is the default behavior, and the Boolean second argument to the
+    `intrusive_ptr` constructor defaults to `true`, so we did not really need to pass
+    it explicitly. On the other hand, if we were dealing with a class that sets its
+    reference count to 1 on initialization, not 0 as `Bar` does, then we would not
+    like the constructor to increment the reference count again. In such cases, we
+    should pass `false` for the second parameter to the `intrusive_ptr` constructor.
+    The copy constructor always increments the reference count via a call to `intrusive_ptr_add_ref`.
+    The destructor of each `intrusive_ptr` instance calls `intrusive_ptr_release`,
+    passing it the encapsulated pointer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'While the preceding example illustrates how you can use the `boost::intrusive_ptr`
+    template, Boost provides some conveniences if you are managing dynamically-allocated
+    objects. The `boost::intrusive_ref_counter` wraps some generic boilerplate code
+    so that you don''t have to roll out so much of it yourself. The following example
+    illustrates this use:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Listing 3.16: Lesser code with intrusive_ptr**'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Instead of maintaining reference counts and providing namespace level overloads
+    for `intrusive_ptr_add_ref` and `intrusive_ptr_release`, we just publicly inherit
+    the class `Bar` from `boost::intrusive_ref_counter<Bar>`. This is all we need
+    to do. This also makes it easy to get the reference count at any point, using
+    the `use_count()` public member inherited from `intrusive_ref_counter<>` into
+    `Bar`. Note that `use_count()` is not a member function of `intrusive_ptr` itself,
+    so we have to use the dereference operator (`operator->`) to invoke it (lines
+    21-24).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The reference counter used in the preceding example is not thread-safe. If
+    you want to ensure reference count thread safety, edit the example to use the
+    `boost::thread_safe_counter` policy class as the second type argument to `boost::intrusive_ref_counter`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: Curiously, `Bar` inherits from an instantiation of the `boost::intrusive_ref_counter`
+    template, which takes `Bar` itself as a template argument. This is once again
+    the Curiously Recurring Template Pattern at work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: shared_array
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Just like `boost::scoped_ptr` had a corresponding template for specifically
+    managing dynamically-allocated arrays, there is a template called `boost::shared_array`
+    that can be used to wrap dynamically-allocated arrays and manage them with shared
+    ownership semantics. Like `scoped_array`, `boost::shared_array` has an overloaded
+    subscript operator (`operator[]`). Like `boost::shared_ptr`, it uses a shared
+    reference count to manage the lifetime of the encapsulated array. Unlike `boost::shared_ptr`,
+    there is no `weak_array` for `shared_array`. It is a convenient abstraction that
+    can be used as a reference counted vector. I leave it to you to explore this further.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Managing non-memory resources using smart pointers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: All the smart pointer classes we have seen so far assume that their resource
+    is dynamically-allocated using the C++ `new` operator and requires deletion using
+    the `delete` operator. The `scoped_array` and `shared_array` classes as well as
+    `unique_ptr`'s array partial specialization assume that their resources are dynamically-allocated
+    arrays and use the array `delete` operator (`delete[]`) to deallocate them. Dynamic
+    memory is not the only resource that a program needs to manage in an exception-safe
+    way, and smart pointers would be remiss to ignore this use case.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `shared_ptr` and `std::unique_ptr` templates can work with alternative
+    user-specified deletion policies. This makes them fit to manage not just dynamic
+    memory but almost any resource with explicit APIs for creation and deletion, such
+    as C-style heap memory allocation and deallocation using `malloc` and `free`,
+    open file streams, Unix open file descriptors and sockets, platform-specific synchronization
+    primitives, Win32 API handles to various resources, and even user-defined abstractions.
+    Here is a short example to round off the chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: We wrap the `FILE` pointer returned by `fopen` in a `shared_ptr<FILE>` object
+    (line 18). However, the `shared_ptr` template knows nothing about `FILE` pointers,
+    so we must also specify the deletion policy. For this, we define a function object
+    called `FILEDeleter` (line 5), whose overloaded function call operator (`operator()`,
+    line 7) takes a parameter of type `FILE` and calls `fclose` on it if it is not
+    null (line 10). A temporary instance of `FILEDeleter` is passed to the constructor
+    of `shared_ptr<FILE>` as a second, deleter argument (line 19). The destructor
+    of `shared_ptr<FILE>` invokes the overloaded function call operator on the passed
+    deleter object, passing the stored `FILE` pointer as argument. There is little
+    use of the overloaded `operator->` in this case, so all operations on the wrapped
+    pointer are performed by accessing the raw pointer using the `get` member function
+    (line 24). We can also use a lambda expression in place of the `FILEDeleter` function
+    object. We introduce lambda expressions in [Chapter 7](ch07.html "Chapter 7. Higher
+    Order and Compile-time Programming"), *Higher Order and Compile-time Programming*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If you have access to C++11, it is always better to use `std::unique_ptr` for
+    such purposes. With `std::unique_ptr`, you have to specify a second template argument
+    for the type of the deleter. The preceding example will use a `std::unique_ptr`
+    with just the following edits:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: We include the C++ standard header file `memory` instead of `boost/shared_ptr.hpp`
+    (line 1), and wrap the `FILE` pointer returned by the call to `fopen` in a `unique_ptr`
+    instance (line 18), passing it a temporary instance of `FILEDeleter` (line 19).
+    The only additional detail is the second type argument to the `unique_ptr` template,
+    specifying the type of the deleter. We can also use a C++ 11 Lambda expression
+    in place of the FILEDeleter function object. We will look at such use in later
+    chapters, after we have introduced Lambda expressions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Self-test questions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For multiple choice questions, choose all options that apply:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What are the Abraham's Exception Safety Guarantees?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. Basic, weak, and strong
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. Basic, strong, and no-throw
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. Weak, strong, and no-throw
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. None, basic, and strong
+  prefs: []
+  type: TYPE_NORMAL
+- en: What are the main differences between `boost::scoped_ptr` and `std::unique_ptr`?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. `boost::scoped_ptr` does not support move semantics
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. `std::scoped_ptr` has no partial specialization for arrays
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. `std::unique_ptr` can be stored in STL containers
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. `std::unique_ptr` supports custom deleters
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why is `boost::shared_ptr` heavier than other smart pointers?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. It uses a shared reference counter
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. It supports both copy and move semantics
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. It uses two allocations per encapsulated object
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. It is not heavier than other smart pointers
+  prefs: []
+  type: TYPE_NORMAL
+- en: What is the disadvantage of using `boost::make_shared` to create a `shared_ptr`?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. It is slower than directly instantiating `boost::shared_ptr`
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. It is not thread safe
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. It does not release object memory until all `weak_ptr` referents expire
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. It is not available in C++11 Standard
+  prefs: []
+  type: TYPE_NORMAL
+- en: What are the primary differences between `boost::shared_ptr` and `std::unique_ptr`?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. `std::unique_ptr` does not support copy semantics
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. `std::unique_ptr` does not support move semantics
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. `boost::shared_ptr` does not support custom deleters
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. `boost::shared_ptr` cannot be used for arrays
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you want to return a `shared_ptr<X>` wrapping the `this` pointer from a member
+    function of class `X`, which of the following would work?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: a. `return boost::shared_ptr<X>(this)`
+  prefs: []
+  type: TYPE_NORMAL
+- en: b. `boost::enable_shared_from_this`
+  prefs: []
+  type: TYPE_NORMAL
+- en: c. `boost::make_shared`
+  prefs: []
+  type: TYPE_NORMAL
+- en: d. `boost::enable_shared_from_raw`
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: This chapter formalized the requirements for exception safety of a piece of
+    code, and then defined various means of managing dynamically-allocated objects
+    in an exception-safe way using smart pointers. We looked at smart pointer templates
+    both from Boost and ones that have been introduced by the new C++11 Standard,
+    and understood the different ownership semantics and intrusive and nonintrusive
+    reference counting. We also got a chance to look at ways of adapting some of the
+    smart pointer templates for managing non-memory resources.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hopefully, you have understood the various ownership semantics and would be
+    able to judiciously apply the techniques in this chapter to such scenarios. There
+    are facilities in the smart pointer library that we did not cover in any significant
+    detail, like `boost::shared_array` and `boost::enable_shared_from_raw`. You should
+    explore them further on your own, focusing on their applicability and their pitfalls.
+    In the next chapter, we will learn about some nifty and useful techniques for
+    dealing with text data using Boost's string algorithms.
+  prefs: []
+  type: TYPE_NORMAL
+- en: References
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Rule of Zero: [http://en.cppreference.com/w/cpp/language/rule_of_three](http://en.cppreference.com/w/cpp/language/rule_of_three)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Designing C++ Interfaces - Exception Safety*, *Mark Radford*: [http://accu.org/index.php/journals/444](http://accu.org/index.php/journals/444)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Exception Safety Analysis*, *Andrei Alexandrescu and David B. Held*: [http://erdani.com/publications/cuj-2003-12.pdf](http://erdani.com/publications/cuj-2003-12.pdf)'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL

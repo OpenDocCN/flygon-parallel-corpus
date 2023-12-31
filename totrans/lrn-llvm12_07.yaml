@@ -1,0 +1,1079 @@
+- en: '*Chapter 5*: Basics of IR Code Generation'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Having created a decorated **Abstract Syntax Tree** (**AST**) for your programming
+    language, the next task is to generate the LLVM IR code from it. LLVM IR code
+    resembles three-address code, with a human-readable representation. Therefore,
+    we need a systematic approach to translate language concepts such as control structures
+    into the lower level of LLVM IR.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, you will learn about the basics of LLVM IR, and how to generate
+    IR for control flow structures from the AST. You will also learn how to generate
+    LLVM IR for expressions in **Static Single Assignment** (**SSA**) **form**, using
+    a modern algorithm. Finally, you will learn how to emit assembler text and object
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This chapter will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generating IR from the AST
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using AST numbering to generate IR code in SSA form
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Setting up the module and the driver
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: By the end of the chapter, you will have acquired the knowledge to create a
+    code generator for your own programming language, and how to integrate it into
+    your own compiler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Technical requirements
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The code files for the chapter are available at [https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang)
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can find the code in action videos at [https://bit.ly/3nllhED](https://bit.ly/3nllhED)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generating IR from the AST
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The LLVM code generator takes a module as described in IR as input and turns
+    it into object code or assembly text. We need to transform the AST representation
+    into IR. To implement an IR code generator, we will look at a simple example first
+    and then develop the classes required for the code generator. The complete implementation
+    will be divided into three classes: the `CodeGenerator`, the `CGModule`, and the
+    `CGProcedure` classes. The `CodeGenerator` class is the general interface used
+    by the compiler driver. The `CGModule` and the `CGProcedure` classes hold the
+    state required for generating the IR code for a compilation unit and a single
+    function.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We begin with a look at the `clang`-generated IR in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Understanding the IR code
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Before generating the IR code, it''s good to know the main elements of the
+    IR language. In [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048), *The
+    Structure of a Compiler*, we already had a brief look at IR. An easy way to get
+    more knowledge of IR is to study the output from `clang`. For example, save this
+    C source code, which implements the Euclidean algorithm for calculating the greatest
+    common divisor of two numbers, as `gcd.c`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'You can then create the IR file, `gcd.ll`, with the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The IR code is not target-independent, even if it often looks like it. The
+    preceding command compiles the source file for an ARM 64-bit CPU on Linux. The
+    `-S` option instructs `clang` to output an assembly file, and with the additional
+    specification of `-emit-llvm`, an IR file is created. The optimization level,
+    `-O1`, is used to get an easy readable IR code. Let''s have a look at the generated
+    file and understand how the C source maps to IR. At the top of the file, some
+    basic properties are established:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: The first line is a comment, informing you about which module identifier was
+    used. On the following line, the filename of the source file is named. With `clang`,
+    both are the same.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `target datalayout` string establishes some basic properties. Its parts
+    are separated by `-`. The following information is included:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A small `e` means that bytes in memory are stored using the little endian schema.
+    To specify a big endian, you use a big `E`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`m:` specifies the name mangling applied to symbols. Here, `m:e` means that
+    ELF name mangling is used.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The entries on the `iN:A:P` form, for example, `i8:8:32`, specify the alignment
+    of data, given in bits. The first number is the alignment required by the ABI,
+    and the second number is the preferred alignment. For bytes (`i8`), the ABI alignment
+    is 1 byte (`8`) and the preferred alignment is 4 bytes (`32`).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`n` specifies which native register sizes are available. `n32:64` means that
+    32-bit and 64-bit wide integers are natively supported.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`S` specifies the alignment of the stack, again in bits. `S128` means that
+    the stack maintains a 16-byte alignment.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs: []
+  type: TYPE_NORMAL
+- en: A lot more information can be provided with the target data layout. You can
+    find the full information in the reference manual at [https://llvm.org/docs/LangRef.html#data-layout](https://llvm.org/docs/LangRef.html#data-layout).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Last, the `target triple` string specifies the architecture we are compiling
+    for. This is essential for the information we gave on the command line. You will
+    find a more in-depth discussion of the triple in [*Chapter 2*](B15647_02_ePub_RK.xhtml#_idTextAnchor032),
+    *Touring the LLVM Source*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Next, the `gcd` function is defined in the IR file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This resembles the function signature in the C file. The `unsigned` data type
+    is translated to the 32-bit integer type, `i32`. The function name is prefixed
+    with `@`, and the parameter names are prefixed with `%`. The body of the function
+    is enclosed in curly braces. The code of the body follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The IR code is organized in so-called `entry`. The code in the block is simple:
+    the first instruction compares the parameter `%b` against `0`. The second instruction
+    branched to label `return` if the condition was `true` and to label `while.body`
+    if the condition was `false`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Another characteristic of the IR code is that it is in a `%cmp`. This register
+    is subsequently used, but it is never written again. Optimizations such as constant
+    propagation and common subexpression elimination work very well with the SSA form
+    and all modern compilers are using it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next basic block is the body of the `while` loop:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Inside the loop of `gcd`, the `a` and `b` parameters are assigned new values.
+    If a register can be only written once, then this is not possible. The solution
+    is to use the special `phi` instruction. The `phi` instruction has a list of basic
+    blocks and values as parameters. A basic block presents the incoming edge from
+    that basic block, and the value is the values from those basic blocks. At runtime,
+    the `phi` instruction compares the label of the previously executed basic block
+    with the labels in the parameter list.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The value of the instruction is then the value associated with the label. For
+    the first `phi` instruction, the value is to register `%rem` if the previously
+    executed basic block was `while.body`. The value is `%b`, if `entry` was the previously
+    executed basic block. The values are the ones at the start of the basic block.
+    The register `%b.addr.010` gets a value from the first `phi` instruction. The
+    same register is used in the parameter list of the second `phi` instruction, but
+    the value is assumed to be the one before it is changed through the first `phi`
+    instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'After the loop body, the return value must be chosen:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Again, a `phi` instruction is used to select the desired value. The `ret` instruction
+    does not only end this basic block, but also denotes the end of this function
+    at runtime. It has the return value as a parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are some restrictions regarding the use of `phi` instructions. They must
+    be the first instructions of a basic block. The first basic block is special:
+    it has no previously executed block. Therefore, it cannot begin with a `phi` instruction.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The IR code itself looks a lot like a mix of C and assembly language. Despite
+    this familiar style, it is not clear how we can easily generate IR code from an
+    AST. In particular, the `phi` instruction looks difficult to generate. But don't
+    be scared. In the next section, we will implement a simple algorithm to do just
+    that!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Knowing the load-and-store approach
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: All local optimizations in LLVM are based on the SSA form shown here. For global
+    variables, memory references are used. The IR language knows load-and-store instructions,
+    which are used to fetch and store those values. You can use this for local variables,
+    too. These instructions are not in SSA form, and LLVM knows how to convert them
+    into the required SSA form. Therefore, you can allocate memory slots for each
+    local variable and use load-and-store instructions to change their value. All
+    you need to remember is the pointer to the memory slot where a variable is stored.
+    In fact, the clang compiler uses this approach.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s look at the IR code with loads and stores. Compile `gcd.c` again, this
+    time without enabling optimization:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `gcd` function now looks different. This is the first basic block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: The IR code now relays the automatic numbering of registers and labels. The
+    names of the parameters are not specified. Implicitly, they are `%0` and `%1`.
+    The basic block has no label, so it gets `2` assigned. The first instructions
+    allocate memory for four 32-bit values. After that, the parameters `%0` and `%1`
+    are stored in the memory slots pointed to by registers `%4` and `%5`. To perform
+    the comparison of parameter `%1` against `0`, the value is explicitly loaded from
+    the memory slot. With this approach, you do not need to use the `phi` instruction!
+    Instead, you load a value from a memory slot, perform a calculation on it and
+    store the new value back in the memory slot. The next time you read the memory
+    slot, you get the last computed value. All the other basic blocks for the `gcd`
+    function follow this pattern.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The advantage of using load-and-store instructions in this way is that it is
+    fairly easy to generate the IR code. The disadvantage is that you generate a lot
+    of IR instructions that LLVM will remove with the `mem2reg` pass in the very first
+    optimization step, after converting the basic block to SSA form. Therefore, we
+    generate the IR code in SSA form directly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We begin the development of IR code generation with the mapping of the control
+    flow to basic blocks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Mapping the control flow to basic blocks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: As mentioned in the previous section, a well-formed basic block is just a *linear
+    sequence of instructions*. A basic block can begin with `phi` instructions and
+    must end with a branch instruction. Inside a basic block, neither `phi` nor branch
+    instructions are allowed. Each basic block has exactly one label, marking the
+    first instruction of the basic block. Labels are the targets of branch instructions.
+    You can view branches as directed edges between two basic blocks, resulting in
+    the **Control Flow Graph** (**CFG**). A basic block can have **predecessors**
+    and **successors**. The first basic block of a function is special in the sense
+    that no predecessors are allowed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As a consequence of these restrictions, control statements of the source language,
+    such as `WHILE` or `IF`, produce several basic blocks. Let''s look at the `WHILE`
+    statement. The condition of the `WHILE` statement controls whether the loop body
+    or the next statement is executed. The condition must be generated in a basic
+    block of its own because there are two predecessors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The basic block resulting from the statement before the `WHILE` loop
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The branch from the end of the loop body back to the condition
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'There are also two successors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The beginning of the loop body
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The basic block resulting from the statement following the `WHILE` loop
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'The loop body itself has at least one basic block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Figure 5.1 – Basic blocks of a WHILE statement'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '](img/Figure_5.1_B15647.jpg)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Figure 5.1 – Basic blocks of a WHILE statement
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The IR code generation follows this structure. We store a pointer to the current
+    basic block in the `CGProcedure` class and use an instance of `llvm::IRBuilder<>`
+    for inserting instructions into the basic block. First, we create the basic blocks:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `Fn` variable denotes the current function, and `getLLVMCtx()` returns
+    the LLVM context. Both are set later. We end the current basic block with a branch
+    to the basic block, which will hold the condition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The basic block for the condition becomes the new current basic block. We generate
+    the condition and end the block with a conditional branch:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we generate the loop body. As a final instruction, we add a branch back
+    to the basic block of the condition:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This ends the generation of the `WHILE` statement. The empty basic block for
+    statements following the `WHILE` statement becomes the new current basic block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Following this schema, you can create an `emit()` method for each statement
+    of the source language.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using AST numbering to generate IR code in SSA form
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In order to generate IR code in SSA form from the AST, we use an approach called
+    **AST numbering**. The basic idea is that for each basic block, we store the current
+    value of local variables written to in this basic block.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although it is simple, we will still need several steps. We will introduce the
+    required data structure first, after which we will implement the reading and writing
+    of values local to a basic block. We will then handle values that are used in
+    several basic blocks and conclude by optimizing the `phi` instructions created.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Defining the data structure to hold values
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We use `struct BasicBlockDef` to hold the information for a single block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The LLVM class, `llvm::Value`, represents a value in SSA form. The `Value`
+    class acts like a label on the result of a computation. It is created once, usually
+    through an IR instruction, and then subsequently used. There can be changes during
+    various optimizations. For example, if the optimizer detects that the values `%1`
+    and `%2` are always the same, then it can replace uses of `%2` with `%1`. Basically,
+    this changes the label, but not the computation. To be aware of such changes,
+    we cannot use the `Value` class directly. Instead, we need a value handle. There
+    are value handles with different functionalities. To track replacements, we use
+    the `llvm::TrackingVH<>` class. As a result, the `Defs` member maps a declaration
+    of the AST (a variable or a formal parameter) to its current value. We now need
+    to store this information for each basic block:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: With this data structure, we are now able to handle local values.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reading and writing values local to a basic block
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To store the current value of a local variable in a basic block, we just create
+    an entry in the maps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The lookup of a variable''s value is a bit more complicated, because the value
+    might not be in the basic block. In this case, we need to extend the search to
+    the predecessors using a possible recursive search:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: The real work is searching the predecessors, which is implemented in the next
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Searching the predecessor blocks for a value
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: If the current basic block we are looking at has only one predecessor, then
+    we search there for the value of the variable. If the basic block has several
+    predecessors, then we need to search for the value in all these blocks and combine
+    the results. To illustrate this situation, you can look at the basic block with
+    the condition of the `WHILE` statement from the previous section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This basic block has two predecessors – the one resulting from the statement
+    before the `WHILE` loop, and the one resulting from the branch for the end of
+    the body of the `WHILE` loop. A variable used in the condition should have an
+    initial value and will most likely be changed in the body of the loop. So, we
+    need to collect these definitions and create a `phi` instruction from it. The
+    basic blocks created from the `WHILE` statement contain a cycle.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Because we recursively search the predecessor blocks, we must break this cycle.
+    To do so, we use a simple trick. We insert an empty `phi` instruction and record
+    this as the current value of the variable. If we see this basic block again in
+    our search, then we find that the variable has a value, which we use. The search
+    stops at this point. After we have collected all the values, we must update the
+    `phi` instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will still face a problem. At the time of the lookup, not all predecessors
+    of a basic block may be known. How can this happen? Look at the creation of the
+    basic blocks for the `WHILE` statement. The IR for the condition of the loop is
+    generated first. But the branch from the end of the body back to the basic block
+    containing the condition can only be added after the IR for the body is generated,
+    because this basic block is not known earlier. If we need to read the value of
+    a variable in the condition, then we are stuck, because not all predecessors are
+    known.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To solve this situation, we must do a little bit more:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, we attach a flag to the basic block.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Then, we define a basic block as sealed if we know all the predecessors of the
+    basic block. If the basic block is not sealed and we need to look up the value
+    of the variable not yet defined in this basic block, then we insert an empty `phi`
+    instruction and use it as the value.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'We also need to remember this instruction. If the block is later sealed, then
+    we need to update the instruction with the real values. To implement this, we
+    add two more members to `struct BasicBlockDef`: The `IncompletePhis` map records
+    the `phi` instructions that we need to later update, and the `Sealed` flag indicates
+    whether the basic block is sealed:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then, the method can be implemented as described:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `addEmptyPhi()` method inserts an empty `phi` instruction at the beginning
+    of the basic block:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To add the missing operands to the `phi` instruction, we first search all the
+    predecessors of the basic block and add the operand pair value and basic block
+    to the `phi` instruction. Then, we try to optimize the instruction:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: This algorithm can generate unwanted `phi` instructions. An approach to optimize
+    these is implemented in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimizing the generated phi instructions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'How can we optimize a `phi` instruction and why should we do it? Although the
+    SSA form is advantageous for many optimizations, the `phi` instruction is often
+    not interpreted by the algorithms and thereby hinders optimization in general.
+    Therefore, the fewer `phi` instructions we generate, the better:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If the instruction has only one operand or all operands have the same value,
+    then we replace the instruction with this value. If the instruction has no operand,
+    then we replace the instruction with the special value, `Undef`. Only if the instruction
+    has two or more distinct operands do we have to keep the instruction:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Removing a `phi` instruction may lead to optimization opportunities in other
+    `phi` instructions. We search for all uses of the value in other `phi` instructions
+    and then try to optimize these instructions, too:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: If desired, this algorithm can be improved further. Instead of always iterating
+    the list of values for each `phi` instruction, we could pick and remember two
+    distinct values. In the `optimize` function, we could then check whether these
+    two values are still in the list of the `phi` instruction. If yes, then we know
+    that there is nothing to optimize. But even without this optimization, this algorithm
+    runs very fast, so we are not going to implement this now.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We are almost done. Only the operation to seal a basic block has not yet been
+    implemented, which we will do in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Sealing a block
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'As soon as we know that all predecessors of a block are known, we can seal
+    the block. If the source language contains only structured statements, such as
+    `tinylang`, then it is easy to determine that place where a block can be sealed.
+    Look again at the basic blocks generated for the `WHILE` statement. The basic
+    block containing the condition can be sealed after the branch from the end of
+    the body is added, because this was the last missing predecessor. To seal a block,
+    we simply add the missing operands to the incomplete `phi` instructions and set
+    the flag:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: With these methods, we are now ready to generate the IR code for expressions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating IR code for expressions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In general, you translate expressions as already shown in [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048),
+    *The Structure of a Compiler*. The only interesting part is how to access variables.
+    The previous section covered local variables, but there are other kinds of variables.
+    Let''s discuss briefly what we need to do:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For a local variable of the procedure, we use the `readLocalVariable()` and
+    `writeLocalVariable()` methods from the previous section.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For a local variable in an enclosing procedure, we require a pointer to the
+    frame of the enclosing procedure. This is handled in a later section.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For a global variable, we generate load-and-store instructions.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For a formal parameter, we have to differentiate between passing by value and
+    passing by reference (the `VAR` parameter in `tinylang`). A parameter passed by
+    value is treated as a local variable, and a parameter passed by reference is treated
+    as a global variable.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Putting it all together, we get the following code for reading a variable or
+    formal parameter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Writing to a variable or formal parameter is symmetrical; we just need to exchange
+    the method to read with the one to write and use a `store` instruction instead
+    of a `load` instruction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, these functions are applied while generating the IR code for functions,
+    which we implement next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Emitting the IR code for a function
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Most of the IR code will live in a function. A function in IR code resembles
+    a function in C. It specifies the name, and the types of the parameters and of
+    the return value and other attributes. To call a function in a different compilation
+    unit, you need to declare the function. This is similar to a prototype in C. If
+    you add basic blocks to the function, then you define the function. We will do
+    all this in the next sections, beginning with a discussion regarding the visibility
+    of symbol names.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Controlling visibility with linkage and name mangling
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Functions (and also global variables) have a linkage style attached. With the
+    linkage style, we define the visibility of a symbol name and what should happen
+    if more than one symbol has the same name. The most basic linkage styles are `private`
+    and `external`. A symbol with `private` linkage is only visible in the current
+    compilation unit, while a symbol with `external` linkage is globally available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For a language without a proper module concept, such as C, this is certainly
+    adequate. With modules, we need to do more. Assume that we have a module called
+    `Square` providing a `Root()` function and a `Cube` module also providing a `Root()`
+    function. If the functions are private, then there is obviously no problem. The
+    function gets the name `Root` and private linkage. The situation is different
+    if the function is exported, so that it can be called in other modules. Using
+    the function name alone is not enough, because this name is not unique.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The solution is to tweak the name to make it globally unique. This is called
+    name mangling. How this is done depends on the requirements and characteristics
+    of the language. In our case, the base idea is to use a combination of the module
+    and the function name to create a global unique name. Using `Square.Root` as a
+    name looks like an obvious solution, but may lead to problems with assemblers,
+    as the dot may have a special meaning. Instead of using a delimiter between the
+    name components, we can get a similar effect with prefixing the name components
+    with their length: `6Square4Root`. This is no legal identifier for LLVM, but we
+    can fix this by prefixing the whole name with `_t` (`t` for `tinylang`): `_t6Square4Root`.
+    In this way, we can create unique names for exported symbols:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: If your source language supports type overloading, then you need to extend this
+    scheme with type names. For example, to distinguish between the C++ functions
+    `int root(int)` and `double root(double)`, the type of the parameter and the return
+    value are added to the function name.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You also need to think about the length of the generated name, because some
+    linkers place restrictions on the length. With nested namespaces and classes in
+    C++, the mangled names can be rather long. There, C++ defines a compression scheme
+    to avoid repeating name components over and over again.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Next, we look at how to treat the parameter types.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Converting types from an AST description to LLVM types
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The parameters of a function also require some consideration. First, we need
+    to map the types of the source language to an LLVM type. As `tinylang` currently
+    only has two types, this is easy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`Int64Ty`, `Int1Ty`, and later `VoidTy` are class members holding the type
+    representation of LLVM types, `i64`, `i1`, and `void`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For a formal parameter that passes by reference, this is not enough. The LLVM
+    type of this parameter is a pointer. We generalize the function and take formal
+    parameters into account:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: With these helpers at hand, we create the LLVM IR function next.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating the LLVM IR function
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To emit a function in LLVM IR, a function type is needed, which is similar
+    to a prototype in C. Creating the function type involves mapping the types and
+    then calling the factory method to create the function type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Based on the function type, we also create the LLVM function. This associates
+    the function type with the linkage and the mangled name:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `getModule()` method returns the current LLVM module, which we will set
+    up a bit later.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With the function created, we can add some more information to it. First, we
+    can give the parameter's names. This makes the IR more readable. Second, we can
+    add attributes to the function and to the parameters to specify some characteristics.
+    As an example, we do this for parameters passed by reference.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At the LLVM level, these parameters are pointers. But from the source language
+    design, these are very restricted pointers. Analog to references in C++, we always
+    need to specify a variable for a `VAR` parameter. So, we know by design that this
+    pointer will never be null and that it is always dereferenceable, meaning that
+    we can read the value pointed to by risking a general protection fault. Also by
+    design, this pointer cannot be passed around. In particular, there are no copies
+    of the pointer that outlive the call to the function. Therefore, the pointer is
+    said to not be captured.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `llvm::AttributeBuilder` class is used to build the set of attributes for
+    a formal parameter. To get the storage size of a parameter type, we can simply
+    ask the data layout:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: We now have created the IR function. In the next section, we add the basic blocks
+    of the function body to the function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Emitting the function body
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We are almost done with emitting the IR code for a function! We only need to
+    put the pieces together to emit a function, including its body:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Given a procedure declaration from `tinylang`, we first create the function
+    type and the function:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Next, we create the first basic block of the function and make it the current
+    one:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we step through all formal parameters. To handle VAR parameters correctly,
+    we need to initialize the `FormalParams` member (used in `readVariable()`). In
+    contrast to local variables, formal parameters have a value in the first basic
+    block, so we make these values known:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE34]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Following this setup, we can call the `emit()` method to start generating the
+    IR code for statements:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The last block after generating the IR code may not yet be sealed, so we call
+    `sealBlock()` now. A procedure in `tinylang` may have an implicit return, so we
+    also check whether the last basic block has a proper terminator, and add one if
+    not:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE36]'
+  prefs: []
+  type: TYPE_PRE
+- en: This finishes the generation of IR code for functions. We still need to create
+    the LLVM module, which holds all the IR code together. We do this in the next
+    section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Setting up the module and the driver
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We collect all functions and global variables of a compilation unit in an LLVM
+    module. To facilitate IR generation, we wrap all the functions from the previous
+    sections in a code generator class. To get a working compiler, we also need to
+    define the target architecture for which we want to generate code, and also add
+    the passes that emit the code. We implement all this in the next chapters, starting
+    with the code generator.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrapping everything in the code generator
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The IR module is the brace around all elements we generate for a compilation
+    unit. At the global level, we iterate through the declarations at the module level
+    and create global variables and call the code generation for procedures. A global
+    variable in `tinylang` is mapped to an instance of the `llvm::GobalValue` class.
+    This mapping is saved in `Globals` and made available to the code generation for
+    procedures:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE37]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The module also holds the `LLVMContext` class and caches the most commonly
+    used LLVM types. The latter ones need to be initialized, for example, for the
+    64-bit integer type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE38]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `CodeGenerator` class initializes the LLVM IR module and calls the code
+    generation for the module. Most importantly, this class must know for which target
+    architecture we like to generate code. This information is passed in the `llvm::TargetMachine`
+    class, which is set up in the driver:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE39]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For ease of use, we also introduce a factory method for the code generator:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE40]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `CodeGenerator` class provides a small interface to create IR code, which
+    is ideal for use in the compiler driver. Before we integrate it, we need to implement
+    support for machine code generation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Initializing the target machine class
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Now, only the creation of the target machine is missing. With the target machine,
+    we define the CPU architecture for which we like to generate code. For each CPU,
+    there are also features available that can be used to influence code generation.
+    For example, a newer CPU of a CPU architecture family can support vector instructions.
+    With features, we can toggle the use of vector instructions on or off. To support
+    setting all these options from the command line, LLVM provides some supporting
+    code. In the `Driver` class, we add the following `include` variable:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE41]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This `include` variable adds common command-line options to our compiler driver.
+    Many LLVM tools also use these command-line options, which have the benefit of
+    providing a common interface to the user. Only the option to specify a target
+    triple is missing. As this is very useful, we add this on our own:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE42]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let''s create the target machine:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the purpose of displaying error messages, the name of the application must
+    be passed to the function:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE43]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We first collect all the information provided by the command line. These are
+    options for the code generator, the name of the CPU, possible features that should
+    be activated or deactivated, and the triple of the target:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE44]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we look up the target in the target registry. If an error occurs, then
+    we display the error message and bail out. A possible error would be an unsupported
+    triple specified by the user:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE45]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'With the help of the `Target` class, we configure the target machine using
+    all the known options requested by the user:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE46]'
+  prefs: []
+  type: TYPE_PRE
+- en: With the target machine instance, we can generate IR code targeting a CPU architecture
+    of our choice. What is missing is the translation to assembly text or the generation
+    of object code files. We add this support in the next section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Emitting assembler text and object code
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In LLVM, the IR code is run through a pipeline of passes. Each pass performs
+    a single task, for example, removing dead code. We will learn more about passes
+    in [*Chapter 8*](B15647_08_ePub_RK.xhtml#_idTextAnchor126), *Optimizing IR*. Outputting
+    assembler code or an object file is implemented as a pass, too. Let's add basic
+    support for it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We need to include even more LLVM header files. We need the `llvm::legacy::PassManager`
+    class for holding the passes to emit code to a file. We also want to be able to
+    output LLVM IR code, so we also need a pass to emit this. And last, we use the
+    `llvm:: ToolOutputFile` class for file operations:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE47]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Another command-line option for outputting LLVM IR is also required:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE48]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The first task in the new `emit()` method is to deal with the name of the output
+    file. If the input is read from `stdin`, indicated by the use of the minus symbol,
+    `-`, then we output the result to `stdout`. The `ToolOutputFile` class knows how
+    to handle the special filename, `-`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE49]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Otherwise, we drop a possible extension of the input filename and append `.ll`,
+    `.s`, or `.o` as an extension, depending on the command-line options given by
+    the user. The `FileType` option is defined in the `llvm/CodeGen/CommandFlags.inc`
+    header file, which we included earlier. This option has no support for emitting
+    IR code, and so we added the new option, `–emit-llvm`, which only takes effect
+    if used together with the assembly file type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE50]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some platforms distinguish between text and binary files, and so we have to
+    provide the right open flags when opening the output file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE51]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now we can add the required passes to `PassManager`. The `TargetMachine` class
+    has a utility method, which adds the requested classes. Therefore, we only need
+    to check whether the user requests to output LLVM IR code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE52]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'With all this preparation done, emitting the file boils down to a single function
+    call:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE53]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `ToolOutputFile` class automatically deletes the file if we do not explicitly
+    request that we want to keep it. This makes error handling easier, as there are
+    potentially many places where we need to handle errors and only one place that
+    is reached in case everything went well. We successfully emitted the code, so
+    we want to keep the file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE54]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And finally, we report success to the caller:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE55]'
+  prefs: []
+  type: TYPE_PRE
+- en: Calling the `emit()` method with the `llvm::Module` we created, with a call
+    to the `CodeGenerator` class, emits the code as requested.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Suppose you have the greatest common divisor algorithm in `tinylang` stored
+    in the `gcd.mod` file. To translate this to a `gcd.os` object file, you type the
+    following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE56]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'If you would like to inspect the generated IR code directly on screen, then
+    you can type the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE57]'
+  prefs: []
+  type: TYPE_PRE
+- en: Let's celebrate! At this point, we have created a complete compiler, from reading
+    the source language up to emitting assembler code or an object file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, you learned how to implement your own code generator for LLVM
+    IR code. Basic blocks are an important data structure, holding all the instructions
+    and expressing branches. You learned how to create basic blocks for the control
+    statements of the source language and how to add instructions to a basic block.
+    You applied a modern algorithm to handle local variables in functions, leading
+    to less IR code. The goal of a compiler is to generate assembler text or an object
+    file for the input, so you also added a simple compilation pipeline. With this
+    knowledge, you will be able to generate LLVM IR and, subsequently, assembler text
+    or object code for your own language compiler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, you will learn how to deal with aggregate data structures
+    and how to ensure that function calls comply with the rules of your platform.
+  prefs: []
+  type: TYPE_NORMAL

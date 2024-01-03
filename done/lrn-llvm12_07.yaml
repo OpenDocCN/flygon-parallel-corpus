@@ -1,0 +1,1550 @@
+- en: '*Chapter 5*: Basics of IR Code Generation'
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: '*第5章*：IR代码生成基础'
+- en: Having created a decorated **Abstract Syntax Tree** (**AST**) for your programming
+    language, the next task is to generate the LLVM IR code from it. LLVM IR code
+    resembles three-address code, with a human-readable representation. Therefore,
+    we need a systematic approach to translate language concepts such as control structures
+    into the lower level of LLVM IR.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 创建了装饰的**抽象语法树**（**AST**）用于您的编程语言后，下一个任务是从中生成LLVM IR代码。LLVM IR代码类似于三地址代码，具有人类可读的表示。因此，我们需要一个系统化的方法来将语言概念，如控制结构，转换为LLVM
+    IR的较低级别。
+- en: In this chapter, you will learn about the basics of LLVM IR, and how to generate
+    IR for control flow structures from the AST. You will also learn how to generate
+    LLVM IR for expressions in **Static Single Assignment** (**SSA**) **form**, using
+    a modern algorithm. Finally, you will learn how to emit assembler text and object
+    code.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您将学习LLVM IR的基础知识，以及如何从AST中为控制流结构生成IR。您还将学习如何使用现代算法以**静态单赋值**（**SSA**）**形式**为表达式生成LLVM
+    IR。最后，您将学习如何发出汇编文本和目标代码。
+- en: 'This chapter will cover the following topics:'
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章将涵盖以下主题：
+- en: Generating IR from the AST
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 从AST生成IR
+- en: Using AST numbering to generate IR code in SSA form
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用AST编号以SSA形式生成IR代码
+- en: Setting up the module and the driver
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 设置模块和驱动程序
+- en: By the end of the chapter, you will have acquired the knowledge to create a
+    code generator for your own programming language, and how to integrate it into
+    your own compiler.
+  id: totrans-7
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章结束时，您将掌握创建自己的编程语言的代码生成器的知识，以及如何将其集成到自己的编译器中。
+- en: Technical requirements
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 技术要求
+- en: The code files for the chapter are available at [https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang)
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的代码文件可在[https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter05/tinylang)找到
+- en: You can find the code in action videos at [https://bit.ly/3nllhED](https://bit.ly/3nllhED)
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以在[https://bit.ly/3nllhED](https://bit.ly/3nllhED)找到代码的实际操作视频
+- en: Generating IR from the AST
+  id: totrans-11
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 从AST生成IR
+- en: 'The LLVM code generator takes a module as described in IR as input and turns
+    it into object code or assembly text. We need to transform the AST representation
+    into IR. To implement an IR code generator, we will look at a simple example first
+    and then develop the classes required for the code generator. The complete implementation
+    will be divided into three classes: the `CodeGenerator`, the `CGModule`, and the
+    `CGProcedure` classes. The `CodeGenerator` class is the general interface used
+    by the compiler driver. The `CGModule` and the `CGProcedure` classes hold the
+    state required for generating the IR code for a compilation unit and a single
+    function.'
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM代码生成器将模块作为IR的描述输入，并将其转换为目标代码或汇编文本。我们需要将AST表示转换为IR。为了实现IR代码生成器，我们将首先查看一个简单的示例，然后开发所需的类：`CodeGenerator`、`CGModule`和`CGProcedure`类。`CodeGenerator`类是编译器驱动程序使用的通用接口。`CGModule`和`CGProcedure`类保存了为编译单元和单个函数生成IR代码所需的状态。
+- en: We begin with a look at the `clang`-generated IR in the next section.
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将从下一节开始查看`clang`生成的IR。
+- en: Understanding the IR code
+  id: totrans-14
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 理解IR代码
+- en: 'Before generating the IR code, it''s good to know the main elements of the
+    IR language. In [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048), *The
+    Structure of a Compiler*, we already had a brief look at IR. An easy way to get
+    more knowledge of IR is to study the output from `clang`. For example, save this
+    C source code, which implements the Euclidean algorithm for calculating the greatest
+    common divisor of two numbers, as `gcd.c`:'
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在生成IR代码之前，了解IR语言的主要元素是很有用的。在[*第3章*]（B15647_03_ePub_RK.xhtml#_idTextAnchor048）*编译器的结构*中，我们已经简要地看了IR。了解IR的更多知识的简单方法是研究`clang`的输出。例如，保存这个C源代码，它实现了欧几里德算法来计算两个数的最大公约数，命名为`gcd.c`：
+- en: '[PRE0]'
+  id: totrans-16
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'You can then create the IR file, `gcd.ll`, with the following command:'
+  id: totrans-17
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，您可以使用以下命令创建IR文件`gcd.ll`：
+- en: '[PRE1]'
+  id: totrans-18
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'The IR code is not target-independent, even if it often looks like it. The
+    preceding command compiles the source file for an ARM 64-bit CPU on Linux. The
+    `-S` option instructs `clang` to output an assembly file, and with the additional
+    specification of `-emit-llvm`, an IR file is created. The optimization level,
+    `-O1`, is used to get an easy readable IR code. Let''s have a look at the generated
+    file and understand how the C source maps to IR. At the top of the file, some
+    basic properties are established:'
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码并非目标无关，即使它看起来经常是这样。前面的命令在Linux上为ARM 64位CPU编译源文件。`-S`选项指示`clang`输出一个汇编文件，并通过额外的`-emit-llvm`规范创建一个IR文件。优化级别`-O1`用于获得易于阅读的IR代码。让我们来看看生成的文件，并了解C源代码如何映射到IR。在文件顶部，建立了一些基本属性：
+- en: '[PRE2]'
+  id: totrans-20
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: The first line is a comment, informing you about which module identifier was
+    used. On the following line, the filename of the source file is named. With `clang`,
+    both are the same.
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一行是一个注释，告诉您使用了哪个模块标识符。在下一行，命名了源文件的文件名。使用`clang`，两者是相同的。
+- en: 'The `target datalayout` string establishes some basic properties. Its parts
+    are separated by `-`. The following information is included:'
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`target datalayout`字符串建立了一些基本属性。它的部分由`-`分隔。包括以下信息：'
+- en: A small `e` means that bytes in memory are stored using the little endian schema.
+    To specify a big endian, you use a big `E`.
+  id: totrans-23
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 小写的`e`表示内存中的字节使用小端模式存储。要指定大端模式，使用大写的`E`。
+- en: '`m:` specifies the name mangling applied to symbols. Here, `m:e` means that
+    ELF name mangling is used.'
+  id: totrans-24
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`m：`指定应用于符号的名称修饰。这里，`m:e`表示使用了ELF名称修饰。'
+- en: The entries on the `iN:A:P` form, for example, `i8:8:32`, specify the alignment
+    of data, given in bits. The first number is the alignment required by the ABI,
+    and the second number is the preferred alignment. For bytes (`i8`), the ABI alignment
+    is 1 byte (`8`) and the preferred alignment is 4 bytes (`32`).
+  id: totrans-25
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`iN:A:P`形式的条目，例如`i8:8:32`，指定了以位为单位的数据对齐。第一个数字是ABI所需的对齐，第二个数字是首选对齐。对于字节（`i8`），ABI对齐是1字节（`8`），首选对齐是4字节（`32`）。'
+- en: '`n` specifies which native register sizes are available. `n32:64` means that
+    32-bit and 64-bit wide integers are natively supported.'
+  id: totrans-26
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`n`指定了可用的本机寄存器大小。`n32:64`表示本机支持32位和64位宽整数。'
+- en: '`S` specifies the alignment of the stack, again in bits. `S128` means that
+    the stack maintains a 16-byte alignment.'
+  id: totrans-27
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`S`指定了堆栈的对齐方式，同样是以位为单位。`S128`表示堆栈保持16字节对齐。'
+- en: Note
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 注意
+- en: A lot more information can be provided with the target data layout. You can
+    find the full information in the reference manual at [https://llvm.org/docs/LangRef.html#data-layout](https://llvm.org/docs/LangRef.html#data-layout).
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 目标数据布局可以提供更多的信息。您可以在参考手册中找到完整的信息，网址为[https://llvm.org/docs/LangRef.html#data-layout](https://llvm.org/docs/LangRef.html#data-layout)。
+- en: Last, the `target triple` string specifies the architecture we are compiling
+    for. This is essential for the information we gave on the command line. You will
+    find a more in-depth discussion of the triple in [*Chapter 2*](B15647_02_ePub_RK.xhtml#_idTextAnchor032),
+    *Touring the LLVM Source*.
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，`target triple`字符串指定了我们正在编译的架构。这对于我们在命令行上提供的信息至关重要。您将在[*第2章*](B15647_02_ePub_RK.xhtml#_idTextAnchor032)中找到对triple的更深入讨论，*LLVM源码之旅*。
+- en: 'Next, the `gcd` function is defined in the IR file:'
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，在IR文件中定义了`gcd`函数。
+- en: '[PRE3]'
+  id: totrans-32
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: 'This resembles the function signature in the C file. The `unsigned` data type
+    is translated to the 32-bit integer type, `i32`. The function name is prefixed
+    with `@`, and the parameter names are prefixed with `%`. The body of the function
+    is enclosed in curly braces. The code of the body follows:'
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这类似于C文件中的函数签名。`unsigned`数据类型被翻译为32位整数类型`i32`。函数名以`@`为前缀，参数名以`%`为前缀。函数体用大括号括起来。函数体的代码如下：
+- en: '[PRE4]'
+  id: totrans-34
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'The IR code is organized in so-called `entry`. The code in the block is simple:
+    the first instruction compares the parameter `%b` against `0`. The second instruction
+    branched to label `return` if the condition was `true` and to label `while.body`
+    if the condition was `false`.'
+  id: totrans-35
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码是以所谓的`entry`组织的。块中的代码很简单：第一条指令将参数`%b`与`0`进行比较。如果条件为`true`，第二条指令将分支到标签`return`，如果条件为`false`，则分支到标签`while.body`。
+- en: Another characteristic of the IR code is that it is in a `%cmp`. This register
+    is subsequently used, but it is never written again. Optimizations such as constant
+    propagation and common subexpression elimination work very well with the SSA form
+    and all modern compilers are using it.
+  id: totrans-36
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码的另一个特点是它在`%cmp`中。这个寄存器随后被使用，但再也没有被写入。像常量传播和公共子表达式消除这样的优化在SSA形式下工作得非常好，所有现代编译器都在使用它。
+- en: 'The next basic block is the body of the `while` loop:'
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一个基本块是`while`循环的主体：
+- en: '[PRE5]'
+  id: totrans-38
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: Inside the loop of `gcd`, the `a` and `b` parameters are assigned new values.
+    If a register can be only written once, then this is not possible. The solution
+    is to use the special `phi` instruction. The `phi` instruction has a list of basic
+    blocks and values as parameters. A basic block presents the incoming edge from
+    that basic block, and the value is the values from those basic blocks. At runtime,
+    the `phi` instruction compares the label of the previously executed basic block
+    with the labels in the parameter list.
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在`gcd`的循环中，`a`和`b`参数被分配了新的值。如果一个寄存器只能写一次，那么这是不可能的。解决方案是使用特殊的`phi`指令。`phi`指令有一个基本块和值的参数列表。基本块表示来自该基本块的入边，值是来自这些基本块的值。在运行时，`phi`指令将先前执行的基本块的标签与参数列表中的标签进行比较。
+- en: The value of the instruction is then the value associated with the label. For
+    the first `phi` instruction, the value is to register `%rem` if the previously
+    executed basic block was `while.body`. The value is `%b`, if `entry` was the previously
+    executed basic block. The values are the ones at the start of the basic block.
+    The register `%b.addr.010` gets a value from the first `phi` instruction. The
+    same register is used in the parameter list of the second `phi` instruction, but
+    the value is assumed to be the one before it is changed through the first `phi`
+    instruction.
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后指令的值就是与标签相关联的值。对于第一个`phi`指令，如果先前执行的基本块是`while.body`，那么值就是寄存器`%rem`。如果`entry`是先前执行的基本块，那么值就是`%b`。这些值是基本块开始时的值。寄存器`%b.addr.010`从第一个`phi`指令中获得一个值。同一个寄存器在第二个`phi`指令的参数列表中使用，但在通过第一个`phi`指令更改之前，假定值是之前的值。
+- en: 'After the loop body, the return value must be chosen:'
+  id: totrans-41
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在循环主体之后，必须选择返回值：
+- en: '[PRE6]'
+  id: totrans-42
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: Again, a `phi` instruction is used to select the desired value. The `ret` instruction
+    does not only end this basic block, but also denotes the end of this function
+    at runtime. It has the return value as a parameter.
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 再次，`phi`指令用于选择所需的值。`ret`指令不仅结束了这个基本块，还表示了运行时这个函数的结束。它将返回值作为参数。
+- en: 'There are some restrictions regarding the use of `phi` instructions. They must
+    be the first instructions of a basic block. The first basic block is special:
+    it has no previously executed block. Therefore, it cannot begin with a `phi` instruction.'
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 关于使用`phi`指令有一些限制。它们必须是基本块的第一条指令。第一个基本块是特殊的：它没有先前执行的块。因此，它不能以`phi`指令开始。
+- en: The IR code itself looks a lot like a mix of C and assembly language. Despite
+    this familiar style, it is not clear how we can easily generate IR code from an
+    AST. In particular, the `phi` instruction looks difficult to generate. But don't
+    be scared. In the next section, we will implement a simple algorithm to do just
+    that!
+  id: totrans-45
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码本身看起来很像C和汇编语言的混合体。尽管有这种熟悉的风格，但我们不清楚如何轻松地从AST生成IR代码。特别是`phi`指令看起来很难生成。但不要害怕。在下一节中，我们将实现一个简单的算法来做到这一点！
+- en: Knowing the load-and-store approach
+  id: totrans-46
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 了解负载和存储方法
+- en: All local optimizations in LLVM are based on the SSA form shown here. For global
+    variables, memory references are used. The IR language knows load-and-store instructions,
+    which are used to fetch and store those values. You can use this for local variables,
+    too. These instructions are not in SSA form, and LLVM knows how to convert them
+    into the required SSA form. Therefore, you can allocate memory slots for each
+    local variable and use load-and-store instructions to change their value. All
+    you need to remember is the pointer to the memory slot where a variable is stored.
+    In fact, the clang compiler uses this approach.
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM中的所有局部优化都是基于这里显示的SSA形式。对于全局变量，使用内存引用。IR语言知道加载和存储指令，用于获取和存储这些值。您也可以用于局部变量。这些指令不是SSA形式，LLVM知道如何将它们转换为所需的SSA形式。因此，您可以为每个局部变量分配内存插槽，并使用加载和存储指令来更改它们的值。您只需要记住存储变量的内存插槽的指针。事实上，clang编译器使用了这种方法。
+- en: 'Let''s look at the IR code with loads and stores. Compile `gcd.c` again, this
+    time without enabling optimization:'
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们看一下带有加载和存储的IR代码。再次编译`gcd.c`，这次不启用优化：
+- en: '[PRE7]'
+  id: totrans-49
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'The `gcd` function now looks different. This is the first basic block:'
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`gcd`函数现在看起来不同了。这是第一个基本块：'
+- en: '[PRE8]'
+  id: totrans-51
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: The IR code now relays the automatic numbering of registers and labels. The
+    names of the parameters are not specified. Implicitly, they are `%0` and `%1`.
+    The basic block has no label, so it gets `2` assigned. The first instructions
+    allocate memory for four 32-bit values. After that, the parameters `%0` and `%1`
+    are stored in the memory slots pointed to by registers `%4` and `%5`. To perform
+    the comparison of parameter `%1` against `0`, the value is explicitly loaded from
+    the memory slot. With this approach, you do not need to use the `phi` instruction!
+    Instead, you load a value from a memory slot, perform a calculation on it and
+    store the new value back in the memory slot. The next time you read the memory
+    slot, you get the last computed value. All the other basic blocks for the `gcd`
+    function follow this pattern.
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码现在传递了寄存器和标签的自动编号。参数的名称没有指定。隐式地，它们是`%0`和`%1`。基本块没有标签，所以它被分配为`2`。第一条指令为四个32位值分配了内存。之后，参数`%0`和`%1`被存储在寄存器`%4`和`%5`指向的内存插槽中。为了执行参数`%1`与`0`的比较，该值被显式地从内存插槽中加载。通过这种方法，您不需要使用`phi`指令！相反，您从内存插槽中加载一个值，对其进行计算，并将新值存储回内存插槽。下次读取内存插槽时，您将得到最后计算出的值。`gcd`函数的所有其他基本块都遵循这种模式。
+- en: The advantage of using load-and-store instructions in this way is that it is
+    fairly easy to generate the IR code. The disadvantage is that you generate a lot
+    of IR instructions that LLVM will remove with the `mem2reg` pass in the very first
+    optimization step, after converting the basic block to SSA form. Therefore, we
+    generate the IR code in SSA form directly.
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以这种方式使用加载和存储指令的优势在于生成IR代码相当容易。缺点是您会生成大量IR指令，LLVM会在将基本块转换为SSA形式后的第一个优化步骤中使用`mem2reg`
+    pass来删除这些指令。因此，我们直接生成SSA形式的IR代码。
+- en: We begin the development of IR code generation with the mapping of the control
+    flow to basic blocks.
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们开始通过将控制流映射到基本块来生成IR代码。
+- en: Mapping the control flow to basic blocks
+  id: totrans-55
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 将控制流映射到基本块
+- en: As mentioned in the previous section, a well-formed basic block is just a *linear
+    sequence of instructions*. A basic block can begin with `phi` instructions and
+    must end with a branch instruction. Inside a basic block, neither `phi` nor branch
+    instructions are allowed. Each basic block has exactly one label, marking the
+    first instruction of the basic block. Labels are the targets of branch instructions.
+    You can view branches as directed edges between two basic blocks, resulting in
+    the **Control Flow Graph** (**CFG**). A basic block can have **predecessors**
+    and **successors**. The first basic block of a function is special in the sense
+    that no predecessors are allowed.
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如前一节所述，一个良好形成的基本块只是*指令的线性序列*。一个基本块可以以`phi`指令开始，并且必须以分支指令结束。在基本块内部，不允许有`phi`或分支指令。每个基本块都有一个标签，标记基本块的第一条指令。标签是分支指令的目标。您可以将分支视为两个基本块之间的有向边，从而得到**控制流图**（**CFG**）。一个基本块可以有**前任者**和**后继者**。函数的第一个基本块在没有前任者的意义上是特殊的。
+- en: 'As a consequence of these restrictions, control statements of the source language,
+    such as `WHILE` or `IF`, produce several basic blocks. Let''s look at the `WHILE`
+    statement. The condition of the `WHILE` statement controls whether the loop body
+    or the next statement is executed. The condition must be generated in a basic
+    block of its own because there are two predecessors:'
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 由于这些限制，源语言的控制语句，如`WHILE`或`IF`，会产生多个基本块。让我们看一下`WHILE`语句。`WHILE`语句的条件控制着循环体或下一条语句是否执行。条件必须在自己的基本块中生成，因为有两个前任者：
+- en: The basic block resulting from the statement before the `WHILE` loop
+  id: totrans-58
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`WHILE`循环之前的语句产生的基本块'
+- en: The branch from the end of the loop body back to the condition
+  id: totrans-59
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 从循环体末尾返回到条件的分支
+- en: 'There are also two successors:'
+  id: totrans-60
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 还有两个后继者：
+- en: The beginning of the loop body
+  id: totrans-61
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 循环体的开始
+- en: The basic block resulting from the statement following the `WHILE` loop
+  id: totrans-62
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`WHILE`循环后面的语句产生的基本块'
+- en: 'The loop body itself has at least one basic block:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 循环体本身至少有一个基本块：
+- en: '![Figure 5.1 – Basic blocks of a WHILE statement'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![图5.1 - WHILE语句的基本块'
+- en: '](img/Figure_5.1_B15647.jpg)'
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '](img/Figure_5.1_B15647.jpg)'
+- en: Figure 5.1 – Basic blocks of a WHILE statement
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图5.1 - WHILE语句的基本块
+- en: 'The IR code generation follows this structure. We store a pointer to the current
+    basic block in the `CGProcedure` class and use an instance of `llvm::IRBuilder<>`
+    for inserting instructions into the basic block. First, we create the basic blocks:'
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR代码生成遵循这种结构。我们在`CGProcedure`类中存储当前基本块的指针，并使用`llvm::IRBuilder<>`的实例将指令插入基本块。首先，我们创建基本块：
+- en: '[PRE9]'
+  id: totrans-68
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'The `Fn` variable denotes the current function, and `getLLVMCtx()` returns
+    the LLVM context. Both are set later. We end the current basic block with a branch
+    to the basic block, which will hold the condition:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Fn`变量表示当前函数，`getLLVMCtx()`返回LLVM上下文。这两者稍后设置。我们以一个分支结束当前基本块，该分支将保持条件：'
+- en: '[PRE10]'
+  id: totrans-70
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'The basic block for the condition becomes the new current basic block. We generate
+    the condition and end the block with a conditional branch:'
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 条件的基本块成为新的当前基本块。我们生成条件并以条件分支结束块：
+- en: '[PRE11]'
+  id: totrans-72
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'Next, we generate the loop body. As a final instruction, we add a branch back
+    to the basic block of the condition:'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们生成循环体。作为最后一条指令，我们添加一个分支回到条件的基本块：
+- en: '[PRE12]'
+  id: totrans-74
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'This ends the generation of the `WHILE` statement. The empty basic block for
+    statements following the `WHILE` statement becomes the new current basic block:'
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这结束了`WHILE`语句的生成。`WHILE`语句后的空基本块成为新的当前基本块：
+- en: '[PRE13]'
+  id: totrans-76
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: Following this schema, you can create an `emit()` method for each statement
+    of the source language.
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 按照这个模式，你可以为源语言的每个语句创建一个`emit()`方法。
+- en: Using AST numbering to generate IR code in SSA form
+  id: totrans-78
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用AST编号生成SSA形式的IR代码
+- en: In order to generate IR code in SSA form from the AST, we use an approach called
+    **AST numbering**. The basic idea is that for each basic block, we store the current
+    value of local variables written to in this basic block.
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了从AST中生成SSA形式的IR代码，我们使用一种称为**AST编号**的方法。基本思想是对于每个基本块，我们存储在该基本块中写入的本地变量的当前值。
+- en: Although it is simple, we will still need several steps. We will introduce the
+    required data structure first, after which we will implement the reading and writing
+    of values local to a basic block. We will then handle values that are used in
+    several basic blocks and conclude by optimizing the `phi` instructions created.
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽管它很简单，我们仍然需要几个步骤。首先我们将介绍所需的数据结构，然后我们将实现读写基本块内的本地值。然后我们将处理在几个基本块中使用的值，并最后优化创建的`phi`指令。
+- en: Defining the data structure to hold values
+  id: totrans-81
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 定义保存值的数据结构
+- en: 'We use `struct BasicBlockDef` to hold the information for a single block:'
+  id: totrans-82
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用`struct BasicBlockDef`来保存单个块的信息：
+- en: '[PRE14]'
+  id: totrans-83
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'The LLVM class, `llvm::Value`, represents a value in SSA form. The `Value`
+    class acts like a label on the result of a computation. It is created once, usually
+    through an IR instruction, and then subsequently used. There can be changes during
+    various optimizations. For example, if the optimizer detects that the values `%1`
+    and `%2` are always the same, then it can replace uses of `%2` with `%1`. Basically,
+    this changes the label, but not the computation. To be aware of such changes,
+    we cannot use the `Value` class directly. Instead, we need a value handle. There
+    are value handles with different functionalities. To track replacements, we use
+    the `llvm::TrackingVH<>` class. As a result, the `Defs` member maps a declaration
+    of the AST (a variable or a formal parameter) to its current value. We now need
+    to store this information for each basic block:'
+  id: totrans-84
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM类`llvm::Value`表示SSA形式中的值。`Value`类就像计算结果的标签。它通常通过IR指令创建一次，然后被后续使用。在各种优化过程中可能会发生变化。例如，如果优化器检测到值`％1`和`％2`始终相同，那么它可以用`％1`替换`％2`的使用。基本上，这改变了标签，但不改变计算。为了意识到这样的变化，我们不能直接使用`Value`类。相反，我们需要一个值句柄。有不同功能的值句柄。为了跟踪替换，我们使用`llvm::TrackingVH<>`类。因此，`Defs`成员将AST的声明（变量或形式参数）映射到其当前值。现在我们需要为每个基本块存储这些信息：
+- en: '[PRE15]'
+  id: totrans-85
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: With this data structure, we are now able to handle local values.
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这种数据结构，我们现在能够处理本地值。
+- en: Reading and writing values local to a basic block
+  id: totrans-87
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 读写基本块内的本地值
+- en: 'To store the current value of a local variable in a basic block, we just create
+    an entry in the maps:'
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要在基本块中存储本地变量的当前值，我们只需在映射中创建一个条目：
+- en: '[PRE16]'
+  id: totrans-89
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'The lookup of a variable''s value is a bit more complicated, because the value
+    might not be in the basic block. In this case, we need to extend the search to
+    the predecessors using a possible recursive search:'
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查找变量的值有点复杂，因为该值可能不在基本块中。在这种情况下，我们需要扩展搜索到前驱，使用可能的递归搜索：
+- en: '[PRE17]'
+  id: totrans-91
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: The real work is searching the predecessors, which is implemented in the next
+    section.
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 真正的工作是搜索前驱，这在下一节中实现。
+- en: Searching the predecessor blocks for a value
+  id: totrans-93
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 搜索前驱块的值
+- en: If the current basic block we are looking at has only one predecessor, then
+    we search there for the value of the variable. If the basic block has several
+    predecessors, then we need to search for the value in all these blocks and combine
+    the results. To illustrate this situation, you can look at the basic block with
+    the condition of the `WHILE` statement from the previous section.
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们正在查看的当前基本块只有一个前驱，那么我们在那里搜索变量的值。如果基本块有几个前驱，那么我们需要在所有这些块中搜索该值并组合结果。要说明这种情况，可以看看上一节中`WHILE`语句的条件的基本块。
+- en: This basic block has two predecessors – the one resulting from the statement
+    before the `WHILE` loop, and the one resulting from the branch for the end of
+    the body of the `WHILE` loop. A variable used in the condition should have an
+    initial value and will most likely be changed in the body of the loop. So, we
+    need to collect these definitions and create a `phi` instruction from it. The
+    basic blocks created from the `WHILE` statement contain a cycle.
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个基本块有两个前驱 - 一个是`WHILE`循环之前的语句产生的，另一个是`WHILE`循环体结束的分支产生的。在条件中使用的变量应该有一个初始值，并且很可能在循环体中被改变。因此，我们需要收集这些定义并从中创建一个`phi`指令。从`WHILE`语句创建的基本块包含一个循环。
+- en: Because we recursively search the predecessor blocks, we must break this cycle.
+    To do so, we use a simple trick. We insert an empty `phi` instruction and record
+    this as the current value of the variable. If we see this basic block again in
+    our search, then we find that the variable has a value, which we use. The search
+    stops at this point. After we have collected all the values, we must update the
+    `phi` instruction.
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因为我们递归搜索前驱块，我们必须打破这个循环。为此，我们使用一个简单的技巧。我们插入一个空的“phi”指令并记录这个作为变量的当前值。如果我们在搜索中再次看到这个基本块，那么我们会发现变量有一个值，我们会使用它。搜索在这一点停止。收集到所有的值后，我们必须更新“phi”指令。
+- en: We will still face a problem. At the time of the lookup, not all predecessors
+    of a basic block may be known. How can this happen? Look at the creation of the
+    basic blocks for the `WHILE` statement. The IR for the condition of the loop is
+    generated first. But the branch from the end of the body back to the basic block
+    containing the condition can only be added after the IR for the body is generated,
+    because this basic block is not known earlier. If we need to read the value of
+    a variable in the condition, then we are stuck, because not all predecessors are
+    known.
+  id: totrans-97
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们仍然会面临一个问题。在查找时，基本块的所有前驱可能并不都已知。这是怎么发生的？看看“WHILE”语句的基本块的创建。循环条件的IR首先生成。但是从主体末尾返回到包含条件的基本块的分支只能在生成主体的IR之后添加，因为这个基本块在之前是未知的。如果我们需要在条件中读取变量的值，那么我们就陷入困境，因为并不是所有的前驱都是已知的。
+- en: 'To solve this situation, we must do a little bit more:'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了解决这种情况，我们必须再做一点：
+- en: First, we attach a flag to the basic block.
+  id: totrans-99
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们给基本块附加一个标志。
+- en: Then, we define a basic block as sealed if we know all the predecessors of the
+    basic block. If the basic block is not sealed and we need to look up the value
+    of the variable not yet defined in this basic block, then we insert an empty `phi`
+    instruction and use it as the value.
+  id: totrans-100
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后，如果我们知道基本块的所有前驱，我们将定义基本块为已封装。如果基本块没有被封装，并且我们需要查找尚未在这个基本块中定义的变量的值，那么我们插入一个空的“phi”指令并将其用作值。
+- en: 'We also need to remember this instruction. If the block is later sealed, then
+    we need to update the instruction with the real values. To implement this, we
+    add two more members to `struct BasicBlockDef`: The `IncompletePhis` map records
+    the `phi` instructions that we need to later update, and the `Sealed` flag indicates
+    whether the basic block is sealed:'
+  id: totrans-101
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们还需要记住这个指令。如果块后来被封装，那么我们需要用真实的值更新指令。为了实现这一点，我们向“struct BasicBlockDef”添加了两个成员：IncompletePhis映射记录了我们需要稍后更新的“phi”指令，Sealed标志指示基本块是否已封装：
+- en: '[PRE18]'
+  id: totrans-102
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'Then, the method can be implemented as described:'
+  id: totrans-103
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后，该方法可以按照描述实现：
+- en: '[PRE19]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'The `addEmptyPhi()` method inserts an empty `phi` instruction at the beginning
+    of the basic block:'
+  id: totrans-105
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: “addEmptyPhi（）”方法在基本块的开头插入一个空的“phi”指令：
+- en: '[PRE20]'
+  id: totrans-106
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'To add the missing operands to the `phi` instruction, we first search all the
+    predecessors of the basic block and add the operand pair value and basic block
+    to the `phi` instruction. Then, we try to optimize the instruction:'
+  id: totrans-107
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了向“phi”指令添加缺失的操作数，我们首先搜索基本块的所有前驱，并将操作数对值和基本块添加到“phi”指令中。然后，我们尝试优化指令：
+- en: '[PRE21]'
+  id: totrans-108
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: This algorithm can generate unwanted `phi` instructions. An approach to optimize
+    these is implemented in the next section.
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个算法可能会生成不需要的“phi”指令。优化这些的方法在下一节中实现。
+- en: Optimizing the generated phi instructions
+  id: totrans-110
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 优化生成的phi指令
+- en: 'How can we optimize a `phi` instruction and why should we do it? Although the
+    SSA form is advantageous for many optimizations, the `phi` instruction is often
+    not interpreted by the algorithms and thereby hinders optimization in general.
+    Therefore, the fewer `phi` instructions we generate, the better:'
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们如何优化“phi”指令，为什么要这样做？尽管SSA形式对许多优化有利，“phi”指令通常不被算法解释，从而一般阻碍了优化。因此，我们生成的“phi”指令越少越好：
+- en: 'If the instruction has only one operand or all operands have the same value,
+    then we replace the instruction with this value. If the instruction has no operand,
+    then we replace the instruction with the special value, `Undef`. Only if the instruction
+    has two or more distinct operands do we have to keep the instruction:'
+  id: totrans-112
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果指令只有一个操作数或所有操作数都具有相同的值，那么我们将用这个值替换指令。如果指令没有操作数，那么我们将用特殊值“Undef”替换指令。只有当指令有两个或更多不同的操作数时，我们才必须保留指令：
+- en: '[PRE22]'
+  id: totrans-113
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'Removing a `phi` instruction may lead to optimization opportunities in other
+    `phi` instructions. We search for all uses of the value in other `phi` instructions
+    and then try to optimize these instructions, too:'
+  id: totrans-114
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 删除一个“phi”指令可能会导致其他“phi”指令的优化机会。我们搜索其他“phi”指令中值的所有用法，然后尝试优化这些指令：
+- en: '[PRE23]'
+  id: totrans-115
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: If desired, this algorithm can be improved further. Instead of always iterating
+    the list of values for each `phi` instruction, we could pick and remember two
+    distinct values. In the `optimize` function, we could then check whether these
+    two values are still in the list of the `phi` instruction. If yes, then we know
+    that there is nothing to optimize. But even without this optimization, this algorithm
+    runs very fast, so we are not going to implement this now.
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果需要，这个算法可以进一步改进。我们可以选择并记住两个不同的值，而不是总是迭代每个“phi”指令的值列表。在“optimize”函数中，我们可以检查这两个值是否仍然在“phi”指令的列表中。如果是，那么我们知道没有什么可以优化的。但即使没有这种优化，这个算法运行非常快，所以我们现在不打算实现这个。
+- en: We are almost done. Only the operation to seal a basic block has not yet been
+    implemented, which we will do in the next section.
+  id: totrans-117
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们几乎完成了。只有封装基本块的操作还没有实现，我们将在下一节中实现。
+- en: Sealing a block
+  id: totrans-118
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 封装一个块
+- en: 'As soon as we know that all predecessors of a block are known, we can seal
+    the block. If the source language contains only structured statements, such as
+    `tinylang`, then it is easy to determine that place where a block can be sealed.
+    Look again at the basic blocks generated for the `WHILE` statement. The basic
+    block containing the condition can be sealed after the branch from the end of
+    the body is added, because this was the last missing predecessor. To seal a block,
+    we simply add the missing operands to the incomplete `phi` instructions and set
+    the flag:'
+  id: totrans-119
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦我们知道一个块的所有前驱都已知，我们就可以封存该块。如果源语言只包含结构化语句，比如 `tinylang`，那么很容易确定块可以被封存的位置。再看一下为
+    `WHILE` 语句生成的基本块。包含条件的基本块可以在从主体末尾添加分支之后封存，因为这是最后一个缺失的前驱。要封存一个块，我们只需向不完整的 `phi`
+    指令添加缺失的操作数并设置标志：
+- en: '[PRE24]'
+  id: totrans-120
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: With these methods, we are now ready to generate the IR code for expressions.
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些方法，我们现在可以准备生成表达式的IR代码了。
+- en: Creating IR code for expressions
+  id: totrans-122
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 为表达式创建IR代码
+- en: 'In general, you translate expressions as already shown in [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048),
+    *The Structure of a Compiler*. The only interesting part is how to access variables.
+    The previous section covered local variables, but there are other kinds of variables.
+    Let''s discuss briefly what we need to do:'
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一般来说，你可以像在[*第3章*](B15647_03_ePub_RK.xhtml#_idTextAnchor048)中已经展示的那样翻译表达式，*编译器的结构*。唯一有趣的部分是如何访问变量。前一节涵盖了局部变量，但还有其他类型的变量。让我们简要讨论一下我们需要做什么：
+- en: For a local variable of the procedure, we use the `readLocalVariable()` and
+    `writeLocalVariable()` methods from the previous section.
+  id: totrans-124
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 对于过程的局部变量，我们使用了前一节中的 `readLocalVariable()` 和 `writeLocalVariable()` 方法。
+- en: For a local variable in an enclosing procedure, we require a pointer to the
+    frame of the enclosing procedure. This is handled in a later section.
+  id: totrans-125
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 对于封闭过程中的局部变量，我们需要一个指向封闭过程框架的指针。这将在后面的部分处理。
+- en: For a global variable, we generate load-and-store instructions.
+  id: totrans-126
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 对于全局变量，我们生成加载和存储指令。
+- en: For a formal parameter, we have to differentiate between passing by value and
+    passing by reference (the `VAR` parameter in `tinylang`). A parameter passed by
+    value is treated as a local variable, and a parameter passed by reference is treated
+    as a global variable.
+  id: totrans-127
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 对于形式参数，我们必须区分按值传递和按引用传递（`tinylang` 中的 `VAR` 参数）。按值传递的参数被视为局部变量，按引用传递的参数被视为全局变量。
+- en: 'Putting it all together, we get the following code for reading a variable or
+    formal parameter:'
+  id: totrans-128
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 把所有这些放在一起，我们得到了读取变量或形式参数的以下代码：
+- en: '[PRE25]'
+  id: totrans-129
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: Writing to a variable or formal parameter is symmetrical; we just need to exchange
+    the method to read with the one to write and use a `store` instruction instead
+    of a `load` instruction.
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 写入变量或形式参数是对称的；我们只需要用写入方法替换读取方法，并使用 `store` 指令代替 `load` 指令。
+- en: Next, these functions are applied while generating the IR code for functions,
+    which we implement next.
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，在生成函数的IR代码时应用这些函数，我们将在下一步实现。
+- en: Emitting the IR code for a function
+  id: totrans-132
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 发出函数的IR代码
+- en: Most of the IR code will live in a function. A function in IR code resembles
+    a function in C. It specifies the name, and the types of the parameters and of
+    the return value and other attributes. To call a function in a different compilation
+    unit, you need to declare the function. This is similar to a prototype in C. If
+    you add basic blocks to the function, then you define the function. We will do
+    all this in the next sections, beginning with a discussion regarding the visibility
+    of symbol names.
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 大部分IR代码将存在于一个函数中。IR代码中的函数类似于C中的函数。它指定了参数和返回值的名称和类型以及其他属性。要在不同的编译单元中调用函数，您需要声明该函数。这类似于C中的原型。如果您向函数添加基本块，那么您就定义了该函数。我们将在接下来的部分中完成所有这些工作，首先讨论符号名称的可见性。
+- en: Controlling visibility with linkage and name mangling
+  id: totrans-134
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 使用链接和名称混淆来控制可见性
+- en: Functions (and also global variables) have a linkage style attached. With the
+    linkage style, we define the visibility of a symbol name and what should happen
+    if more than one symbol has the same name. The most basic linkage styles are `private`
+    and `external`. A symbol with `private` linkage is only visible in the current
+    compilation unit, while a symbol with `external` linkage is globally available.
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数（以及全局变量）都有一个链接样式。通过链接样式，我们定义了符号名称的可见性以及如果有多个符号具有相同名称时应该发生什么。最基本的链接样式是 `private`
+    和 `external`。具有 `private` 链接的符号只在当前编译单元中可见，而具有 `external` 链接的符号是全局可用的。
+- en: For a language without a proper module concept, such as C, this is certainly
+    adequate. With modules, we need to do more. Assume that we have a module called
+    `Square` providing a `Root()` function and a `Cube` module also providing a `Root()`
+    function. If the functions are private, then there is obviously no problem. The
+    function gets the name `Root` and private linkage. The situation is different
+    if the function is exported, so that it can be called in other modules. Using
+    the function name alone is not enough, because this name is not unique.
+  id: totrans-136
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于没有适当模块概念的语言，比如C，这当然是足够的。有了模块，我们需要做更多的工作。假设我们有一个名为 `Square` 的模块，提供一个 `Root()`
+    函数，还有一个名为 `Cube` 的模块，也提供一个 `Root()` 函数。如果函数是私有的，那么显然没有问题。函数得到名称 `Root` 和私有链接。如果函数被导出，以便在其他模块中调用，情况就不同了。仅使用函数名称是不够的，因为这个名称不是唯一的。
+- en: 'The solution is to tweak the name to make it globally unique. This is called
+    name mangling. How this is done depends on the requirements and characteristics
+    of the language. In our case, the base idea is to use a combination of the module
+    and the function name to create a global unique name. Using `Square.Root` as a
+    name looks like an obvious solution, but may lead to problems with assemblers,
+    as the dot may have a special meaning. Instead of using a delimiter between the
+    name components, we can get a similar effect with prefixing the name components
+    with their length: `6Square4Root`. This is no legal identifier for LLVM, but we
+    can fix this by prefixing the whole name with `_t` (`t` for `tinylang`): `_t6Square4Root`.
+    In this way, we can create unique names for exported symbols:'
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 解决方案是调整名称以使其全局唯一。这称为名称混编。如何做取决于语言的要求和特性。在我们的情况下，基本思想是使用模块和函数名的组合来创建全局唯一的名称。使用`Square.Root`作为名称看起来是一个明显的解决方案，但可能会导致与汇编器的问题，因为点可能具有特殊含义。我们可以通过在名称组件前面加上它们的长度来获得类似的效果，而不是在名称组件之间使用分隔符：`6Square4Root`。这对于LLVM来说不是合法标识符，但我们可以通过在整个名称前面加上`_t`（`t`代表`tinylang`）来解决这个问题：`_t6Square4Root`。通过这种方式，我们可以为导出的符号创建唯一的名称：
+- en: '[PRE26]'
+  id: totrans-138
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: If your source language supports type overloading, then you need to extend this
+    scheme with type names. For example, to distinguish between the C++ functions
+    `int root(int)` and `double root(double)`, the type of the parameter and the return
+    value are added to the function name.
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果您的源语言支持类型重载，那么您需要使用类型名称来扩展此方案。例如，为了区分C++函数`int root(int)`和`double root(double)`，参数的类型和返回值被添加到函数名中。
+- en: You also need to think about the length of the generated name, because some
+    linkers place restrictions on the length. With nested namespaces and classes in
+    C++, the mangled names can be rather long. There, C++ defines a compression scheme
+    to avoid repeating name components over and over again.
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您还需要考虑生成名称的长度，因为一些链接器对长度有限制。在C++中有嵌套的命名空间和类，混编的名称可能会很长。在那里，C++定义了一种压缩方案，以避免一遍又一遍地重复名称组件。
+- en: Next, we look at how to treat the parameter types.
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将看看如何处理参数类型。
+- en: Converting types from an AST description to LLVM types
+  id: totrans-142
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 将AST描述中的类型转换为LLVM类型
+- en: 'The parameters of a function also require some consideration. First, we need
+    to map the types of the source language to an LLVM type. As `tinylang` currently
+    only has two types, this is easy:'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数的参数也需要一些考虑。首先，我们需要将源语言的类型映射到LLVM类型。由于`tinylang`目前只有两种类型，这很容易：
+- en: '[PRE27]'
+  id: totrans-144
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: '`Int64Ty`, `Int1Ty`, and later `VoidTy` are class members holding the type
+    representation of LLVM types, `i64`, `i1`, and `void`.'
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Int64Ty`，`Int1Ty`，以及后来的`VoidTy`是类成员，保存着LLVM类型`i64`，`i1`和`void`的类型表示。'
+- en: 'For a formal parameter that passes by reference, this is not enough. The LLVM
+    type of this parameter is a pointer. We generalize the function and take formal
+    parameters into account:'
+  id: totrans-146
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于通过引用传递的形式参数，这还不够。这个参数的LLVM类型是一个指针。我们概括函数并考虑形式参数：
+- en: '[PRE28]'
+  id: totrans-147
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: With these helpers at hand, we create the LLVM IR function next.
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些帮助，我们接下来创建LLVM IR函数。
+- en: Creating the LLVM IR function
+  id: totrans-149
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 创建LLVM IR函数
+- en: 'To emit a function in LLVM IR, a function type is needed, which is similar
+    to a prototype in C. Creating the function type involves mapping the types and
+    then calling the factory method to create the function type:'
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要在LLVM IR中发出函数，需要一个函数类型，它类似于C中的原型。创建函数类型涉及映射类型，然后调用工厂方法创建函数类型：
+- en: '[PRE29]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'Based on the function type, we also create the LLVM function. This associates
+    the function type with the linkage and the mangled name:'
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据函数类型，我们还创建LLVM函数。这将函数类型与链接和名称混合在一起：
+- en: '[PRE30]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: The `getModule()` method returns the current LLVM module, which we will set
+    up a bit later.
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`getModule()`方法返回当前的LLVM模块，稍后我们将对其进行设置。'
+- en: With the function created, we can add some more information to it. First, we
+    can give the parameter's names. This makes the IR more readable. Second, we can
+    add attributes to the function and to the parameters to specify some characteristics.
+    As an example, we do this for parameters passed by reference.
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 创建函数后，我们可以为其添加更多信息。首先，我们可以给参数命名。这使得IR更易读。其次，我们可以向函数和参数添加属性以指定一些特性。例如，我们对通过引用传递的参数这样做。
+- en: At the LLVM level, these parameters are pointers. But from the source language
+    design, these are very restricted pointers. Analog to references in C++, we always
+    need to specify a variable for a `VAR` parameter. So, we know by design that this
+    pointer will never be null and that it is always dereferenceable, meaning that
+    we can read the value pointed to by risking a general protection fault. Also by
+    design, this pointer cannot be passed around. In particular, there are no copies
+    of the pointer that outlive the call to the function. Therefore, the pointer is
+    said to not be captured.
+  id: totrans-156
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在LLVM级别，这些参数是指针。但是根据源语言设计，这些是非常受限制的指针。类似于C++中的引用，我们总是需要为`VAR`参数指定一个变量。因此，我们知道这个指针永远不会为空，并且它总是可以解引用的，这意味着我们可以读取指向的值而不会出现一般保护错误。同样根据设计，这个指针不能被传递。特别是，没有指针的副本会在函数调用之后存在。因此，该指针被称为不被捕获。
+- en: 'The `llvm::AttributeBuilder` class is used to build the set of attributes for
+    a formal parameter. To get the storage size of a parameter type, we can simply
+    ask the data layout:'
+  id: totrans-157
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`llvm::AttributeBuilder`类用于构建形式参数的属性集。要获取参数类型的存储大小，我们可以简单地询问数据布局：'
+- en: '[PRE31]'
+  id: totrans-158
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: We now have created the IR function. In the next section, we add the basic blocks
+    of the function body to the function.
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们现在已经创建了IR函数。在下一节中，我们将向函数添加函数体的基本块。
+- en: Emitting the function body
+  id: totrans-160
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 发出函数体
+- en: 'We are almost done with emitting the IR code for a function! We only need to
+    put the pieces together to emit a function, including its body:'
+  id: totrans-161
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们几乎完成了为函数发出IR代码！我们只需要将各个部分组合在一起以发出函数，包括其函数体：
+- en: 'Given a procedure declaration from `tinylang`, we first create the function
+    type and the function:'
+  id: totrans-162
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 给定来自`tinylang`的过程声明，我们首先创建函数类型和函数：
+- en: '[PRE32]'
+  id: totrans-163
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'Next, we create the first basic block of the function and make it the current
+    one:'
+  id: totrans-164
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们创建函数的第一个基本块，并将其设置为当前基本块：
+- en: '[PRE33]'
+  id: totrans-165
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'Then we step through all formal parameters. To handle VAR parameters correctly,
+    we need to initialize the `FormalParams` member (used in `readVariable()`). In
+    contrast to local variables, formal parameters have a value in the first basic
+    block, so we make these values known:'
+  id: totrans-166
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后我们遍历所有的形式参数。为了正确处理VAR参数，我们需要初始化`FormalParams`成员（在`readVariable()`中使用）。与局部变量不同，形式参数在第一个基本块中有一个值，所以我们让这些值知道：
+- en: '[PRE34]'
+  id: totrans-167
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: 'Following this setup, we can call the `emit()` method to start generating the
+    IR code for statements:'
+  id: totrans-168
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在进行下一步之前，我们可以调用`emit()`方法开始生成语句的IR代码：
+- en: '[PRE35]'
+  id: totrans-169
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: 'The last block after generating the IR code may not yet be sealed, so we call
+    `sealBlock()` now. A procedure in `tinylang` may have an implicit return, so we
+    also check whether the last basic block has a proper terminator, and add one if
+    not:'
+  id: totrans-170
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在生成IR代码之后，最后一个块可能还没有封闭，所以现在我们调用`sealBlock()`。`tinylang`中的一个过程可能有一个隐式返回，所以我们还要检查最后一个基本块是否有适当的终结符，如果没有，就添加一个：
+- en: '[PRE36]'
+  id: totrans-171
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: This finishes the generation of IR code for functions. We still need to create
+    the LLVM module, which holds all the IR code together. We do this in the next
+    section.
+  id: totrans-172
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这完成了函数的IR代码生成。我们仍然需要创建LLVM模块，其中包含所有的IR代码。我们将在下一节中完成这个工作。
+- en: Setting up the module and the driver
+  id: totrans-173
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 设置模块和驱动程序
+- en: We collect all functions and global variables of a compilation unit in an LLVM
+    module. To facilitate IR generation, we wrap all the functions from the previous
+    sections in a code generator class. To get a working compiler, we also need to
+    define the target architecture for which we want to generate code, and also add
+    the passes that emit the code. We implement all this in the next chapters, starting
+    with the code generator.
+  id: totrans-174
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在LLVM模块中收集编译单元的所有函数和全局变量。为了简化IR生成，我们将前面章节中的所有函数封装在一个代码生成器类中。为了获得一个可工作的编译器，我们还需要定义要生成代码的目标架构，并添加生成代码的传递。我们将在接下来的章节中实现所有这些，从代码生成器开始。
+- en: Wrapping everything in the code generator
+  id: totrans-175
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 将所有内容包装在代码生成器中
+- en: 'The IR module is the brace around all elements we generate for a compilation
+    unit. At the global level, we iterate through the declarations at the module level
+    and create global variables and call the code generation for procedures. A global
+    variable in `tinylang` is mapped to an instance of the `llvm::GobalValue` class.
+    This mapping is saved in `Globals` and made available to the code generation for
+    procedures:'
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: IR模块是我们为编译单元生成的所有元素的大括号。在全局级别，我们遍历模块级别的声明，并创建全局变量，并调用过程的代码生成。在`tinylang`中，全局变量映射到`llvm::GobalValue`类的实例。这个映射保存在`Globals`中，并且可以在过程的代码生成中使用：
+- en: '[PRE37]'
+  id: totrans-177
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: 'The module also holds the `LLVMContext` class and caches the most commonly
+    used LLVM types. The latter ones need to be initialized, for example, for the
+    64-bit integer type:'
+  id: totrans-178
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 模块还包含`LLVMContext`类，并缓存了最常用的LLVM类型。后者需要初始化，例如，64位整数类型：
+- en: '[PRE38]'
+  id: totrans-179
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: 'The `CodeGenerator` class initializes the LLVM IR module and calls the code
+    generation for the module. Most importantly, this class must know for which target
+    architecture we like to generate code. This information is passed in the `llvm::TargetMachine`
+    class, which is set up in the driver:'
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CodeGenerator`类初始化LLVM IR模块，并调用模块的代码生成。最重要的是，这个类必须知道我们想要为哪个目标架构生成代码。这个信息传递给`llvm::TargetMachine`类，在驱动程序中设置：'
+- en: '[PRE39]'
+  id: totrans-181
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: 'For ease of use, we also introduce a factory method for the code generator:'
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了方便使用，我们还引入了一个代码生成器的工厂方法：
+- en: '[PRE40]'
+  id: totrans-183
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: The `CodeGenerator` class provides a small interface to create IR code, which
+    is ideal for use in the compiler driver. Before we integrate it, we need to implement
+    support for machine code generation.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CodeGenerator`类提供了一个小接口来创建IR代码，这对于在编译器驱动程序中使用是理想的。在集成之前，我们需要实现对机器代码生成的支持。'
+- en: Initializing the target machine class
+  id: totrans-185
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 初始化目标机器类
+- en: 'Now, only the creation of the target machine is missing. With the target machine,
+    we define the CPU architecture for which we like to generate code. For each CPU,
+    there are also features available that can be used to influence code generation.
+    For example, a newer CPU of a CPU architecture family can support vector instructions.
+    With features, we can toggle the use of vector instructions on or off. To support
+    setting all these options from the command line, LLVM provides some supporting
+    code. In the `Driver` class, we add the following `include` variable:'
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，只剩下创建目标机器了。有了目标机器，我们可以定义要生成代码的CPU架构。对于每个CPU，还有一些可用的特性，可以用来影响代码生成。例如，CPU架构系列的新CPU可以支持矢量指令。有了特性，我们可以切换矢量指令的使用。为了支持从命令行设置所有这些选项，LLVM提供了一些支持代码。在`Driver`类中，我们添加了以下`include`变量：
+- en: '[PRE41]'
+  id: totrans-187
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE41]'
+- en: 'This `include` variable adds common command-line options to our compiler driver.
+    Many LLVM tools also use these command-line options, which have the benefit of
+    providing a common interface to the user. Only the option to specify a target
+    triple is missing. As this is very useful, we add this on our own:'
+  id: totrans-188
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个`include`变量将常见的命令行选项添加到我们的编译器驱动程序中。许多LLVM工具也使用这些命令行选项，这样做的好处是为用户提供了一个共同的接口。只是缺少指定目标三元组的选项。由于这非常有用，我们自己添加这个选项：
+- en: '[PRE42]'
+  id: totrans-189
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE42]'
+- en: 'Let''s create the target machine:'
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们创建目标机器：
+- en: 'For the purpose of displaying error messages, the name of the application must
+    be passed to the function:'
+  id: totrans-191
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了显示错误消息，应用程序的名称必须传递给函数：
+- en: '[PRE43]'
+  id: totrans-192
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE43]'
+- en: 'We first collect all the information provided by the command line. These are
+    options for the code generator, the name of the CPU, possible features that should
+    be activated or deactivated, and the triple of the target:'
+  id: totrans-193
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先收集命令行提供的所有信息。这些是代码生成器的选项，CPU的名称，可能要激活或停用的特性，以及目标的三元组：
+- en: '[PRE44]'
+  id: totrans-194
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE44]'
+- en: 'Then we look up the target in the target registry. If an error occurs, then
+    we display the error message and bail out. A possible error would be an unsupported
+    triple specified by the user:'
+  id: totrans-195
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后我们在目标注册表中查找目标。如果发生错误，我们会显示错误消息并退出。用户指定的可能错误是不支持的三元组：
+- en: '[PRE45]'
+  id: totrans-196
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE45]'
+- en: 'With the help of the `Target` class, we configure the target machine using
+    all the known options requested by the user:'
+  id: totrans-197
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 借助 `Target` 类的帮助，我们使用用户请求的所有已知选项配置目标机器：
+- en: '[PRE46]'
+  id: totrans-198
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE46]'
+- en: With the target machine instance, we can generate IR code targeting a CPU architecture
+    of our choice. What is missing is the translation to assembly text or the generation
+    of object code files. We add this support in the next section.
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了目标机器实例，我们可以生成针对我们选择的 CPU 架构的 IR 代码。缺少的是将其转换为汇编文本或生成目标代码文件。我们将在下一节中添加这个支持。
+- en: Emitting assembler text and object code
+  id: totrans-200
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 发出汇编文本和目标代码
+- en: In LLVM, the IR code is run through a pipeline of passes. Each pass performs
+    a single task, for example, removing dead code. We will learn more about passes
+    in [*Chapter 8*](B15647_08_ePub_RK.xhtml#_idTextAnchor126), *Optimizing IR*. Outputting
+    assembler code or an object file is implemented as a pass, too. Let's add basic
+    support for it!
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在 LLVM 中，IR 代码通过一系列 passes 运行。每个 pass 执行一个任务，例如删除死代码。我们将在 [*第 8 章*](B15647_08_ePub_RK.xhtml#_idTextAnchor126)
+    中了解更多关于 passes 的知识，*优化 IR*。输出汇编代码或目标文件也被实现为一个 pass。让我们为此添加基本支持！
+- en: 'We need to include even more LLVM header files. We need the `llvm::legacy::PassManager`
+    class for holding the passes to emit code to a file. We also want to be able to
+    output LLVM IR code, so we also need a pass to emit this. And last, we use the
+    `llvm:: ToolOutputFile` class for file operations:'
+  id: totrans-202
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '我们需要包含更多的 LLVM 头文件。我们需要 `llvm::legacy::PassManager` 类来保存发出代码到文件的 passes。我们还希望能够输出
+    LLVM IR 代码，因此我们还需要一个 pass 来发出这个。最后，我们使用 `llvm:: ToolOutputFile` 类进行文件操作：'
+- en: '[PRE47]'
+  id: totrans-203
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE47]'
+- en: 'Another command-line option for outputting LLVM IR is also required:'
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 还需要另一个用于输出 LLVM IR 的命令行选项：
+- en: '[PRE48]'
+  id: totrans-205
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE48]'
+- en: 'The first task in the new `emit()` method is to deal with the name of the output
+    file. If the input is read from `stdin`, indicated by the use of the minus symbol,
+    `-`, then we output the result to `stdout`. The `ToolOutputFile` class knows how
+    to handle the special filename, `-`:'
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 新 `emit()` 方法中的第一个任务是处理输出文件的名称。如果输入是从 `stdin` 读取的，表示为减号 `-`，那么我们将结果输出到 `stdout`。`ToolOutputFile`
+    类知道如何处理特殊文件名 `-`：
+- en: '[PRE49]'
+  id: totrans-207
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE49]'
+- en: 'Otherwise, we drop a possible extension of the input filename and append `.ll`,
+    `.s`, or `.o` as an extension, depending on the command-line options given by
+    the user. The `FileType` option is defined in the `llvm/CodeGen/CommandFlags.inc`
+    header file, which we included earlier. This option has no support for emitting
+    IR code, and so we added the new option, `–emit-llvm`, which only takes effect
+    if used together with the assembly file type:'
+  id: totrans-208
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 否则，我们会删除输入文件名的可能扩展，并根据用户给出的命令行选项附加`.ll`、`.s`或`.o`作为扩展名。`FileType` 选项在 `llvm/CodeGen/CommandFlags.inc`
+    头文件中定义，我们之前已经包含了这个选项。这个选项不支持发出 IR 代码，所以我们添加了新选项 `–emit-llvm`，只有在与汇编文件类型一起使用时才会生效：
+- en: '[PRE50]'
+  id: totrans-209
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE50]'
+- en: 'Some platforms distinguish between text and binary files, and so we have to
+    provide the right open flags when opening the output file:'
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一些平台区分文本和二进制文件，因此在打开输出文件时我们必须提供正确的打开标志：
+- en: '[PRE51]'
+  id: totrans-211
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE51]'
+- en: 'Now we can add the required passes to `PassManager`. The `TargetMachine` class
+    has a utility method, which adds the requested classes. Therefore, we only need
+    to check whether the user requests to output LLVM IR code:'
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们可以向 `PassManager` 添加所需的 passes。`TargetMachine` 类有一个实用方法，用于添加请求的类。因此，我们只需要检查用户是否要求输出
+    LLVM IR 代码：
+- en: '[PRE52]'
+  id: totrans-213
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE52]'
+- en: 'With all this preparation done, emitting the file boils down to a single function
+    call:'
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 准备工作都做好了，发出文件归结为一个函数调用：
+- en: '[PRE53]'
+  id: totrans-215
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE53]'
+- en: 'The `ToolOutputFile` class automatically deletes the file if we do not explicitly
+    request that we want to keep it. This makes error handling easier, as there are
+    potentially many places where we need to handle errors and only one place that
+    is reached in case everything went well. We successfully emitted the code, so
+    we want to keep the file:'
+  id: totrans-216
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`ToolOutputFile` 类会在我们没有明确要求保留文件时自动删除文件。这样做可以使错误处理更容易，因为可能有很多地方需要处理错误，但只有一个地方在一切顺利的情况下被调用。我们成功地发出了代码，所以我们想要保留这个文件：'
+- en: '[PRE54]'
+  id: totrans-217
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE54]'
+- en: 'And finally, we report success to the caller:'
+  id: totrans-218
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，我们向调用者报告成功：
+- en: '[PRE55]'
+  id: totrans-219
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE55]'
+- en: Calling the `emit()` method with the `llvm::Module` we created, with a call
+    to the `CodeGenerator` class, emits the code as requested.
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用我们创建的 `llvm::Module` 调用 `CodeGenerator` 类的 `emit()` 方法，按照请求发出代码。
+- en: 'Suppose you have the greatest common divisor algorithm in `tinylang` stored
+    in the `gcd.mod` file. To translate this to a `gcd.os` object file, you type the
+    following:'
+  id: totrans-221
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 假设您在 `tinylang` 中有最大公约数算法存储在 `gcd.mod` 文件中。要将其转换为 `gcd.os` 目标文件，您可以输入以下内容：
+- en: '[PRE56]'
+  id: totrans-222
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE56]'
+- en: 'If you would like to inspect the generated IR code directly on screen, then
+    you can type the following:'
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果您想直接在屏幕上检查生成的 IR 代码，那么可以输入以下内容：
+- en: '[PRE57]'
+  id: totrans-224
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE57]'
+- en: Let's celebrate! At this point, we have created a complete compiler, from reading
+    the source language up to emitting assembler code or an object file.
+  id: totrans-225
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们庆祝一下！到目前为止，我们已经创建了一个完整的编译器，从读取源语言到发出汇编代码或目标文件。
+- en: Summary
+  id: totrans-226
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, you learned how to implement your own code generator for LLVM
+    IR code. Basic blocks are an important data structure, holding all the instructions
+    and expressing branches. You learned how to create basic blocks for the control
+    statements of the source language and how to add instructions to a basic block.
+    You applied a modern algorithm to handle local variables in functions, leading
+    to less IR code. The goal of a compiler is to generate assembler text or an object
+    file for the input, so you also added a simple compilation pipeline. With this
+    knowledge, you will be able to generate LLVM IR and, subsequently, assembler text
+    or object code for your own language compiler.
+  id: totrans-227
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您学习了如何为 LLVM IR 代码实现自己的代码生成器。基本块是一个重要的数据结构，包含所有指令并表示分支。您学习了如何为源语言的控制语句创建基本块，以及如何向基本块添加指令。您应用了一种现代算法来处理函数中的局部变量，从而减少了
+    IR 代码。编译器的目标是为输入生成汇编文本或目标文件，因此您还添加了一个简单的编译流水线。有了这些知识，您将能够为自己的语言编译器生成 LLVM IR，随后生成汇编文本或目标代码。
+- en: In the next chapter, you will learn how to deal with aggregate data structures
+    and how to ensure that function calls comply with the rules of your platform.
+  id: totrans-228
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，您将学习如何处理聚合数据结构，以及如何确保函数调用符合您平台的规则。

@@ -1,0 +1,658 @@
+- en: Chapter 8. Resource Management and Extending RxJava
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 第8章。资源管理和扩展RxJava
+- en: Through the previous chapters, we've learned how to use RxJava's observables.
+    We've been using many different operators and `factory` methods. The `factory`
+    methods were the source of various `Observable` instances with different behavior
+    and origin of their emissions. Using the operators, on the other hand, we've been
+    building complex logic around these observables.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过前面的章节，我们已经学会了如何使用RxJava的可观察对象。我们已经使用了许多不同的操作符和`工厂`方法。`工厂`方法是各种具有不同行为和发射源的`Observable`实例的来源。另一方面，使用操作符，我们已经围绕这些可观察对象构建了复杂的逻辑。
+- en: In this chapter, we'll learn how to create our own `factory` methods, which
+    will be capable of managing their source resources. In order to do that, we'll
+    need a way to manage and dispose of the resources. We've created and used multiple
+    methods like this with source files, HTTP requests, folders, or data in the memory.
+    But some of them don't clean up their resources. For example, the HTTP request
+    observable needs a `CloseableHttpAsyncClient` instance; we created a method that
+    receives it and left the management of it to the user. The time has come to learn
+    how to manage and clean up our source data automatically, encapsulated in our
+    `factory` methods.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将学习如何创建我们自己的`工厂`方法，这些方法将能够管理它们的源资源。为了做到这一点，我们需要一种管理和释放资源的方法。我们已经创建并使用了多种类似的方法，包括源文件、HTTP请求、文件夹或内存中的数据。但其中一些并没有清理它们的资源。例如，HTTP请求可观察对象需要一个`CloseableHttpAsyncClient`实例；我们创建了一个接收它并将其管理留给用户的方法。现在是时候学习如何自动管理和清理我们的源数据，封装在我们的`工厂`方法中了。
+- en: We'll learn how to write our own operators, too. Java is not a dynamic language,
+    and that's why we won't be adding operators as methods of the `Observable` class.
+    There is a way to insert them in the observable chain of actions and we will see
+    that in this chapter.
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们也将学习如何编写我们自己的操作符。Java不是一种动态语言，这就是为什么我们不会将操作符添加为`Observable`类的方法。有一种方法可以将它们插入到可观察的操作链中，我们将在本章中看到。
+- en: 'The topics covered in this chapter are:'
+  id: totrans-4
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章涵盖的主题有：
+- en: Resource management with the `using()` method
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用`using()`方法进行资源管理
+- en: Creating custom operators using the *higher-order* `lift()` operator
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用*高阶* `lift()` 操作符创建自定义操作符
+- en: Creating compositions of operators with `compose`
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用`compose`创建操作符的组合
+- en: Resource management
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 资源管理
+- en: 'If we look back at the HTTP request method that we used in [Chapter 6](ch06.html
+    "Chapter 6. Using Concurrency and Parallelism with Schedulers"), *Using Concurrency
+    and Parallelism with Schedulers* and [Chapter 5](ch05.html "Chapter 5. Combinators,
+    Conditionals, and Error Handling"), *Combinators, Conditionals, and Error Handling*,
+    it has this signature: `Observable<Map> requestJson(HttpAsyncClient client, String
+    url)`.'
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们回顾一下我们在[第6章](ch06.html "第6章。使用调度程序进行并发和并行处理")中使用的HTTP请求方法，*使用调度程序进行并发和并行处理*和[第5章](ch05.html
+    "第5章。组合器、条件和错误处理")中使用的HTTP请求方法，它的签名是：`Observable<Map> requestJson(HttpAsyncClient
+    client, String url)`。
+- en: 'Instead of just calling a method that makes a request to a URL and returns
+    the response as JSON, we create a `HttpAsyncClient` instance, have to start the
+    it and pass it to the `requestJson()` method. But there is more: we need to close
+    the *client* after we read the result, and because the observable is *asynchronous*,
+    we need to wait for its `OnCompleted` notification and then to do the closing.
+    This is very complex and should be changed. The `Observable`, which read from
+    files, need to create streams/readers/channels and close them when all the subscribers
+    are *unsubscribed*. The `Observable`, emitting data from a database should set
+    up and then close all the connections, statements, and result sets that are used
+    after reading is done. And that is true for the `HttpAsyncClient` object, too.
+    It is the resource that we use to open a connection to a remote server; our observable
+    should clean it up after everything is read and all the subscribers are no longer
+    subscribed.'
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们不仅仅是调用一个方法，该方法向URL发出请求并将响应作为JSON返回，我们创建了一个`HttpAsyncClient`实例，必须启动它并将其传递给`requestJson()`方法。但还有更多：我们需要在读取结果后关闭*客户端*，因为可观察是*异步*的，我们需要等待它的`OnCompleted`通知，然后关闭它。这非常复杂，应该进行更改。从文件中读取的`Observable`需要在所有订阅者*取消订阅*后创建流/读取器/通道并关闭它们。从数据库中发出数据的`Observable`应该在读取完成后设置并关闭所有连接、语句和结果集。对于`HttpAsyncClient`对象也是如此。它是我们用来打开与远程服务器的连接的资源；我们的可观察对象应该在一切都被读取并且所有订阅者不再订阅时清理它。
+- en: 'Let''s answer this one question: Why does the `requestJson()` method need this
+    `HttpAsyncClient` object? The answer is that we used a RxJava module for the HTTP
+    request. The code for this is as follows:'
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们回答一个问题：为什么`requestJson()`方法需要这个`HttpAsyncClient`对象？答案是我们使用了一个RxJava模块进行HTTP请求。其代码如下：
+- en: '[PRE0]'
+  id: totrans-12
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'This code creates the request and the code needs the client, so we need the
+    client to create our `Observable` instance. We can''t change this code, because
+    changing it means to write the HTTP request by ourselves, and that''s not good.
+    There is already a library that does it for us. We''ll have to use something that
+    provides the `HttpAsyncClient` instance on *subscribing* and disposes from it
+    on *unsubscribing*. There is something that does just this: the `using()` factory
+    method.'
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这段代码创建了请求，代码需要客户端，所以我们需要客户端来创建我们的`Observable`实例。我们不能改变这段代码，因为改变它意味着要自己编写HTTP请求，这样不好。已经有一个库可以为我们做这件事。我们需要使用一些东西，在*订阅*时提供`HttpAsyncClient`实例，并在*取消订阅*时释放它。有一个方法可以做到这一点：`using()`工厂方法。
+- en: Introducing the Observable.using method
+  id: totrans-14
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 介绍`Observable.using`方法
+- en: 'The signature of the `Observable.using` method is as follows:'
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Observable.using`方法的签名如下：'
+- en: '[PRE1]'
+  id: totrans-16
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'This looks quite complex, but after a second glance it is not so hard to understand.
+    Let''s take a look at the following description:'
+  id: totrans-17
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这看起来相当复杂，但仔细看一下就不难理解了。让我们来看一下以下描述：
+- en: Its first parameter is `Func0<Resource> resourceFactory`, a function that creates
+    a `Resource` object (here `Resource` is an arbitrary object; it is not interface
+    or class but the name of a type parameter). It is our job to implement the resource
+    creation.
+  id: totrans-18
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 它的第一个参数是 `Func0<Resource> resourceFactory`，一个创建 `Resource` 对象的函数（这里 `Resource`
+    是一个任意对象；它不是接口或类，而是类型参数的名称）。我们的工作是实现资源的创建。
+- en: The `Func1<? super Resource, ? extends Observable<? extends T>> observableFactory`
+    parameter, the second argument, is a function that receives a `Resource` object
+    and returns an `Observable` instance. This function will be called with the `Resource`
+    object that we already created by the first parameter. We can use this resource
+    to create our `Observable` instance.
+  id: totrans-19
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`Func1<? super Resource, ? extends Observable<? extends T>> observableFactory`
+    参数，第二个参数，是一个接收 `Resource` 对象并返回 `Observable` 实例的函数。这个函数将使用我们已经通过第一个参数创建的 `Resource`
+    对象进行调用。我们可以使用这个资源来创建我们的 `Observable` 实例。'
+- en: The `Action1<? super Resource> disposeAction` parameter is called when the `Resource`
+    object should be disposed of. It receives the `Resource` object that was created
+    by the `resourceFactory` parameter (and used to create an `Observable` instance),
+    and it is our job to dispose of it. This is called on *unsubscribing*.
+  id: totrans-20
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`Action1<? super Resource> disposeAction` 参数在应该处理 `Resource` 对象时被调用。它接收了由 `resourceFactory`
+    参数创建的 `Resource` 对象（并用于创建 `Observable` 实例），我们的工作是处理它。这在*取消订阅*时被调用。'
+- en: 'We are able to create a function, making an HTTP request, without passing it
+    the `HttpAsyncClient` object now. We have utilities that will create and dispose
+    of it on demand. Let''s implement the function:'
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们能够创建一个函数，进行 HTTP 请求，而现在不需要传递 `HttpAsyncClient` 对象。我们有工具可以根据需要创建和处理它。让我们来实现这个函数：
+- en: '[PRE2]'
+  id: totrans-22
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'The method is not so hard to understand. Let''s break it down:'
+  id: totrans-23
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个方法并不难理解。让我们来分解一下：
+- en: The signature of the method is simple; it has only one parameter, `URL`. The
+    callers of the method won't need to create and manage the life cycle of a `CloseableHttpAsyncClient`
+    instance. It returns an `Observable` instance capable of emitting a `ObservableHttpResponse`
+    response and *completing*. The `getJson()` method can use that to transform the
+    `ObservableHttpResponse` response into the `Map` instance representing the JSON,
+    again without the need of passing the *client*.
+  id: totrans-24
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 该方法的签名很简单；它只有一个参数，`URL`。调用该方法的调用者不需要创建和管理 `CloseableHttpAsyncClient` 实例的生命周期。它返回一个能够发出
+    `ObservableHttpResponse` 响应并*完成*的 `Observable` 实例。`getJson()` 方法可以使用它将 `ObservableHttpResponse`
+    响应转换为表示 JSON 的 `Map` 实例，而无需传递 *client*。
+- en: The `resourceFactory` lambda is simple; it creates a default `CloseableHttpAsyncClient`
+    instance and starts it. When called, it will return an initialized HTTP *client*
+    capable of requesting remote server data. We output that the *client* is ready
+    for debugging purposes.
+  id: totrans-25
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`resourceFactory` lambda 很简单；它创建了一个默认的 `CloseableHttpAsyncClient` 实例并启动它。当被调用时，它将返回一个初始化的
+    HTTP *client*，能够请求远程服务器数据。我们输出 *client* 已准备好用于调试目的。'
+- en: The `observableFactory` function has access to the `CloseableHttpAsyncClient`
+    instance that was created by the `resourceFactory` function, so it uses it and
+    the passed `URL` to construct the resulting `Observable` instance. This is done
+    through RxJava's `rxjava-apache-http` module API ([https://github.com/ReactiveX/RxApacheHttp](https://github.com/ReactiveX/RxApacheHttp)).
+    We output what we are doing.
+  id: totrans-26
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`observableFactory` 函数可以访问由 `resourceFactory` 函数创建的 `CloseableHttpAsyncClient`
+    实例，因此它使用它和传递的 `URL` 来构造最终的 `Observable` 实例。这是通过 RxJava 的 `rxjava-apache-http`
+    模块 API（[https://github.com/ReactiveX/RxApacheHttp](https://github.com/ReactiveX/RxApacheHttp)）完成的。我们输出我们正在做的事情。'
+- en: The `disposeAction` function receives the `CloseableHttpAsyncClient` object
+    that was used for the creation of the `Observable` instance and *closes* it. Again,
+    we print a message to the standard output that we are about to do that.
+  id: totrans-27
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`disposeAction` 函数接收了用于创建 `Observable` 实例的 `CloseableHttpAsyncClient` 对象并对其进行*关闭*。同样，我们打印一条消息到标准输出，说明我们即将这样做。'
+- en: With the help of the `using()` factory method, we return our HTTP *request*
+    `Observable` instance. This won't trigger any of the three lambdas yet. *Subscribing*
+    to the returned `Observable` instance will call the `resourceFactory` function,
+    and then the `observableFactory` function.
+  id: totrans-28
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 借助 `using()` 工厂方法，我们返回我们的 HTTP *request* `Observable` 实例。这不会触发任何三个 lambda 中的任何一个。订阅返回的
+    `Observable` 实例将调用 `resourceFactory` 函数，然后调用 `observableFactory` 函数。
+- en: 'This is how we implemented an `Observable` instance capable of managing its
+    own resources. Let''s see how it is used:'
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这就是我们实现了一个能够管理自己资源的 `Observable` 实例。让我们看看它是如何使用的：
+- en: '[PRE3]'
+  id: totrans-30
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: We use the new `request()` method to list the repositories of the *ReactiveX*
+    *orgranisation*. We just pass the URL to it and we get an `Observable` response.
+    Until we subscribe to it, no resources will be allocated and no requests will
+    be executed, so we print that you are not yet subscribed.
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用新的 `request()` 方法来列出 *ReactiveX* *组织*的存储库。我们只需将 URL 传递给它，就会得到一个 `Observable`
+    响应。在我们订阅它之前，不会分配任何资源，也不会执行任何请求，所以我们打印出你还没有订阅。
+- en: The `stringResponse` observable contains logic and converts the raw `ObservableHttpResponse`
+    object to `String`. Still, no resources are allocated and no request is sent.
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`stringResponse` 可观察对象包含逻辑并将原始的 `ObservableHttpResponse` 对象转换为 `String`。但是，没有分配任何资源，也没有发送请求。'
+- en: We use the `BlockingObservable` class' `first()` method to subscribe to the
+    `Observable` instance and wait for its result. We retrieve the response as `String`
+    and output it. Now, a resource is allocated and a request is made. After the data
+    is fetched, the `subscriber` encapsulated by the `BlockingObservable` instance
+    is automatically unsubscribed, so the resource used (the HTTP client) is disposed
+    of. We make a second subscription in order to see what happens next.
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用 `BlockingObservable` 类的 `first()` 方法订阅 `Observable` 实例并等待其结果。我们将响应作为 `String`
+    检索并输出它。现在，资源已分配并发出了请求。在获取数据后，`BlockingObservable` 实例封装的 `subscriber` 会自动取消订阅，因此使用的资源（HTTP
+    客户端）被处理掉。我们进行第二次订阅，以查看接下来会发生什么。
+- en: 'Let''s look at the output of this program:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们来看一下这个程序的输出：
+- en: '[PRE4]'
+  id: totrans-35
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: So, when we subscribe to the website, the HTTP client and the `Observable` instances
+    are created, using our factory lambdas. The creation is executed on the current
+    main thread. The request is made and printed (cropped here). The client is disposed
+    of on an IO thread and the request is executed when the `Observable` instance
+    completes the execution.
+  id: totrans-36
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因此，当我们订阅网站时，HTTP客户端和`Observable`实例是使用我们的工厂lambda创建的。创建在当前主线程上执行。发出请求并打印（此处裁剪）。客户端在IO线程上被处理，当`Observable`实例完成执行时，请求被执行。
+- en: When subscribing for the second time, we go through the same process from the
+    beginning; we allocate the resource, create `Observable` instance and dispose
+    of the resource. This is because the `using()` method works that way—it allocates
+    one resource per subscription. We can use different techniques to reuse the same
+    result on the next subscription instead of making a new request and allocating
+    resource for it. For example, we can reuse the `CompositeSubscription` method
+    for multiple subscribers or a `Subject` instance. However, there is one easier
+    way to reuse the fetched response of the next subscription.
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第二次订阅时，我们从头开始经历相同的过程；我们分配资源，创建`Observable`实例并处理资源。这是因为`using()`方法的工作方式——它为每个订阅分配一个资源。我们可以使用不同的技术来重用下一次订阅的相同结果，而不是进行新的请求和分配资源。例如，我们可以为多个订阅者重用`CompositeSubscription`方法或`Subject`实例。然而，有一种更简单的方法可以重用下一次订阅的获取响应。
+- en: Caching data with Observable.cache
+  id: totrans-38
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用Observable.cache进行数据缓存
+- en: We can use caching to cache the response in the memory and then, on the next
+    subscription, instead of requesting the remote server again, to use the cached
+    data.
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以使用缓存将响应缓存在内存中，然后在下一次订阅时，而不是再次请求远程服务器，使用缓存的数据。
+- en: 'Let''s change the code to look like this:'
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们将代码更改为如下所示：
+- en: '[PRE5]'
+  id: totrans-41
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'The `cache()` operator called at the end of the `stringResponse` chain will
+    cache the response represented by a `string` for all the following `subscribers`.
+    So, the output this time will be:'
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在`stringResponse`链的末尾调用的`cache()`操作符将为所有后续的`subscribers`缓存由`string`表示的响应。因此，这次的输出将是：
+- en: '[PRE6]'
+  id: totrans-43
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: Now, we can reuse our `stringResponse` `Observable` instance through our programs
+    without making additional resource allocation and request.
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们可以在程序中重用我们的`stringResponse` `Observable`实例，而无需进行额外的资源分配和请求。
+- en: Note
+  id: totrans-45
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The demo source code can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java).
+  id: totrans-46
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 演示源代码可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/ResourceManagement.java)找到。
+- en: 'At last, the `requestJson()` method can be implemented like this:'
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，`requestJson()`方法可以这样实现：
+- en: '[PRE7]'
+  id: totrans-48
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: Simpler and with resource auto management (the resource, a http client is created
+    and destroyed automatically ), the method implements its own caching functionality
+    too (we implemented it back in [Chapter 5](ch05.html "Chapter 5. Combinators,
+    Conditionals, and Error Handling"), *Combinators, Conditionals, and Error Handling*).
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 更简单，具有资源自动管理（资源，即http客户端会自动创建和销毁），该方法还实现了自己的缓存功能（我们在[第5章](ch05.html "第5章。组合器、条件和错误处理")中实现了它，*组合器、条件和错误处理*）。
+- en: Note
+  id: totrans-50
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: All the methods, which create `Observable` instances, developed through the
+    book can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java
+    class](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java
+    class) contained in the source code. There is also a cache-in-files implementation
+    for the `requestJson()` method that you can find there.
+  id: totrans-51
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 书中开发的所有创建`Observable`实例的方法都可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java类](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/CreateObservable.java类)中找到。那里还有一个`requestJson()`方法的文件缓存实现。
+- en: With this, we are able to extend RxJava, creating our own factory methods to
+    make `Observable` instances dependent on arbitrary data sources.
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这个，我们可以扩展RxJava，创建自己的工厂方法，使`Observable`实例依赖于任意数据源。
+- en: The next section of the chapter will show how to put our own logic into the
+    `Observable` chain of operators.
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的下一部分将展示如何将我们自己的逻辑放入`Observable`操作符链中。
+- en: Creating custom operators with lift
+  id: totrans-54
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用lift创建自定义操作符
+- en: After learning about and using so many various operators, we are ready to write
+    our own operators. The `Observable` class has an operator called `lift`. It receives
+    an instance of the `Operator` interface. This interface is just an empty one that
+    extends the `Func1<Subscriber<? super R>, Subscriber<? super T>>` interface. This
+    means that we can pass even lambdas as operators.
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在学习和使用了许多不同的操作符之后，我们已经准备好编写自己的操作符。`Observable`类有一个名为`lift`的操作符。它接收`Operator`接口的实例。这个接口只是一个空的接口，它扩展了`Func1<Subscriber<?
+    super R>, Subscriber<? super T>>`接口。这意味着我们甚至可以将lambda作为操作符传递。
+- en: 'The best way of learning how to use the `lift` operator is to write an example
+    of it. Let''s create an operator that adds a sequential index to every item emitted
+    (of course, this is doable without a dedicated operator). This way, we will be
+    able to produce indexed items. For this purpose, we need a class that stores an
+    item and its index. Let''s create a more general class called `Pair`:'
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 学习如何使用`lift`操作符的最佳方法是编写一个示例。让我们创建一个操作符，为发出的每个项目添加一个顺序索引（当然，这也可以在没有专用操作符的情况下完成）。这样，我们将能够生成带有索引的项目。为此，我们需要一个存储项目及其索引的类。让我们创建一个更通用的称为`Pair`的类：
+- en: '[PRE8]'
+  id: totrans-57
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: The instances of this class are very simple *immutable* objects that contain
+    two arbitrary objects. In our case, the *left* field will be the index of type
+    `Long` and the *right* field will be the emitted item. The `Pair` class, as with
+    any *immutable* class, contains implementations of the `hashCode()` and `equals()`
+    methods.
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个类的实例是非常简单的*不可变*对象，包含两个任意对象。在我们的例子中，*left*字段将是类型为`Long`的索引，*right*字段将是发射的项。`Pair`类，和任何*不可变*类一样，包含了`hashCode()`和`equals()`方法的实现。
+- en: 'Here is the code for the operator:'
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是运算符的代码：
+- en: '[PRE9]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: The `call()` method of the `Operator` interface has one parameter, a `Subscriber`
+    instance. This instance will subscribe to the observable that will be returned
+    by the `lift()` operator. The method returns a new `Subscriber` instance, which
+    will subscribe to the observable upon which the `lift()` operator was called.
+    We can change the data of all the notifications in it and that is how we will
+    be writing our own operator's logic.
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Operator`接口的`call()`方法有一个参数，一个`Subscriber`实例。这个实例将订阅由`lift()`运算符返回的可观察对象。该方法返回一个新的`Subscriber`实例，它将订阅调用了`lift()`运算符的可观察对象。我们可以在其中更改所有通知的数据，这就是我们将编写我们自己运算符逻辑的方式。'
+- en: The `Indexed` class has a state—`index`. By default, its initial value is `0`,
+    but there is a *constructor* that can create an `Indexed` instance with arbitrary
+    initial value. Our operator delegates the `OnError` and `OnCompleted` notifications
+    to the subscribers unchanged. The interesting method is `onNext()`. It modifies
+    the incoming item by creating a `Pair` instance of it and the current value of
+    `index` field. After that, the `index` is incremented. That way, the next item
+    will use the incremented `index` and increment it again.
+  id: totrans-62
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Indexed`类有一个状态——`index`。默认情况下，它的初始值是`0`，但是有一个*构造函数*可以创建一个具有任意初始值的`Indexed`实例。我们的运算符将`OnError`和`OnCompleted`通知无修改地委托给订阅者。有趣的方法是`onNext()`。它通过创建一个`Pair`实例和`index`字段的当前值来修改传入的项。之后，`index`被递增。这样，下一个项将使用递增的`index`并再次递增它。'
+- en: 'And now, we have our first operator. Let''s write an unit test to showcase
+    its behavior:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们有了我们的第一个运算符。让我们编写一个单元测试来展示它的行为：
+- en: '[PRE10]'
+  id: totrans-64
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: The test emits the letters from `'a'` to `'e'` and uses the `lift()` operator
+    to insert our `Indexed` operator implementation into the observable chain. We
+    expect a list of five `Pair` instances of sequential numbers starting from zero—the
+    *indexes* and the letters. We use the `toList().toBlocking().single()` technique
+    to retrieve the actual list of emitted items and to assert that they are equal
+    to the expected emissions. Because `Pair` instances have the `hashCode()` and
+    `equals()` methods defined, we can compare `Pair` instances, so the test passes.
+    If we *subscribe* for the second time, the `Indexed` operator should provide indexing
+    from the initial index, `0`. Using a `TestSubscriber` instance, we do that and
+    assert that the letters are indexed, starting with `0`.
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 测试发射从`'a'`到`'e'`的字母，并使用`lift()`运算符将我们的`Indexed`运算符实现插入到可观察链中。我们期望得到一个由从零开始的顺序数字——*索引*和字母组成的五个`Pair`实例的列表。我们使用`toList().toBlocking().single()`技术来检索实际发射项的列表，并断言它们是否等于预期的发射。因为`Pair`实例有定义了`hashCode()`和`equals()`方法，我们可以比较`Pair`实例，所以测试通过了。如果我们第二次*订阅*，`Indexed`运算符应该从初始索引`0`开始提供索引。我们使用`TestSubscriber`实例来做到这一点，并断言字母被索引，从`0`开始。
+- en: Note
+  id: totrans-66
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The code for the `Indexed` operator can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java)
+    and the unit test testing its behavior at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java).
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Indexed`运算符的代码可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Lift.java)找到，以及测试其行为的单元测试可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java)找到。'
+- en: 'Using the `lift()` operator and different `Operator` implementations, we can
+    write our own operators, which operate on every single item of the emitted sequence.
+    But in most cases, we will be able to implement our logic without creating new
+    operators. For example, the indexed behavior can be implemented in many different
+    ways, one of which is by *zipping* with `Observable.range` method, like this:'
+  id: totrans-68
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用`lift()`运算符和不同的`Operator`实现，我们可以编写我们自己的运算符，这些运算符作用于发射序列的每个单独项。但在大多数情况下，我们将能够在不创建新运算符的情况下实现我们的逻辑。例如，索引行为可以以许多不同的方式实现，其中一种方式是通过与`Observable.range`方法*合并*，就像这样：
+- en: '[PRE11]'
+  id: totrans-69
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: Implementing a new operator has many traps, such as chaining the subscriptions,
+    supporting *backpressure*, and reusing variables. If possible, we should try to
+    compose the existing operators, which are written by experienced RxJava contributors.
+    So, in some cases, an operator that transforms the `Observable` itself is a better
+    idea, for example, applying multiple operators on it as one. For this, we can
+    use the *composing* operator, `compose()`.
+  id: totrans-70
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 实现新的运算符有许多陷阱，比如链接订阅、支持*背压*和重用变量。如果可能的话，我们应该尝试组合现有的由经验丰富的RxJava贡献者编写的运算符。因此，在某些情况下，一个转换`Observable`本身的运算符是一个更好的主意，例如，将多个运算符应用于它作为一个。为此，我们可以使用*组合*运算符`compose()`。
+- en: Composing multiple operators with the Observable.compose operator
+  id: totrans-71
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用Observable.compose运算符组合多个运算符
+- en: The `compose()` operator has one parameter of type `Transformer`. The `Transformer`
+    interface, like the `Operator` one, is an *empty* interface that extends `Func1`
+    (this approach hides the type complexities that are involved by using `Func1`).
+    The difference is that it extends the `Func1<Observable<T>, Observable<R>>` method,
+    so that it transforms an `Observable` and not a `Subscriber`. This means that,
+    instead of operating on each individual item emitted by the *source* observable,
+    it operates directly on the source.
+  id: totrans-72
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`compose()`操作符有一个`Transformer`类型的参数。`Transformer`接口，就像`Operator`一样，是一个*空*接口，它扩展了`Func1`（这种方法隐藏了使用`Func1`所涉及的类型复杂性）。不同之处在于它扩展了`Func1<Observable<T>,
+    Observable<R>>`方法，这样它就可以转换一个`Observable`而不是一个`Subscriber`。这意味着它不是在*源*observable发出的每个单独项目上操作，而是直接在源上操作。'
+- en: 'We can illustrate the use of this operator and the `Transformer` interface
+    through an example. First, we will create a `Transformer` implementation:'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以通过一个例子来说明这个操作符和`Transformer`接口的使用。首先，我们将创建一个`Transformer`实现：
+- en: '[PRE12]'
+  id: totrans-74
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: The idea of this implementation is to filter the emissions of an observable,
+    depending on the order in which they are incoming. It operates on the whole sequence,
+    using our `Indexed` operator to add an index to every item. After that, it filters
+    the `Pair` instances that have odd indexes and retrieves the original items from
+    the filtered `Pair` instances. That way, only the members of the emitted sequence
+    that are placed at odd positions reach the subscribers.
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个实现的思想是根据observable发出的顺序来过滤它们的发射。它在整个序列上操作，使用我们的`Indexed`操作符为每个项目添加一个索引。然后，它过滤具有奇数索引的`Pair`实例，并从过滤后的`Pair`实例中检索原始项目。这样，只有在奇数位置上的发射序列成员才会到达订阅者。
+- en: 'Again let''s write a *unit test*, ensuring that the new `OddFilter` transformer
+    behaves in the right way:'
+  id: totrans-76
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们再次编写一个*单元测试*，确保新的`OddFilter`转换器的行为是正确的：
+- en: '[PRE13]'
+  id: totrans-77
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: As you can see, an instance of our `OddFilter` class is passed to the `compose()`
+    operator, and that way, it is applied to the observable that was created by the
+    `range()` factory method. The observable emits seven strings. If the `OddFilter`
+    implementation works right, it should filter out the strings emitted at odd positions.
+  id: totrans-78
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如你所看到的，我们的`OddFilter`类的一个实例被传递给`compose()`操作符，这样，它就被应用到了由`range()`工厂方法创建的observable上。这个observable发出了七个字符串。如果`OddFilter`的实现正确，它应该过滤掉在奇数位置发出的字符串。
+- en: Note
+  id: totrans-79
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The source code of the `OddFilter` class can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java).
+    The unit test testing it can be viewed/downloaded at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java).
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`OddFilter`类的源代码可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter08/Compose.java)找到。测试它的单元测试可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/test/java/com/packtpub/reactive/chapter08/IndexedTest.java)中查看/下载。'
+- en: 'More about implementing custom operators can be found here: [https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators](https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators).
+    If you use RxJava in dynamic languages such Groovy, you''ll be able to extend
+    the `Observable` class with new methods, or you can use RxJava with Xtend, a flexible
+    dialect of Java. Refer to [http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html](http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html).'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 关于实现自定义操作符的更多信息可以在这里找到：[https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators](https://github.com/ReactiveX/RxJava/wiki/Implementing-Your-Own-Operators)。如果你在Groovy等动态语言中使用RxJava，你可以扩展`Observable`类以添加新方法，或者你可以使用Xtend，这是一种灵活的Java方言。参考[http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html](http://mnmlst-dvlpr.blogspot.de/2014/07/rxjava-and-xtend.html)。
+- en: Summary
+  id: totrans-82
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: Creating our own operators and resource-dependent `Observable` instances gives
+    us unlimited possibilities when it comes to creating logic around the `Observable`
+    class. We are able to turn each data source into an `Observable` instance and
+    transform the incoming data in many different ways.
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 创建我们自己的操作符和依赖资源的`Observable`实例给了我们在围绕`Observable`类创建逻辑时无限的可能性。我们能够将每个数据源转换成一个`Observable`实例，并以许多不同的方式转换传入的数据。
+- en: 'I wanted this book to cover the most interesting and important parts of RxJava.
+    If I have missed something important, the documentation at [https://github.com/ReactiveX/RxJava/wiki](https://github.com/ReactiveX/RxJava/wiki)
+    is one of the best on the web.. Refer especially to this section for further reading:
+    [https://github.com/ReactiveX/RxJava/wiki/Additional-Reading](https://github.com/ReactiveX/RxJava/wiki/Additional-Reading).'
+  id: totrans-84
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我希望这本书涵盖了RxJava最有趣和重要的部分。如果我漏掉了重要的内容，[https://github.com/ReactiveX/RxJava/wiki](https://github.com/ReactiveX/RxJava/wiki)上的文档是网络上最好的之一。特别是在这一部分，可以找到更多阅读材料：[https://github.com/ReactiveX/RxJava/wiki/Additional-Reading](https://github.com/ReactiveX/RxJava/wiki/Additional-Reading)。
+- en: I have tried to structure the code and the ideas and to provide them in small
+    iterations over the chapters. The first and second chapters are more ideological;
+    they introduce the reader to the basic ideas of the functional programming and
+    the reactive programming and the second chapter tries to establish the the origins
+    of the `Observable` class. The third chapter provides the reader with the means
+    to create a variety of different `Observable` instances. The fourth and fifth
+    chapters teach us how to write logic around those `Observable` instances and the
+    sixth adds multi-threading to this logic. The seventh chapter comes with *unit
+    testing* the logic that the reader has learned to write and the eight tries to
+    extend the capabilities of this logic even further.
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我试图将代码和想法进行结构化，并在各章节中进行小的迭代。第一章和第二章更具有意识形态性；它们向读者介绍了函数式编程和响应式编程的基本思想，第二章试图建立`Observable`类的起源。第三章为读者提供了创建各种不同`Observable`实例的方法。第四章和第五章教会我们如何围绕这些`Observable`实例编写逻辑，第六章将多线程添加到这个逻辑中。第七章涉及读者学会编写的逻辑的*单元测试*，第八章试图进一步扩展这个逻辑的能力。
+- en: I hope you, the reader, found this book useful. Don't forget, RxJava is just
+    a tool. The important things are your knowledge and your thinking.
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 希望读者发现这本书有用。不要忘记，RxJava只是一个工具。重要的是你的知识和思维。

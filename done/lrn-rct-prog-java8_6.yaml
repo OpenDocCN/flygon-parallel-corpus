@@ -1,0 +1,1495 @@
+- en: Chapter 6. Using Concurrency and Parallelism with Schedulers
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 第6章。使用调度程序进行并发和并行处理
+- en: Modern processors have multiple cores and enable many time-consuming operations
+    to be processed faster simultaneously. The Java concurrency API (which includes
+    threads and much more) makes it possible to do just that.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现代处理器具有多个核心，并且能够同时更快地处理许多耗时操作。Java并发API（包括线程等）使这成为可能。
+- en: RxJava's `Observable` chains seem a good match for the threads. It would be
+    great if we could *subscribe* to our source and do all the transforming, combining,
+    and filtering in the background and, when everything is done, have the result
+    to be passed to the main threads. Yes, this sounds wonderful, but RxJava is single-threaded
+    by default. This means that, in the most cases, when the `subscribe` method is
+    called on an `Observable` instance, the current thread blocks until everything
+    is emitted. (This is not true for the `Observable` instances created by the `interval`
+    or `timer` factory methods, for example.). This is a good thing because working
+    with threads is not so easy. They are powerful, but they need to be synchronized
+    with each other; for example, when one depends on the result of another.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: RxJava的`Observable`链似乎很适合线程。如果我们可以在后台*订阅*我们的源并进行所有的转换、组合和过滤，然后在一切都完成时将结果传递给主线程，那将是很棒的。是的，这听起来很美好，但是RxJava默认是单线程的。这意味着，在大多数情况下，当在`Observable`实例上调用`subscribe`方法时，当前线程会阻塞直到所有内容被发出。（这对于由`interval`或`timer`工厂方法创建的`Observable`实例并不成立，例如。）这是一件好事，因为处理线程并不那么容易。它们很强大，但它们需要彼此同步；例如，当一个依赖于另一个的结果时。
+- en: One of the hardest things to manage in a multi-threaded environment is the shared
+    data between the threads. One thread could read from a data source while another
+    is modifying it, which leads to different versions of the same data being used
+    by the different threads. If an `Observable` chain is constructed the right way,
+    there is no shared state. This means that synchronization is not so complex.
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在多线程环境中最难管理的事情之一是线程之间的共享数据。一个线程可以从数据源中读取，而另一个线程正在修改它，这导致不同版本的相同数据被不同的线程使用。如果`Observable`链构造得当，就没有共享状态。这意味着同步并不那么复杂。
+- en: 'In this chapter, we will talk about executing things in parallel and look at
+    what concurrency means. Additionally, we''ll learn some techniques for handling
+    the situation when too many items are emitted by our `Observable` instances (a
+    situation which is not so rare in the multi-threaded environment). The topics
+    covered in this chapter are as follows:'
+  id: totrans-4
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将讨论并行执行事务，并了解并发意味着什么。此外，我们将学习一些处理我们的`Observable`实例发出太多项目的情况的技术（这在多线程环境中并不罕见）。本章涵盖的主题如下：
+- en: Using `Scheduler` instances to achieve *concurrency*
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用`Scheduler`实例实现*并发*
+- en: '**Buffering**, **throttling**, and **debouncing** with `Observable` instances'
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用`Observable`实例的**缓冲**、**节流**和**去抖动**
+- en: RxJava's schedulers
+  id: totrans-7
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: RxJava的调度程序
+- en: The schedulers are the RxJava's way of achieving concurrency. They are in charge
+    of creating and managing the threads for us (internally relying on Java's threadpool
+    facilities). We won't be dealing with Java's concurrency API and its quirks and
+    complexities. We've been using the schedulers all along, implicitly with timers
+    and intervals, but the time has come to master them.
+  id: totrans-8
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调度程序是RxJava实现并发的方式。它们负责为我们创建和管理线程（在内部依赖于Java的线程池设施）。我们不会涉及Java的并发API及其怪癖和复杂性。我们一直在使用调度程序，隐式地使用定时器和间隔，但是现在是掌握它们的时候了。
+- en: Let's recall the `Observable.interval` factory method, which we introduced back
+    in [Chapter 3](ch03.html "Chapter 3. Creating and Connecting Observables, Observers,
+    and Subjects"), *Creating and Connecting Observables, Observers, and Subjects*.
+    As we saw before, RxJava is *single-threaded* by *default*, so in most cases,
+    calling the `subscribe` method on the `Observable` instance will block the current
+    thread. But that is not the case with the `interval Observable` instances. If
+    we look at the JavaDoc of the `Observable<Long> interval(long interval, TimeUnit
+    unit)` method, we'll see that it says that the `Observable` instance created by
+    it operates on something called '*the computation Scheduler*'.
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们回顾一下我们在[第3章](ch03.html "第3章。创建和连接Observables、Observers和Subjects")中介绍的`Observable.interval`工厂方法，*创建和连接Observables、Observers和Subjects*。正如我们之前看到的，RxJava默认情况下是*单线程*的，所以在大多数情况下，在`Observable`实例上调用`subscribe`方法会阻塞当前线程。但是`interval
+    Observable`实例并非如此。如果我们查看`Observable<Long> interval(long interval, TimeUnit unit)`方法的JavaDoc，我们会看到它说，由它创建的`Observable`实例在一个叫做“计算调度程序”的东西上运行。
+- en: In order to inspect the behavior of the `interval` method (as well as other
+    things in this chapter) we will need a powerful debugging utility. That's why
+    the first thing we'll be doing in this chapter is implementing it.
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了检查`interval`方法的行为（以及本章中的其他内容），我们将需要一个强大的调试工具。这就是为什么我们在本章中要做的第一件事。
+- en: Debugging Observables and their schedulers
+  id: totrans-11
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 调试Observables和它们的调度程序
+- en: In the previous chapter, we've introduced the `doOnNext()` operator, which could
+    be used for logging the emitted items directly from within the `Observable` chain.
+    We mentioned that there are `doOnError()` and `doOnCompleted()` operators too.
+    But there is one that combines all three of them—the `doOnEach()` operator. We
+    can log everything from it because it receives all the notifications emitted,
+    regardless of their type. We can put it halfway through the chain of operators
+    and use it to log, say, the state there. It takes a `Notification -> void` function.
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上一章中，我们介绍了`doOnNext()`操作符，它可以用于直接从`Observable`链中记录发出的项目。我们提到了`doOnError()`和`doOnCompleted()`操作符。但是有一个结合了所有三者的操作符——`doOnEach()`操作符。我们可以从中记录所有内容，因为它接收所有发出的通知，而不管它们的类型。我们可以将它放在操作符链的中间，并使用它来记录状态。它接受一个`Notification
+    -> void`函数。
+- en: 'Here is the source of a higher order *debug* function returning a `lambda`
+    result, which is capable of logging the emissions of an `Observable` instance
+    labeled, using the passed description:'
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是一个返回`lambda`结果的高阶*debug*函数的源代码，它能够记录使用传递的描述标记的`Observable`实例的发射：
+- en: '[PRE0]'
+  id: totrans-14
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: Depending on the passed *description* and *offset*, the returned method logs
+    each notification. The important thing, however, is that it logs the current active
+    thread's name before everything else. `<value>` marks the *OnNext notifications*;
+    `X`, the *OnError notifications*; and `|`, the *OnCompleted notifications*, and
+    the `nextOffset` variable is used to show the values in time.
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据传递的*description*和*offset*，返回的方法记录每个通知。然而，重要的是，在一切之前记录当前活动线程的名称。`<value>`标记*OnNext通知*；`X`标记*OnError通知*；`|`标记*OnCompleted通知*，`nextOffset`变量用于显示时间上的值。
+- en: 'Here is an example of using this new method:'
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是使用这个新方法的一个例子：
+- en: '[PRE1]'
+  id: totrans-17
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'This example will generate five sequential numbers, beginning with the number
+    five. We pass a call to our `debug(String, String)` method to the `doOnEach()`
+    operator to log everything after the call of the `range()` method. With a subscribe
+    call without parameters, this little chain will be triggered. The output is as
+    follows:'
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个例子将生成五个连续的数字，从数字五开始。我们通过调用我们的`debug(String, String)`方法传递给`doOnEach()`操作符来记录`range()`方法调用之后的一切。通过不带参数的订阅调用，这个小链将被触发。输出如下：
+- en: '[PRE2]'
+  id: totrans-19
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: The first thing logged is the name of the current thread (the main one), then
+    we have the description of the `Observable` instance passed to the `debug()` method,
+    and after that, a colon and dashes forming arrows, representing the time. Finally
+    we have the symbol of the type of the notification—the value itself for values
+    and `|` for completed.
+  id: totrans-20
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先记录的是当前线程的名称（主线程），然后是传递给`debug()`方法的`Observable`实例的描述，之后是一个冒号和破折号形成的箭头，表示时间。最后是通知类型的符号——对于值本身是值，对于完成是`|`。
+- en: 'Let''s define one overload to the `debug()` helper method so that we don''t
+    need to pass a second parameter to it with an additional offset, if it is not
+    needed:'
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们定义`debug()`辅助方法的一个重载，这样我们就不需要传递第二个参数给它，如果不需要额外的偏移量：
+- en: '[PRE3]'
+  id: totrans-22
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: Note
+  id: totrans-23
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: 'The code for the preceding methods can be viewed/downloaded at: [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/Helpers.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/Helpers.java).'
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面方法的代码可以在以下链接查看/下载：[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/Helpers.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/common/Helpers.java)。
+- en: Now we are ready to debug what's happening with the `Observable` instances,
+    created by the interval method!
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们准备调试由间隔方法创建的`Observable`实例发生了什么！
+- en: The interval Observable and its default scheduler
+  id: totrans-26
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 间隔Observable及其默认调度程序
+- en: 'Let''s examine the following example:'
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们来看下面的例子：
+- en: '[PRE4]'
+  id: totrans-28
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'This creates an `interval Observable` instance, emitting every half second.
+    We use the `take()` method to get only the first five *notifications* and to complete.
+    We''ll use our `debug()` helper method to log the values, emitted by the `Observable`
+    instance, created by the interval method and use the call to `subscribe()`, which
+    will trigger the logic. The output should look like this:'
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这创建了一个`interval Observable`实例，每隔半秒发出一次。我们使用`take()`方法只获取前五个*通知*并完成。我们将使用我们的`debug()`辅助方法记录由间隔方法创建的`Observable`实例发出的值，并使用`subscribe()`调用来触发逻辑。输出应该如下所示：
+- en: '[PRE5]'
+  id: totrans-30
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: Everything should be familiar here, except the thread that the `Observable`
+    instance executes on! This thread is not the *main* one. It seems it is created
+    by a RxJava-managed pool of reusable `Thread` instances, judging by its name (`RxComputationThreadPool-1`).
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这里应该都很熟悉，除了`Observable`实例执行的线程！这个线程不是*主*线程。看起来它是由RxJava管理的可重用`Thread`实例池创建的，根据它的名称（`RxComputationThreadPool-1`）。
+- en: 'If you recall, the `Observable.interval` factory method had the following overload:'
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果你还记得，`Observable.interval`工厂方法有以下重载：
+- en: '[PRE6]'
+  id: totrans-33
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'This means that we can specify a scheduler on which it will operate. It was
+    mentioned previously, that the overload with only two parameters operates on the
+    *computation* scheduler. So, now let''s try passing another scheduler and see
+    what''s going to happen:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这意味着我们可以指定它将在哪个调度程序上运行。之前提到过，只有两个参数的重载在*computation*调度程序上运行。所以，现在让我们尝试传递另一个调度程序，看看会发生什么：
+- en: '[PRE7]'
+  id: totrans-35
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'This is the same as before, but with one little difference. We pass a scheduler
+    called *immediate*. The idea is to execute the work immediately on the currently
+    running thread. The result is as follows:'
+  id: totrans-36
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这与以前相同，但有一点不同。我们传递了一个名为*immediate*的调度程序。这样做的想法是立即在当前运行的线程上执行工作。结果如下：
+- en: '[PRE8]'
+  id: totrans-37
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: By specifying this scheduler, we made the `interval Observable` instance run
+    on the current, *main* thread.
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过指定这个调度程序，我们使`interval Observable`实例在当前*主*线程上运行。
+- en: Note
+  id: totrans-39
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The source code for the preceding example can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/IntervalAndSchedulers.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/IntervalAndSchedulers.java).
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面例子的源代码可以在以下链接找到：[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/IntervalAndSchedulers.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/IntervalAndSchedulers.java)。
+- en: With the help of the schedulers, we can instruct our operators to run on a particular
+    thread or to use a particular pool of threads.
+  id: totrans-41
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 借助调度程序的帮助，我们可以指示我们的操作符在特定线程上运行或使用特定的线程池。
+- en: Everything we just covered leads us to the conclusion that the schedulers spawn
+    new threads, or reuse already spawned ones on which the *operations*, part of
+    the `Observable` instance chain, execute. Thus, we can achieve concurrency (operators
+    making progress at the same time) by using only them.
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们刚刚讨论的一切都导致了这样的结论：调度程序会生成新的线程，或者重用已经生成的线程，*操作*是`Observable`实例链的一部分，会在这些线程上执行。因此，我们可以通过仅使用它们来实现并发（操作同时进行）。
+- en: 'In order to have *multi-threaded* logic, we''ll have to learn just these two
+    things:'
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了拥有*多线程*逻辑，我们只需要学习这两件事：
+- en: The types of schedulers we can chose from
+  id: totrans-44
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 我们可以选择的调度程序类型
+- en: How to use these schedulers with an arbitrary `Observable` chain of *operations*
+  id: totrans-45
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如何在任意`Observable`链的*操作*中使用这些调度程序
+- en: Types of schedulers
+  id: totrans-46
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 调度程序的类型
+- en: There are several types of `schedulers` dedicated for certain kinds of actions.
+    In order to learn more about them, let's take a look at the `Scheduler` class.
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有几种专门用于某种类型操作的`schedulers`。为了更多地了解它们，让我们看一下`Scheduler`类。
+- en: 'It turns out that the class is quite simple. It has only two methods, as follows:'
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 事实证明这个类非常简单。它只有两个方法，如下所示：
+- en: '`long now()`'
+  id: totrans-49
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`long now()`'
+- en: '`abstract Worker createWorker()`'
+  id: totrans-50
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`abstract Worker createWorker()`'
+- en: The first one returns the current time in milliseconds, and the second creates
+    a `Worker` instance. These `Worker` instances are used for executing actions on
+    a single thread or event loop (depending on the implementation). Scheduling actions
+    for execution is done using the Worker's `schedule*` methods. The `Worker` class
+    implements the `Subscription` interface, so it has an `unsubscribe()` method.
+    *Unsubscribing* the `Worker` *unschedules* all outstanding work and allows a resource
+    cleanup.
+  id: totrans-51
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一个返回当前时间的毫秒数，第二个创建一个`Worker`实例。这些`Worker`实例用于在单个线程或事件循环上执行操作（取决于实现）。使用`Worker`的`schedule*`方法来安排执行操作。`Worker`类实现了`Subscription`接口，因此它有一个`unsubscribe()`方法。*取消订阅*`Worker`会*取消排队*的所有未完成工作，并允许资源清理。
+- en: 'We can use the workers to perform scheduling outside the `Observable` context.
+    For every `Scheduler` type, we can do the following:'
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以使用工作线程在`Observable`上下文之外执行调度。对于每种`Scheduler`类型，我们可以做到以下几点：
+- en: '[PRE9]'
+  id: totrans-53
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: This will schedule the passed action and execute it. In most cases, this method
+    shouldn't be used directly for scheduling work, we just pick the right scheduler
+    and schedule actions on it instead. In order to understand what they do, we can
+    use the method to inspect the various types of schedulers available.
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这将安排传递的操作并执行它。在大多数情况下，这个方法不应该直接用于调度工作，我们只需选择正确的调度程序并在其上安排操作即可。为了了解它们的作用，我们可以使用这个方法来检查各种可用的调度程序类型。
+- en: 'Let''s define a testing method:'
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们定义一个测试方法：
+- en: '[PRE10]'
+  id: totrans-56
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: The method uses the passed `Scheduler` instance to do some work. There is an
+    option to specify whether it should use the same `Worker` instance for every task,
+    or spawn a new one for every sub-task. Basically, the dummy work consists of filling
+    up a list with random numbers and then removing these numbers one by one. Every
+    *add operation* and *remove operation* are scheduled via the worker created by
+    the passed `Scheduler` instance as a sub-task. And before and after every sub-task
+    the current thread and some additional information is logged.
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该方法使用传递的`Scheduler`实例来执行一些工作。有一个选项可以指定它是否应该为每个任务使用相同的`Worker`实例，或者为每个子任务生成一个新的`Worker`实例。基本上，虚拟工作包括用随机数填充列表，然后逐个删除这些数字。每个*添加操作*和*删除操作*都是通过传递的`Scheduler`实例创建的工作线程作为子任务进行调度的。在每个子任务之前和之后，当前线程和一些额外信息都被记录下来。
+- en: Tip
+  id: totrans-58
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 提示
+- en: In a real-world scenario, once all the work has been done, we should always
+    invoke the `worker.unsubscribe()` method.
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在现实世界的场景中，一旦所有工作都完成了，我们应该始终调用`worker.unsubscribe()`方法。
+- en: Turning to the predefined `Scheduler` instances. They can be retrieved via a
+    set of static methods contained in the `Schedulers` class. We will be using the
+    debugging method defined previously to inspect their behavior in order to learn
+    their differences and usefulness.
+  id: totrans-60
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 转向预定义的`Scheduler`实例。它们可以通过`Schedulers`类中包含的一组静态方法来获取。我们将使用之前定义的调试方法来检查它们的行为，以了解它们的差异和用处。
+- en: The Schedulers.immediate scheduler
+  id: totrans-61
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: '`Schedulers.immediate`调度程序'
+- en: 'The `Schedulers.immediate` scheduler executes work here and now. When an action
+    is passed to its worker''s `schedule(Action0)` method, it is just called. Let''s
+    suppose we run our test method with it, like this:'
+  id: totrans-62
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Schedulers.immediate`调度程序在此时此刻执行工作。当一个操作传递给它的工作线程的`schedule(Action0)`方法时，它就会被调用。假设我们用它来运行我们的测试方法，就像这样：'
+- en: '[PRE11]'
+  id: totrans-63
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'In both the cases, the result will look like this:'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这两种情况下，结果看起来都是这样的：
+- en: '[PRE12]'
+  id: totrans-65
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: In other words, everything is executed on the caller thread—the main one and
+    nothing is in parallel.
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 换句话说，一切都在调用线程上执行——主线程上，没有任何并行操作。
+- en: This scheduler can be used to execute methods, such as `interval()` and `timer()`,
+    in the foreground.
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个调度程序可以用来在前台执行`interval()`和`timer()`等方法。
+- en: The Schedulers.trampoline scheduler
+  id: totrans-68
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: '`Schedulers.trampoline`调度程序'
+- en: 'The scheduler, retrieved by the `Schedulers.trampoline` method *enqueues* sub-tasks
+    on the current `thread`. The enqueued work is executed after the work currently
+    in progress completes. Say we were to run this:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过`Schedulers.trampoline`方法检索到的调度程序会在当前`线程`上*排队*子任务。排队的工作会在当前正在进行的工作完成后执行。假设我们要运行这个：
+- en: '[PRE13]'
+  id: totrans-70
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'In the first case, the result will be the same as with the immediate scheduler,
+    because all the tasks are executed in their own `Worker` instances and, therefore,
+    there is only one task to be enqueued for execution in every worker. But when
+    we use the same `Worker` instance for scheduling every sub-task, we get this:'
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在第一种情况下，结果将与立即调度程序相同，因为所有任务都是在它们自己的`Worker`实例中执行的，因此每个工作线程只有一个任务要排队执行。但是当我们使用相同的`Worker`实例来调度每个子任务时，我们会得到这样的结果：
+- en: '[PRE14]'
+  id: totrans-72
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: In other words, it will first execute the entire main action and after that,
+    the sub-tasks; thus, the `List` instance will be filled in (the sub-tasks were
+    enqueued) but never emptied. That's because, while executing the main task, the
+    `List` instance was still empty and the `while` loop was not triggered.
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 换句话说，它将首先执行整个主要操作，然后执行子任务；因此，“List”实例将被填充（子任务已入队），但永远不会被清空。这是因为在执行主任务时，“List”实例仍然为空，并且“while”循环没有被触发。
+- en: Note
+  id: totrans-74
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The *trampoline* scheduler is useful for avoiding a `StackOverflowError` exception
+    while running many tasks recursively. For example, let's assume a task completes
+    and then calls itself to perform some new work. In the case of a single-threaded
+    environment, this would lead to stack overflow due to the recursion; however,
+    if we use the *trampoline* scheduler, it will serialize all scheduled activities
+    and the stack depth will remain normal. However, the *trampoline* scheduler is
+    usually slower than the *immediate* one. So, using the correct one depends on
+    the use case.
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*trampoline*调度程序可用于在递归运行多个任务时避免“StackOverflowError”异常。例如，假设一个任务完成后调用自身执行一些新工作。在单线程环境中，这将导致由于递归而导致堆栈溢出；但是，如果我们使用*trampoline*调度程序，它将序列化所有已安排的活动，并且堆栈深度将保持正常。但是，*trampoline*调度程序通常比*immediate*调度程序慢。因此，使用正确的调度程序取决于用例。'
+- en: The Schedulers.newThread scheduler
+  id: totrans-76
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Schedulers.newThread调度程序
+- en: 'This schedule creates a *new* `Thread` instance (a single-threaded `ScheduledThreadPoolExecutor`
+    instance to be precise) for every new `Worker` instance. Additionally, each worker
+    enqueues the actions it receives through its `schedule()` method, much like the
+    trampoline scheduler does. Let''s look at the following code:'
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此调度程序为每个新的`Worker`实例创建一个*new* `Thread`实例（确切地说是单线程的`ScheduledThreadPoolExecutor`实例）。此外，每个工作人员通过其`schedule()`方法排队接收到的操作，就像*trampoline*调度程序一样。让我们看看以下代码：
+- en: '[PRE15]'
+  id: totrans-78
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: It will have the same behavior as the *trampoline* but it will run in a new
+    `thread:`
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 它将具有与*trampoline*相同的行为，但将在新的`thread:`中运行：
+- en: '[PRE16]'
+  id: totrans-80
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'Instead, if we call the testing method like this:'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 相反，如果我们像这样调用测试方法：
+- en: '[PRE17]'
+  id: totrans-82
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'This will spawn a new `Thread` instance for every *sub-task*, which will produce
+    output similar to this:'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这将为每个*子任务*生成一个新的`Thread`实例，其输出类似于这样：
+- en: '[PRE18]'
+  id: totrans-84
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: By using the *new thread* `Scheduler` instance, you can execute background tasks.
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过使用*new thread* `Scheduler`实例，您可以执行后台任务。
+- en: Note
+  id: totrans-86
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: A very important requirement here is that its workers need to be *unsubscribed*
+    to avoid leaking threads and OS resources. Note that it is expensive to create
+    new threads each time, so in most cases, the *computation* and the *IO* `Scheduler`
+    instances should be used.
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这里非常重要的要求是，其工作人员需要*取消订阅*以避免泄漏线程和操作系统资源。请注意，每次创建新线程都是昂贵的，因此在大多数情况下，应使用*computation*和*IO*
+    `Scheduler`实例。
+- en: The Schedulers.computation scheduler
+  id: totrans-88
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Schedulers.computation调度程序
+- en: The computation scheduler is very similar to the *new thread* one, but it takes
+    into account the number of processors/cores that the machine on which it runs
+    has, and uses a thread pool that can reuse a limited number of threads. Every
+    new `Worker` instance schedules sequential actions on one of these `Thread` instances.
+    If the thread is not used at the moment they are executed, and if it is active,
+    they are enqueued to execute on it later.
+  id: totrans-89
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 计算调度程序与*new thread*调度程序非常相似，但它考虑了运行它的机器的处理器/核心数量，并使用可以重用有限数量线程的线程池。每个新的`Worker`实例在其中一个`Thread`实例上安排顺序操作。如果线程当前未被使用，并且它是活动的，则它们将被排队以便稍后执行。
+- en: If we use the same `Worker` instance, we'll just enqueue all the actions on
+    its thread and the result will be the same as scheduling with one `Worker` instance,
+    using the *new thread* `Scheduler` instance.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们使用相同的`Worker`实例，我们将只是将所有操作排队到其线程上，并且结果将与使用一个`Worker`实例调度，使用*new thread*
+    `Scheduler`实例相同。
+- en: 'My machine has four cores. Say I call the testing method on it like this:'
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我的机器有四个核心。假设我像这样调用测试方法：
+- en: '[PRE19]'
+  id: totrans-92
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'I''d get output similar to this:'
+  id: totrans-93
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我会得到类似于这样的输出：
+- en: '[PRE20]'
+  id: totrans-94
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: Everything is executed using only four `Thread` instances from a pool (note
+    that there is a way to limit the number of `Thread` instances to be less than
+    the available processor count).
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所有内容都是使用来自池中的四个`Thread`实例执行的（请注意，有一种方法可以将`Thread`实例的数量限制为少于可用处理器数量）。
+- en: The *computation* `Scheduler` instance is your real choice for doing background
+    work—computations or processing thus its name. You can use it for everything that
+    should run in the background and is not an *IO* related or blocking operation.
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*computation* `Scheduler`实例是执行后台工作 - 计算或处理的最佳选择，因此它的名称。您可以将其用于应该在后台运行且不是*IO*相关或阻塞操作的所有内容。'
+- en: The Schedulers.io scheduler
+  id: totrans-97
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Schedulers.io调度程序
+- en: The Input-Output (IO) scheduler uses a `ScheduledExecutorService` instance to
+    retrieve the threads from a *thread pool* for its workers. Unused threads are
+    cached and reused on demand. It can spawn an arbitrary number of threads if it
+    is necessary.
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输入输出（IO）调度程序使用`ScheduledExecutorService`实例从*线程池*中检索线程以供其工作人员使用。未使用的线程将被缓存并根据需要重用。如果需要，它可以生成任意数量的线程。
+- en: Again, if we run our example with only one `Worker` instance, the actions will
+    be enqueued on its thread, and it will behave like the *computation* and *new
+    thread* schedulers.
+  id: totrans-99
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 同样，如果我们只使用一个`Worker`实例运行我们的示例，操作将被排队到其线程上，并且其行为将与*computation*和*new thread*调度程序相同。
+- en: 'Say we run it with multiple `Worker` instances, like this:'
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 假设我们使用多个`Worker`实例运行它，如下所示：
+- en: '[PRE21]'
+  id: totrans-101
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'It would produce `Thread` instances on demand from its *pool*. The result looks
+    like this:'
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 它将根据需要从其*池*生成`Thread`实例。结果如下：
+- en: '[PRE22]'
+  id: totrans-103
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: The *IO* scheduler is reserved for blocking *IO operations*. Use it for requests
+    to servers, reading from files and sockets, and other similar blocking tasks.
+    Note that its thread pool is unbounded; if its workers are not unsubscribed, the
+    pool will grow indefinitely.
+  id: totrans-104
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*IO*调度程序专用于阻塞*IO操作*。用于向服务器发出请求，从文件和套接字读取以及其他类似的阻塞任务。请注意，其线程池是无界的；如果其工作人员未取消订阅，则池将无限增长。'
+- en: Note
+  id: totrans-105
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The source code for all the preceding code is located at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SchedulersTypes.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SchedulersTypes.java).
+  id: totrans-106
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所有前述代码的源代码位于[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SchedulersTypes.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SchedulersTypes.java)。
+- en: The Schedulers.from(Executor) method
+  id: totrans-107
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Schedulers.from(Executor)方法
+- en: This can be used to create a custom `Scheduler` instance. If none of the predefined
+    schedulers work for you, use this method, passing it to a `java.util.concurrent.Executor`
+    instance, to implement the behavior you need.
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这可以用来创建一个自定义的`Scheduler`实例。如果没有预定义的调度程序适合您，可以使用这个方法，将它传递给`java.util.concurrent.Executor`实例，以实现您需要的行为。
+- en: Now that we've learned about how and when the predefined `Scheduler` instances
+    should be used, is time to see how to integrate them with our `Observable` sequence.
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们已经了解了预定义的`Scheduler`实例应该如何使用，是时候看看如何将它们与我们的`Observable`序列集成了。
+- en: Combining Observables and schedulers
+  id: totrans-110
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 组合Observable和调度程序
+- en: In order to execute our observable logic on other threads, we can use the schedulers.
+    There are two special operators, which receive `Scheduler` as a parameter and
+    produce `Observable` instances, capable of performing operations on `Thread` instances
+    different from the current one.
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了在其他线程上执行我们的可观察逻辑，我们可以使用调度程序。有两个特殊的操作符，它们接收`Scheduler`作为参数，并生成`Observable`实例，能够在与当前线程不同的`Thread`实例上执行操作。
+- en: The Observable<T> subscribeOn(Scheduler) method
+  id: totrans-112
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Observable<T> subscribeOn(Scheduler)方法
+- en: 'The `subscribeOn()` method creates an `Observable` instance, whose `subscribe`
+    method causes the subscription to occur on a thread retrieved from the passed
+    scheduler. For example, we have this:'
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`subscribeOn()`方法创建一个`Observable`实例，其`subscribe`方法会导致订阅在从传递的调度程序中检索到的线程上发生。例如，我们有这样的：'
+- en: '[PRE23]'
+  id: totrans-114
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'We''ll get this output:'
+  id: totrans-115
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将得到以下输出：
+- en: '[PRE24]'
+  id: totrans-116
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: This is normal; calling the `subscribe` method executes the observable logic
+    on the main thread, and only after all this is done, we see `'Hey!'`.
+  id: totrans-117
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是正常的；调用`subscribe`方法会在主线程上执行可观察逻辑，只有在所有这些都完成之后，我们才会看到`'Hey!'`。
+- en: 'Let''s modify the code to look like this:'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们修改代码看起来像这样：
+- en: '[PRE25]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'The output changes to the following:'
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输出变成了以下内容：
+- en: '[PRE26]'
+  id: totrans-121
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: This means that the *caller* thread doesn't block printing '`Hey!'` first or
+    in between the the numbers, and all the `Observable` instance observable logic
+    is executed on a *computation* thread. This way, you can use every scheduler you
+    like to decide where to execute the work.
+  id: totrans-122
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这意味着*调用者*线程不会阻塞首先打印`'Hey!'`或在数字之间，所有`Observable`实例的可观察逻辑都在*计算*线程上执行。这样，您可以使用任何您喜欢的调度程序来决定在哪里执行工作。
+- en: 'Here we need to mention something important about the `subscribeOn()` method.
+    If you call it multiple times throughout the chain like this:'
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们需要提到`subscribeOn()`方法的一些重要内容。如果您在整个链中多次调用它，就像这样：
+- en: '[PRE27]'
+  id: totrans-124
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: The call to it that is *the closest* to the beginning of the chain matters.
+    Here we *subscribe* on the *computation* scheduler first, then on the *IO* scheduler,
+    and then on the *new thread* scheduler, but our code will be executed on the *computation*
+    scheduler because this is specified *first* in the chain.
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调用它时*最接近*链的开头很重要。在这里，我们首先在*计算*调度程序上*订阅*，然后在*IO*调度程序上，然后在*新线程*调度程序上，但我们的代码将在*计算*调度程序上执行，因为这在链中*首先*指定。
+- en: '[PRE28]'
+  id: totrans-126
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: In conclusion, don't specify a scheduler in methods producing `Observable` instances;
+    leave this choice to the callers of your methods. Alternatively, make your methods
+    receive a `Scheduler` instance as a parameter; like the `Observable.interval`
+    method, for example.
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 总之，在生成`Observable`实例的方法中不要指定调度程序；将这个选择留给方法的调用者。或者，使您的方法接收`Scheduler`实例作为参数；例如`Observable.interval`方法。
+- en: Note
+  id: totrans-128
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The `subscribeOn()` operator is usable with `Observable` instances that block
+    the caller thread when one subscribes to them. Using the `subscribeOn()` method
+    with such sources lets the caller thread progress concurrently with the `Observable`
+    instance logic.
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`subscribeOn()`操作符可用于在订阅时阻塞调用者线程的`Observable`实例。在这些源上使用`subscribeOn()`方法让调用者线程与`Observable`实例逻辑并发进行。'
+- en: And what about the other operator, which helps us doing work on other threads?
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 那么另一个操作符呢，它帮助我们在其他线程上执行工作呢？
+- en: The Observable<T> observeOn(Scheduler) operator
+  id: totrans-131
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: Observable<T> observeOn(Scheduler)操作符
+- en: 'The `observeOn()` operator is similar to the `subscribeOn()` operator, but
+    instead of executing the entire chain on the passed `Scheduler` instances, it
+    executes the part of the chain from its place within it, onwards. The easiest
+    way to understand this is through an example. Let''s use the previous one, after
+    slightly modifying it:'
+  id: totrans-132
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`observeOn()`操作符类似于`subscribeOn()`操作符，但它不是在传递的`Scheduler`实例上执行整个链，而是从其在其中的位置开始执行链的一部分。通过一个例子最容易理解这一点。让我们使用稍微修改过的前一个例子：'
+- en: '[PRE29]'
+  id: totrans-133
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'Here, we tell the `Observable` chain to execute on the *main* thread after
+    subscribing until it reaches the `observeOn()` operator. At this point, it is
+    moved on the *computation* scheduler. The output of this is something similar
+    to the following:'
+  id: totrans-134
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们告诉`Observable`链在订阅后在*主*线程上执行，直到它到达`observeOn()`操作符。在这一点上，它被移动到*计算*调度程序上。这样的输出类似于以下内容：
+- en: '[PRE30]'
+  id: totrans-135
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: As we can see, the part of the chain before the call to the operator blocks
+    the *main* thread, preventing printing `Hey!`. However, after all the notifications
+    pass through the `observeOn()` operator, `'Hey!'` is printed and the execution
+    continues on the *computation* thread.
+  id: totrans-136
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们所看到的，调用操作符之前的链部分会阻塞*主*线程，阻止打印`Hey!`。然而，在所有通知通过`observeOn()`操作符之后，`'Hey!'`被打印出来，执行继续在*计算*线程上进行。
+- en: If we move the `observeOn()` operator up the `Observable` chain, a greater part
+    of the logic will be executed using the *computation* scheduler.
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们将`observeOn()`操作符移到`Observable`链上，更大部分的逻辑将使用*计算*调度程序执行。
+- en: Of course, the `observeOn()` operator can be used together with the `subscribeOn()`
+    operator. That way, part of the chain could be executed on one thread and the
+    rest of it on another (in most cases). This is especially useful if you code a
+    client-side application because, normally, these applications run on one *event
+    enqueueing* thread. You can read from files/servers using the *IO* scheduler with
+    `subscribeOn()`/`observeOn()` operator and then observe the result on the *event*
+    thread.
+  id: totrans-138
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，`observeOn()`操作符可以与`subscribeOn()`操作符一起使用。这样，链的一部分可以在一个线程上执行，而其余部分可以在另一个线程上执行（在大多数情况下）。如果你编写客户端应用程序，这是特别有用的，因为通常这些应用程序在一个*事件排队*线程上运行。你可以使用`subscribeOn()`/`observeOn()`操作符使用*IO*调度程序从文件/服务器读取数据，然后在*事件*线程上观察结果。
+- en: Tip
+  id: totrans-139
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 提示
+- en: 'There is an Android module for RxJava that is not covered by this book, but
+    it is getting quite a lot of attention. You can read more about it here: [https://github.com/ReactiveX/RxJava/wiki/The-RxJava-Android-Module](https://github.com/ReactiveX/RxJava/wiki/The-RxJava-Android-Module).'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有一个RxJava的Android模块没有在本书中涵盖，但它受到了很多关注。你可以在这里了解更多信息：[https://github.com/ReactiveX/RxJava/wiki/The-RxJava-Android-Module](https://github.com/ReactiveX/RxJava/wiki/The-RxJava-Android-Module)。
+- en: If you are an Android developer don't miss it!
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果你是Android开发人员，不要错过它！
+- en: There are similar modules for **Swing** and **JavaFx** as well.
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**Swing**和**JavaFx**也有类似的模块。'
+- en: 'Let''s look at an example using both the `subscribeOn()` and `observeOn()`
+    operators:'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们看一个使用`subscribeOn()`和`observeOn()`操作符的示例：
+- en: '[PRE31]'
+  id: totrans-144
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'Here, we use one call for the `subsribeOn()` operator at the beginning of the
+    chain (actually, it doesn''t matter where we put it, because it is a sole call
+    to that operator) and two calls for the `observeOn()` operator. The result of
+    executing this code looks like this:'
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们在链的开头使用了一个`subsribeOn()`操作符的调用（实际上，放在哪里都无所谓，因为它是对该操作符的唯一调用），以及两个`observeOn()`操作符的调用。执行此代码的结果如下：
+- en: '[PRE32]'
+  id: totrans-146
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: We can see that the chain passes through three threads. If we do this with more
+    elements, some of the code will be executed seemingly in *parallel*. The conclusion
+    is that, using the `observeOn()` operator, we can change the threads multiple
+    times; using the `subscribeOn()` operator, we can do this one time—*on subscription*.
+  id: totrans-147
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以看到链通过了三个线程。如果我们使用更多元素，一些代码将看起来是*并行*执行的。结论是，使用`observeOn()`操作符，我们可以多次更改线程；使用`subscribeOn()`操作符，我们可以一次性进行此操作—*订阅*。
+- en: Note
+  id: totrans-148
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The source for the preceding examples with the `observeOn()`/`subscribeOn()`
+    operators can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SubscribeOnAndObserveOn.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SubscribeOnAndObserveOn.java).
+  id: totrans-149
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用`observeOn()`/`subscribeOn()`操作符的上述示例的源代码可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SubscribeOnAndObserveOn.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/SubscribeOnAndObserveOn.java)找到。
+- en: With these two operators, we can have `Observable` instances and *multi-threading*
+    working together. But being *concurrent* doesn't really mean that we can do things
+    in *parallel*. It means that our program has multiple threads, making some progress
+    independently. True parallelism is when our program uses the CPU (cores) of the
+    machine it runs on at their maximum and its threads run literally at the same
+    time.
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用这两个操作符，我们可以让`Observable`实例和*多线程*一起工作。但是*并发*并不真正意味着我们可以*并行*执行任务。它意味着我们的程序有多个线程，可以独立地取得一些进展。真正的*并行*是当我们的程序以最大限度利用主机机器的CPU（核心）并且其线程实际上同时运行时。
+- en: All of our examples up until now just moved the chain logic onto another threads.
+    Although, some of the examples really did part of their operations in *parallel*,
+    but a true *parallelism* example looks different.
+  id: totrans-151
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们的所有示例都只是将链逻辑移动到其他线程上。尽管有些示例确实在*并行*中执行了部分操作，但真正的*并行*示例看起来是不同的。
+- en: Parallelism
+  id: totrans-152
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 并行
+- en: 'We can achieve *parallelism* only by using the operators that we already know.
+    Think about the `flatMap()` operator; it creates an `Observable` instance for
+    each item emitted by the source. If we call the `subscribeOn()` operator with
+    a `Scheduler` instance on these `Observable` instances, each one of them will
+    be *scheduled* on a new `Worker` instance, and they''ll work in *parallel* (if
+    the host machine allows that). Here is an example of this:'
+  id: totrans-153
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们只能通过使用我们已经知道的操作符来实现*并行*。想想`flatMap()`操作符；它为源发出的每个项目创建一个`Observable`实例。如果我们在这些`Observable`实例上使用`subscribeOn()`操作符和`Scheduler`实例，每个实例将在新的`Worker`实例上*调度*，并且它们将*并行*工作（如果主机机器允许）。这是一个例子：
+- en: '[PRE33]'
+  id: totrans-154
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'The output of this code looks like this:'
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这段代码的输出如下：
+- en: '[PRE34]'
+  id: totrans-156
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: We can see by the names of the threads that the `Observable` instances defined
+    through the `flatMap()` operator are executed in *parallel*. And that's really
+    the case—the four threads are using the four cores of my processor.
+  id: totrans-157
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以通过线程的名称看出，通过`flatMap()`操作符定义的`Observable`实例是在*并行*中执行的。这确实是这种情况——四个线程正在使用我的处理器的四个核心。
+- en: 'I''ll provide another example, this time for *parallel* requests to a remote
+    server. We''ll be using the `requestJson()` method we defined in the previous
+    chapter. The idea is this:'
+  id: totrans-158
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我将提供另一个示例，这次是对远程服务器进行*并行*请求。我们将使用前一章中定义的`requestJson()`方法。思路是这样的：
+- en: We'll retrieve information about the followers of a GitHub user (for this example
+    we'll be using my account).
+  id: totrans-159
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们将检索GitHub用户的关注者信息（在本例中，我们将使用我的帐户）。
+- en: For every follower, we'll get the URL to its profile.
+  id: totrans-160
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 对于每个关注者，我们将得到其个人资料的URL。
+- en: We will request the profiles of the followers in *parallel*.
+  id: totrans-161
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们将以*并行*方式请求关注者的个人资料。
+- en: We'll print the number of the followers and the number of their followers.
+  id: totrans-162
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们将打印关注者的数量以及他们的关注者数量。
+- en: 'Let''s see how this is implemented:'
+  id: totrans-163
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们看看这是如何实现的：
+- en: '[PRE35]'
+  id: totrans-164
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: 'Here''s what''s happening in the preceding code:'
+  id: totrans-165
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上述代码中发生了什么：
+- en: First we perform a request to the followers data of my user.
+  id: totrans-166
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们对我的用户的关注者数据进行请求。
+- en: The request returns the followers as *JSON* strings, which are converted into
+    `Map` objects (see the implementation of the `requestJson` method). From each
+    of the *JSON* files, the URL to the profile of the follower it represents is read.
+  id: totrans-167
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 请求以*JSON*字符串形式返回关注者，这些字符串被转换为`Map`对象（请参阅`requestJson`方法的实现）。从每个*JSON*文件中，读取表示关注者个人资料的URL。
+- en: A new request is executed for each of these URLs. The requests run in *parallel*
+    on *IO* threads, because we use the same technique as in the previous example.
+    It is worth mentioning that the `flatMap()` operator has an overload that takes
+    a `maxConcurrent` integer parameter. We can limit the concurrent requests using
+    it.
+  id: totrans-168
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 对每个URL执行一个新的请求。请求在*IO*线程上*并行*运行，因为我们使用了与前面示例相同的技术。值得一提的是，`flatMap()`运算符有一个重载，它接受一个`maxConcurrent`整数参数。我们可以使用它来限制并发请求。
+- en: After user data for a follower is fetched, the information for his/her followers
+    is generated.
+  id: totrans-169
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 获取关注者的用户数据后，生成他/她的关注者的信息。
+- en: This information is printed as a side effect.
+  id: totrans-170
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 这些信息作为副作用打印出来。
+- en: We count my followers using the `count()` operator (which is the same as the
+    `scan(0.0, (sum, element) -> sum + 1).last()` call). Then we print them. The order
+    of the printed data is not guaranteed to be the same as the order in which the
+    followers were traversed.
+  id: totrans-171
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用`count()`运算符来计算我的关注者数量（这与`scan(0.0, (sum, element) -> sum + 1).last()`调用相同）。然后我们打印它们。打印的数据顺序不能保证与遍历关注者的顺序相同。
+- en: Note
+  id: totrans-172
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: The source code for the preceding example can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/ParallelRequestsExample.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/ParallelRequestsExample.java).
+  id: totrans-173
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面示例的源代码可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/ParallelRequestsExample.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/ParallelRequestsExample.java)找到。
+- en: That's all about *concurrency* and *parallelism*. Everything is pretty simple,
+    but powerful. There are a few rules (such as using the `Subscribers.io` instance
+    for blocking operations, using the *computation* one for background tasks, and
+    so on) that you must follow to ensure nothing goes wrong, even with *multi-threaded*
+    observable chains of actions.
+  id: totrans-174
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这就是*并发*和*并行*的全部内容。一切都很简单，但功能强大。有一些规则（例如使用`Subscribers.io`实例进行阻塞操作，使用*计算*实例进行后台任务等），您必须遵循以确保没有任何问题，即使是*多线程*的可观察链操作。
+- en: It is very possible using this *parallelism* technique to flood the `Observable`
+    instance chain with data, and that's a problem. That's why we'll have to deal
+    with it. Through the rest of this chapter, we'll learn how to handle too many
+    elements coming from an *upstream* observable chains of actionse.
+  id: totrans-175
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用这种*并行*技术很可能会使`Observable`实例链中涌入大量数据，这是一个问题。这就是为什么我们必须处理它。在本章的其余部分，我们将学习如何处理来自*上游*可观察链操作的太多元素。
+- en: Buffering, throttling, and debouncing
+  id: totrans-176
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 缓冲、节流和去抖动
+- en: 'Here is one interesting example:'
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这里有一个有趣的例子：
+- en: '[PRE36]'
+  id: totrans-178
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'This goes through all the files in a folder and reads all of them in parallel
+    if they are not folders themselves. For the example, while I''m running it, there
+    are five text files in the folder, and one of them is quite large. While printing
+    the content of these files with our `subscribePrint()` method, we get something
+    that looks like this:'
+  id: totrans-179
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这将遍历文件夹中的所有文件，并且如果它们本身不是文件夹，则会并行读取它们。例如，当我运行它时，文件夹中有五个文本文件，其中一个文件相当大。在使用我们的`subscribePrint()`方法打印这些文件的内容时，我们得到了类似于这样的内容：
+- en: '[PRE37]'
+  id: totrans-180
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: The output is cropped, but the important thing is that we get this `MissingBackpressureException`
+    exception.
+  id: totrans-181
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输出被裁剪了，但重要的是我们得到了`MissingBackpressureException`异常。
+- en: The threads reading each of the files are trying to push their data into the
+    `merge()` operator (the `flatMap()` operator is implemented as `merge(map(func))`).
+    The operator is struggling with a large amount of data, so it will try to notify
+    the overproducing `Observable` instances to slow down (this ability to notify
+    the upstream that the amount of data can't be handled is called *backpressure*).
+    The problem is that they don't implement such a mechanism (*backpressure*), so
+    the `MissingBackpressureException` exception is encountered.
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 读取每个文件的线程正在尝试将它们的数据推送到`merge()`运算符（`flatMap()`运算符实现为`merge(map(func))`）。该运算符正在努力处理大量数据，因此它将尝试通知过度生产的`Observable`实例减速（通知上游无法处理数据量的能力称为*背压*）。问题在于它们没有实现这样的机制（*背压*），因此会遇到`MissingBackpressureException`异常。
+- en: Dealing with such a situation is achieved through implementing *backpressure*
+    into the upstream observables, using one of the special `onBackpressure*` methods
+    or by trying to avoid it by packaging the large amount of incoming items into
+    a smaller set of emissions. This packaging is done through *buffering*, *dropping*
+    some of the incoming items, *throttling* (buffering using time intervals or events),
+    and *debouncing* (buffering using the intervals between emissions of items).
+  id: totrans-183
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过在上游可观察对象中实现*背压*，使用其中一个特殊的`onBackpressure*`方法或尝试通过将大量传入的项目打包成更小的发射集来避免它。这种打包是通过*缓冲*、*丢弃*一些传入的项目、*节流*（使用时间间隔或事件进行缓冲）和*去抖动*（使用项目发射之间的间隔进行缓冲）来完成的。
+- en: Let's examine some of them.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们检查其中一些。
+- en: Throttling
+  id: totrans-185
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 节流
+- en: Using this mechanism, we can regulate the emission rate of an `Observable` instance.
+    We can specify time intervals or another flow-controlling `Observable` instance
+    to achieve this.
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用这种机制，我们可以调节`Observable`实例的发射速率。我们可以指定时间间隔或另一个流控制`Observable`实例来实现这一点。
+- en: Using the `sample()` operator, we can control the emissions of an `Observable`
+    instance using another one, or a time interval.
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用`sample()`运算符，我们可以使用另一个`Observable`实例或时间间隔来控制`Observable`实例的发射。
+- en: '[PRE38]'
+  id: totrans-188
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: The *sampling* `Observable` instance emits every 100 milliseconds for the first
+    two seconds and then begins emitting every 200 milliseconds. The *data* `Observable`
+    instance drops all of its items until the *sampling* emits. When this happens,
+    the last item emitted by the *data* `Observable` instance is passed through. So
+    we have great data loss, but it's harder to encounter the `MissingBackpressureException`
+    exception (it is possible to get it, though).
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*采样* `Observable` 实例在前两秒每 100 毫秒发出一次，然后开始每 200 毫秒发出一次。*data* `Observable` 实例放弃了所有项目，直到
+    *sampling* 发出。当这种情况发生时，*data* `Observable` 实例发出的最后一个项目被传递。因此，我们有很大的数据丢失，但更难遇到
+    `MissingBackpressureException` 异常（尽管有可能遇到）。'
+- en: 'The `sample()` operator has two additional overloads to which you can pass
+    time intervals, a `TimeUnit` metric and, optionally, a `Scheduler` instance:'
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`sample()` 操作符有两个额外的重载，可以传递时间间隔、`TimeUnit` 度量和可选的 `Scheduler` 实例：'
+- en: '[PRE39]'
+  id: totrans-191
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: Using the `sample()` operator with the `Observable` instance gives us more detailed
+    control over the data flow. The `throttleLast()` operator is just an alias for
+    the different versions of the `sample()` operator that receive the time interval.
+    The `throttleFirst()` operator is the same as the `throttleLast()` operator, but
+    the *source* `Observable` instance will emit the first item it emitted at the
+    beginning of the interval, instead of the last. These operators are running on
+    the *computation* scheduler by default.
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用 `sample()` 操作符与 `Observable` 实例可以更详细地控制数据流。`throttleLast()` 操作符只是 `sample()`
+    操作符的不同版本的别名，它接收时间间隔。`throttleFirst()` 操作符与 `throttleLast()` 操作符相同，但 *source* `Observable`
+    实例将在间隔开始时发出它发出的第一个项目，而不是最后一个。这些操作符默认在 *computation* 调度程序上运行。
+- en: These techniques are useful (as well as most of the others in this section)
+    when you have multiple, similar events. For example, if you want to capture and
+    react to *mouse-move events*, you don't need all the events, containing all the
+    pixel positions; you need only some of them.
+  id: totrans-193
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些技术在有多个相似事件时非常有用（以及本节中的大多数其他技术）。例如，如果您想捕获并对 *鼠标移动事件* 做出反应，您不需要包含所有像素位置的所有事件；您只需要其中一些。
+- en: Debouncing
+  id: totrans-194
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 防抖动
+- en: In our previous example, *debouncing* won't work. Its idea is to emit only items
+    that are not followed by other items for a given time interval. Therefore, some
+    time must pass between emissions in order to propagate something. Because all
+    of the items in our *data* `Observable` instances are emitted seemingly at once,
+    there is no interval between them to use. So we need to change the example a bit
+    in order to demonstrate this.
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们之前的例子中，*防抖动* 不起作用。它的想法是仅发出在给定时间间隔内没有后续项目的项目。因此，必须在发射之间经过一些时间才能传播一些东西。因为我们
+    *data* `Observable` 实例中的所有项目似乎一次性发出，它们之间没有可用的间隔。因此，我们需要稍微改变示例以演示这一点。
+- en: '[PRE40]'
+  id: totrans-196
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: Here we are using the `sample()` operator with a special *sampling* `Observable`
+    instance in order to reduce the emissions to occur on 100, 200, and 150 milliseconds.
+    By using the `repeat()` operator, we create an *infinite* `Observable` instance,
+    repeating the source, and set it to execute on the *computation* scheduler. Now
+    we can use the `debounce()` operator to emit only this set of items with time
+    gaps between their emissions of 150 or more milliseconds.
+  id: totrans-197
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们使用 `sample()` 操作符与特殊的 *sampling* `Observable` 实例，以便将发射减少到发生在 100、200 和
+    150 毫秒的时间间隔上。通过使用 `repeat()` 操作符，我们创建了一个重复源的 *无限* `Observable` 实例，并将其设置为在 *computation*
+    调度程序上执行。现在我们可以使用 `debounce()` 操作符，只发出这组项目，并在它们的发出之间有 150 毫秒或更长的时间间隔。
+- en: '*Debouncing*, like *throttling*, can be used to filter similar events from
+    an over-producing source. A good example of this is an auto-complete search. We
+    don''t want to trigger searches on every letter inputted by the user; we need
+    to wait for him/her to stop typing and then trigger the search. We can use the
+    `debounce()` operator for that and set a reasonable *time interval*. The `debounce()`
+    operator has an overload that takes a `Scheduler` instance as its third argument.
+    Additionally, there is one more overload with a selector returning an `Observable`
+    instance for more fine-grained control over the *data flow*.'
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*防抖动*，像 *节流* 一样，可以用于过滤来自过度生产的源的相似事件。一个很好的例子是自动完成搜索。我们不希望在用户输入每个字母时触发搜索；我们需要等待他/她停止输入，然后触发搜索。我们可以使用
+    `debounce()` 操作符，并设置一个合理的 *时间间隔*。`debounce()` 操作符有一个重载，它将 `Scheduler` 实例作为其第三个参数。此外，还有一个带有选择器返回
+    `Observable` 实例的重载，以更精细地控制 *数据流*。'
+- en: The buffer and window operators
+  id: totrans-199
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 缓冲和窗口操作符
+- en: These two sets of operators are *transforming* operators much like the `map()`
+    or `flatMap()` operators. They *transform* a series of elements in a collection—a
+    sequence of these elements to be emitted as one.
+  id: totrans-200
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这两组操作符与 `map()` 或 `flatMap()` 操作符一样是 *transforming* 操作符。它们将一系列元素转换为一个集合，这些元素的序列将作为一个元素发出。
+- en: 'This book will not cover these operators in detail, but it''s worth mentioning
+    that the `buffer()` operator has overloads that are able to collect emissions
+    based on *time intervals*, *selectors*, and other `Observable` instances. It can
+    be configured to skip items too. Here is an example with the `buffer(int count,
+    int skip)` method, a version of the `buffer()` operator that collects *count*
+    items and skips *skip* items:'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本书不会详细介绍这些操作符，但值得一提的是，`buffer()` 操作符具有能够基于 *时间间隔*、*选择器* 和其他 `Observable` 实例收集发射的重载。它还可以配置为跳过项目。以下是使用
+    `buffer(int count, int skip)` 方法的示例，这是 `buffer()` 操作符的一个版本，它收集 *count* 个项目并跳过
+    *skip* 个项目：
+- en: '[PRE41]'
+  id: totrans-202
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE41]'
+- en: 'This will output something similar to the following:'
+  id: totrans-203
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这将输出类似于以下内容：
+- en: '[PRE42]'
+  id: totrans-204
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE42]'
+- en: The `window()` operator has exactly the same set of overloads as the `buffer()`
+    operator. The difference is that instead of arrays of the buffered elements, the
+    `Observable` instance created by the `window()` operator emits `Observable` instances
+    emitting the collected elements.
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`window()` 操作符与 `buffer()` 操作符具有完全相同的重载集。不同之处在于，`window()` 操作符创建的 `Observable`
+    实例发出发出收集的元素的 `Observable` 实例，而不是缓冲元素的数组。'
+- en: In order to demonstrate a different overload, we'll present an example using
+    the `window(long timespan, long timeshift, TimeUnit units)` method. This operator
+    collects elements emitted within the *timespan* interval and skips all the elements
+    emitted within the *timeshift* interval. This is repeated until the source `Observable`
+    instance is complete.
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了演示不同的重载，我们将使用`window(long timespan, long timeshift, TimeUnit units)`方法来举例。该操作符会收集在*timespan*时间间隔内发出的元素，并跳过在*timeshift*时间间隔内发出的所有元素。这将重复，直到源`Observable`实例完成。
+- en: '[PRE43]'
+  id: totrans-207
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE43]'
+- en: We use the `flatMap()` operator to flatten the `Observable` instances. The result
+    consists of all the items emitted in the first three milliseconds of the *subscription*,
+    plus the ones emitted for three milliseconds after a 200-millisecond gap, and
+    this is repeated while the source is emitting.
+  id: totrans-208
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用`flatMap()`操作符来展平`Observable`实例。结果包括在*订阅*的前三毫秒内发出的所有项，以及在200毫秒间隔后的三毫秒内发出的项，这将在源发出时重复。
+- en: Note
+  id: totrans-209
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 注意
+- en: All the examples introduced in the preceding section can be found at [https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/BackpressureExamples.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/BackpressureExamples.java).
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在前一节介绍的所有示例都可以在[https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/BackpressureExamples.java](https://github.com/meddle0x53/learning-rxjava/blob/master/src/main/java/com/packtpub/reactive/chapter06/BackpressureExamples.java)找到。
+- en: The backpressure operators
+  id: totrans-211
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 背压操作符
+- en: The last set of operators preventing the `MissingBackpressureException` exception
+    actually activate automatically when there is an overproducing *source* `Observable`
+    instance.
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后一组操作符可以防止`MissingBackpressureException`异常，当有一个过度生产的*源*`Observable`实例时，它们会自动激活。
+- en: 'The `onBackpressureBuffer()` operator buffers the items emitted by the faster
+    than its `Observer` instance''s *source* `Observable`. The buffered items are
+    then emitted in a way that the subscribers can handle them. For example:'
+  id: totrans-213
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`onBackpressureBuffer()`操作符会对由快于其`Observer`实例的*源*`Observable`发出的项进行缓冲。然后以订阅者可以处理的方式发出缓冲的项。例如：'
+- en: '[PRE44]'
+  id: totrans-214
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE44]'
+- en: Here we used a big capacity for the buffer because of the large number of elements,
+    but note that overflowing this buffer will get the `MissingBackpressureException`
+    exception back.
+  id: totrans-215
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们使用了一个大容量的缓冲区，因为元素数量很大，但请注意，溢出此缓冲区将导致`MissingBackpressureException`异常。
+- en: The `onBackpressureDrop()` operator drops all the incoming items from the *source*
+    `Observable` instance that can not be handled by the subscribers.
+  id: totrans-216
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`onBackpressureDrop()`操作符会丢弃所有来自*源*`Observable`实例的无法被订阅者处理的传入项。'
+- en: There is a way to establish *backpressure* by implementing smart Observables
+    or Subscribers, but this topic is beyond the scope of this book. There is an excellent
+    article about *backpressure* and observables on the RxJava wiki page—[https://github.com/ReactiveX/RxJava/wiki/Backpressure](https://github.com/ReactiveX/RxJava/wiki/Backpressure).
+    Many of the operators mentioned in this section are described there in depth,
+    and there are marble diagrams available to help you understand the more complex
+    ones.
+  id: totrans-217
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有一种方法可以通过实现智能的Observables或Subscribers来建立*背压*，但这个话题超出了本书的范围。在RxJava维基页面上有一篇关于*背压*和observable的优秀文章—[https://github.com/ReactiveX/RxJava/wiki/Backpressure](https://github.com/ReactiveX/RxJava/wiki/Backpressure)。本节中提到的许多操作符在那里都有详细描述，并且有大理石图可用于帮助您理解更复杂的操作符。
+- en: Summary
+  id: totrans-218
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, we've learned how to execute our observable logic on other
+    threads that are different from the *main* one. There are some simple rules and
+    techniques for doing this, and if everything is followed accordingly, there should
+    be no dangers. Using these techniques, we are able to write *concurrent* programs.
+    We've also learned how to achieve *parallel* execution using the schedulers and
+    the `flatMap()` operator, and we saw a real-world example of doing that.
+  id: totrans-219
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们学习了如何在与*主*线程不同的其他线程上执行我们的observable逻辑。有一些简单的规则和技术可以做到这一点，如果一切都按照规定进行，就不应该有危险。使用这些技术，我们能够编写*并发*程序。我们还学习了如何使用调度程序和`flatMap()`操作符实现*并行*执行，并且看到了一个真实世界的例子。
+- en: Another useful thing that we've examined was how to handle *overproducing* sources
+    of data. There are a lot of operators that are able to do that by different means,
+    and we introduced some of them, and talked about their usefulness.
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们还研究了如何处理*过度生产*的数据源。有许多操作符可以通过不同的方式来做到这一点，我们介绍了其中一些，并讨论了它们的有用性。
+- en: With that, we have the knowledge to write arbitrary RxJava programs capable
+    of working with data from different sources. We know how to do this using multiple
+    threads. Using RxJava, its operators, and *constructions* is almost like coding
+    using a new language. It has its rules and flow control methods.
+  id: totrans-221
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些知识，我们可以编写任意的RxJava程序，能够处理来自不同源的数据。我们知道如何使用多个线程来做到这一点。使用RxJava、它的操作符和*构造*几乎就像使用一种新语言编码。它有自己的规则和流程控制方法。
+- en: In order to write stable applications, we'll have to learn how to *unit test*
+    them. Testing *asynchronous* code is not an easy task. The good news is that there
+    are some operators and classes provided by RxJava that are going to help us do
+    that. You can read more about them in the next chapter.
+  id: totrans-222
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了编写稳定的应用程序，我们必须学会如何对它们进行*单元测试*。测试*异步*代码并不是一件容易的事情。好消息是，RxJava提供了一些操作符和类来帮助我们做到这一点。您可以在下一章中了解更多信息。

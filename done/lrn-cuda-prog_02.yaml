@@ -1,0 +1,2345 @@
+- en: CUDA Memory Management
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: CUDA内存管理
+- en: As we described in [Chapter 1](3be2aa92-ffec-4831-90b5-ebbfab302a71.xhtml), *Introduction
+    t**o CUDA Programming*, the CPU and GPU architectures are fundamentally different
+    and so is their memory hierarchy. They not only differ in terms of sizes and types
+    but also in terms of their purpose and design. So far, we have studied how each
+    thread accesses its own data with the help of indexing (`blockIdx` and `threadIdx`).
+    We also made use of APIs such as `cudaMalloc` to allocate memory on the device.
+    Many memory paths are available in a GPU, each with different performance characteristics.
+    Launching the CUDA kernel can help us to achieve maximum performance, but only
+    when the right type of memory hierarchy is used in an optimal way. It is the developer's
+    responsibility to map datasets to the right memory type.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们在[第1章](3be2aa92-ffec-4831-90b5-ebbfab302a71.xhtml)中所描述的，*CUDA编程简介*，CPU和GPU架构在根本上是不同的，它们的内存层次结构也是不同的。它们不仅在大小和类型上有所不同，而且在目的和设计上也有所不同。到目前为止，我们已经学习了每个线程如何通过索引（`blockIdx`和`threadIdx`）访问自己的数据。我们还使用了诸如`cudaMalloc`之类的API在设备上分配内存。GPU中有许多内存路径，每个路径的性能特征都不同。启动CUDA核心可以帮助我们实现最大性能，但只有在以最佳方式使用正确类型的内存层次结构时才能实现。将数据集映射到正确的内存类型是开发人员的责任。
+- en: 'Empirically, if we were to plot a graph that outlines the top application performance
+    constraints on the GPU, it would look something like the following diagram:'
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据经验，如果我们绘制一个图表，概述GPU上的顶级应用性能约束，它将看起来像以下图表：
+- en: '![](img/ce9fca55-7032-4add-8f56-5a8d1af24a01.png)'
+  id: totrans-3
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/ce9fca55-7032-4add-8f56-5a8d1af24a01.png)'
+- en: The preceding pie charts represent a rough breakdown of the performance problems
+    that are seen in the majority of CUDA-based applications. It is clearly visible
+    that, most of the time, the application's performance will be bottlenecked by
+    memory-related constraints. Based on the application and which memory path is
+    taken, the memory-related constraints are divided further.
+  id: totrans-4
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上述饼图粗略地分解了大多数基于CUDA的应用程序中出现的性能问题。很明显，大多数情况下，应用程序的性能将受到与内存相关的约束的限制。根据应用程序和采取的内存路径，内存相关的约束进一步划分。
+- en: Let's take a different view of this approach and understand the importance of
+    using the right memory type efficiently. The latest NVIDIA GPU with Volta Architecture
+    provides 7,000 GFLOP of peak performance and its device memory bandwidth is 900
+    GB/s. The first observation you will have will be regarding the ratio of FLOP
+    to memory bandwidth, which is approximately 7:1\. This is assuming that all of
+    the threads are accessing 4 bytes (float) of data for performing an operation.
+    The total required bandwidth that's required to perform this operation in one
+    go is *4*7,000 = 28,000* GB/s, that is, to achieve peak performance. 900 GB/s
+    limits the execution to 225 GFLOP. This bounds the execution rate to 3.2% ( 225
+    GFLOP is 3.2% of the peak, which is 7,000 GFLOP) of the peak floating-point execution
+    rate of the device. As you are aware by now, GPU is a latency hiding architecture
+    that has many threads available for execution, which means it can, theoretically,
+    tolerate long memory access latencies. Still, surplus calls to memory can prevent
+    very few threads from stalling or waiting and will result in some of the SMs being
+    idle. The CUDA architecture provides several other methods that we can use to
+    access memory to solve this problem of memory bottlenecks.
+  id: totrans-5
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们以不同的方式来看待这种方法，并了解有效使用正确类型的内存的重要性。最新的NVIDIA GPU采用Volta架构，提供了7,000 GFLOP的峰值性能，其设备内存带宽为900
+    GB/s。您将首先注意到的是FLOP与内存带宽的比率，大约为7:1。这是假设所有线程都访问4字节（浮点数）数据执行操作。执行此操作所需的总带宽是*4*7,000
+    = 28,000* GB/s，即达到峰值性能所需的带宽。900 GB/s将执行限制为225 GFLOP。这将执行速率限制为峰值的3.2%（225 GFLOP是设备的7,000
+    GFLOP峰值的3.2%）。正如您现在所知，GPU是一种隐藏延迟的架构，有许多可用于执行的线程，这意味着它在理论上可以容忍长的内存访问延迟。然而，对内存的过多调用可能会导致一些SMs空闲，导致一些线程停顿或等待。CUDA架构提供了其他几种方法，我们可以使用这些方法来访问内存，以解决内存瓶颈问题。
+- en: 'The path of data traversing from CPU memory until being utilized by the SM
+    for processing is demonstrated in the following diagram. Here, we can see the
+    journey of the data element before it reaches the SM core for computation. Each
+    memory bandwidth is orders of magnitude different, and so is the latency to access
+    them:'
+  id: totrans-6
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 从CPU内存到被SM用于处理的数据路径在下图中展示。在这里，我们可以看到数据元素在到达SM核心进行计算之前的旅程。每个内存带宽的数量级都不同，访问它们的延迟也不同：
+- en: '![](img/39dc4102-fded-4f2f-a522-3b7dbc01cb19.png)'
+  id: totrans-7
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/39dc4102-fded-4f2f-a522-3b7dbc01cb19.png)'
+- en: In the preceding diagram, we can see the data path from the CPU until it reaches
+    the registers where the final calculation is done by the ALU/cores.
+  id: totrans-8
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上图中，我们可以看到从CPU到达寄存器的数据路径，最终计算是由ALU/核心完成的。
+- en: 'The following diagram shows the different types of memory hierarchies that
+    are present in the latest GPU architecture. Each memory may have a different size,
+    latency, throughput, and visibility for the application developer:'
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下图显示了最新GPU架构中存在的不同类型的内存层次结构。每种内存可能具有不同的大小、延迟、吞吐量和应用程序开发人员的可见性：
+- en: '![](img/77cc060d-afe2-41f5-b4ea-842fe41e58fe.png)'
+  id: totrans-10
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/77cc060d-afe2-41f5-b4ea-842fe41e58fe.png)'
+- en: The preceding diagram shows different types of memory that are present in the
+    latest GPU architecture and their placement in the hardware.
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上图显示了最新GPU架构中存在的不同类型的内存及其在硬件中的位置。
+- en: 'In this chapter, you will learn how to optimally utilize different types of
+    GPU memories. We will also be looking at the latest features of GPU-like unified
+    memory, which makes the life of a programmer much simpler. The following memory
+    topics will be covered in detail in this chapter:'
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您将学习如何最佳地利用不同类型的GPU内存。我们还将研究GPU统一内存的最新特性，这使得程序员的生活变得更简单。本章将详细介绍以下内存主题：
+- en: Global memory/device memory
+  id: totrans-13
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 全局内存/设备内存
+- en: Shared memory
+  id: totrans-14
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 共享内存
+- en: Read-only data/cache
+  id: totrans-15
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 只读数据/缓存
+- en: Pinned memory
+  id: totrans-16
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 固定内存
+- en: Unified memory
+  id: totrans-17
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 统一内存
+- en: 'But before we look at the memory hierarchy, we will follow the cycle of optimization,
+    which is as follows:'
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 但在我们查看内存层次结构之前，我们将遵循优化周期，如下所示：
+- en: 'Step 1: Analyze'
+  id: totrans-19
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 步骤1：分析
+- en: 'Step 2: Parallelize'
+  id: totrans-20
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 步骤2：并行化
+- en: 'Step 3: Optimize'
+  id: totrans-21
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 步骤3：优化
+- en: Analysis of the application requires us to not only understand the characteristics
+    of our application but how effectively it runs on the GPU. For this purpose, we
+    will introduce you to Visual Profiler first, before going into the GPU memory.
+    Since we have used some of the latest features of CUDA here, please read the following
+    section before proceeding with this chapter.
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对应用程序的分析要求我们不仅要了解我们应用程序的特性，还要了解它在GPU上的有效运行方式。为此，我们将首先向您介绍Visual Profiler，然后再进入GPU内存。由于我们在这里使用了一些最新的CUDA功能，请在继续本章之前阅读以下部分。
+- en: Technical requirements
+  id: totrans-23
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 技术要求
+- en: A Linux PC with a modern NVIDIA GPU (Pascal architecture onward) is required
+    for this chapter, along with all of the necessary GPU drivers and the CUDA Toolkit
+    (10.0 onward) installed. If you are unsure of your GPU's architecture, please
+    visit the NVIDIA GPU's site at [https://developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus) and
+    confirm it. This chapter's code is also available on GitHub at [https://github.com/PacktPublishing/Learn-CUDA-Programming](https://github.com/PacktPublishing/Learn-CUDA-Programming).
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章需要一台带有现代NVIDIA GPU（Pascal架构或更高版本）的Linux PC，以及安装了所有必要的GPU驱动程序和CUDA Toolkit（10.0或更高版本）。如果您不确定您的GPU架构，请访问NVIDIA
+    GPU网站[https://developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus)进行确认。本章的代码也可以在GitHub上找到[https://github.com/PacktPublishing/Learn-CUDA-Programming](https://github.com/PacktPublishing/Learn-CUDA-Programming)。
+- en: The sample code examples for this chapter have been developed and tested with
+    version 10.1 of CUDA Toolkit. However, it is recommended to use the latest CUDA
+    version or higher.
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的示例代码示例是使用CUDA Toolkit的10.1版本开发和测试的。但是，建议使用最新的CUDA版本或更高版本。
+- en: In the next section, we will introduce you to the Visual Profiler, which will
+    help us to analyze our applications. We will also look at how well it runs on
+    the GPU.
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将向您介绍Visual Profiler，它将帮助我们分析我们的应用程序。我们还将看一下它在GPU上的运行情况。
+- en: NVIDIA Visual Profiler
+  id: totrans-27
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: NVIDIA Visual Profiler
+- en: To understand the effective utilization of different memory hierarchies, it
+    is important to analyze the characteristics of applications at runtime. Profilers
+    are very handy tools that measure and show different metrics that help us to analyze
+    the way memory, SM, cores, and other resources are used. NVIDIA made a decision
+    to provide an API that developers of profiler tools can use to hook into a CUDA
+    application, and a number of profiling tools have evolved over time, such as TAU
+    Performance systems, Vampir Trace, and the HPC Toolkit. These all make use of
+    the **CUDA Profiler Tools Interface** (**CUPTI**) to provide profiling information
+    for CUDA applications.
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了了解不同内存层次结构的有效利用，重要的是在运行时分析应用程序的特性。分析器是非常方便的工具，可以测量和显示不同的指标，帮助我们分析内存、SM、核心和其他资源的使用方式。
+    NVIDIA决定提供一个API，供分析器工具的开发人员用于连接到CUDA应用程序，随着时间的推移，一些分析工具已经发展出来，如TAU性能系统、Vampir
+    Trace和HPC Toolkit。所有这些工具都利用**CUDA分析器工具接口**（**CUPTI**）为CUDA应用程序提供分析信息。
+- en: NVIDIA itself develops and maintains profiling tools that are given as part
+    of the CUDA Toolkit. This chapter makes use of these two profiling tools (NVPROF
+    and NVVP) to demonstrate the efficient use of different memory types and is not
+    a guide to profiling tools.
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: NVIDIA本身开发并维护作为CUDA Toolkit的一部分提供的分析工具。本章使用这两个分析工具（NVPROF和NVVP）来演示不同内存类型的有效使用，并不是分析工具的指南。
+- en: We will be demonstrating the characteristics of CUDA applications using either
+    NVPROF or NVVP. NVPROF is a command-line tool, while `nvvp` has a visual interface.
+    `nvvp` comes in two formats, one being a standalone version and another being
+    an integrated version inside Nsight Eclipse.
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将使用NVPROF或NVVP来演示CUDA应用程序的特性。NVPROF是一个命令行工具，而`nvvp`具有可视化界面。`nvvp`有两种格式，一种是独立版本，另一种是集成在Nsisght
+    Eclipse中的版本。
+- en: 'The NVVP Profiler window that we will be using extensively looks as follows:'
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将广泛使用的NVVP分析器窗口如下所示：
+- en: '![](img/56803b05-bc2d-41d1-aba1-66bb38d85c30.png)'
+  id: totrans-32
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/56803b05-bc2d-41d1-aba1-66bb38d85c30.png)'
+- en: This is an NVVP version 9.0 window snapshot that was taken on macOS.
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是在macOS上拍摄的NVVP 9.0版本窗口快照。
+- en: 'There are four views available in the window: Timeline, Guide, Analysis Results,
+    and Summary. The Timeline view, as the name denotes, shows the CPU and GPU activity
+    that occurred across time. The Visual Profiler shows a summary view of the memory
+    hierarchy of the CUDA programming model. The Analysis view shows the analysis
+    result. The Visual Profiler provides two modes of analysis:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 窗口中有四个视图可用：时间轴、指南、分析结果和摘要。时间轴视图显示了随时间发生的CPU和GPU活动。Visual Profiler显示了CUDA编程模型的内存层次结构的摘要视图。分析视图显示了分析结果。Visual
+    Profiler提供了两种分析模式：
+- en: '**Guided analysis:** As the name suggests, it guides the developer by taking
+    a step-by-step approach to understanding the key performance limiters. We would
+    suggest this mode for beginners before moving on to the unguided mode once they
+    become experts in understanding different metrics.'
+  id: totrans-35
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**引导分析：**顾名思义，它通过逐步方法指导开发人员了解关键性能限制器。我们建议初学者在成为了解不同指标的专家之前先使用此模式，然后再转到无引导模式。'
+- en: '**Unguided analysis:** The developer has to manually look at the results in
+    this mode to understand the performance limiter.'
+  id: totrans-36
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**无引导分析：**开发人员必须手动查看此模式下的结果，以了解性能限制器。'
+- en: 'The CUDA Toolkit provides two GPU application profile tools, the **NVIDIA Profiler** (**NVPROF**) and
+    the **NVIDIA Visual Profiler** (**NVVP**). To obtain performance limiter information,
+    we need to have to types of profiling: timeline analysis and metric analysis.
+    This code can be accessed at `02_memory_overview/04_sgemm`. The profiling command can be
+    executed as follows:'
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: CUDA Toolkit 提供了两个 GPU 应用程序性能分析工具，**NVIDIA Profiler**（**NVPROF**）和**NVIDIA Visual
+    Profiler**（**NVVP**）。为了获得性能限制器信息，我们需要进行两种类型的分析：时间线分析和度量分析。此代码可在 `02_memory_overview/04_sgemm`
+    中访问。分析命令可以执行如下：
+- en: '[PRE0]'
+  id: totrans-38
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: Let's open the Visual Profiler. If you are using Linux or OSX, you can execute `nvvp` in
+    Terminal. Or, you can find the `nvvp` binary from the CUDA Toolkit installed binary.
+    If you are using Windows, you can execute this tool using the Windows search box
+    with the `nvvp` command.
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们打开 Visual Profiler。如果你使用的是 Linux 或 OSX，你可以在终端中执行 `nvvp`。或者，你可以从安装了 CUDA Toolkit
+    的二进制文件中找到 `nvvp` 可执行文件。如果你使用的是 Windows，你可以使用 Windows 搜索框执行该工具，命令为 `nvvp`。
+- en: 'To open two-profiled data, we will use the File | Import... menu, as follows:'
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要打开两个分析数据，我们将使用“文件”|“导入...”菜单，如下所示：
+- en: '![](img/93fc3b11-ff9a-4c01-ab35-c4b52977a905.png)'
+  id: totrans-41
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/93fc3b11-ff9a-4c01-ab35-c4b52977a905.png)'
+- en: 'Then, we''ll continue by clicking the Next button at the bottom:'
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们将继续点击底部的“下一步”按钮：
+- en: '![](img/fef3b906-3e8d-43ea-9945-8bee75de1527.png).'
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '![](img/fef3b906-3e8d-43ea-9945-8bee75de1527.png)。'
+- en: 'Our CUDA application uses one process. So, let''s continue by clicking the Next button
+    at the bottom:'
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的 CUDA 应用程序使用一个进程。因此，让我们继续点击底部的“下一步”按钮：
+- en: '![](img/3e64070c-e869-4d9a-aa83-e4915355f965.png)'
+  id: totrans-45
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/3e64070c-e869-4d9a-aa83-e4915355f965.png)'
+- en: 'Now, let''s put the collected profiled data into the Visual Profiler. The following
+    screenshot shows an example. Put the timeline data in the second textbox by using
+    the Browse... button on the right. Then, place metric analysis data in the next
+    textbox in the same way:'
+  id: totrans-46
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们将收集的分析数据放入 Visual Profiler 中。以下截图显示了一个示例。通过右侧的“浏览...”按钮，将时间线数据放入第二个文本框。然后，以相同的方式将度量分析数据放入下一个文本框中：
+- en: '![](img/2ccb86bb-9e2a-4062-b862-eedf5473da49.png)'
+  id: totrans-47
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/2ccb86bb-9e2a-4062-b862-eedf5473da49.png)'
+- en: For detailed usage of profiling tools, please refer to the CUDA Profiling guide,
+    which comes as part of the CUDA Toolkit (the respective web link is [https://docs.nvidia.com/cuda/profiler-users-guide/index.html](https://docs.nvidia.com/cuda/profiler-users-guide/index.html)).
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关性能分析工具的详细使用，请参阅 CUDA Profiling 指南，该指南作为 CUDA Toolkit 的一部分提供（相应的网页链接为 [https://docs.nvidia.com/cuda/profiler-users-guide/index.html](https://docs.nvidia.com/cuda/profiler-users-guide/index.html)）。
+- en: 'In Windows-based systems, after the CUDA Toolkit''s installation, you can launch
+    the Visual Profiler from the Start menu. On a Linux system with X11 forwarding,
+    you can launch Visual Profiler by running the `nvvp` command, which stands for
+    NVIDIA Visual Profiler:'
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在基于 Windows 的系统中，在安装了 CUDA Toolkit 后，你可以从“开始”菜单中启动 Visual Profiler。在具有 X11 转发的
+    Linux 系统中，你可以通过运行 `nvvp` 命令来启动 Visual Profiler，`nvvp` 代表 NVIDIA Visual Profiler：
+- en: '[PRE1]'
+  id: totrans-50
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: Since we now have a fair understanding of the analysis tool that we will use,
+    let's jump into the first and definitely most critical GPU memory—global memory/device
+    memory.
+  id: totrans-51
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 既然我们现在对将要使用的分析工具有了一个公平的理解，让我们进入第一个也是绝对最关键的 GPU 内存——全局内存/设备内存。
+- en: Global memory/device memory
+  id: totrans-52
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 全局内存/设备内存
+- en: This section will provide details on how to make use of global memory, also
+    referred to as device memory. In this section, we will also talk about how efficiently
+    we can load/store data from global memory into the cache. Since global memory
+    is a staging area where all of the data gets copied from CPU memory, the best
+    utilization of this memory is essential. Global memory or device memory is visible
+    to all of the threads in the kernel. This memory is also visible to the CPU.
+  id: totrans-53
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本节将详细介绍如何使用全局内存，也称为设备内存。在本节中，我们还将讨论如何高效地将数据从全局内存加载/存储到缓存中。由于全局内存是一个暂存区，所有数据都从
+    CPU 内存中复制到这里，因此必须充分利用这种内存。全局内存或设备内存对于内核中的所有线程都是可见的。这种内存也对 CPU 可见。
+- en: The programmer explicitly manages allocation and deallocation with `cudaMalloc`
+    and `cudaFree`, respectively. Data is allocated with `cudaMalloc` and declared
+    as `__device__`. Global memory is the default staging area for all of the memory
+    that's transferred from the CPU using the `cudaMemcpy` API.
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 程序员使用 `cudaMalloc` 和 `cudaFree` 显式地管理分配和释放。数据使用 `cudaMalloc` 分配，并声明为 `__device__`。全局内存是从
+    CPU 使用 `cudaMemcpy` API 传输的所有内存的默认暂存区。
+- en: Vector addition on global memory
+  id: totrans-55
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 全局内存上的矢量加法
+- en: 'The Vector addition example we used in the first chapter demonstrates the use
+    of global memory. Let''s look at the code snippet again and try to understand
+    how global memory is used:'
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在第一章中使用的矢量加法示例演示了全局内存的使用。让我们再次查看代码片段，并尝试理解全局内存的使用方式：
+- en: '[PRE2]'
+  id: totrans-57
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: '`cudaMalloc` allocates the data on the device memory. The pointers in the arguments
+    in the kernel (`a`, `b`, and `c`) point to this device memory. We free this memory
+    using the `cudaFree` API. As you can see, all of the threads in the blocks have
+    access to this memory inside the kernel.'
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`cudaMalloc` 在设备内存上分配数据。内核中的参数指针（`a`、`b` 和 `c`）指向这个设备内存。我们使用 `cudaFree` API
+    释放这个内存。正如你所看到的，块中的所有线程都可以在内核中访问这个内存。'
+- en: 'This code can be accessed at `02_memory_overview/01_vector_addition`. In order
+    to compile this code, you can use the following command:'
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此代码可在 `02_memory_overview/01_vector_addition` 中访问。要编译此代码，可以使用以下命令：
+- en: '[PRE3]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: This is a simple example of making use of global memory. In the next section,
+    we will look at how to access the data optimally.
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是一个使用全局内存的简单示例。在下一节中，我们将看看如何最优地访问数据。
+- en: Coalesced versus uncoalesced global memory access
+  id: totrans-62
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 合并与未合并的全局内存访问
+- en: To effectively use global memory, it is important to understand the concept
+    of warp in the CUDA programming model, which we have ignored so far. The warp
+    is a unit of thread scheduling/execution in SMs. Once a block has been assigned
+    to an SM, it is divided into a 32 -thread unit known as a **warp**. This is the
+    basic execution unit in CUDA programming.
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了有效使用全局内存，了解CUDA编程模型中warp的概念是非常重要的，这是我们到目前为止忽略的。warp是SM中的线程调度/执行单位。一旦一个块被分配给一个SM，它被划分为一个32个线程的单位，称为**warp**。这是CUDA编程中的基本执行单位。
+- en: 'To demonstrate the concept of a warp, let''s look at an example. If two blocks
+    get assigned to an SM and each block has 128 threads, then the number of warps
+    within a block is *128/32 = 4* warps and the total number of warps on the SM is
+    *4 * 2 = 8* warps. The following diagram shows how a CUDA block gets divided and
+    scheduled on a GPU SM:'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了演示warp的概念，让我们看一个例子。如果两个块被分配给一个SM，每个块有128个线程，那么块内的warp数量是*128/32 = 4*个warp，SM上的总warp数量是*4
+    * 2 = 8*个warp。以下图表显示了CUDA块如何在GPU SM上被划分和调度：
+- en: '![](img/b1b16bf3-50bc-4e16-a5be-1bbc72b7e395.png)'
+  id: totrans-65
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/b1b16bf3-50bc-4e16-a5be-1bbc72b7e395.png)'
+- en: 'How the block and warps are scheduled on the SM and its core is more of architecture-specific
+    and will be different for generations such as Kepler, Pascal, and the latest architecture,
+    Volta. For now, we can ignore the integrities of scheduling. Among all of the
+    available warps, the ones with operands that are ready for the next instruction
+    become eligible for execution. Based on the scheduling policy of the GPU where
+    the CUDA program is running, the warps are selected for execution. All of the
+    threads in a warp execute the same instruction when selected. CUDA follows the
+    **Single Instruction, Multiple Thread** (**SIMT**) model, that is, all threads
+    in a warp fetch and execute the same instruction at one instance in time. To optimally
+    utilize access from global memory, the access should coalesce. The difference
+    between coalesced and uncoalesced is as follows:'
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 块和warp在SM和其核心上的调度更多地是与体系结构相关的，对于Kepler、Pascal和最新的Volta等不同的架构，情况会有所不同。目前，我们可以忽略调度的完整性。在所有可用的warp中，具有下一条指令所需操作数的warp变得可以执行。根据运行CUDA程序的GPU的调度策略，选择要执行的warp。当被选择时，warp中的所有线程执行相同的指令。CUDA遵循**单指令，多线程**（**SIMT**）模型，也就是说，warp中的所有线程在同一时间实例中获取和执行相同的指令。为了最大程度地利用全局内存的访问，访问应该合并。合并和未合并之间的区别如下：
+- en: '**Coalesced global memory access:** Sequential memory access is adjacent.'
+  id: totrans-67
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**合并的全局内存访问：** 顺序内存访问是相邻的。'
+- en: '**Uncoalesced global memory access:** Sequential memory access is not adjacent.'
+  id: totrans-68
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**未合并的全局内存访问：** 顺序内存访问不是相邻的。'
+- en: 'The following diagram shows an example of this access pattern in more detail.
+    The left-hand side of the diagram shows coalesced access where threads from the
+    warp access adjacent data and hence resulting in one 32-wide operation and 1 cache
+    miss. The right-hand side of the diagram shows a scenario where access from threads
+    within a warp is random and may result in calling 32 one wide operation and hence
+    may have 32 cache misses, which is the worst-case scenario:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表更详细地展示了这种访问模式的示例。图表的左侧显示了合并访问，其中warp中的线程访问相邻数据，因此导致了一个32位宽的操作和1次缓存未命中。图表的右侧显示了一种情况，即warp内的线程访问是随机的，可能导致调用32次单个宽度的操作，因此可能有32次缓存未命中，这是最坏的情况：
+- en: '![](img/b125e1a6-614e-48f2-b4d6-dd00e95b1cfe.jpg)'
+  id: totrans-70
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/b125e1a6-614e-48f2-b4d6-dd00e95b1cfe.jpg)'
+- en: To understand this concept further, we need to understand how data reaches from
+    global memory via cache lines.
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了进一步理解这个概念，我们需要了解数据如何通过缓存行从全局内存到达。
+- en: '**Scenario 1:** Warp request 32 aligned, 4 consecutive bytes'
+  id: totrans-72
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**情况1：** warp请求32个对齐的、4个连续的字节'
+- en: 'The address falls within 1 cache line and one 32-wide operation. The bus utilization
+    is 100%, that is, we are utilizing all of the data being fetched from the global
+    memory into a cache and not wasting any bandwidth at all. This is shown in the
+    following diagram:'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 地址落在1个缓存行内和一个32位宽的操作内。总线利用率为100%，也就是说，我们利用从全局内存中获取的所有数据到缓存中，并没有浪费任何带宽。如下图所示：
+- en: '![](img/1f19c553-c555-425a-a0c6-fe683f87a986.png)'
+  id: totrans-74
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/1f19c553-c555-425a-a0c6-fe683f87a986.png)'
+- en: The preceding diagram shows coalesced access, resulting in optimal utilization
+    of the bus.
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上图显示了合并的访问，导致了总线的最佳利用。
+- en: '**Scenario 2:** Warp request 32 scattered 4-byte words'
+  id: totrans-76
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**情况2：** warp请求32个分散的4字节单词'
+- en: 'While the warp needs 128 bytes, there are 32 one wide fetches being executed,
+    resulting in *32 * 128* bytes moving across the bus on a miss. Bus utilization
+    is effectively less than 1%, as shown in the following diagram:'
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 虽然warp需要128字节，但在未命中时执行了32次单个宽度的获取，导致*32 * 128*字节在总线上移动。如下图所示，总线利用率实际上低于1%：
+- en: '![](img/bd6f035c-56e5-4aa9-8062-310f4bbe5908.png)'
+  id: totrans-78
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/bd6f035c-56e5-4aa9-8062-310f4bbe5908.png)'
+- en: The preceding diagram shows uncoalesced access, resulting in a waste of bus
+    bandwidth**.**
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上图显示了未合并的访问，导致了总线带宽的浪费。
+- en: As we can see in the preceding diagram, it is important how threads within the
+    warp access the data from global memory. To optimally utilize global memory, it
+    is important to improve coalescing. There are multiple strategies that can be
+    used. One such strategy is to change the data layout to improve locality. Let's
+    look at an example. Computer vision algorithms that apply filters onto an image
+    or apply masks onto an image requires the image to be stored onto a data structure.
+    The developer has two choices when it comes to declaring an image type.
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们在前面的图表中看到的，warp内的线程如何从全局内存中访问数据非常重要。为了最大程度地利用全局内存，改善合并是非常重要的。有多种可以使用的策略。其中一种策略是改变数据布局以改善局部性。让我们看一个例子。将滤波器应用于图像或将掩模应用于图像的计算机视觉算法需要将图像存储到数据结构中。当开发人员声明图像类型时，有两种选择。
+- en: 'The following code snippet makes use of the `Coefficients_SOA` data structure
+    to store data in an array format. The `Coefficients_SOA` structure stores image-related
+    data such as RGB, hue, and saturation values:'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下代码片段使用`Coefficients_SOA`数据结构以数组格式存储数据。`Coefficients_SOA`结构存储与图像相关的数据，如RGB、色调和饱和度值：
+- en: '[PRE4]'
+  id: totrans-82
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'The following diagram shows the data layout regarding how data is stored for
+    `Coefficients_SOA` and accessed by different threads in a kernel:'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表显示了关于`Coefficients_SOA`存储数据的数据布局，以及在内核中由不同线程访问数据的情况：
+- en: '![](img/3742c385-2a7c-4ed3-be87-6f5c1bd9ee67.jpg)'
+  id: totrans-84
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/3742c385-2a7c-4ed3-be87-6f5c1bd9ee67.jpg)'
+- en: By doing this, we can see how the use of the AOS data structure resulted in uncoalesced
+    global memory access.
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过这样做，我们可以看到AOS数据结构的使用导致了不连续的全局内存访问。
+- en: 'The same image can be stored in an array structure format, as shown in the
+    following code snippet:'
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 同样的图像可以以数组结构格式存储，如下面的代码片段所示：
+- en: '[PRE5]'
+  id: totrans-87
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'The following diagram shows the data layout regarding how data is stored for `Coefficients_AOS` and
+    accessed by different threads in a kernel:'
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表显示了关于`Coefficients_AOS`存储数据的数据布局，以及在内核中由不同线程访问数据的情况：
+- en: '![](img/6cba8cd2-87a2-4b90-8145-0f2ad79ace78.jpg)'
+  id: totrans-89
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/6cba8cd2-87a2-4b90-8145-0f2ad79ace78.jpg)'
+- en: By doing this, we can see how using the SOA data structure results in uncoalesced
+    global memory access.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过这样做，我们可以看到使用SOA数据结构导致了不连续的全局内存访问。
+- en: While sequential code on CPU prefers AOS for cache efficiency, SOA is preferred
+    in **Single Instruction Multiple Thread** (**SIMT**)models such as CUDA for execution
+    and memory efficiency.
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 虽然CPU上的顺序代码更喜欢AOS以提高缓存效率，但在**单指令多线程**（**SIMT**）模型（如CUDA）中，SOA更受欢迎，以提高执行和内存效率。
+- en: 'Let''s try to analyze this aspect by making use of a profiler. Configure your
+    environment according to the following steps:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们尝试通过使用分析器来分析这一方面。根据以下步骤配置你的环境：
+- en: Prepare your GPU application. As an example, we will use two pieces of code
+    to demonstrate the efficient use of global memory. While the `aos_soa.cu` file
+    contains the naive implementation that uses the AOS data structure, `aos_soa_solved.cu`
+    makes use of the SOA data structure, which utilizes global memory efficiently.
+    This code can be found in `02_memory_overview/02_aos_soa`.
+  id: totrans-93
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 准备好你的GPU应用程序。例如，我们将使用两段代码来演示全局内存的有效使用。`aos_soa.cu`文件包含了使用AOS数据结构的朴素实现，而`aos_soa_solved.cu`则使用了SOA数据结构，可以有效地利用全局内存。这段代码可以在`02_memory_overview/02_aos_soa`中找到。
+- en: Compile your application with the `nvcc` compiler and then profile it using
+    the `nvprof` compiler. The following commands are an example of the `nvcc` command
+    for this. We then use the `nvprof` command to profile the application. The `--analysis-metrics`
+    flag is also passed so that we can get metrics for the kernels.
+  id: totrans-94
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用`nvcc`编译器编译你的应用程序，然后使用`nvprof`编译器对其进行分析。以下命令是对此的一个`nvcc`命令的示例。然后我们使用`nvprof`命令对应用程序进行分析。还传递了`--analysis-metrics`标志，以便我们可以获得内核的指标。
+- en: 'The generated profiles, that is, `aos_soa.prof` and `aos_soa_solved.prof`,
+    are then loaded into the NVIDIA Visual Profiler. The user needs to load the profiling
+    output from the File | Open menu. Also, don''t forget to choose All Files as part
+    of the file name options:'
+  id: totrans-95
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成的分析文件，即`aos_soa.prof`和`aos_soa_solved.prof`，然后加载到NVIDIA Visual Profiler中。用户需要从“文件|打开”菜单中加载分析输出。此外，不要忘记在文件名选项中选择“所有文件”。
+- en: '[PRE6]'
+  id: totrans-96
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'The profile output is shown in the following screenshot. It is a naive implementation
+    that uses the AOS data structure:'
+  id: totrans-97
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是分析输出的屏幕截图。这是一个使用AOS数据结构的朴素实现：
+- en: '![](img/3d6e2a1c-0926-460e-bd5d-d9b72094e20b.png)'
+  id: totrans-98
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/3d6e2a1c-0926-460e-bd5d-d9b72094e20b.png)'
+- en: The preceding diagram shows the output of the profiler in guided analysis mode.
+  id: totrans-99
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的图表显示了在引导分析模式下分析器的输出。
+- en: 'The first thing you will see is that the profiler clearly states that the application
+    is memory bound. As you can see, the profilers don''t just show metrics but also
+    the analysis of what those metrics mean. In this example, since we are using AOS,
+    the profiler clearly states that the access pattern is not efficient. But how
+    did the compiler come to this conclusion? Let''s take a look at the following
+    screenshot, which gives more details about it:'
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 你将看到的第一件事是分析器明确指出应用程序受到内存限制。正如你所看到的，分析器不仅显示指标，还分析了这些指标的含义。在这个例子中，由于我们使用AOS，分析器明确指出访问模式不高效。但编译器是如何得出这个结论的呢？让我们看一下下面的屏幕截图，它提供了更多的细节：
+- en: '![](img/90e14975-2add-439a-9772-65d594fed082.png)'
+  id: totrans-101
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/90e14975-2add-439a-9772-65d594fed082.png)'
+- en: As we can see, it clearly states that the ideal number transaction for accessing
+    data is four, while the run is doing 32 transactions/accesses.
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们所看到的，它清楚地说明了访问数据的理想事务数为四，而实际运行时进行了32次事务/访问。
+- en: When we change the data structure from AOS to SOA, the bottlenecks are solved.
+    When you run the `aos_soa_solved` executable, you will see that the kernel time
+    reduces, which is an improvement for our timings. On a V100 16 GB card, the time
+    reduces from 104 μs to 47 μs, which is a speedup factor of `2.2x`. The profiler
+    output, `aos_soa_solved.prof`, will show that the kernel is still memory-bound,
+    which is quite obvious since we are reading and writing more memory data compared
+    to doing the computation.
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当我们将数据结构从AOS更改为SOA时，瓶颈得到了解决。当你运行`aos_soa_solved`可执行文件时，你会发现内核时间减少了，这对我们的计时来说是一个改进。在V100
+    16 GB卡上，时间从104微秒减少到47微秒，这是一个`2.2x`的加速因子。分析输出`aos_soa_solved.prof`将显示内核仍然受到内存限制，这是非常明显的，因为我们读写的内存数据比进行计算时要多。
+- en: Memory throughput analysis
+  id: totrans-104
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 内存吞吐量分析
+- en: 'It becomes important for an application developer to understand the memory
+    throughput of an application. This can be defined in two ways:'
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于应用程序开发人员来说，了解应用程序的内存吞吐量非常重要。这可以通过两种方式来定义：
+- en: '**From an app point of view:** Counts the bytes that were requested by the
+    application'
+  id: totrans-106
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**从应用程序的角度来看：** 计算应用程序请求的字节数'
+- en: '**From a hardware point of view:** Count the bytes that were moved by the hardware'
+  id: totrans-107
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**从硬件的角度来看：** 计算硬件传输的字节数'
+- en: 'The two numbers are completely different. There are many reasons for this,
+    including uncoalesced access resulting in not all of the transaction bytes being
+    utilized, shared memory bank conflicts, and so on. The two aspects we should use
+    to analyze the application from a memory point of view are as follows:'
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这两个数字完全不同。其中许多原因包括未协调的访问导致未利用所有事务字节，共享内存银行冲突等。我们应该从内存角度使用两个方面来分析应用程序：
+- en: '**Address pattern:** Determining the access pattern in real code is quite difficult
+    and hence the use of tools such as profilers becomes really important. The metrics
+    that are shown by the profiler, such as global memory efficiency and L1/L2 transactions
+    per access need to be carefully looked at.'
+  id: totrans-109
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 地址模式：在实际代码中确定访问模式是非常困难的，因此使用诸如性能分析器之类的工具变得非常重要。性能分析器显示的指标，如全局内存效率和每次访问的L1/L2事务，需要仔细观察。
+- en: '**The number of concurrent accesses in flight:** As a GPU is a latency-hiding
+    architecture, it becomes important to saturate the memory bandwidth. But determining
+    the number of concurrent accesses is generally insufficient. Also, the throughput from
+    an HW point of view is much more different than the theoretical value.'
+  id: totrans-110
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**飞行中的并发访问数量：**由于GPU是一种隐藏延迟的架构，饱和内存带宽变得非常重要。但是确定并发访问的数量通常是不够的。此外，从硬件的角度来看，吞吐量与理论值相比要不同得多。'
+- en: 'The following diagram demonstrates that ~6 KB of data in flight per SM can
+    reach 90% of peak bandwidth for the Volta architecture. The same experiment, when
+    done on a previous generation architecture, will yield a different graph. In general,
+    it is recommended to understand the GPU memory characteristic for a particular
+    architecture in order to get the best performance from that hardware:'
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下图演示了每个SM中飞行的约6KB数据可以达到Volta架构峰值带宽的90%。在以前的一代架构上进行相同的实验会得到不同的图表。一般来说，建议了解特定架构的GPU内存特性，以便从硬件中获得最佳性能：
+- en: '![](img/86177233-314d-430b-88d6-e81fedb8d916.png)'
+  id: totrans-112
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/86177233-314d-430b-88d6-e81fedb8d916.png)'
+- en: This section provided us with sample uses of global memory and how we can utilize
+    it in an optimal fashion. Sometimes, coalesced data access from global memory
+    is difficult (for example, in CFD domains, in the case of unstructured grids,
+    the data of neighboring cells may not reside next to each other in memory). To
+    solve a problem like this or to reduce the impact on performance, we need to make
+    use of another form of memory, known as shared memory.
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本节为我们提供了全局内存的示例用法以及如何以最佳方式利用它。有时，全局内存的协调数据访问很困难（例如，在CFD领域，对于非结构化网格，相邻单元格的数据可能不会相邻存储在内存中）。为了解决这样的问题或减少对性能的影响，我们需要利用另一种形式的内存，称为共享内存。
+- en: Shared memory
+  id: totrans-114
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 共享内存
+- en: Shared memory has always had a vital role to play in the CUDA memory hierarchy
+    known as the **User-Managed Cache**. This provides a mechanism for users so that
+    they can read/write data in a coalesced fashion from global memory and store it
+    in memory, which acts like a cache but can be controlled by the user. In this
+    section, we will not only go through the steps we can take to make use of shared
+    memory but also talk about how we can efficiently load/store data from shared
+    memory and how it is internally arranged in banks. Shared memory is only visible
+    to threads in the same block. All of the threads in a block see the same version
+    of a shared variable.
+  id: totrans-115
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 共享内存一直在CUDA内存层次结构中扮演着重要角色，被称为**用户管理的缓存**。这为用户提供了一种机制，可以以协调的方式从全局内存中读取/写入数据并将其存储在内存中，这类似于缓存但可以由用户控制。在本节中，我们不仅将介绍利用共享内存的步骤，还将讨论如何有效地从共享内存中加载/存储数据以及它在银行中的内部排列。共享内存只对同一块中的线程可见。块中的所有线程看到共享变量的相同版本。
+- en: Shared memory has similar benefits to a CPU cache; however, while a CPU cache
+    cannot be explicitly managed, shared memory can. Shared memory has an order of
+    magnitude lower latency than global memory and an order of magnitude higher bandwidth
+    than global memory. But the key usage of shared memory comes from the fact that
+    threads within a block can share memory access. CUDA programmers can use shared
+    variables to hold the data that was reused many times during the execution phase
+    of the kernel. Also, since threads within the same block can share results, this
+    helps to avoid redundant calculations. The CUDA Toolkit, up until version 9.0,
+    did not provide a reliable communication mechanism between threads in different
+    blocks. We will be covering the CUDA 9.0 communication mechanism in more detail
+    in subsequent chapters. For now, we will assume that communication between threads
+    is only possible in CUDA by making use of shared memory.
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 共享内存具有类似于CPU缓存的好处；然而，CPU缓存无法明确管理，而共享内存可以。共享内存的延迟比全局内存低一个数量级，带宽比全局内存高一个数量级。但共享内存的关键用途来自于块内线程可以共享内存访问。CUDA程序员可以使用共享变量来保存在内核执行阶段中多次重复使用的数据。此外，由于同一块内的线程可以共享结果，这有助于避免冗余计算。直到9.0版本，CUDA
+    Toolkit没有提供可靠的通信机制来在不同块的线程之间进行通信。我们将在后续章节中更详细地介绍CUDA 9.0通信机制。目前，我们将假设在CUDA中只能通过使用共享内存来实现线程之间的通信。
+- en: Matrix transpose on shared memory
+  id: totrans-117
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 共享内存上的矩阵转置
+- en: 'One of the most primitive examples that''s used for demonstrating shared memory
+    is that of the matrix transpose. Matrix transpose is a memory-bound operation.
+    The following code snippet, which uses the `matrix_transpose_naive` kernel, shows
+    a sample implementation of the matrix transpose kernel:'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 用于演示共享内存的最原始的例子之一是矩阵转置。矩阵转置是一个内存绑定的操作。以下代码片段使用`matrix_transpose_naive`内核，展示了矩阵转置内核的示例实现：
+- en: '[PRE7]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: The preceding code shows the naive implementation of matrix transpose using
+    global memory. If this is implemented in a naive way, this will result in uncoalesced access
+    either while reading the matrix or writing the matrix. The execution time of the
+    kernel on a V100 PCIe 16 GB card is ~60 μs.
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上述代码展示了使用全局内存的矩阵转置的朴素实现。如果以朴素的方式实现，这将导致在读取矩阵或写入矩阵时出现未协调的访问。在V100 PCIe 16 GB卡上，内核的执行时间约为60微秒。
+- en: 'Configure your environment according to the following steps:'
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据以下步骤配置您的环境：
+- en: Prepare your GPU application. This code can be found in `02_memory_overview/02_matrix_transpose`.
+  id: totrans-122
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 准备您的GPU应用程序。此代码可以在`02_memory_overview/02_matrix_transpose`中找到。
+- en: Compile your application with the `nvcc` compiler and then profile it using
+    the `nvprof` compiler. The following commands are an example of the `nvcc` command
+    for this. Then, we use the `nvprof` command to profile the application. The `--analysis-metrics`
+    flag is also passed to get metrics for the kernels.
+  id: totrans-123
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用`nvcc`编译器编译您的应用程序，然后使用`nvprof`编译器对其进行分析。以下命令是对此的`nvcc`命令的一个示例。然后，我们使用`nvprof`命令对应用程序进行分析。还传递了`--analysis-metrics`标志以获取内核的指标。
+- en: 'The generated profile, that is, `matrix_transpose.prof`, is then loaded in
+    the NVIDIA Visual Profiler. The user needs to load the profiling output from the File
+    | Open menu. Also, don''t forget to choose All Files as part of the filename options:'
+  id: totrans-124
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 生成的配置文件，即`matrix_transpose.prof`，然后加载到NVIDIA Visual Profiler中。用户需要从“文件|打开”菜单中加载分析输出。还要记得选择“所有文件”作为文件名选项的一部分：
+- en: '[PRE8]'
+  id: totrans-125
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'The following screenshot shows the output of profiling. The output clearly
+    states that there is uncoalesced access to global memory, which is a key indicator
+    that needs to be worked on so that we can improve performance:'
+  id: totrans-126
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下截图显示了性能分析的输出。输出清楚地表明对全局内存的访问是未协调的，这是需要解决的关键指标，以便我们可以提高性能：
+- en: '![](img/44f9e83a-c02c-424b-b703-4f58cdb5f3a8.png)'
+  id: totrans-127
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/44f9e83a-c02c-424b-b703-4f58cdb5f3a8.png)'
+- en: 'One way to solve this problem is to make use of high bandwidth and low latency
+    memory, such as shared memory. The trick here is to read and write from global
+    memory in a coalesced fashion. Here, the read or write to shared memory can be
+    an uncoalesced pattern. The use of shared memory results in better performance
+    and the time is reduced to 21 microseconds, which is a factor of 3x time speedup:'
+  id: totrans-128
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 解决这个问题的一种方法是利用高带宽和低延迟的内存，比如共享内存。这里的诀窍是以协调的方式从全局内存读取和写入。在这里，对共享内存的读取或写入可以是未协调的模式。使用共享内存会带来更好的性能，时间缩短到21微秒，这是3倍的加速时间：
+- en: '[PRE9]'
+  id: totrans-129
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: The preceding code snippet shows the implementation of matrix transpose using
+    shared memory. Global memory reads/writes coalesce, while the transpose happens
+    in the shared memory.
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上述代码片段显示了使用共享内存的矩阵转置的实现。全局内存读取/写入是协调的，而转置发生在共享内存中。
+- en: Bank conflicts and its effect on shared memory
+  id: totrans-131
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 银行冲突及其对共享内存的影响
+- en: 'Good speedup compared to using global memory does not necessarily imply that
+    we are using shared memory effectively. This becomes clearer if we look at the
+    profiler metrics. If we shift from guided analysis to unguided analysis for the
+    profiler output, that is, `matrix_transpose.prof`, we will see that the shared
+    memory access pattern shows alignment problems, as shown in the following screenshot:'
+  id: totrans-132
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 与使用全局内存相比的良好加速并不一定意味着我们有效地使用了共享内存。如果我们转换从引导分析到未引导分析的分析器输出，即`matrix_transpose.prof`，我们将看到共享内存访问模式显示出对齐问题，如下截图所示：
+- en: '![](img/436d4870-5d3b-4251-8d60-cdf8e0fc4ad4.png)'
+  id: totrans-133
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/436d4870-5d3b-4251-8d60-cdf8e0fc4ad4.png)'
+- en: We can see how the profiler shows nonoptimal usage of shared memory, which is
+    a sign of a bank conflict.
+  id: totrans-134
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以看到分析器显示了共享内存的非最佳使用，这是银行冲突的一个迹象。
+- en: 'To effectively understand this alignment problem, it is important to understand
+    the concept of *banks*. Shared memory is organized into banks to achieve higher
+    bandwidth. Each bank can service one address per cycle. Memory can serve as many
+    simultaneous accesses as it has banks. The Volta GPU has 32 banks, each 4 bytes
+    wide. When an array is stored in shared memory, the adjacent 4-byte words go to
+    successive banks, as demonstrated in the following diagram:'
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了有效地理解这个对齐问题，重要的是要理解*bank*的概念。共享内存被组织成bank以实现更高的带宽。每个bank可以在一个周期内服务一个地址。内存可以为它有的bank提供多个同时访问。Volta
+    GPU有32个bank，每个bank宽度为4字节。当一个数组存储在共享内存中时，相邻的4字节单词会进入连续的bank，如下图所示：
+- en: '![](img/367a30e8-819e-4b7a-bda1-a1aa3212e9c4.png)'
+  id: totrans-136
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/367a30e8-819e-4b7a-bda1-a1aa3212e9c4.png)'
+- en: The logical view in the preceding diagram shows how data is stored in shared
+    memory.
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上述图中的逻辑视图显示了数据在共享内存中的存储方式。
+- en: 'Multiple simultaneous accesses by threads within a warp to a bank results in
+    a bank conflict. In other words, a bank conflict occurs when, inside a warp, two
+    or more threads access different 4-byte words in the same bank. Logically, this
+    is when two or more threads access different *rows* in the same bank. The following
+    diagrams show examples of different *n*-way bank conflicts. The worst case is
+    a 32-way conflict | 31 replays – each replay adds a few cycles of latency:'
+  id: totrans-138
+  prefs: []
+  type: TYPE_NORMAL
+  zh: warp内的线程对bank的多个同时访问会导致bank冲突。换句话说，当warp内的两个或多个线程访问同一个bank中的不同4字节单词时，就会发生bank冲突。从逻辑上讲，这是当两个或多个线程访问同一个bank中的不同*行*时。以下图示例展示了不同*n*-way
+    bank冲突的例子。最坏的情况是32-way冲突 | 31次重播 - 每次重播都会增加一些延迟：
+- en: '![](img/7826d460-f142-4d1e-86bb-fdd80b74bcaa.png)'
+  id: totrans-139
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/7826d460-f142-4d1e-86bb-fdd80b74bcaa.png)'
+- en: 'The preceding scenario shows threads from the same warp accessing the adjacent
+    4-byte elements that reside in different banks, resulting in no bank conflict.
+    Take a look at the following diagram:'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 上述情景显示了来自同一个warp的线程访问驻留在不同bank中的相邻4字节元素，导致没有bank冲突。看一下下图：
+- en: '![](img/6b606f97-4c2f-46f1-8cdb-3f9f1b43d8f7.png)'
+  id: totrans-141
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/6b606f97-4c2f-46f1-8cdb-3f9f1b43d8f7.png)'
+- en: 'This is another no bank conflict scenario where threads from the same warp
+    access random 4-byte elements that reside in different banks, resulting in no
+    bank conflict. Sequential access due to a 2-way bank conflict in shared memory
+    is shown in the following diagram:'
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这是另一个没有银行冲突的场景，同一warp的线程访问随机的4字节元素，这些元素位于不同的银行中，因此没有银行冲突。由于共享内存中的2路银行冲突，顺序访问如下图所示：
+- en: '![](img/8b840222-c509-44e5-94df-5340ecdc9d65.png)'
+  id: totrans-143
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/8b840222-c509-44e5-94df-5340ecdc9d65.png)'
+- en: The preceding diagram shows a scenario where threads **T0** and **T1** from
+    the same warp access 4-byte elements residing in the same bank and hence resulting
+    in a 2-way bank conflict.
+  id: totrans-144
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的图表显示了一个场景，其中来自同一warp的线程T0和T1访问同一银行中的4字节元素，因此导致了2路银行冲突。
+- en: 'In the preceding example of the matrix transpose, we made use of shared memory
+    to get better performance. However, we can see a 32-way bank conflict. To resolve
+    this, a simple technique known as padding can be used. All this does is pad the
+    shared memory with a dummy, that is, one additional column, which results in threads
+    accessing different banks and hence resulting in better performance:'
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在前面的矩阵转置示例中，我们利用了共享内存来获得更好的性能。然而，我们可以看到32路银行冲突。为了解决这个问题，可以使用一种称为填充的简单技术。所有这些都是在共享内存中填充一个虚拟的，即一个额外的列，这样线程就可以访问不同的银行，从而获得更好的性能：
+- en: '[PRE10]'
+  id: totrans-146
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: The preceding code snippet, where we used the `matrix_transpose_shared` kernel,
+    shows this concept of padding, which results in removing bank conflicts and hence
+    better utilization of shared memory bandwidth. As usual, run the code and verify
+    this behavior with the help of the Visual Profiler. With these changes, you should
+    see the time of the kernel reduce to 13 microseconds, which is a further speedup
+    of 60%.
+  id: totrans-147
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的代码片段中，我们使用了`matrix_transpose_shared`内核，展示了填充的概念，这样可以消除银行冲突，从而更好地利用共享内存带宽。像往常一样，运行代码并借助可视化分析器验证这种行为。通过这些更改，您应该看到内核的时间减少到13微秒，这进一步提高了60%的速度。
+- en: In this section, we saw how to optimally utilize shared memory, which provides
+    both read and write access as a scratchpad. But sometimes, the data is just read-only
+    input and does not require write access. In this scenario, GPU provides an optimal
+    memory known as **texture** memory. We will take a look at this in the next chapter,
+    along with other advantages that it provides to developers. We will cover read-only
+    data in the following section.
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们看到了如何最大限度地利用共享内存，它提供了读写访问作为一个临时存储器。但有时，数据只是只读输入，不需要写访问。在这种情况下，GPU提供了一种称为**纹理**内存的最佳内存。我们将在下一章中详细介绍这一点，以及它为开发人员提供的其他优势。我们将在下一节中介绍只读数据。
+- en: Read-only data/cache
+  id: totrans-149
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 只读数据/缓存
+- en: As you may have already guessed based on the memory name, a read-only cache
+    is suitable for storing data that is read-only and does not change during the
+    course of kernel execution. The cache is optimized for this purpose and, based
+    on the GPU architecture, frees up and reduces the load on the other cache, resulting
+    in better performance. In this section, we will provide details on how to make
+    use of a read-only cache with the help of an image processing code sample that
+    does image resizing.
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据内存名称，只读缓存适合存储只读数据，并且在内核执行过程中不会发生更改。该缓存针对此目的进行了优化，并且根据GPU架构，释放并减少了其他缓存的负载，从而提高了性能。在本节中，我们将详细介绍如何利用只读缓存，以及如何使用图像处理代码示例进行图像调整。
+- en: Read-only data is visible to all of the threads in the grid in a GPU. The data
+    is marked as read-only for the GPU, which means any changes to this data will
+    result in unspecified behavior in the kernel. CPU, on the other hand, has both
+    read and write access to this data.
+  id: totrans-151
+  prefs: []
+  type: TYPE_NORMAL
+  zh: GPU中的所有线程都可以看到只读数据。对于GPU来说，这些数据被标记为只读，这意味着对这些数据的任何更改都会导致内核中的未指定行为。另一方面，CPU对这些数据具有读写访问权限。
+- en: Traditionally, this cache is also referred to as the texture cache. While the
+    user can explicitly call the texture API to make use of the read-only cache, with
+    the latest GPU architecture, developers can take advantage of this cache without
+    making use of the CUDA texture API explicitly. With the latest CUDA version and
+    GPUs such as Volta, kernel pointer arguments marked as `const __restrict__` are
+    qualified to be read-only data that traverses through the read-only cache data
+    path. A developer can also force loading through this cache with the `__ldg` intrinsic.
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 传统上，这个缓存也被称为纹理缓存。虽然用户可以显式调用纹理API来利用只读缓存，但是在最新的GPU架构中，开发人员可以在不显式使用CUDA纹理API的情况下利用这个缓存。使用最新的CUDA版本和像Volta这样的GPU，标记为`const
+    __restrict__`的内核指针参数被视为只读数据，通过只读缓存数据路径传输。开发人员还可以通过`__ldg`内在函数强制加载这个缓存。
+- en: Read-only data is ideally used when an algorithm demands the entire warp to
+    read the same address/data, which primarily results in a broadcast to all of the
+    threads requesting the data per clock cycle. The texture cache is optimized for
+    2D and 3D locality. With threads being part of the same warp, read data from texture
+    addresses that have 2D and 3D locality tend to achieve better performance. Textures
+    have proven useful in applications that demand random memory access, especially
+    prior to Volta architecture cards.
+  id: totrans-153
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 只读数据在算法要求整个warp读取相同地址/数据时理想地使用，这主要导致每个时钟周期对所有请求数据的线程进行广播。纹理缓存针对2D和3D局部性进行了优化。随着线程成为同一warp的一部分，从具有2D和3D局部性的纹理地址读取数据往往会获得更好的性能。纹理在要求随机内存访问的应用程序中已被证明是有用的，特别是在Volta架构之前的显卡中。
+- en: Texture provides support for bilinear and trilinear interpolation, which is
+    particularly useful for image process algorithms such as scaling an image.
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 纹理支持双线性和三线性插值，这对于图像处理算法如缩放图像特别有用。
+- en: 'The following diagram shows an example of threads within a warp accessing elements
+    spatially located in a 2D space. The texture is suitable for these kinds of workloads:'
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下图显示了一个warp内的线程访问空间位置在2D空间中的元素的示例。纹理适用于这类工作负载：
+- en: '![](img/b5bd2c1c-54a6-44ad-9bf1-fd533f1da8bc.png)'
+  id: totrans-156
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/b5bd2c1c-54a6-44ad-9bf1-fd533f1da8bc.png)'
+- en: Now, let's take a look at a small real-world algorithm about scaling to demonstrate
+    the use of texture memory.
+  id: totrans-157
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们看一个关于缩放的小型实际算法，以演示纹理内存的使用。
+- en: Computer vision – image scaling using texture memory
+  id: totrans-158
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 计算机视觉-使用纹理内存进行图像缩放
+- en: 'We will be using image scaling as an example to demonstrate the use of texture
+    memory. An example of image scaling is shown in the following screenshot:'
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将使用图像缩放作为示例来演示纹理内存的使用。图像缩放的示例如下截图所示：
+- en: '![](img/fea97149-f4e0-4cad-b8a1-dfec2573fabc.png)'
+  id: totrans-160
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/fea97149-f4e0-4cad-b8a1-dfec2573fabc.png)'
+- en: Image scaling requires interpolation of an image pixel in 2 dimensions. Texture
+    provides both of these functionalities (interpolation and efficient access to
+    2D locality) which, if accessed by global memory directly, would result in unconcealed
+    memory access.
+  id: totrans-161
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 图像缩放需要在2维中插值图像像素。纹理提供了这两个功能（插值和对2D局部性的高效访问），如果直接通过全局内存访问，将导致内存访问不连续。
+- en: 'Configure your environment according to the following steps:'
+  id: totrans-162
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据以下步骤配置您的环境：
+- en: Prepare your GPU application. This code can be found at `02_memory_overview/03_image_scaling`.
+  id: totrans-163
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 准备您的GPU应用程序。此代码可以在`02_memory_overview/03_image_scaling`中找到。
+- en: 'Compile your application with the `nvcc` compiler with the following command:'
+  id: totrans-164
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用`nvcc`编译器编译您的应用程序，使用以下命令：
+- en: '[PRE11]'
+  id: totrans-165
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: The `scrImagePgmPpmPackage.cpp` file contains the source code for reading and
+    writing images with `.pgm` extensions. The texture code is present in `image_scaling.cu`.
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`scrImagePgmPpmPackage.cpp`文件包含了读取和写入`.pgm`扩展名图像的源代码。纹理代码位于`image_scaling.cu`中。'
+- en: For viewing the `pgm` files users can make use of viewers like IrfanView ([https://www.irfanview.com/main_download_engl.htm](https://www.irfanview.com/main_download_engl.htm))
+    which are free to use.
+  id: totrans-167
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 用户可以使用IrfanView（[https://www.irfanview.com/main_download_engl.htm](https://www.irfanview.com/main_download_engl.htm)）等查看器来查看`pgm`文件，这些查看器是免费使用的。
+- en: 'Primarily, there are four steps that are required so that we can make use of
+    texture memory:'
+  id: totrans-168
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 主要有四个步骤是必需的，以便我们可以使用纹理内存：
+- en: Declare the texture memory.
+  id: totrans-169
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 声明纹理内存。
+- en: Bind the texture memory to a texture reference.
+  id: totrans-170
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 将纹理内存绑定到纹理引用。
+- en: Read the texture memory using a texture reference in the CUDA kernel.
+  id: totrans-171
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在CUDA内核中使用纹理引用读取纹理内存。
+- en: Unbind the texture memory from your texture reference.
+  id: totrans-172
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 从纹理引用中解绑纹理内存。
+- en: 'The following code snippet shows the four steps we can use to make use of texture
+    memory. From the Kepler GPU architecture and CUDA 5.0 onward, a new feature called
+    bindless textures was introduced. This exposes texture objects, which is basically
+    a C++ object that can be passed to the CUDA kernel. They are referred to as bindless
+    as they don''t require manual binding/unbinding, which was the case for earlier
+    GPU and CUDA versions. Texture objects are declared using the `cudaTextureObject_t` class
+    API. Let''s go through these steps now:'
+  id: totrans-173
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下代码片段显示了我们可以使用的四个步骤来使用纹理内存。从Kepler GPU架构和CUDA 5.0开始，引入了一项名为无绑定纹理的新功能。这暴露了纹理对象，它基本上是一个可以传递给CUDA内核的C++对象。它们被称为无绑定，因为它们不需要手动绑定/解绑，这是早期GPU和CUDA版本的情况。纹理对象使用`cudaTextureObject_t`类API声明。现在让我们通过这些步骤：
+- en: 'First, declare the texture memory:'
+  id: totrans-174
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，声明纹理内存：
+- en: '[PRE12]'
+  id: totrans-175
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'Create a channel description, which will be used while we link to the texture:'
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 创建一个通道描述，我们在链接到纹理时将使用：
+- en: '[PRE13]'
+  id: totrans-177
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'Then, specify the texture object parameters:'
+  id: totrans-178
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后，指定纹理对象参数：
+- en: '[PRE14]'
+  id: totrans-179
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'Next, read the texture memory from your texture reference in the CUDA kernel:'
+  id: totrans-180
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，在CUDA内核中从纹理引用中读取纹理内存：
+- en: '[PRE15]'
+  id: totrans-181
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'Finally, destroy the texture object:'
+  id: totrans-182
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，销毁纹理对象：
+- en: '[PRE16]'
+  id: totrans-183
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'The important aspects of texture memory, which act like configurations and
+    are set by the developer, are as follows:'
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 纹理内存的重要方面，它们像配置一样由开发人员设置，如下所示：
+- en: '**Texture dimension:** This defines whether the texture is addressed as a 1D,
+    2D, or 3D array. Elements within a texture are also referred to as texels. The
+    depth, width, and height are also set to define each dimension. Note that each
+    GPU architecture defines the maximum size for each dimension that is acceptable.'
+  id: totrans-185
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**纹理维度：**这定义了纹理是作为1D、2D还是3D数组寻址。纹理中的元素也称为纹素。深度、宽度和高度也被设置以定义每个维度。请注意，每个GPU架构都定义了可接受的每个维度的最大尺寸。'
+- en: '**Texture type:** This defines the size in terms of whether it is a basic integer
+    or floating-point texel.'
+  id: totrans-186
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**纹理类型：**这定义了基本整数或浮点纹素的大小。'
+- en: '**Texture read mode:** Read mode for texture defines how the elements are read.
+    They can be either read in `NormalizedFloat` or `ModeElement` format. Normalized
+    float mode expects the index within a range of [0.0 1.0] and [-1.0 1.0] for unsigned
+    integer and signed integer types.'
+  id: totrans-187
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**纹理读取模式：**纹理的读取模式定义了元素的读取方式。它们可以以`NormalizedFloat`或`ModeElement`格式读取。标准化浮点模式期望在[0.0
+    1.0]和[-1.0 1.0]范围内的索引，对于无符号整数和有符号整数类型。'
+- en: '**Texture addressing mode:** One of the unique features of texture is how it
+    can address access that is out of range. This might sound unusual but, in fact,
+    is pretty common in many imaging algorithms. As an example, if you are applying
+    interpolation by averaging the neighboring pixels, what should be the behavior
+    for the boundary pixels? Texture provides this as an option to the developer so
+    that they can choose whether to treat out of range as clamped, wrapped, or mirrored.
+    In the resizing example, we have set it to clamp mode, which basically means that
+    out of range access is clamped to the boundary.'
+  id: totrans-188
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**纹理寻址模式：**纹理的一个独特特性是它如何寻址超出范围的访问。这听起来可能很不寻常，但实际上在许多图像算法中非常常见。例如，如果您正在通过平均相邻像素来应用插值，那么边界像素的行为应该是什么？纹理为开发人员提供了这个选项，以便他们可以选择将超出范围视为夹紧、包裹或镜像。在调整大小的示例中，我们已将其设置为夹紧模式，这基本上意味着超出范围的访问被夹紧到边界。'
+- en: '**Texture filtering mode:** Setting the mode defines how the return value is
+    computed when fetching the texture. Two types of filtering modes are supported: `cudaFilterModePoint` and `cudaFilterModeLinear`.
+    When set to linear mode, interpolation is possible (simple linear for 1D, bilinear
+    for 2D, and trilinear for 3D). Linear mode only works when the return type is
+    of the float type. `ModePoint`, on the other hand, does not perform interpolation
+    but returns a texel of the nearest coordinate.'
+  id: totrans-189
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**纹理过滤模式：**设置模式定义在获取纹理时如何计算返回值。支持两种类型的过滤模式：`cudaFilterModePoint`和`cudaFilterModeLinear`。当设置为线性模式时，可以进行插值（1D的简单线性，2D的双线性和3D的三线性）。仅当返回类型为浮点类型时，线性模式才有效。另一方面，`ModePoint`不执行插值，而是返回最近坐标的纹素。'
+- en: The key intention of introducing texture memory in this section is to provide
+    you with an example of its usage and to show you where texture memory is useful.
+    It provides a good overview of the different configuration parameters. Please
+    refer to the CUDA API guide ([https://docs.nvidia.com/cuda/cuda-runtime-api/index.html](https://docs.nvidia.com/cuda/cuda-runtime-api/index.html))
+    for more information.
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中引入纹理内存的关键目的是为您提供其用法的示例，并向您展示纹理内存的有用之处。它提供了不同配置参数的良好概述。有关更多信息，请参阅CUDA API指南（[https://docs.nvidia.com/cuda/cuda-runtime-api/index.html](https://docs.nvidia.com/cuda/cuda-runtime-api/index.html)）。
+- en: In this section, we described the purpose of using texture memory by the use
+    of an example. In the next section, we will look at the fastest (lowest latency)
+    available GPU memory (registers). This is present in abundance in GPU compared
+    to CPU.
+  id: totrans-191
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们通过示例描述了使用纹理内存的目的。在下一节中，我们将研究GPU内存中最快（最低延迟）的可用内存（寄存器）。与CPU相比，GPU中富裕地存在这种内存。
+- en: Registers in GPU
+  id: totrans-192
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: GPU中的寄存器
+- en: One of the fundamental differences between the CPU and GPU architectures is
+    the abundance of registers in GPU compared to CPU. This helps the threads to keep
+    most of their data in registers and hence reducing the latency of context switching.
+    Hence, it is also important to make this memory optimally.
+  id: totrans-193
+  prefs: []
+  type: TYPE_NORMAL
+  zh: CPU和GPU架构之间的一个基本区别是GPU中寄存器的丰富性相对于CPU。这有助于线程将大部分数据保存在寄存器中，从而减少上下文切换的延迟。因此，使这种内存达到最佳状态也很重要。
+- en: Registers have a scope of a single thread. A private copy of the variable is
+    created for all of the launched threads in the GRID. Each thread has access to
+    its private copy of the variable, while other thread's private variables cannot
+    be accessed. For example, if a kernel is launched with 1,000 threads, then a variable
+    whose scope is a thread gets its own copy of the variable.
+  id: totrans-194
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 寄存器的范围是单个线程。在GRID中为所有启动的线程创建变量的私有副本。每个线程都可以访问其变量的私有副本，而其他线程的私有变量则无法访问。例如，如果使用1,000个线程启动内核，那么作为线程范围的变量将获得其自己的变量副本。
+- en: Local variables that are declared as part of the kernel are stored in the registers.
+    Intermediate values are also stored in registers. Every SM has a fixed set of
+    registers. During compilation, a compiler (`nvcc`) tries to find the best number
+    of registers per thread. In case the number of registers falls short, which generally
+    happens when the CUDA kernel is large and has a lot of local variables and intermediate
+    calculations, the data gets pushed to local memory, which may reside either in
+    an L1/L2 cache or even lower in the memory hierarchy, such as global memory. This
+    is also referred to as register spills. The number of registers per thread plays
+    an important role in how many blocks and threads can be active on an SM. This
+    concept is covered in detail in the next chapter, which has a section dedicated
+    to occupancy. In general, it is recommended to not declare lots of unnecessary
+    local variables. If the registers are restricting the number of threads that can
+    be scheduled on an SM, then the developer should look at restructuring the code
+    by splitting the kernel into two—or more, if possible.
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作为内核的一部分声明的局部变量存储在寄存器中。中间值也存储在寄存器中。每个SM都有一组固定的寄存器。在编译期间，编译器（`nvcc`）尝试找到每个线程的最佳寄存器数量。如果寄存器数量不足，通常发生在CUDA内核较大且具有许多局部变量和中间计算时，数据将被推送到本地内存，该内存可以位于L1/L2缓存中，甚至更低的内存层次结构中，例如全局内存。这也被称为寄存器溢出。每个线程的寄存器数量在SM上可以激活多少个块和线程方面起着重要作用。这个概念在下一章中有详细介绍，该章节专门讨论了占用率。一般来说，建议不要声明大量不必要的局部变量。如果寄存器限制了可以在SM上调度的线程数量，那么开发人员应该考虑通过将内核拆分为两个或更多个（如果可能）来重新构建代码。
+- en: 'A variable that''s declared as part of the `vecAdd` kernel is stored in register
+    memory. The arguments that are passed to the kernel, that is, `A`, `B`, and `C`, point
+    to global memory, but the variable themselves are stored either in the shared
+    memory of registers based on the GPU architecture.The following diagram shows
+    the UDA memory hierarchy and the default locations of the different variable types:'
+  id: totrans-196
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作为`vecAdd`内核的一部分声明的变量存储在寄存器内存中。传递给内核的参数，即`A`、`B`和`C`，指向全局内存，但变量本身存储在基于GPU架构的共享内存或寄存器中。以下图显示了CUDA内存层次结构和不同变量类型的默认位置：
+- en: '![](img/4063603e-0e98-42d7-9a61-5353c9dfb82d.png)'
+  id: totrans-197
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/4063603e-0e98-42d7-9a61-5353c9dfb82d.png)'
+- en: So far, we have seen the purpose and optimal usage of the key memory hierarchy
+    (global, texture, shared, and registers). In the next section, we will look at
+    some of the optimizations and features of GPU memory that can improve the performance
+    of the application and increase the productivity of developers while they are
+    writing CUDA programs.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们已经看到了关键内存层次结构（全局、纹理、共享和寄存器）的目的和最佳用法。在下一节中，我们将看一些可以提高应用程序性能并增加开发人员在编写CUDA程序时的生产力的GPU内存的优化和特性。
+- en: Pinned memory
+  id: totrans-199
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 固定内存
+- en: It is time to recall the path that's taken by data, that is, from CPU memory
+    to the GPU registers, which are finally consumed by the GPU cores for computation.
+    Even though GPU has more compute performance and higher memory bandwidth, the
+    overall benefit of the speedup gained by the application can become normalized
+    due to the transfer between CPU memory and GPU memory. This transfer of data happens
+    via bus/links/protocols such as PCIe (in the case of CPU architectures from Intel
+    and AMD) or NVLink (for CPU architectures such as `power` from OpenPower Foundation).
+  id: totrans-200
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在是时候回想一下数据的路径，即从CPU内存到GPU寄存器，最终由GPU核心用于计算。尽管GPU具有更高的计算性能和更高的内存带宽，但由于CPU内存和GPU内存之间的传输，应用程序获得的加速效果可能会变得规范化。数据传输是通过总线/链接/协议进行的，例如PCIe（对于英特尔和AMD等CPU架构）或NVLink（对于OpenPower
+    Foundation的`power`等CPU架构）。
+- en: 'In order to overcome these bottlenecks, the following tricks/guidelines are
+    recommended:'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了克服这些瓶颈，建议采用以下技巧/指南：
+- en: First, it is recommended to minimize the amount of data that's transferred between
+    the host and device when possible. This may even mean to run a portion of sequential
+    code as a kernel on the GPU, thereby giving little or no speedup compared to running
+    them sequentially on the host CPU.
+  id: totrans-202
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 首先，建议在可能的情况下尽量减少主机和设备之间传输的数据量。这甚至可能意味着将顺序代码的一部分作为GPU上的内核运行，与在主机CPU上顺序运行相比，几乎没有或没有加速。
+- en: Second, it is important to achieve higher bandwidth between the host and the
+    device by making use of pinned memory.
+  id: totrans-203
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 其次，通过利用固定内存，重要的是在主机和设备之间实现更高的带宽。
+- en: It is advised to batch small transfers into one large transfer. This helps to
+    reduce the latency involved in calling the data transfer CUDA API, which may range
+    from a few microseconds to a few milliseconds based on the system's configuration.
+  id: totrans-204
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 建议将小的传输批量成一个大的传输。这有助于减少调用数据传输CUDA API所涉及的延迟，根据系统配置，这可能从几微秒到几毫秒不等。
+- en: Lastly, applications can make use of asynchronous data transfers to overlap
+    the kernel execution with data transfers.
+  id: totrans-205
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 最后，应用程序可以利用异步数据传输来重叠内核执行和数据传输。
+- en: We will be covering pinned memory transfer in more detail in this section. Asynchronous
+    transfers will be covered in more detail in [Chapter 4](449e8a0b-fb41-41b5-8b1d-9ab81fae16c5.xhtml), *Kernel
+    Execution Model and Optimization Strategies*, where we will make use of a concept
+    called CUDA streams.
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将在本节中更详细地介绍固定内存传输。异步传输将在[第4章](449e8a0b-fb41-41b5-8b1d-9ab81fae16c5.xhtml)中更详细地介绍，*内核执行模型和优化策略*，在那里我们将使用一个称为CUDA流的概念。
+- en: Bandwidth test – pinned versus pageable
+  id: totrans-207
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 带宽测试-固定与分页
+- en: By default, the memory allocation API known as `malloc()` allocates a memory
+    type that's pageable. What this means is that, if needed, the memory that is mapped
+    as pages can be swapped out by other applications or the OS itself. Hence, most
+    devices, including GPUs and others such as InfiniBand, which also sit on the PCIe
+    bus, expect the memory to be pinned before the transfer. By default, the GPU will
+    not access the pageable memory. Hence, when a transfer of memory is invoked, the
+    CUDA driver allocates the temporary pinned memory, copies the data from the default
+    pageable memory to this temporary pinned memory, and then transfers it to the
+    device via a **Device Memory Controller** (**DMA**).
+  id: totrans-208
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 默认情况下，称为`malloc()`的内存分配API分配的是可分页的内存类型。这意味着，如果需要，作为页面映射的内存可以被其他应用程序或操作系统本身交换出去。因此，大多数设备，包括GPU和其他设备（如InfiniBand等），也位于PCIe总线上，都希望在传输之前将内存固定。默认情况下，GPU将不访问可分页内存。因此，当调用内存传输时，CUDA驱动程序会分配临时固定内存，将数据从默认可分页内存复制到此临时固定内存，然后通过**设备内存控制器**（**DMA**）将其传输到设备。
+- en: This additional step not only adds latency but also has a chance to get the
+    page that was requested transferred to the GPU memory, which has been swapped
+    and needs to be brought back to GPU memory.
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个额外的步骤不仅会增加延迟，还有可能会将请求的页面传输到已经被交换并需要重新传输到GPU内存的GPU内存。
+- en: 'To understand the impact of making use of pinned memory, let''s try to compile
+    and run a piece of sample code. This has been provided as part of the CUDA samples.
+    Configure your environment according to the following steps:'
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了了解使用固定内存的影响，让我们尝试编译和运行一段示例代码。这已作为CUDA示例的一部分提供。根据以下步骤配置您的环境：
+- en: Prepare your GPU application. This code is present in`<CUDA_SAMPLES_DIR>/1_Utilities/bandwidthTest`.
+  id: totrans-211
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 准备您的GPU应用程序。此代码位于`<CUDA_SAMPLES_DIR>/1_Utilities/bandwidthTest`中。
+- en: Compile your application with the `make` command.
+  id: totrans-212
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用`make`命令编译您的应用程序。
+- en: 'Run the executable in two modes, that is, `pageable` and `pinned`, as follows:'
+  id: totrans-213
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 以`分页`和`固定`两种模式运行可执行文件，如下所示：
+- en: '[PRE17]'
+  id: totrans-214
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: Note that `CUDA_SAMPLES_DIR` is the path to the directory where the CUDA installation
+    has been placed.
+  id: totrans-215
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 注意，`CUDA_SAMPLES_DIR`是CUDA安装所在目录的路径。
+- en: 'As we can see, the key change, compared to the previous pieces of code, is
+    that we have written so far is a data allocation API. The following code snippet
+    shows the allocation of memory using the `cudaMallocHost` API instead of `malloc`:'
+  id: totrans-216
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们所看到的，与之前的代码相比，关键的变化是我们迄今为止编写的是数据分配API。以下代码片段显示了使用`cudaMallocHost` API而不是`malloc`来分配内存：
+- en: '[PRE18]'
+  id: totrans-217
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: The `cudaMallocHost` API makes the memory pinned memory instead of pageable
+    memory. While the allocation API has changed, we can still use the same data transfers
+    API, that is, `cudaMemcpy()`*. *Now, the important question is, *what is this
+    pinned memory and why does it provide better bandwidth? *We will cover this in
+    the next section.
+  id: totrans-218
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`cudaMallocHost` API使内存成为固定内存而不是分页内存。虽然分配API已更改，但我们仍然可以使用相同的数据传输API，即`cudaMemcpy()`。现在，重要的问题是，*固定内存是什么，为什么它提供更好的带宽？*我们将在下一节中介绍这个问题。'
+- en: The impact on performance can be seen from the output of the bandwidth test.
+    We have plotted the results in a graph so that you can easily understand the impact. The
+    *x* axis shows that data that was transferred in KB, while the *y* axis shows
+    the achieved bandwidth in MB/sec.
+  id: totrans-219
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 性能的影响可以从带宽测试的输出中看出。我们已经将结果绘制成图表，以便您可以轻松理解影响。*x*轴显示了以KB为单位传输的数据，而*y*轴显示了以MB/sec为单位的实现带宽。
+- en: 'The first graph is for **Host to Device** transfer, while the second graph
+    is for **Device to Host** transfers. The first thing you will see is that the
+    maximum bandwidth that can be achieved is ~12 GB/sec. PCIe Gen3''s theoretical
+    bandwidth is 16 GB/sec, but what''s achievable is in the range of 12 GB/sec. Achievable
+    bandwidth highly depends on the system (motherboard, CPU, PCIe topology, and so
+    on):'
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一个图是**主机到设备**的传输，而第二个图是**设备到主机**的传输。您将看到的第一件事是可实现的最大带宽约为12 GB/sec。PCIe Gen3的理论带宽为16
+    GB/sec，但实际可实现的范围在12 GB/sec左右。可实现的带宽高度取决于系统（主板、CPU、PCIe拓扑等）：
+- en: '![](img/e309df71-3726-487e-a095-dcdda648b79b.jpg)'
+  id: totrans-221
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/e309df71-3726-487e-a095-dcdda648b79b.jpg)'
+- en: As you can see, for pinned memory, bandwidth is always higher for the lower
+    transfer sizes while pageable memory bandwidth becomes equal at higher data size
+    transfers since the driver and DMA engine start optimizing the transfers by applying
+    concepts such as overlapping. As much as it is advised to make use of pinned memory,
+    there is a downside to overdoing it as well. Allocating the whole system memory
+    as pinned for the application(s) can reduce overall system performance. This happens
+    because it takes away the pages that are available for other application and operating
+    system tasks. The right size that should be pinned is very application and system-dependent
+    and there is no-off-the-shelf formula available for this. The best thing we can
+    do is test the application on the available system and choose the optimal performance
+    parameters.
+  id: totrans-222
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如您所见，对于固定内存，在较小的传输大小时带宽始终更高，而在可分页内存中，随着数据大小的增加，带宽变得相等，因为驱动程序和DMA引擎开始通过应用诸如重叠的概念来优化传输。尽管建议使用固定内存，但过度使用也有缺点。为应用程序分配整个系统内存作为固定内存可能会降低整体系统性能。这是因为它会占用其他应用程序和操作系统任务可用的页面。应该固定的正确大小非常依赖于应用程序和系统，并且没有通用的公式可用。我们能做的最好的事情是在可用系统上测试应用程序并选择最佳的性能参数。
+- en: Also, it is important to understand that new interconnects such as NVLink provide
+    higher bandwidth and lower latency for applications that are bound by these data
+    transfers. Currently, NVLink between CPU and GPU is only provided with the Power
+    CPU.
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，重要的是要了解新的互连技术，如NVLink，为受这些数据传输限制的应用程序提供了更高的带宽和更低的延迟。目前，CPU和GPU之间的NVLink仅与Power
+    CPU一起提供。
+- en: In this section, we looked at how to improve the data transfer speed between
+    CPU and GPU. We will now move on to making use of one of the new features of CUDA,
+    called unified memory, which has helped to improve the productivity of developers
+    writing CUDA programs.
+  id: totrans-224
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们将看看如何提高CPU和GPU之间的数据传输速度。现在我们将继续利用CUDA的一个新特性，称为统一内存，这有助于提高编写CUDA程序的开发人员的生产力。
+- en: Unified memory
+  id: totrans-225
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 统一内存
+- en: With every new CUDA and GPU architecture release, new features are added. These
+    new features provide more performance and ease of programming or allow developers
+    to implement new algorithms that otherwise weren't possible to port on GPUs using
+    CUDA. One such important feature that was released from CUDA 6.0 onward and finds
+    its implementation from the Kepler GPU architecture is unified memory. We will
+    refer to unified memory as UM in this chapter.
+  id: totrans-226
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 随着每一次新的CUDA和GPU架构发布，都会添加新的功能。这些新功能提供了更高的性能和更便捷的编程，或者允许开发人员实现新的算法，否则无法使用CUDA在GPU上进行移植。从CUDA
+    6.0开始发布的一个重要功能是统一内存，从Kepler GPU架构开始实现。在本章中，我们将统一内存称为UM。
+- en: 'In simpler words, UM provides the user with a view of single memory space that''s
+    accessible by all GPUs and CPUs in the system. This is illustrated in the following
+    diagram:'
+  id: totrans-227
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以更简单的话来说，UM为用户提供了一个单一内存空间的视图，所有GPU和CPU都可以访问该空间。下图对此进行了说明：
+- en: '![](img/768c31b3-add3-4a60-a38e-34966eb35f1b.jpg)'
+  id: totrans-228
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/768c31b3-add3-4a60-a38e-34966eb35f1b.jpg)'
+- en: In this section, we will cover how to make use of UM, optimize it, and highlight
+    the key advantages of making use of it. Like global memory access, if done in
+    an uncoalesced fashion, results in bad performance, the UM feature, if not used
+    in the right manner, will result in degradation in terms of the application's
+    overall performance. We will take a step-wise approach, starting with a simple
+    program, and build over it so that we can understand UM and its implication on
+    performance.
+  id: totrans-229
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们将介绍如何使用UM，优化它，并突出利用它的关键优势。与全局内存访问一样，如果以不连续的方式进行，会导致性能不佳，如果未正确使用UM功能，也会导致应用程序整体性能下降。我们将采取逐步的方法，从一个简单的程序开始，并在此基础上构建，以便我们可以理解UM及其对性能的影响。
+- en: 'Let''s try to compile and run some sample pieces of code. Configure your environment
+    according to the following steps:'
+  id: totrans-230
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们尝试编译和运行一些示例代码。根据以下步骤配置您的环境：
+- en: Prepare your GPU application. This code can be found in `02_memory_overview/unified_memory`.
+  id: totrans-231
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 准备您的GPU应用程序。此代码可以在`02_memory_overview/unified_memory`中找到。
+- en: 'Compile your application with the following `nvcc` command:'
+  id: totrans-232
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用以下`nvcc`命令编译您的应用程序：
+- en: '[PRE19]'
+  id: totrans-233
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: Please note that the results that are shown in this section are for the Tesla
+    P100 card. The same code, when run on other architectures such as Kepler, is expected
+    to give different results. The concentration of this section is on the latest
+    architectures, such as Pascal and Volta.
+  id: totrans-234
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，本节中显示的结果是针对Tesla P100卡的。当在其他架构（如Kepler）上运行相同的代码时，预计会产生不同的结果。本节的重点是最新的架构，如Pascal和Volta。
+- en: Understanding unified memory page allocation and transfer
+  id: totrans-235
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 了解统一内存页面分配和传输
+- en: 'Let''s start with the naive implementation of UM. The first piece of code, `unified_memory.cu`,
+    demonstrates the basic usage of this concept. The key change in the code is the
+    usage of the `cudaMallocManaged()` API instead of allocating the memory using
+    `malloc`, as shown in the following code snippet:'
+  id: totrans-236
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们从UM的朴素实现开始。代码的第一部分`unified_memory.cu`演示了这个概念的基本用法。代码中的关键更改是使用`cudaMallocManaged()`API来分配内存，而不是使用`malloc`，如下面的代码片段所示：
+- en: '[PRE20]'
+  id: totrans-237
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'If we look at the source code carefully, we will see that the `x` and `y` variables
+    are allocated only once and point to unified memory. The same pointer is being
+    sent to both the GPU `add<<<>>>()` kernel and used for initialization in the CPU
+    using the `for` loop. This makes things really simple for programmers as they
+    don''t need to keep track of whether the pointer is pointing to CPU memory or
+    GPU memory. But does it necessarily mean that we get good performance or transfer
+    speeds out of it? Not necessarily, so let''s try to dig deeper by profiling this
+    code, as shown in the following screenshot:'
+  id: totrans-238
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果我们仔细查看源代码，我们会发现`x`和`y`变量只被分配一次并指向统一内存。同一个指针被发送到GPU的`add<<<>>>()`内核，并且在CPU中使用`for`循环进行初始化。这对程序员来说非常简单，因为他们不需要跟踪指针是指向CPU内存还是GPU内存。但这是否意味着我们能获得良好的性能或传输速度呢？不一定，所以让我们尝试通过对这段代码进行性能分析来深入了解，如下面的屏幕截图所示：
+- en: '![](img/d9df1195-6123-4c69-bc00-fd5ef9fc642e.jpg)'
+  id: totrans-239
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/d9df1195-6123-4c69-bc00-fd5ef9fc642e.jpg)'
+- en: 'We used the following command to get the profiling output:'
+  id: totrans-240
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用以下命令来获取性能分析输出：
+- en: '[PRE21]'
+  id: totrans-241
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'As expected, most of the time is spent in the `add<<<>>>` kernel. Let''s try
+    to theoretically calculate the bandwidth. We will use the following formula to
+    calculate the bandwidth:'
+  id: totrans-242
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如预期的那样，大部分时间都花在了`add<<<>>>`内核上。让我们尝试理论计算带宽。我们将使用以下公式来计算带宽：
+- en: '*Bandwidth = Bytes / Seconds = (3 * 4,194,304 bytes * 1e-9 bytes/GB) / 2.6205e-3s
+    = 5 GB/s*'
+  id: totrans-243
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*带宽 = 字节/秒 = (3 * 4,194,304字节 * 1e-9字节/GB) / 2.6205e-3秒 = 5 GB/s*'
+- en: As you can see, P100 provides a theoretical bandwidth of 720 GB/s, while we
+    are able to achieve only 5 GB/s, which is really poor. You may be wondering why
+    were are only calculating the memory bandwidth. The reason for this is that the
+    application is memory-bound as it completes three memory operations and only one
+    addition. Therefore, it makes sense to concentrate on this aspect only.
+  id: totrans-244
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如您所见，P100提供了720 GB/s的理论带宽，而我们只能实现5 GB/s，这实在是太差了。您可能想知道为什么我们只计算内存带宽。这是因为应用程序受内存限制，因为它完成了三次内存操作和仅一次加法。因此，只集中在这个方面是有意义的。
+- en: From Pascal cards onward, `cudaMallocManaged()` does not allocate physical memory
+    but allocates memory based on a first-touch basis. If the GPU first touches the
+    variable, the page will be allocated and mapped in the GPU page table; otherwise,
+    if the CPU first touches the variable, it will be allocated and mapped to the
+    CPU. In our code, the `x` and `y` variables get used in the CPU for initialization.
+    Hence, the page is allocated to the CPU. In the `add<<<>>>` kernel, when these
+    variables are accessed, there is a page fault which occurs and the time of page
+    migration gets added to the kernel time. This is the fundamental reason why kernel
+    time is high. Now, let's dive deep into the steps for page migration.
+  id: totrans-245
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 从Pascal卡开始，`cudaMallocManaged()`不再分配物理内存，而是基于首次触摸的基础上分配内存。如果GPU首次触摸变量，页面将被分配并映射到GPU页表；否则，如果CPU首次触摸变量，它将被分配并映射到CPU。在我们的代码中，`x`和`y`变量在CPU中用于初始化。因此，页面被分配给CPU。在`add<<<>>>`内核中，当访问这些变量时，会发生页面错误，并且页面迁移的时间被添加到内核时间中。这是内核时间高的根本原因。现在，让我们深入了解页面迁移的步骤。
+- en: 'The sequence of operations that are completed in a page migration are as follows:'
+  id: totrans-246
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 页面迁移中完成的操作顺序如下：
+- en: 'First, we need to allocate new pages on the GPU and CPU (first-touch basis).
+    If the page is not present and mapped to another, a device page table page fault
+    occurs. When ***x**, which resides in **page 2**, is accessed in the GPU that
+    is currently mapped to CPU memory, it gets a page fault. Take a look at the following
+    diagram:'
+  id: totrans-247
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们需要在GPU和CPU上分配新页面（首次触摸）。如果页面不存在并且映射到另一个页面，会发生设备页表页错误。当在GPU中访问当前映射到CPU内存的**page
+    2**中的**x**时，会发生页面错误。请看下图：
+- en: '![](img/1870160e-d6f8-4d3a-92e4-ff861290d337.png)'
+  id: totrans-248
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/1870160e-d6f8-4d3a-92e4-ff861290d337.png)'
+- en: 'In the next step, the old page on the CPU is unmapped, as shown in the following
+    diagram:'
+  id: totrans-249
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，CPU上的旧页面被取消映射，如下图所示：
+- en: '![](img/8535b1f3-68ac-46a9-bc94-a6b16b9c50c1.jpg)'
+  id: totrans-250
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/8535b1f3-68ac-46a9-bc94-a6b16b9c50c1.jpg)'
+- en: 'Next, the data is copied from the CPU to the GPU, as shown in the following
+    diagram:'
+  id: totrans-251
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，数据从CPU复制到GPU，如下图所示：
+- en: '![](img/016530df-0a4d-4be0-a8b8-3fd2437925be.jpg)'
+  id: totrans-252
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/016530df-0a4d-4be0-a8b8-3fd2437925be.jpg)'
+- en: 'Finally, the new pages are mapped on the GPU, while the old pages are freed
+    on the CPU, as shown in the following diagram:'
+  id: totrans-253
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，新页面在GPU上映射，旧页面在CPU上释放，如下图所示：
+- en: '![](img/c0655a9b-0339-4ca4-a6a2-f39c32608523.jpg)'
+  id: totrans-254
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/c0655a9b-0339-4ca4-a6a2-f39c32608523.jpg)'
+- en: The **Translation Lookaside Buffer** (**TLB**) in GPU, much like in the CPU,
+    performs address translation from the physical address to the virtual address.
+    When a page fault occurs, the TLB for the respective SM is locked. This basically
+    means that the new instructions will be stalled until the time the preceding steps
+    are performed and finally unlock the TLB. This is necessary to maintain coherency
+    and maintain a consistent state of memory view within an SM. The driver is responsible
+    for removing these duplicates, updating the mapping, and transferring page data.
+    All of this time, as we mentioned earlier, is added to the overall kernel time.
+  id: totrans-255
+  prefs: []
+  type: TYPE_NORMAL
+  zh: GPU中的**转换后备缓冲器**（**TLB**）与CPU中的类似，执行从物理地址到虚拟地址的地址转换。当发生页面错误时，相应SM的TLB被锁定。这基本上意味着新指令将被暂停，直到执行前面的步骤并最终解锁TLB。这是为了保持一致性并在SM内维护内存视图的一致状态。驱动程序负责删除这些重复项，更新映射并传输页面数据。正如我们之前提到的，所有这些时间都被添加到总体内核时间中。
+- en: 'So, we know the problem now. What is the solution, though? To solve this problem,
+    we are going to make use of two approaches:'
+  id: totrans-256
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所以，我们现在知道问题所在。但解决方案是什么呢？为了解决这个问题，我们将采用两种方法：
+- en: First, we will create an initialization kernel on the GPU so that there are
+    no page faults during the `add<<<>>>` kernel run. Then, we will optimize the page
+    faults by making use of the warp per page concept.
+  id: totrans-257
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 首先，我们将在GPU上创建一个初始化内核，以便在`add<<<>>>`内核运行期间没有页面错误。然后，我们将通过利用每页的warp概念来优化页面错误。
+- en: We will prefetch the data.
+  id: totrans-258
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 我们将预取数据。
+- en: We will cover these methods in the next sections.
+  id: totrans-259
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将在接下来的部分中介绍这些方法。
+- en: Optimizing unified memory with warp per page
+  id: totrans-260
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用每页warp优化统一内存
+- en: 'Let''s start with the first approach, which is the initialization kernel. If
+    you take a look at the source code in the `unified_memory_initialized.cu` file,
+    we added a new kernel there named `init<<<>>>`, as shown in the following code:'
+  id: totrans-261
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们从第一种方法开始，即初始化内核。如果你看一下`unified_memory_initialized.cu`文件中的源代码，我们在那里添加了一个名为`init<<<>>>`的新内核，如下所示：
+- en: '[PRE22]'
+  id: totrans-262
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'By adding a kernel to initialize the array in the GPU itself, the pages are
+    allocated and mapped to the GPU memory as they are touched first in the `init<<<>>>`
+    kernel. Let''s look at the output of the profiling results for this code, where
+    profiling the output with the initialization kernel is shown:'
+  id: totrans-263
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过在GPU本身添加一个初始化数组的内核，页面在`init<<<>>>`内核中首次被触摸时被分配和映射到GPU内存。让我们来看看这段代码的性能分析结果输出，其中显示了初始化内核的性能分析输出：
+- en: '![](img/29bcc42e-cf74-4f62-98c5-f5c47a533c79.jpg)'
+  id: totrans-264
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/29bcc42e-cf74-4f62-98c5-f5c47a533c79.jpg)'
+- en: We used the following command to get the profiling output
+  id: totrans-265
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用以下命令获取了性能分析输出
+- en: '[PRE23]'
+  id: totrans-266
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'As you can see, the time of the `add<<<>>>` kernel was reduced to 18 μs. This
+    effectively gives us the following kernel bandwidth:'
+  id: totrans-267
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如你所看到的，`add<<<>>>`内核的时间减少到了18微秒。这有效地给了我们以下内核带宽：
+- en: '*Bandwidth = Bytes / Seconds = (3 * 4,194,304 bytes * 1e-9 bytes/GB) / 18.84e-6s
+    = 670 GB/s*'
+  id: totrans-268
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*带宽 = 字节/秒 = (3 * 4,194,304字节 * 1e-9字节/GB) / 18.84e-6秒 = 670 GB/s*'
+- en: 'This bandwidth is what you would expect in a non-unified memory scenario. As
+    we can see from the naive implementation in the preceding screenshot, there is
+    no host to device row in the profiling output. However, you might have seen that
+    even though the `add<<<>>>` kernel time has reduced, the `init<<<>>>` kernel has
+    not become the hotspot taking maximum time. This is because we touch the memory
+    for the first time in the `init<<<>>>` kernel. Also, you might be wondering what
+    these GPU fault groups are. As we discussed earlier, individual page faults may
+    be grouped together in groups to improve bandwidth based on heuristics, as well
+    as the access pattern. To dive further into this, let''s reprofile the code with
+    `--print-gpu-trace` so that we can see individual page faults. As you can see
+    the following screenshot, the GPU trace shows the overall trace of faults and
+    virtual addresses on which this fault happened:'
+  id: totrans-269
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个带宽是你在非统一内存场景中所期望的。正如我们从前面截图中的天真实现中所看到的，性能分析输出中没有主机到设备的行。然而，你可能已经注意到，即使`add<<<>>>`内核的时间已经减少，`init<<<>>>`内核也没有成为占用最长时间的热点。这是因为我们在`init<<<>>>`内核中首次触摸内存。此外，你可能想知道这些GPU错误组是什么。正如我们之前讨论的，个别页面错误可能会根据启发式规则和访问模式进行分组，以提高带宽。为了进一步深入了解这一点，让我们使用`--print-gpu-trace`重新对代码进行分析，以便我们可以看到个别页面错误。正如你从以下截图中所看到的，GPU跟踪显示了错误的整体跟踪和发生错误的虚拟地址：
+- en: '![](img/8c5e2708-82dc-44ee-a680-74bbd6a305e1.jpg)'
+  id: totrans-270
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/8c5e2708-82dc-44ee-a680-74bbd6a305e1.jpg)'
+- en: 'We used the following command to get the profiling output:'
+  id: totrans-271
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用以下命令获取了性能分析输出：
+- en: '[PRE24]'
+  id: totrans-272
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'The second row shows 11 page faults for the same page. As we discussed earlier,
+    the role of the driver is to filter these duplicate faults and transfer each page
+    just once. In a complicated access pattern, generally, the driver doesn''t have
+    enough information about what data can be migrated to the GPU. To improve this
+    scenario, we will further implement the warp per page concept, which basically
+    means that each warp will access elements that are in the same pages. This requires
+    additional effort from the developer. Let''s reimplement the `init<<<>>>` kernel.
+    You can see this implementation in the `unified_memory_64align.cu` file, which
+    we compiled earlier. The snapshot of the kernel is shown in the following code
+    snippet:'
+  id: totrans-273
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第二行显示了相同页面的11个页面错误。正如我们之前讨论的，驱动程序的作用是过滤这些重复的错误并只传输每个页面一次。在复杂的访问模式中，通常驱动程序没有足够的信息来确定哪些数据可以迁移到GPU。为了改善这种情况，我们将进一步实现每页warp的概念，这基本上意味着每个warp将访问位于相同页面中的元素。这需要开发人员额外的努力。让我们重新实现`init<<<>>>`内核。你可以在之前编译的`unified_memory_64align.cu`文件中看到这个实现。以下是内核的快照：
+- en: '[PRE25]'
+  id: totrans-274
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'The kernel shows that the indexing is based on `warp_id`. The warp size in
+    the GPU is 32 and is responsible for populating the `x` and `y` variables within
+    an index that has a range of 64 KB, that is, warp 1 is responsible for the first
+    64 KB, while warp 2 is responsible for the elements in the next 64 KB. Each thread
+    in a warp loops (the innermost `for` loop) to populate the index within the same
+    64 KB. Let''s look at the profiling results of this code. As we can see from the
+    profiling output in the following screenshot, the time for the `init<<<>>>` kernel
+    has reduced, and the GPU fault group has also considerably reduced:'
+  id: totrans-275
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该内核显示索引是基于`warp_id`。 GPU中的warp大小为32，负责填充具有64KB范围的索引中的`x`和`y`变量，也就是说，warp 1负责前64KB的部分，而warp
+    2负责接下来64KB的元素。warp中的每个线程循环（最内层的`for`循环）以填充相同64KB内的索引。让我们来看看这段代码的性能分析结果。正如我们从以下截图中的性能分析输出中所看到的，`init<<<>>>`内核的时间已经减少，GPU错误组也大大减少：
+- en: '![](img/3566af1c-8117-4300-a9ca-f6881d8e16f8.jpg)'
+  id: totrans-276
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/3566af1c-8117-4300-a9ca-f6881d8e16f8.jpg)'
+- en: 'We can reconfirm this by running the profiler with `--print-gpu-trace`:'
+  id: totrans-277
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以通过使用`--print-gpu-trace`运行分析器来重新确认这一点：
+- en: '[PRE26]'
+  id: totrans-278
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: 'The following screenshot clearly shows that the GPU page faults per page have
+    decreased:'
+  id: totrans-279
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下截图清楚地显示了GPU每页的页面错误已经减少：
+- en: '![](img/4a798b4b-3c10-4012-917a-edf54eab358a.jpg)'
+  id: totrans-280
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/4a798b4b-3c10-4012-917a-edf54eab358a.jpg)'
+- en: Optimizing unified memory using data prefetching
+  id: totrans-281
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 统一内存的优化使用数据预取
+- en: 'Now, let''s look at an easier method, called data prefetching. One key thing
+    about CUDA is that it provides different methods to the developer, starting from
+    the easiest ones to the ones that require ninja programming skills. **Data prefetching**
+    are basically hints to the driver to prefetch the data that we believe will be
+    used in the device prior to its use. CUDA provides a prefetching API called `cudaMemPrefetchAsync()`
+    for this purpose. To see its implementation, let''s look at the `unified_memory_prefetch.cu` file,
+    which we compiled earlier. A snapshot of this code is shown in the following code
+    snippet:'
+  id: totrans-282
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们看一个更简单的方法，称为数据预取。CUDA的一个关键特点是它为开发人员提供了不同的方法，从最简单的方法到需要忍者编程技能的方法。**数据预取**基本上是对驱动程序的提示，以在使用设备之前预取我们认为将在设备中使用的数据。CUDA为此目的提供了一个名为`cudaMemPrefetchAsync()`的预取API。要查看其实现，请查看我们之前编译的`unified_memory_prefetch.cu`文件。以下代码片段显示了此代码的快照：
+- en: '[PRE27]'
+  id: totrans-283
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'The code is quite simple and explains itself. The concept is fairly simple:
+    in the case where it is known what memory will be used on a particular device,
+    the memory can be prefetched. Let''s take a look at the profiling result, which
+    is shown in the following screenshot.'
+  id: totrans-284
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 代码非常简单，而且解释自己。概念相当简单：在已知将在特定设备上使用哪些内存的情况下，可以预取内存。让我们来看一下在以下截图中显示的分析结果。
+- en: 'As we can see, the `add<<<>>>` kernel provides the bandwidth that we expect
+    it to provide:'
+  id: totrans-285
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如我们所看到的，`add<<<>>>`内核提供了我们期望的带宽：
+- en: '![](img/5a07082c-4e58-4946-9ba6-764b41041553.jpg)'
+  id: totrans-286
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/5a07082c-4e58-4946-9ba6-764b41041553.jpg)'
+- en: Unified memory is an evolving feature and changes with every CUDA version and
+    GPU architecture release. It is expected that you keep yourself informed by accessing
+    the latest CUDA programming guide ([https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd)).
+  id: totrans-287
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 统一内存是一个不断发展的功能，随着每个CUDA版本和GPU架构的发布而发生变化。预计您通过访问最新的CUDA编程指南（[https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd)）来保持自己的信息。
+- en: So far, we have seen the usefulness of the UM concept, which not only provides
+    ease of programming (not explicitly managing memory using the CUDA API) but is
+    much more powerful and helpful when it comes to porting applications that were
+    otherwise either not possible to be ported on GPU or were too difficult to port. One
+    of the key advantages of using UM is over-subscription. GPU memory is quite limited
+    compared to CPU memory. The latest GPU (Volta card V100) provides 32 GB max per
+    GPU. With the help of UM, multiple pieces of GPU memory, along with CPU memory,
+    can be seen as one big memory. For example, the NVIDIA DGX2 machine, which has
+    a 16 Volta GPU of 323 GB, can be seen as a collection of GPU memory with a maximum
+    size of 512 GB. The advantages of these are enormous for applications such as **Computational
+    Fluid Dynamics** (**CFD**) and analytics. Previously, where it was difficult to
+    fit the problem size in GPU memory, it is now possible. Moving pieces by hand
+    is error-prone and requires tuning the memory size.
+  id: totrans-288
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们已经看到了UM概念的用处，它不仅提供了编程的便利（不需要使用CUDA API显式管理内存），而且在移植原本不可能移植到GPU上的应用程序或者原本移植困难的应用程序时更加强大和有用。使用UM的一个关键优势是超额订阅。与CPU内存相比，GPU内存非常有限。最新的GPU（Volta卡V100）每个GPU提供32GB的最大内存。借助UM，多个GPU内存片段以及CPU内存可以被视为一个大内存。例如，拥有16个Volta
+    GPU的NVIDIA DGX2机器，其内存大小为323GB，可以被视为具有最大512GB大小的GPU内存集合。这对于诸如计算流体动力学（CFD）和分析等应用程序来说是巨大的优势。以前，很难将问题大小适应GPU内存，现在却是可能的。手动移动片段容易出错，并且需要调整内存大小。
+- en: Also, the advent of high speed interconnects such as NVLink and NVSwitch allow
+    for fast transfer between GPU with high bandwidth and low latency. You can actually
+    get high performance with unified memory!
+  id: totrans-289
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，高速互连的出现，如NVLink和NVSwitch，允许GPU之间进行高带宽和低延迟的快速传输。您实际上可以通过统一内存获得高性能！
+- en: 'Data prefetching, combined with hints specifying where the data will actually
+    reside, is helpful for multiple processors that need to simultaneously access
+    the same data. The API name that''s used in this case is `cudaMemAdvice()`. Hence,
+    by knowing your application inside out, you can optimize the access by making
+    use of these hints. These are also useful if you wish to override some of the
+    driver heuristics. Some of the advice that''s currently being taken by the API
+    is as follows:'
+  id: totrans-290
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 数据预取，结合指定数据实际所在位置的提示，对于需要同时访问相同数据的多个处理器是有帮助的。在这种情况下使用的API名称是`cudaMemAdvice()`。因此，通过全面了解您的应用程序，您可以通过利用这些提示来优化访问。如果您希望覆盖某些驱动程序启发式方法，这些提示也是有用的。目前API正在采用的一些建议如下：
+- en: '`cudaMemAdviseSetReadMostly`: As the name suggests, this implies that the data
+    is mostly read-only. The driver creates a read-only copy of the data, resulting
+    in a reduction of the page fault. It is important to note that the data can still
+    be written to. In that case, the page copies become invalidated, except for the
+    device that wrote the memory:'
+  id: totrans-291
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`cudaMemAdviseSetReadMostly`：顾名思义，这意味着数据大部分是只读的。驱动程序会创建数据的只读副本，从而减少页面错误。重要的是要注意，数据仍然可以被写入。在这种情况下，页面副本将变得无效，除了写入内存的设备：'
+- en: '[PRE28]'
+  id: totrans-292
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: '`cudaMemAdviseSetPreferredLocation`: This advice sets the preferred location
+    for the data to be the memory belonging to the device. Setting the preferred location
+    does not cause data to migrate to that location immediately. Like in the following
+    code, `mykernel<<<>>>` will page fault and generate direct mapping to data on
+    the CPU. The driver tries to *resist* migrating data away from the set preferred
+    location using `cudaMemAdvise`:'
+  id: totrans-293
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`cudaMemAdviseSetPreferredLocation`：此建议将数据的首选位置设置为设备所属的内存。设置首选位置不会立即导致数据迁移到该位置。就像在以下代码中，`mykernel<<<>>>`将会出现页面错误并在CPU上生成数据的直接映射。驱动程序试图*抵制*将数据迁离设置的首选位置，使用`cudaMemAdvise`：'
+- en: '[PRE29]'
+  id: totrans-294
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: '`cudaMemAdviseSetAccessedBy`: This advice implies that the data will be accessed
+    by the device. The device will create a direct mapping of input in the CPU memory
+    and no page faults will be generated:'
+  id: totrans-295
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`cudaMemAdviseSetAccessedBy`：这个建议意味着数据将被设备访问。设备将在CPU内存中创建输入的直接映射，不会产生页面错误：'
+- en: '[PRE30]'
+  id: totrans-296
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: In the next section, we will use a holistic view to see how different memories
+    in GPU have evolved with the newer architecture.
+  id: totrans-297
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在接下来的部分，我们将以整体的视角来看GPU中不同的内存是如何随着新的架构而发展的。
+- en: GPU memory evolution
+  id: totrans-298
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: GPU内存的演变
+- en: 'GPU architectures have evolved over time and memory architectures have changed
+    considerably. If we take a look at the last four generations, there are some common
+    patterns which emerge, some of which are as follows:'
+  id: totrans-299
+  prefs: []
+  type: TYPE_NORMAL
+  zh: GPU架构随着时间的推移发生了变化，内存架构也发生了相当大的变化。如果我们看一下过去四代的情况，会发现一些共同的模式，其中一些如下：
+- en: The memory capacity, in general, has increased in levels.
+  id: totrans-300
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 内存容量总体上已经提高了几个级别。
+- en: The memory bandwidth and capacity have increased with new generation architectures.
+  id: totrans-301
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 内存带宽和容量随着新一代架构的出现而增加。
+- en: 'The following table shows the properties for the last four generations:'
+  id: totrans-302
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下表格显示了过去四代的属性：
+- en: '| **Memory type** | **Properties** | **Volta V100** | **Pascal P100** | **Maxwell
+    M60** | **Kepler K80** |'
+  id: totrans-303
+  prefs: []
+  type: TYPE_TB
+  zh: '| **内存类型** | **属性** | **Volta V100** | **Pascal P100** | **Maxwell M60** |
+    **Kepler K80** |'
+- en: '| **Register** | Size per SM | 256 KB | 256 KB | 256 KB | 256 KB |'
+  id: totrans-304
+  prefs: []
+  type: TYPE_TB
+  zh: '| **寄存器** | 每个SM的大小 | 256 KB | 256 KB | 256 KB | 256 KB |'
+- en: '| **L1** | Size | 32...128 KiB | 24 KiB | 24 KiB | 16...48 KiB |'
+  id: totrans-305
+  prefs: []
+  type: TYPE_TB
+  zh: '| **L1** | 大小 | 32...128 KiB | 24 KiB | 24 KiB | 16...48 KiB |'
+- en: '| Line size | 32 | 32 B | 32 B | 128 B |'
+  id: totrans-306
+  prefs: []
+  type: TYPE_TB
+  zh: '| 行大小 | 32 | 32 B | 32 B | 128 B |'
+- en: '| **L2** | Size | 6144 KiB | 4,096 KiB | 2,048 KiB | 1,536 Kib |'
+  id: totrans-307
+  prefs: []
+  type: TYPE_TB
+  zh: '| **L2** | 大小 | 6144 KiB | 4,096 KiB | 2,048 KiB | 1,536 Kib |'
+- en: '| Line size | 64 B | 32B | 32B | 32B |'
+  id: totrans-308
+  prefs: []
+  type: TYPE_TB
+  zh: '| 行大小 | 64 B | 32B | 32B | 32B |'
+- en: '| **Shared memory** | Size per SMX | Up to 96 KiB | 64 KiB | 64 KiB | 48 KiB
+    |'
+  id: totrans-309
+  prefs: []
+  type: TYPE_TB
+  zh: '| **共享内存** | 每个SMX的大小 | 高达96 KiB | 64 KiB | 64 KiB | 48 KiB |'
+- en: '| Size per GPU | up to 7,689 KiB | 3,584 KiB | 1,536 KiB | 624 KiB |'
+  id: totrans-310
+  prefs: []
+  type: TYPE_TB
+  zh: '| 每个GPU的大小 | 高达7,689 KiB | 3,584 KiB | 1,536 KiB | 624 KiB |'
+- en: '| Theoretical bandwidth | 13,800 GiB/s | 9,519 GiB/s | 2,410 GiB/s | 2,912
+    GiB/s |'
+  id: totrans-311
+  prefs: []
+  type: TYPE_TB
+  zh: '| 理论带宽 | 13,800 GiB/s | 9,519 GiB/s | 2,410 GiB/s | 2,912 GiB/s |'
+- en: '| **Global memory** | Memory bus | HBM2 | HBM2 | GDDR5 | GDDR5 |'
+  id: totrans-312
+  prefs: []
+  type: TYPE_TB
+  zh: '| **全局内存** | 内存总线 | HBM2 | HBM2 | GDDR5 | GDDR5 |'
+- en: '| Size | 32,152 MiB | 16,276 MiB | 8,155 MiB | 12,237 MiB |'
+  id: totrans-313
+  prefs: []
+  type: TYPE_TB
+  zh: '| 大小 | 32,152 MiB | 16,276 MiB | 8,155 MiB | 12,237 MiB |'
+- en: '| Theoretical bandwidth | 900 GiB/s | 732 GiB/s | 160 GiB/s | 240 GiB/s |'
+  id: totrans-314
+  prefs: []
+  type: TYPE_TB
+  zh: '| 理论带宽 | 900 GiB/s | 732 GiB/s | 160 GiB/s | 240 GiB/s |'
+- en: In general, the preceding observations have helped CUDA applications to run
+    faster with the newer architectures. But in parallel, some fundamental changes
+    were also brought to the CUDA programming model, as well as the memory architecture,
+    to make life easy for CUDA programmers. One such change we observed was for texture
+    memory where, prior to CUDA 5.0, the developer had to manually bind and unbind
+    the textures and had to be declared globally. With CUDA 5.0, it was not necessary
+    to do so. It also removed the restrictions on the number of texture references
+    a developer could have in an application.
+  id: totrans-315
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 总的来说，前面的观察结果已经帮助CUDA应用在新的架构下运行得更快。但与此同时，CUDA编程模型和内存架构也进行了一些根本性的改变，以便为CUDA程序员简化工作。我们观察到的一个这样的改变是纹理内存，之前在CUDA
+    5.0之前，开发人员必须手动绑定和解绑纹理，并且必须在全局声明。但在CUDA 5.0中，这是不必要的。它还取消了应用程序中开发人员可以拥有的纹理引用数量的限制。
+- en: 'We also looked at the Volta architecture and some of the fundamental changes
+    that were made to simplify programming for developers. The total capacity in Volta
+    is 128 KB/SM, which is seven times more than its previous generation card, Pascal
+    P100, which makes larger caches available for developers. Also, since the L1 cache
+    in the Volta architecture has much less latency due to unification, this makes
+    it a high-bandwidth and low-latency access to frequently reused data. The key
+    reason to do this is to allow L1 cache operations to attain the benefits of shared
+    memory performance. The key problem with shared memory is that it needs to be
+    explicitly controlled by developers. This becomes less necessary when working
+    with newer architectures such as Volta. This does not mean that shared memory
+    becomes redundant, however. Ninja programmers who want to extract every inch of
+    performance still prefer to use shared memory, but many other applications do
+    not require this expertise anymore. The difference between the Pascal and Volta
+    L1 cache and shared memory is shown in the following diagram:'
+  id: totrans-316
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '我们还研究了Volta架构以及为简化开发人员编程而进行的一些根本性改变。Volta的总容量是每个SM 128 KB，比其上一代显卡Pascal P100多了七倍，这为开发人员提供了更大的缓存。此外，由于Volta架构中L1缓存的延迟要小得多，这使得它对频繁重用的数据具有高带宽和低延迟的访问。这样做的关键原因是让L1缓存操作获得共享内存性能的好处。共享内存的关键问题是需要开发人员显式控制。在使用Volta等新架构时，这种需求就不那么必要了。但这并不意味着共享内存变得多余。一些极客程序员仍然希望充分利用共享内存的性能，但许多其他应用程序不再需要这种专业知识。Pascal和Volta
+    L1缓存和共享内存之间的区别如下图所示： '
+- en: '![](img/675c799b-6de1-445d-affd-9ddd781c90f8.jpg)'
+  id: totrans-317
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/675c799b-6de1-445d-affd-9ddd781c90f8.jpg)'
+- en: The preceding diagram shows the unification of shared memory and the L1 cache
+    compared to Pascal. It is important to understand that the CUDA programming model
+    has remained almost constant from its inception. Even though the memory's capacity,
+    bandwidth, or latency changes with every architecture, the same CUDA code will
+    run on all architectures. What will definitely change, though, is the impact of
+    performance in terms of these architectural changes. For example, an application
+    that made use of shared memory before Volta and used to see performance gain compared
+    to using global memory might not see such a speedup in Volta because of the unification
+    of L1 and shared memory.
+  id: totrans-318
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的图表显示了与Pascal相比共享内存和L1缓存的统一。重要的是要理解，CUDA编程模型从诞生以来几乎保持不变。尽管每个架构的内存容量、带宽或延迟都在变化，但相同的CUDA代码将在所有架构上运行。不过，随着这些架构变化，性能的影响肯定会发生变化。例如，在Volta之前利用共享内存的应用程序，与使用全局内存相比可能会看到性能提升，但在Volta中可能不会看到这样的加速，因为L1和共享内存的统一。
+- en: Why do GPUs have caches?
+  id: totrans-319
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 为什么GPU有缓存？
+- en: In this evolution process, it is also important to understand that CPU and GPU
+    caches are very different and serve a different purpose. As part of the CUDA architecture,
+    we usually launch hundreds to thousands of threads per SM. Tens of thousands of
+    threads share the L2 cache. So, L1 and L2 are small per thread. For example, at
+    2,048 threads/SM with 80 SM, each thread gets only 64 bytes at L1 and 38 Bytes
+    at L2 per thread. Caches in GPU cache common data that's accessed by many threads.
+    This is sometimes referred to as spatial locality. A typical example of this is
+    when accesses by threads are unaligned and irregular. The GPU cache can help to
+    reduce the effect of register spills and local memory since the CPU cache is primarily
+    for temporal locality.
+  id: totrans-320
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这个演变过程中，还很重要的一点是要理解CPU和GPU缓存是非常不同的，而且有不同的用途。作为CUDA架构的一部分，我们通常在每个SM上启动数百到数千个线程。数万个线程共享L2缓存。因此，L1和L2对每个线程来说都很小。例如，在每个SM上有2,048个线程，共有80个SM，每个线程只能获得64字节的L1缓存和38字节的L2缓存。GPU缓存中存储着许多线程访问的公共数据。这有时被称为空间局部性。一个典型的例子是当线程的访问是不对齐和不规则的时候。GPU缓存可以帮助减少寄存器溢出和局部内存的影响，因为CPU缓存主要用于时间局部性。
+- en: Summary
+  id: totrans-321
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: We started this chapter by providing an introduction to the different types
+    of GPU memory. We went into detail about the global, texture, and shared memories,
+    as well as registers. We also looked at what new features the GPU's memory evolution
+    has provided, such as unified memory, which helps to improve the programmer's
+    productivity. We saw how these features are implemented in the latest GPU architectures,
+    such as Pascal and Volta.
+  id: totrans-322
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在本章开始时介绍了不同类型的GPU内存。我们详细讨论了全局、纹理和共享内存，以及寄存器。我们还看了GPU内存演变提供了哪些新功能，例如统一内存，这有助于提高程序员的生产力。我们看到了这些功能在最新的GPU架构（如Pascal和Volta）中是如何实现的。
+- en: In the next chapter, we will go into the details of CUDA thread programming
+    and how to optimally launch different thread configurations to get the best performance
+    out of GPU hardware. We will also be introducing new CUDA Toolkit features such
+    as cooperative groups for flexible thread programming and multi-precision programming
+    on GPUs.
+  id: totrans-323
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，我们将深入讨论CUDA线程编程的细节，以及如何最优地启动不同的线程配置，以发挥GPU硬件的最佳性能。我们还将介绍新的CUDA Toolkit功能，例如用于灵活线程编程的协作组和GPU上的多精度编程。

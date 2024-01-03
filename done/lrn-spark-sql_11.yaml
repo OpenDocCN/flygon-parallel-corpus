@@ -1,0 +1,1554 @@
+- en: Tuning Spark SQL Components for Performance
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 调优Spark SQL组件以提高性能
+- en: In this chapter, we will focus on the performance tuning aspects of Spark SQL-based
+    components. The Spark SQL Catalyst optimizer is central to the efficient execution
+    of many, if not all, Spark applications, including **ML Pipelines**, **Structured
+    Streaming**, and **GraphFrames**-based applications. We will first explain the
+    key foundational aspects regarding serialization/deserialization using encoders and
+    the logical and physical plans associated with query executions, and then present
+    the details of the **cost-based optimization** (**CBO**) feature released in Spark
+    2.2\. Additionally, we will present some tips and tricks that developers can use
+    to improve the performance of their applications throughout the chapter.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将重点关注基于Spark SQL的组件的性能调优方面。Spark SQL Catalyst优化器是许多Spark应用程序（包括**ML Pipelines**、**Structured
+    Streaming**和**GraphFrames**）高效执行的核心。我们将首先解释与查询执行相关的序列化/反序列化使用编码器的逻辑和物理计划的关键基础方面，然后介绍Spark
+    2.2中发布的**基于成本的优化**（**CBO**）功能的详细信息。此外，我们将在整个章节中提供一些开发人员可以使用的技巧和窍门，以改善其应用程序的性能。
+- en: 'More specifically, in this chapter, you will learn the following:'
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 更具体地说，在本章中，您将学习以下内容：
+- en: Basic concepts essential to understanding performance tuning
+  id: totrans-3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 理解性能调优的基本概念
+- en: Understanding Spark internals that drives performance
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 理解驱动性能的Spark内部原理
+- en: Understanding cost-based optimizations
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 理解基于成本的优化
+- en: Understanding the performance impact of enabling whole-stage code generation
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 理解启用整体代码生成的性能影响
+- en: Introducing performance tuning in Spark SQL
+  id: totrans-7
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 介绍Spark SQL中的性能调优
+- en: 'Spark computations are typically in-memory and can be bottlenecked by the resources
+    in the cluster: CPU, network bandwidth, or memory. In addition, although the data
+    fits in memory, network bandwidth may be challenging.'
+  id: totrans-8
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark计算通常是内存中的，并且可能受到集群资源的限制：CPU、网络带宽或内存。此外，即使数据适合内存，网络带宽可能也是一个挑战。
+- en: Tuning Spark applications is a necessary step to reduce both the number and
+    size of data transfer over the network and/or reduce the overall memory footprint
+    of the computations.
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调优Spark应用程序是减少网络传输的数据数量和大小和/或减少计算的整体内存占用的必要步骤。
+- en: In this chapter, we will focus our attention on Spark SQL Catalyst because it
+    is key to deriving benefits from a whole set of application components.
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将把注意力集中在Spark SQL Catalyst上，因为它对从整套应用程序组件中获益至关重要。
+- en: 'Spark SQL is at the heart of major enhancements made to Spark recently, including
+    **ML Pipelines**, **Structured Streaming**, and **GraphFrames**. The following
+    figure illustrates the key role **Spark SQL** plays between the **Spark Core**
+    and the higher-level APIs built on top of it:'
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark SQL是最近对Spark进行的重大增强的核心，包括**ML Pipelines**、**Structured Streaming**和**GraphFrames**。下图说明了**Spark
+    SQL**在**Spark Core**和构建在其之上的高级API之间发挥的关键作用：
+- en: '![](img/00292.jpeg)'
+  id: totrans-12
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00292.jpeg)'
+- en: In the next several sections, we will cover the fundamental understanding required
+    for tuning Spark SQL applications. We will start with the **DataFrame/Dataset**
+    APIs.
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在接下来的几节中，我们将介绍调优Spark SQL应用程序所需的基本理解。我们将从**DataFrame/Dataset** API开始。
+- en: Understanding DataFrame/Dataset APIs
+  id: totrans-14
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 理解DataFrame/Dataset API
+- en: A **Dataset** is a strongly typed collection of domain-specific objects that
+    can be transformed parallelly, using functional or relational operations. Each
+    Dataset also has a view called a **DataFrame**, which is not strongly typed and
+    is essentially a Dataset of row objects.
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**数据集**是一种强类型的领域特定对象的集合，可以使用函数或关系操作并行转换。每个数据集还有一个称为**DataFrame**的视图，它不是强类型的，本质上是一组行对象的数据集。'
+- en: Spark SQL applies structured views to the data from different source systems
+    stored using different data formats. Structured APIs, such as the DataFrame/Dataset
+    API, allows developers to use a high-level API to write their programs. These
+    APIs allow them to focus on the "what" rather than the "how" of the data processing
+    required.
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark SQL将结构化视图应用于来自不同数据格式的不同源系统的数据。结构化API（如DataFrame/Dataset API）允许开发人员使用高级API编写程序。这些API允许他们专注于数据处理所需的“是什么”，而不是“如何”。
+- en: Even though applying a structure can limit what can be expressed, in practice,
+    structured APIs can accommodate the vast majority of computations required in
+    application development. Also, it is these very limitations (imposed by structured
+    APIs) that present several of the main optimization opportunities.
+  id: totrans-17
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽管应用结构可能会限制可以表达的内容，但实际上，结构化API可以容纳应用开发中所需的绝大多数计算。此外，正是这些由结构化API所施加的限制，提供了一些主要的优化机会。
+- en: In the next section, we will explore encoders and their role in efficient serialization
+    and deserialization.
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将探讨编码器及其在高效序列化和反序列化中的作用。
+- en: Optimizing data serialization
+  id: totrans-19
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 优化数据序列化
+- en: The **Encoder** is the fundamental concept in the **serialization** and **deserialization**
+    (**SerDe**) framework in Spark SQL 2.0\. Spark SQL uses the SerDe framework for
+    I/O resulting in greater time and space efficiencies. Datasets use a specialized
+    encoder to serialize the objects for processing or transmitting over the network
+    instead of using Java serialization or Kryo.
+  id: totrans-20
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 编码器是Spark SQL 2.0中**序列化**和**反序列化**（**SerDe**）框架中的基本概念。Spark SQL使用SerDe框架进行I/O，从而实现更高的时间和空间效率。数据集使用专门的编码器来序列化对象，以便在处理或通过网络传输时使用，而不是使用Java序列化或Kryo。
+- en: Encoders are required to support domain objects efficiently. These encoders
+    map the domain object type, `T`, to Spark's internal type system, and `Encoder
+    [T]` is used to convert objects or primitives of type `T` to and from Spark SQL's
+    internal binary row format representation (using Catalyst expressions and code
+    generation). The resulting binary structure often has a much lower memory footprint
+    and is optimized for efficiency in data processing (for example, in a columnar
+    format).
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 编码器需要有效地支持领域对象。这些编码器将领域对象类型`T`映射到Spark的内部类型系统，`Encoder [T]`用于将类型`T`的对象或原语转换为Spark
+    SQL的内部二进制行格式表示（使用Catalyst表达式和代码生成）。结果的二进制结构通常具有更低的内存占用，并且针对数据处理的效率进行了优化（例如，以列格式）。
+- en: Efficient serialization is key to achieving good performance in distributed
+    applications. Formats that are slow to serialize objects will significantly impact
+    the performance. Often, this will be the first thing you tune to optimize a Spark
+    application.
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 高效的序列化是实现分布式应用程序良好性能的关键。序列化对象速度慢的格式将显著影响性能。通常，这将是您调优以优化Spark应用程序的第一步。
+- en: Encoders are highly optimized and use runtime code generation to build custom
+    bytecode for serialization and deserialization. Additionally, they use a format
+    that allows Spark to perform many operations, such as filtering and sorting, without
+    requiring to be deserialized back to an object. As encoders know the schema of
+    the records, they can offer significantly faster serialization and deserialization
+    (compared to the default Java or Kryo serializers).
+  id: totrans-23
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 编码器经过高度优化，并使用运行时代码生成来构建用于序列化和反序列化的自定义字节码。此外，它们使用一种格式，允许Spark执行许多操作，如过滤和排序，而无需将其反序列化为对象。由于编码器知道记录的模式，它们可以提供显著更快的序列化和反序列化（与默认的Java或Kryo序列化器相比）。
+- en: In addition to speed, the resulting serialized size of encoder output can also
+    be significantly smaller, thereby reducing the cost of network transfers. Furthermore,
+    the serialized data is already in the Tungsten binary format, which means that
+    many operations can be executed in place, without needing to materialize the object.
+    Spark has built-in support for automatically generating encoders for primitive
+    types, such as String and Integer, and also case classes.
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除了速度之外，编码器输出的序列化大小也可以显著减小，从而降低网络传输的成本。此外，序列化数据已经是钨丝二进制格式，这意味着许多操作可以就地执行，而无需实例化对象。Spark内置支持自动生成原始类型（如String和Integer）和案例类的编码器。
+- en: Here, we present an example of creating a custom encoder for the Bid records
+    from [Chapter 1](part0022.html#KVCC0-e9cbc07f866e437b8aa14e841622275c)*, *Getting
+    Started with Spark SQL**. Note that the encoders for most common types are automatically
+    provided by importing `spark.implicits._`, and the default encoders are already
+    imported in Spark shell.
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们展示了从[第1章](part0022.html#KVCC0-e9cbc07f866e437b8aa14e841622275c)*，*Getting
+    Started with Spark SQL**中为Bid记录创建自定义编码器的示例。请注意，通过导入`spark.implicits._`，大多数常见类型的编码器都会自动提供，并且默认的编码器已经在Spark
+    shell中导入。
+- en: 'First, let''s import all the classes we need for the code in this chapter:'
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，让我们导入本章代码所需的所有类：
+- en: '[PRE0]'
+  id: totrans-27
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'Next, we will define a `case` class for our domain object for `Bid` records
+    in the input Dataset:'
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将为输入数据集中“Bid”记录的领域对象定义一个“case”类：
+- en: '[PRE1]'
+  id: totrans-29
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'Next, we will create an `Encoder` object using the `case` class from the preceding
+    step, as shown:'
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将使用上一步的“case”类创建一个“Encoder”对象，如下所示：
+- en: '[PRE2]'
+  id: totrans-31
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'The schema can be accessed using the schema property, as follows:'
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 可以使用schema属性访问模式，如下所示：
+- en: '[PRE3]'
+  id: totrans-33
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: 'We use the implementation of `ExpressionEncoder` (the only implementation of
+    an encoder trait available in Spark SQL 2), as illustrated:'
+  id: totrans-34
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用了`ExpressionEncoder`的实现（这是Spark SQL 2中唯一可用的编码器特性的实现）：
+- en: '[PRE4]'
+  id: totrans-35
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'Here are the serializer and the deserializer parts of the encoder:'
+  id: totrans-36
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是编码器的序列化器和反序列化器部分：
+- en: '[PRE5]'
+  id: totrans-37
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'Next, we will read in our input Dataset, as demonstrated:'
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将演示如何读取我们的输入数据集：
+- en: '[PRE6]'
+  id: totrans-39
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'We will then display a `Bid` record, as follows, from our newly created DataFrame:'
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们将从我们新创建的DataFrame中显示一个“Bid”记录，如下所示：
+- en: '[PRE7]'
+  id: totrans-41
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'For convenience, we can use the record from the preceding step to create a
+    new record as in the `Dataset[Bid]`:'
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了方便起见，我们可以使用上一步的记录创建一个新记录，如在“Dataset[Bid]”中：
+- en: '[PRE8]'
+  id: totrans-43
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'We will then serialize the record to the internal representation, as shown:'
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们将记录序列化为内部表示，如下所示：
+- en: '[PRE9]'
+  id: totrans-45
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'Spark uses `InternalRows` internally for I/O. So, we deserialize the bytes
+    to a JVM object, that is, a `Scala` object, as follows. However, we need to import
+    `Dsl` expressions, and explicitly specify `DslSymbol`, as there are competing
+    implicits in the Spark shell:'
+  id: totrans-46
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark在I/O中内部使用`InternalRows`。因此，我们将字节反序列化为JVM对象，即`Scala`对象，如下所示。但是，我们需要导入`Dsl`表达式，并明确指定`DslSymbol`，因为在Spark
+    shell中存在竞争的隐式：
+- en: '[PRE10]'
+  id: totrans-47
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'Here, we retrieve the serialized `Bid` object:'
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们检索序列化的“Bid”对象：
+- en: '[PRE11]'
+  id: totrans-49
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'We can verify that the two objects are the same, as shown:'
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以验证两个对象是否相同，如下所示：
+- en: '[PRE12]'
+  id: totrans-51
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: In the next section, we will shift our focus to Spark SQL's Catalyst optimizations.
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将把重点转移到Spark SQL的Catalyst优化。
+- en: Understanding Catalyst optimizations
+  id: totrans-53
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 理解Catalyst优化
+- en: We briefly explored the Catalyst optimizer in [Chapter 1](part0022.html#KVCC0-e9cbc07f866e437b8aa14e841622275c)*,
+    *Getting Started with Spark SQL**. Basically, Catalyst has an internal representation
+    of the user's program, called the **query plan**. A set of transformations is
+    executed on the initial query plan to yield the optimized query plan. Finally,
+    through Spark SQL's code generation mechanism, the optimized query plan gets converted
+    to a DAG of RDDs, ready for execution. At its core, the Catalyst optimizer defines
+    the abstractions of users' programs as trees and also the transformations from
+    one tree to another.
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们在[第1章](part0022.html#KVCC0-e9cbc07f866e437b8aa14e841622275c)* **使用Spark SQL入门**中简要探讨了Catalyst优化器。基本上，Catalyst具有用户程序的内部表示，称为**查询计划**。一组转换在初始查询计划上执行，以产生优化的查询计划。最后，通过Spark
+    SQL的代码生成机制，优化的查询计划转换为RDD的DAG，准备执行。在其核心，Catalyst优化器定义了用户程序的抽象为树，以及从一棵树到另一棵树的转换。
+- en: In order to take advantage of optimization opportunities, we need an optimizer
+    that automatically finds the most efficient plan to execute data operations (specified
+    in the user's program). In the context of this chapter, Spark SQL's Catalyst optimizer
+    acts as the interface between the user's high-level programming constructs and
+    the low-level execution plans.
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了利用优化机会，我们需要一个优化器，它可以自动找到执行数据操作的最有效计划（在用户程序中指定）。在本章的上下文中，Spark SQL的Catalyst优化器充当用户高级编程构造和低级执行计划之间的接口。
+- en: Understanding the Dataset/DataFrame API
+  id: totrans-56
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 理解数据集/DataFrame API
+- en: A Dataset or a DataFrame is typically created as a result of reading from a data
+    source or the execution of a query. Internally, queries are represented by trees
+    of operators, for example, logical and physical trees. Internally, a Dataset represents
+    a logical plan that describes the computation required to produce the data. When
+    an action is invoked, Spark's query optimizer optimizes the logical plan and generates
+    a physical plan for efficient execution in a parallel and distributed manner.
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 数据集或DataFrame通常是通过从数据源读取或执行查询而创建的。在内部，查询由运算符树表示，例如逻辑和物理树。数据集表示描述生成数据所需的逻辑计划。当调用动作时，Spark的查询优化器会优化逻辑计划，并生成用于并行和分布式执行的物理计划。
+- en: A query plan is used describe a data operation such as aggregate, join, or filter,
+    to generate a new Dataset using different kinds of input Datasets.
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查询计划用于描述数据操作，例如聚合、连接或过滤，以使用不同类型的输入数据集生成新的数据集。
+- en: The first kind of query plan is the logical plan, and it describes the computation
+    required on the Datasets without specifically defining the mechanism of conducting
+    the actual computation. It gives us an abstraction of the user's program and allows
+    us to freely transform the query plan, without worrying about the execution details.
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一种查询计划是逻辑计划，它描述了在数据集上所需的计算，而不具体定义实际计算的机制。它给我们提供了用户程序的抽象，并允许我们自由地转换查询计划，而不用担心执行细节。
+- en: A query plan is a part of Catalyst that models a tree of relational operators,
+    that is, a structured query. A query plan has a `statePrefix` that is used when
+    displaying a plan with `!` to indicate an invalid plan, and `'` to indicate an
+    unresolved plan. A query plan is invalid if there are missing input attributes
+    and children subnodes are non-empty, and it is unresolved if the column names
+    have not been verified and column types have not been looked up in the catalog.
+  id: totrans-60
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查询计划是Catalyst的一部分，它对关系运算符树进行建模，即结构化查询。查询计划具有`statePrefix`，在显示计划时使用`!`表示无效计划，使用`'`表示未解析计划。如果存在缺少的输入属性并且子节点非空，则查询计划无效；如果列名尚未经过验证并且列类型尚未在目录中查找，则查询计划未解析。
+- en: As a part of the optimizations, the Catalyst optimizer applies various rules
+    to manipulate these trees in phases. We can use the explain function to explore
+    the logical as well as the optimized physical plan.
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作为优化的一部分，Catalyst优化器应用各种规则来在阶段中操作这些树。我们可以使用explain函数来探索逻辑计划以及优化后的物理计划。
+- en: 'Now, we will present a simple example of three Datasets and display their optimization
+    plans using the `explain()` function:'
+  id: totrans-62
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，我们将以三个数据集的简单示例，并使用`explain()`函数显示它们的优化计划：
+- en: '[PRE13]'
+  id: totrans-63
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'Analyzed logical plans result from applying the Analyzer''s check rules on
+    the initial parsed plan. Analyzer is a logical query plan Analyzer in Spark SQL
+    that semantically validates and transforms an unresolved logical plan to an analyzed
+    logical plan (using logical evaluation rules):'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 分析逻辑计划是在初始解析计划上应用分析器的检查规则的结果。分析器是Spark SQL中的逻辑查询计划分析器，它在语义上验证和转换未解析的逻辑计划为分析的逻辑计划（使用逻辑评估规则）：
+- en: '[PRE14]'
+  id: totrans-65
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'Enable `TRACE` or `DEBUG` logging levels for the respective session-specific
+    loggers to see what happens inside the Analyzer. For example, add the following
+    line to `conf/log4j` properties:'
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 启用会话特定记录器的`TRACE`或`DEBUG`日志级别，以查看分析器内部发生的情况。例如，将以下行添加到`conf/log4j`属性中：
+- en: '[PRE15]'
+  id: totrans-67
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: The Analyzer is a Rule Executor that defines the logical plan evaluation rules
+    for resolving and modifying the same. It resolves unresolved relations and functions
+    using the session catalog. The optimization rules for fixed points and the one-pass
+    rules (the once strategy) in the batch are also defined here.
+  id: totrans-68
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 分析器是一个规则执行器，定义了解析和修改逻辑计划评估规则。它使用会话目录解析未解析的关系和函数。固定点的优化规则和批处理中的一次性规则（一次策略）也在这里定义。
+- en: 'In the logical plan optimization phase, the following set of actions is executed:'
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在逻辑计划优化阶段，执行以下一系列操作：
+- en: Rules convert logical plans into semantically equivalent ones for better performance
+  id: totrans-70
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 规则将逻辑计划转换为语义上等效的计划，以获得更好的性能
+- en: Heuristic rules are applied to push down predicated columns, remove unreferenced
+    columns, and so on
+  id: totrans-71
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 启发式规则用于推送下推断列，删除未引用的列等
+- en: Earlier rules enable the application of later rules; for example, merge query
+    blocks enable global join reorder
+  id: totrans-72
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 较早的规则使后续规则的应用成为可能；例如，合并查询块使全局连接重新排序
+- en: '`SparkPlan` is the Catalyst query plan for physical operators that are used
+    to build the physical query plan. Upon execution, the physical operators produce
+    RDDs of rows. The available logical plan optimizations can be extended and additional
+    rules can be registered as experimental methods.'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`SparkPlan`是用于构建物理查询计划的Catalyst查询计划的物理运算符。在执行时，物理运算符会产生行的RDD。可用的逻辑计划优化可以扩展，并且可以注册额外的规则作为实验方法。'
+- en: '[PRE16]'
+  id: totrans-74
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: Understanding Catalyst transformations
+  id: totrans-75
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 理解Catalyst转换
+- en: 'In this section, we will explore Catalyst transformations in detail. Transformations
+    in Spark are pure functions, that is, a tree is not mutated during the transformation
+    (instead, a new one is produced). In Catalyst, there are two kinds of transformations:'
+  id: totrans-76
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这一部分，我们将详细探讨Catalyst转换。在Spark中，转换是纯函数，也就是说，在转换过程中不会改变树的结构（而是生成一个新的树）。在Catalyst中，有两种类型的转换：
+- en: In the first type, the transformation does not change the type of the tree.
+    Using this transformation, we can transform an expression to another expression,
+    a logical plan to another logical plan, or a physical plan to another physical
+    plan.
+  id: totrans-77
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在第一种类型中，转换不会改变树的类型。使用这种转换，我们可以将一个表达式转换为另一个表达式，一个逻辑计划转换为另一个逻辑计划，或者一个物理计划转换为另一个物理计划。
+- en: The second type of transformation changes a tree from one kind of tree to another.
+    For example, this type of transformation is used to change a logical plan to a
+    physical plan.
+  id: totrans-78
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 第二种类型的转换将一个树从一种类型转换为另一种类型。例如，这种类型的转换用于将逻辑计划转换为物理计划。
+- en: A function (associated with a given tree) is used to implement a single rule.
+    For example, in expressions, this can be used for constant folding optimization.
+    A transformation is defined as a partial function. (Recall that a partial function
+    is a function that is defined for a subset of its possible arguments.) Typically,
+    case statements figure out whether a rule is triggered or not; for example, the
+    predicate filter is pushed below the `JOIN` node as it reduces the input size
+    of `JOIN`; this is called the **predicate pushdown**. Similarly, a projection
+    is performed only for the required columns used in the query. This way, we can
+    avoid reading unnecessary data.
+  id: totrans-79
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一个函数（与给定树相关联）用于实现单个规则。例如，在表达式中，这可以用于常量折叠优化。转换被定义为部分函数。（回想一下，部分函数是为其可能的参数子集定义的函数。）通常，case语句会判断规则是否被触发；例如，谓词过滤器被推到`JOIN`节点下面，因为它减少了`JOIN`的输入大小；这被称为**谓词下推**。类似地，投影仅针对查询中使用的所需列执行。这样，我们可以避免读取不必要的数据。
+- en: Often, we need to combine different types of transformation rule. A Rule Executor
+    is used to combine multiple rules. It transforms a tree to another tree of the
+    same type by applying many rules (defined in batches).
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通常，我们需要结合不同类型的转换规则。规则执行器用于组合多个规则。它通过应用许多规则（批处理中定义的）将一个树转换为相同类型的另一个树。
+- en: 'There are two approaches used for applying rules:'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有两种方法用于应用规则：
+- en: In the first approach, we apply the rule repeatedly until the tree does not
+    change any more (called the fixed point)
+  id: totrans-82
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在第一种方法中，我们重复应用规则，直到树不再发生变化（称为固定点）
+- en: In the second type, we apply all the rules in a batch, only once (the once strategy)
+  id: totrans-83
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在第二种类型中，我们一次批处理应用所有规则（一次策略）
+- en: 'Next, we look at the second type of transformation, in which we change from
+    one tree to another kind of tree: more specifically, how Spark transforms a logical
+    plan to a physical plan. A logical plan is transformed to a physical plan by applying
+    a set of strategies. Primarily, a pattern matching approach is taken for these
+    transformations. For example, a strategy converts the logical project node to
+    a physical project node, a logical Filter node to a physical Filter node, and
+    so on. A strategy may not be able to convert everything, so mechanisms are built-in
+    to trigger other strategies at specific points in the code (for example, the `planLater`
+    method).'
+  id: totrans-84
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将看看第二种类型的转换，即从一种树转换为另一种树：更具体地说，Spark如何将逻辑计划转换为物理计划。通过应用一组策略，可以将逻辑计划转换为物理计划。主要是采用模式匹配的方法进行这些转换。例如，一个策略将逻辑投影节点转换为物理投影节点，逻辑过滤节点转换为物理过滤节点，依此类推。策略可能无法转换所有内容，因此在代码的特定点内置了触发其他策略的机制（例如`planLater`方法）。
+- en: 'The optimization process comprises of three steps:'
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 优化过程包括三个步骤：
+- en: 'Analysis (Rule Executor): This transforms an unresolved logical plan to a resolved
+    logical plan. The unresolved to resolved state uses the Catalog to find where
+    Datasets and columns come from and the types of column.'
+  id: totrans-86
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 分析（规则执行器）：这将一个未解析的逻辑计划转换为已解析的逻辑计划。未解析到已解析的状态使用目录来查找数据集和列的来源以及列的类型。
+- en: 'Logical Optimization (Rule Executor): This transforms a resolved logical plan
+    to an optimized logical plan.'
+  id: totrans-87
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 逻辑优化（规则执行器）：这将一个已解析的逻辑计划转换为优化的逻辑计划。
+- en: 'Physical Planning (Strategies+Rule Executor): This consists of two phases:'
+  id: totrans-88
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 物理规划（策略+规则执行器）：包括两个阶段：
+- en: Transforms an optimized logical plan to a physical plan.
+  id: totrans-89
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 将优化的逻辑计划转换为物理计划。
+- en: Rule Executor is used to adjust the physical plan to make it ready for execution.
+    This includes how we shuffle the data and how we partition it.
+  id: totrans-90
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 规则执行器用于调整物理计划，使其准备好执行。这包括我们如何洗牌数据以及如何对其进行分区。
+- en: As shown in the following example, an expression represents a new value, and
+    it is computed based on its input values, for example, adding a constant to each
+    element within a column, such as `1 + t1.normal`. Similarly, an attribute is a
+    column in a Dataset (for example, `t1.id`) or a column generated by a specific
+    data operation, for example, v.
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如下例所示，表达式表示一个新值，并且它是基于其输入值计算的，例如，将一个常量添加到列中的每个元素，例如`1 + t1.normal`。类似地，属性是数据集中的一列（例如，`t1.id`）或者由特定数据操作生成的列，例如v。
+- en: The output has a list of attributes generated by this logical plan, for example,
+    id and v. The logical plan also has a set of invariants about the rows generated
+    by this plan, for example, `t2.id > 5000000`. Finally, we have statistics, the
+    size of the plan in rows/bytes, per column stats, for example, min, max, and the
+    number of distinct values, and the number of null values.
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输出中列出了由此逻辑计划生成的属性列表，例如id和v。逻辑计划还具有关于此计划生成的行的一组不变量，例如，`t2.id > 5000000`。最后，我们有统计信息，行/字节中计划的大小，每列统计信息，例如最小值、最大值和不同值的数量，以及空值的数量。
+- en: 'The second kind of query plan is the physical plan, and it describes the required
+    computations on Datasets with specific definitions on how to conduct the computations.
+    A physical plan is actually executable:'
+  id: totrans-93
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第二种查询计划是物理计划，它描述了对具有特定定义的数据集进行计算所需的计算。物理计划实际上是可执行的：
+- en: '[PRE17]'
+  id: totrans-94
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'All the plans for the preceding query are displayed in the following code block.
+    Note our annotations in the parsed logical plan, reflecting parts of the original
+    SQL query:'
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前述查询的所有计划都显示在以下代码块中。请注意我们在解析逻辑计划中的注释，反映了原始SQL查询的部分内容：
+- en: '[PRE18]'
+  id: totrans-96
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: You can use Catalyst's API to customize Spark to roll out your own planner rules.
+  id: totrans-97
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以使用Catalyst的API自定义Spark以推出自己的计划规则。
+- en: For more details on the Spark SQL Catalyst optimizer, refer to [https://spark-summit.org/2017/events/a-deep-dive-into-spark-sqls-catalyst-optimizer/](https://spark-summit.org/2017/events/a-deep-dive-into-spark-sqls-catalyst-optimizer/).
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关Spark SQL Catalyst优化器的更多详细信息，请参阅[https://spark-summit.org/2017/events/a-deep-dive-into-spark-sqls-catalyst-optimizer/](https://spark-summit.org/2017/events/a-deep-dive-into-spark-sqls-catalyst-optimizer/)。
+- en: Visualizing Spark application execution
+  id: totrans-99
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 可视化Spark应用程序执行
+- en: In this section, we will present the key details of the SparkUI interface, which
+    is indispensable for tuning tasks. There are several approaches to monitoring
+    Spark applications, for example, using web UIs, metrics, and external instrumentation.
+    The information displayed includes a list of scheduler stages and tasks, a summary
+    of RDD sizes and memory usage, environmental information, and information about
+    the running executors.
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们将介绍SparkUI界面的关键细节，这对于调整任务至关重要。监视Spark应用程序有几种方法，例如使用Web UI、指标和外部仪表。显示的信息包括调度器阶段和任务列表、RDD大小和内存使用摘要、环境信息以及有关正在运行的执行器的信息。
+- en: 'This interface can be accessed by simply opening `http://<driver-node>:4040`
+    (`http://localhost:4040`) in a web browser. Additional `SparkContexts` running
+    on the same host bind to successive ports: 4041, 4042, and so on.'
+  id: totrans-101
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 可以通过简单地在Web浏览器中打开`http://<driver-node>:4040`（`http://localhost:4040`）来访问此界面。在同一主机上运行的其他`SparkContexts`绑定到连续的端口：4041、4042等。
+- en: For a more detailed coverage of monitoring and instrumentation in Spark, refer
+    to [https://spark.apache.org/docs/latest/monitoring.html](https://spark.apache.org/docs/latest/monitoring.html).
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关Spark监控和仪表的更详细覆盖范围，请参阅[https://spark.apache.org/docs/latest/monitoring.html](https://spark.apache.org/docs/latest/monitoring.html)。
+- en: 'We will explore Spark SQL execution visually using two examples. First, we
+    create the two sets of Datasets. The difference between the first set (`t1`, `t2`,
+    and `t3`) and the second set (`t4`, `t5`, and `t6`) of `Dataset[Long]` is the
+    size:'
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将使用两个示例可视化地探索Spark SQL执行。首先，我们创建两组数据集。第一组（`t1`、`t2`和`t3`）与第二组（`t4`、`t5`和`t6`）的`Dataset[Long]`之间的区别在于大小：
+- en: '[PRE19]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'We will execute the following `JOIN` query against two sets of Datasets to
+    visualize the Spark jobs information in the SparkUI dashboard:'
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将执行以下`JOIN`查询，针对两组数据集，以可视化SparkUI仪表板中的Spark作业信息：
+- en: '[PRE20]'
+  id: totrans-106
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'The following screenshot displays the event timeline:'
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下屏幕截图显示了事件时间轴：
+- en: '![](img/00293.jpeg)'
+  id: totrans-108
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00293.jpeg)'
+- en: 'The generated **DAG Visualization** with the stages and the shuffles (**Exchange**)
+    is shown next:'
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 生成的**DAG可视化**显示了阶段和洗牌（**Exchange**）：
+- en: '![](img/00294.jpeg)'
+  id: totrans-110
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00294.jpeg)'
+- en: 'A summary of the job, including execution duration, successful tasks, and the
+    total number of tasks, and so on, is displayed here:'
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作业摘要，包括执行持续时间、成功任务和总任务数等，显示在此处：
+- en: '![](img/00295.jpeg)'
+  id: totrans-112
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00295.jpeg)'
+- en: 'Click on the SQL tab to see the detailed execution flow, as demonstrated:'
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 单击SQL选项卡以查看详细的执行流程，如下所示：
+- en: '![](img/00296.jpeg)'
+  id: totrans-114
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00296.jpeg)'
+- en: 'Next, we will run the same queries on the set of larger Datasets. Note that
+    the `BroadcastHashJoin` in the first example now changes to `SortMergeJoin` due
+    to the increased size of the input Datasets:'
+  id: totrans-115
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们将在更大的数据集上运行相同的查询。请注意，由于输入数据集的增加，第一个示例中的`BroadcastHashJoin`现在变为`SortMergeJoin`：
+- en: '[PRE21]'
+  id: totrans-116
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'The execution DAG is shown in the following figure:'
+  id: totrans-117
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 执行DAG如下图所示：
+- en: '![](img/00297.jpeg)'
+  id: totrans-118
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00297.jpeg)'
+- en: 'The job execution summary is, as shown:'
+  id: totrans-119
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作业执行摘要如下所示：
+- en: '![](img/00298.jpeg)'
+  id: totrans-120
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00298.jpeg)'
+- en: 'The SQL execution details are shown in the following figure:'
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: SQL执行详细信息如下图所示：
+- en: '![](img/00299.jpeg)'
+  id: totrans-122
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00299.jpeg)'
+- en: In addition to displaying in the UI, metrics are also available as JSON data.
+    This gives developers a good way to create new visualizations and monitoring tools
+    for Spark. The REST endpoints are mounted at `/api/v1`; for example, they would
+    typically be accessible at `http://localhost:4040/api/v1`. These endpoints have
+    been strongly versioned to make it easier to develop applications using them.
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除了在UI中显示，指标也可用作JSON数据。这为开发人员提供了一个很好的方式来为Spark创建新的可视化和监控工具。REST端点挂载在`/api/v1`；例如，它们通常可以在`http://localhost:4040/api/v1`上访问。这些端点已经强烈版本化，以便更容易地使用它们开发应用程序。
+- en: Exploring Spark application execution metrics
+  id: totrans-124
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 探索Spark应用程序执行指标
+- en: Spark has a configurable metrics system based on the `Dropwizard Metrics` library.
+    This allows users to report Spark metrics to a variety of sinks, including `HTTP`,
+    `JMX`, and `CSV` files. Spark's metrics corresponding to Spark components include
+    the Spark standalone master process, applications within the master that report
+    on various applications, a Spark standalone worker process, Spark executor, the
+    Spark driver process, and the Spark shuffle service.
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark具有基于`Dropwizard Metrics`库的可配置度量系统。这允许用户将Spark指标报告给各种接收器，包括`HTTP`，`JMX`和`CSV`文件。与Spark组件对应的Spark指标包括Spark独立主进程，主进程中报告各种应用程序的应用程序，Spark独立工作进程，Spark执行程序，Spark驱动程序进程和Spark洗牌服务。
+- en: 'The next series of screenshots contain details, including summary metrics and
+    the aggregated metrics by executors for one of the stages of the JOIN query against
+    the larger Datasets:'
+  id: totrans-126
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一系列的屏幕截图包含详细信息，包括摘要指标和针对较大数据集的JOIN查询的一个阶段的执行程序的聚合指标：
+- en: '![](img/00300.jpeg)'
+  id: totrans-127
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00300.jpeg)'
+- en: 'The summary metrics for the completed tasks is, as shown:'
+  id: totrans-128
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 已完成任务的摘要指标如下所示：
+- en: '![](img/00301.jpeg)'
+  id: totrans-129
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00301.jpeg)'
+- en: 'The aggregated metrics by Executor is, as shown:'
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 按执行程序聚合的指标如下所示：
+- en: '![](img/00302.jpeg)'
+  id: totrans-131
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00302.jpeg)'
+- en: Using external tools for performance tuning
+  id: totrans-132
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用外部工具进行性能调优
+- en: External monitoring tools are often used to profile the performance of Spark
+    jobs in large-sized `Spark clusters`. For example, Ganglia can provide an insight
+    into overall cluster utilization and resource bottlenecks. Additionally, the `OS
+    profiling` tools and `JVM` utilities can provide fine-grained profiling on individual
+    nodes and for working with `JVM` internals, respectively.
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通常使用外部监视工具来分析大型`Spark集群`中Spark作业的性能。例如，Ganglia可以提供有关整体集群利用率和资源瓶颈的见解。此外，`OS profiling`工具和`JVM`实用程序可以提供有关单个节点的细粒度分析和用于处理`JVM`内部的工具。
+- en: For more details on visualizing Spark application execution, refer to [https://databricks.com/blog/2015/06/22/understanding-your-spark-application-through-visualization.html](https://databricks.com/blog/2015/06/22/understanding-your-spark-application-through-visualization.html).
+  id: totrans-134
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关可视化Spark应用程序执行的更多详细信息，请参阅[https://databricks.com/blog/2015/06/22/understanding-your-spark-application-through-visualization.html](https://databricks.com/blog/2015/06/22/understanding-your-spark-application-through-visualization.html)。
+- en: In the next section, we will shift our focus to the new cost-based optimizer
+    released in Spark 2.2.
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将把焦点转移到Spark 2.2中发布的新成本优化器。
+- en: Cost-based optimizer in Apache Spark 2.2
+  id: totrans-136
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: Apache Spark 2.2中的成本优化器
+- en: 'In Spark, the optimizer''s goal is to minimize end-to-end query response time.
+    It is based on two key ideas:'
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在Spark中，优化器的目标是最小化端到端查询响应时间。它基于两个关键思想：
+- en: Pruning unnecessary data as early as possible, for example, filter pushdown
+    and column pruning.
+  id: totrans-138
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽早剪枝不必要的数据，例如，过滤器下推和列修剪。
+- en: Minimizing per-operator cost, for example, broadcast versus shuffle and optimal
+    join order.
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最小化每个操作员的成本，例如广播与洗牌和最佳连接顺序。
+- en: Till Spark 2.1, Catalyst was essentially a rule-based optimizer. Most Spark
+    SQL optimizer rules are heuristic rules: `PushDownPredicate`, `ColumnPruning`,
+    `ConstantFolding`, and so on. They do not consider the cost of each operator or
+    selectivity when estimating `JOIN` relation sizes. Therefore, the `JOIN` order
+    is mostly decided by its position in `SQL queries` and the physical join implementation
+    is decided based on heuristics. This can lead to suboptimal plans being generated.
+    However, if the cardinalities are known in advance, more efficient queries can
+    be obtained. The goal of the CBO optimizer is to do exactly that, automatically.
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 直到Spark 2.1，Catalyst本质上是一个基于规则的优化器。大多数Spark SQL优化器规则都是启发式规则：`PushDownPredicate`，`ColumnPruning`，`ConstantFolding`等。它们在估计`JOIN`关系大小时不考虑每个操作员的成本或选择性。因此，`JOIN`顺序大多由其在`SQL查询`中的位置决定，并且基于启发式规则决定物理连接实现。这可能导致生成次优计划。然而，如果基数事先已知，就可以获得更有效的查询。CBO优化器的目标正是自动执行这一点。
+- en: Huawei implemented the CBO in Spark SQL initially; after they open sourced their
+    work, many other contributors, including Databricks, worked to finish its first
+    version. The CBO-related changes to Spark SQL, specifically the major entry points
+    into Spark SQL's data structure and workflow, have been designed and implemented
+    in a non-intrusive manner.
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 华为最初在Spark SQL中实施了CBO；在他们开源了他们的工作之后，包括Databricks在内的许多其他贡献者致力于完成其第一个版本。与Spark
+    SQL相关的CBO更改，特别是进入Spark SQL数据结构和工作流的主要入口点，已经以一种非侵入性的方式进行了设计和实施。
+- en: A configuration parameter, `spark.sql.cbo`, can be used to enable/disable this
+    feature. Currently (in Spark 2.2), the default value is false.
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 配置参数`spark.sql.cbo`可用于启用/禁用此功能。目前（在Spark 2.2中），默认值为false。
+- en: For more details, refer to Huawei's design document available at [https://issues.apache.org/jira/browse/SPARK-16026](https://issues.apache.org/jira/browse/SPARK-16026).
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关更多详细信息，请参阅华为的设计文档，网址为[https://issues.apache.org/jira/browse/SPARK-16026](https://issues.apache.org/jira/browse/SPARK-16026)。
+- en: Spark SQL's Catalyst optimizer has many rule-based optimization techniques implemented,
+    for example, predicate pushdown to reduce the number of the qualifying records
+    before a join operation is performed, and project pruning to reduce the number
+    of the participating columns before further processing. However, without detailed
+    column statistical information on data distribution, it is difficult to accurately
+    estimate the filter factor and cardinality, and thus the output size of a database
+    operator. With inaccurate and/or misleading statistics, the optimizer can end
+    up choosing suboptimal query execution plans.
+  id: totrans-144
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark SQL的Catalyst优化器实施了许多基于规则的优化技术，例如谓词下推以减少连接操作执行之前的符合记录数量，以及项目修剪以减少进一步处理之前参与的列数量。然而，如果没有关于数据分布的详细列统计信息，就很难准确估计过滤因子和基数，从而难以准确估计数据库操作员的输出大小。使用不准确和/或误导性的统计信息，优化器最终可能会选择次优的查询执行计划。
+- en: In order to improve the quality of query execution plans, the Spark SQL optimizer
+    has been enhanced with detailed statistical information. A better estimate of
+    the number of output records and the output size (for each database operator)
+    helps the optimizer choose a better query plan. The CBO implementation collects,
+    infers, and propagates `table / column` statistics on `source / intermediate`
+    data. The query tree is annotated with these statistics. Furthermore, it also
+    calculates the cost of each operator in terms of the number of output rows, the
+    output size, and so on. Based on these cost calculations, it picks the most optimal
+    query execution plan.
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了改进查询执行计划的质量，Spark SQL优化器已经增强了详细的统计信息。更好地估计输出记录的数量和输出大小（对于每个数据库运算符）有助于优化器选择更好的查询计划。CBO实现收集、推断和传播`源/中间`数据的`表/列`统计信息。查询树被注释了这些统计信息。此外，它还计算每个运算符的成本，例如输出行数、输出大小等。基于这些成本计算，它选择最优的查询执行计划。
+- en: Understanding the CBO statistics collection
+  id: totrans-146
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 了解CBO统计收集
+- en: The `Statistics` class is the key data structure holding statistics information.
+    This data structure is referenced when we execute statistics collection SQL statements
+    to save information into the system catalog. This data structure is also referenced
+    when we fetch statistics information from the system catalog to optimize a query
+    plan.
+  id: totrans-147
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`Statistics`类是保存统计信息的关键数据结构。当我们执行统计收集SQL语句以将信息保存到系统目录中时，会引用这个数据结构。当我们从系统目录中获取统计信息以优化查询计划时，也会引用这个数据结构。'
+- en: 'CBO relies on detailed statistic to optimize a query execution plan. The following
+    SQL statement can be used to collect `table-level` statistics, such as the number
+    of rows, number of files (or HDFS data blocks), and table size (in bytes). It
+    collects `table-level` statistics and saves them in the `meta-store`. Before 2.2,
+    we only had the table size and not the number of rows:'
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: CBO依赖于详细的统计信息来优化查询执行计划。以下SQL语句可用于收集`表级`统计信息，例如行数、文件数（或HDFS数据块数）和表大小（以字节为单位）。它收集`表级`统计信息并将其保存在`元数据存储`中。在2.2版本之前，我们只有表大小，而没有行数：
+- en: '[PRE22]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'Similarly, the following SQL statement can be used to collect column level
+    statistics for the specified columns. The collected information includes the maximal
+    column value, minimal column value, number of distinct values, number of null
+    values, and so on. It collects column level statistics and saves them in the `meta-store`.
+    Typically, it is executed only for columns in the `WHERE` and the `GROUP BY` clauses:'
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 类似地，以下SQL语句可用于收集指定列的列级统计信息。收集的信息包括最大列值、最小列值、不同值的数量、空值的数量等。它收集列级统计信息并将其保存在`元数据存储`中。通常，它仅针对`WHERE`和`GROUP
+    BY`子句中的列执行：
+- en: '[PRE23]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'The given SQL statement displays the metadata, including table level statistics
+    of a table in an extended format:'
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 给定的SQL语句以扩展格式显示表的元数据，包括表级统计信息：
+- en: '[PRE24]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'The `customers` table is created in a later section of this chapter:'
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`customers`表是在本章的后面部分创建的：'
+- en: '[PRE25]'
+  id: totrans-155
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'The following SQL statement can be used to display statistics in the optimized
+    logical plan:'
+  id: totrans-156
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下SQL语句可用于显示优化后的逻辑计划中的统计信息：
+- en: '[PRE26]'
+  id: totrans-157
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: Statistics collection functions
+  id: totrans-158
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 统计收集函数
+- en: Statistics are collected using a set of functions, for example, the row count
+    is actually obtained by running a SQL statement, such as `select count(1) from
+    table_name`. Using SQL statement to get row count is fast as we are leveraging
+    Spark SQL's execution parallelism. Similarly, the `analyzeColumns` function gets
+    the basic statistics information for a given column. The basic statistics, such
+    as `max`, `min`, and `number-of-distinct-values`, are also obtained by running
+    SQL statements.
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 统计信息是使用一组函数收集的，例如，行数实际上是通过运行SQL语句获得的，例如`select count(1) from table_name`。使用SQL语句获取行数是快速的，因为我们利用了Spark
+    SQL的执行并行性。类似地，`analyzeColumns`函数获取给定列的基本统计信息。基本统计信息，如`最大值`、`最小值`和`不同值的数量`，也是通过运行SQL语句获得的。
+- en: Filter operator
+  id: totrans-160
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 过滤运算符
+- en: A filter condition is the predicate expression specified in the `WHERE` clause
+    of a SQL select statement. The predicate expression can be quite complex when
+    we evaluate the overall filter factor.
+  id: totrans-161
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 过滤条件是SQL select语句的`WHERE`子句中指定的谓词表达式。当我们评估整体过滤因子时，谓词表达式可能非常复杂。
+- en: There are several operators for which the filter cardinality estimation is executed,
+    for example, between the `AND`, `OR`, and `NOT` logical expressions, and also
+    for logical expressions such as `=`, `<`, `<=`, `>`, `>=`, and `in`.
+  id: totrans-162
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有几个运算符执行过滤基数估计，例如，在`AND`、`OR`和`NOT`逻辑表达式之间，以及逻辑表达式如`=`、`<`、`<=`、`>`、`>=`和`in`。
+- en: For the filter operator, our goal is to compute the filter to find out the portion
+    of the previous (or child) operator's output after applying the filter condition.
+    A filter factor is a double number between `0.0` and `1.0`. The number of output
+    rows for the filter operator is basically the number of its `child node's` output
+    times the filter factor. Its output size is its `child node's` output size times
+    the filter factor.
+  id: totrans-163
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于过滤运算符，我们的目标是计算过滤条件，以找出应用过滤条件后前一个（或子）运算符输出的部分。过滤因子是一个介于`0.0`和`1.0`之间的双精度数。过滤运算符的输出行数基本上是其`子节点`的输出行数乘以过滤因子。其输出大小是其`子节点`的输出大小乘以过滤因子。
+- en: Join operator
+  id: totrans-164
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 连接运算符
+- en: Before we compute the cardinality of a two-table join output, we should already
+    have the output cardinalities of its `child nodes` on both sides. The cardinality
+    of each join side is no longer the number of records in the original join table.
+    Rather, it is the number of qualified records after applying all execution operators
+    before this join operator.
+  id: totrans-165
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在计算两个表连接输出的基数之前，我们应该已经有其两侧`子节点`的输出基数。每个连接侧的基数不再是原始连接表中的记录数。相反，它是在此连接运算符之前应用所有执行运算符后合格记录的数量。
+- en: If a user collects the `join column` statistics, then we know the number of
+    distinct values for each `join column`. Since we also know the number of records
+    on the join relation, we can tell whether or not `join column` is a unique key.
+    We can compute the ratio of a number of distinct values on `join column` over
+    the number of records in join relation. If the ratio is close to `1.0` (say greater
+    than `0.95`), then we can assume that the `join column` is unique. Therefore,
+    we can precisely determine the number of records per distinct value if a `join
+    column` is unique.
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果用户收集`join column`统计信息，那么我们就知道每个`join column`的不同值的数量。由于我们还知道连接关系上的记录数量，我们可以判断`join
+    column`是否是唯一键。我们可以计算`join column`上不同值的数量与连接关系中记录数量的比率。如果比率接近`1.0`（比如大于`0.95`），那么我们可以假设`join
+    column`是唯一的。因此，如果`join column`是唯一的，我们可以精确确定每个不同值的记录数量。
+- en: Build side selection
+  id: totrans-167
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 构建侧选择
+- en: The CBO can select a good physical strategy for an execution operator. For example,
+    CBO can choose the `build side` selection for a `hash join` operation. For two-way
+    hash joins, we need to choose one operand as `build side` and the other as `probe
+    side`. The approach chooses the lower-cost child as the `build side` of `hash
+    join`.
+  id: totrans-168
+  prefs: []
+  type: TYPE_NORMAL
+  zh: CBO可以为执行操作符选择一个良好的物理策略。例如，CBO可以选择`hash join`操作的`build side`选择。对于双向哈希连接，我们需要选择一个操作数作为`build
+    side`，另一个作为`probe side`。该方法选择成本较低的子节点作为`hash join`的`build side`。
+- en: 'Before Spark 2.2, the build side was selected based on original table sizes.
+    For the following Join query example, the earlier approach would have selected
+    `BuildRight`. However, with CBO, the `build side` is selected based on the estimated
+    cost of various operators before the join. Here, `BuildLeft` would have been selected.
+    It can also decide whether or not a broadcast join should be performed. Additionally,
+    the execution sequence of the database operators for a given query can be rearranged.
+    `cbo` can choose the best plan among multiple candidate plans for a given query.
+    The goal is to select the candidate plan with the lowest cost:'
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在Spark 2.2之前，构建侧是基于原始表大小选择的。对于以下Join查询示例，早期的方法会选择`BuildRight`。然而，使用CBO，构建侧是基于连接之前各种操作符的估计成本选择的。在这里，会选择`BuildLeft`。它还可以决定是否执行广播连接。此外，可以重新排列给定查询的数据库操作符的执行顺序。`cbo`可以在给定查询的多个候选计划中选择最佳计划。目标是选择具有最低成本的候选计划：
+- en: '[PRE27]'
+  id: totrans-170
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: In the next section, we will explore CBO optimization in multi-way joins.
+  id: totrans-171
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将探讨多向连接中的CBO优化。
+- en: Understanding multi-way JOIN ordering optimization
+  id: totrans-172
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 理解多向连接排序优化
+- en: 'Spark SQL optimizer''s heuristics rules can transform a `SELECT` statement
+    into a query plan with the following characteristics:'
+  id: totrans-173
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark SQL优化器的启发式规则可以将`SELECT`语句转换为具有以下特征的查询计划：
+- en: The filter operator and project operator are pushed down below the join operator,
+    that is, both the filter and project operators are executed before the join operator
+  id: totrans-174
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 过滤操作符和投影操作符被推送到连接操作符下面，也就是说，过滤和投影操作符在连接操作符之前执行。
+- en: Without subquery block, the join operator is pushed down below the aggregate
+    operator for a select statement, that is, a join operator is usually executed
+    before the aggregate operator
+  id: totrans-175
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 没有子查询块时，连接操作符被推送到聚合操作符下面，也就是说，连接操作符通常在聚合操作符之前执行。
+- en: With this observation, the biggest benefit we can get from CBO is multi-way
+    join ordering optimization. Using a dynamic programming technique, we try to get
+    the globally optimal join order for a multi-way join query.
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过这一观察，我们从CBO中可以获得的最大好处是多向连接排序优化。使用动态规划技术，我们尝试为多向连接查询获得全局最优的连接顺序。
+- en: For more details on multi-way join reordering in Spark 2.2, refer to [https://spark-summit.org/2017/events/cost-based-optimizer-in-apache-spark-22/](https://spark-summit.org/2017/events/cost-based-optimizer-in-apache-spark-22/).
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关Spark 2.2中多向连接重新排序的更多详细信息，请参阅[https://spark-summit.org/2017/events/cost-based-optimizer-in-apache-spark-22/](https://spark-summit.org/2017/events/cost-based-optimizer-in-apache-spark-22/)。
+- en: Clearly, the join cost is the dominant factor in choosing the best join order.
+    The cost formula is dependent on the implementation of the Spark SQL execution
+    engine.
+  id: totrans-178
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 显然，连接成本是选择最佳连接顺序的主要因素。成本公式取决于Spark SQL执行引擎的实现。
+- en: 'The join cost formula in Spark is as follows:'
+  id: totrans-179
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark中的连接成本公式如下：
+- en: '*weight * cardinality + size * (1 - weight)*'
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*权重*基数+大小*（1-权重）*'
+- en: The weight in the formula is a tuning parameter configured via the `spark.sql.cbo.joinReorder.card.weight`
+    parameter (the default value is `0.7`). The cost of a plan is the sum of the costs
+    of all intermediate tables. Note that the current cost formula is very coarse
+    and subsequent versions of Spark are expected to have a more fine-grained formula.
+  id: totrans-181
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 公式中的权重是通过`spark.sql.cbo.joinReorder.card.weight`参数配置的调整参数（默认值为`0.7`）。计划的成本是所有中间表的成本之和。请注意，当前的成本公式非常粗糙，预计Spark的后续版本将具有更精细的公式。
+- en: For more details on reordering the joins using a dynamic programming algorithm,
+    refer to the paper by Selinger et al, at [http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.129.5879&rep=rep1&type=pdf](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.129.5879&rep=rep1&type=pdf).
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关使用动态规划算法重新排序连接的更多详细信息，请参阅Selinger等人的论文，网址为[http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.129.5879&rep=rep1&type=pdf](http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.129.5879&rep=rep1&type=pdf)。
+- en: First, we put all the items (basic joined nodes) into level 1, then we build
+    all two-way joins at level 2 from plans at level 1 (single items), then build
+    all three-way joins from plans at previous levels (two-way joins and single items),
+    then four-way joins and so on, until we have built all n-way joins, and pick the
+    best plan among them at each stage.
+  id: totrans-183
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，我们将所有项目（基本连接节点）放入级别1，然后从级别1的计划（单个项目）构建级别2的所有双向连接，然后从先前级别的计划（双向连接和单个项目）构建所有三向连接，然后是四向连接，依此类推，直到我们构建了所有n向连接，并在每个阶段选择最佳计划。
+- en: When building m-way joins, we only keep the best plan (with the lowest cost)
+    for the same set of m items. For example, for three-way joins, we keep only the
+    best plan for items `{A, B, C}` among plans `(A J B) J C`, `(A J C) J B`, and
+    `(B J C) J A`.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在构建m路连接时，我们只保留相同m个项目集的最佳计划（成本最低）。例如，对于三路连接，我们只保留项目集`{A, B, C}`的最佳计划，包括`(A J
+    B) J C`、`(A J C) J B`和`(B J C) J A`。
+- en: One drawback of this algorithm is the assumption that a lowest cost plan can
+    only be generated among the lowest cost plans from its previous levels. In addition,
+    because the decision to choose a sorted-merge join, which preserves the order
+    of its input, versus other join methods is done in the query planner phase, we
+    do not have this information to make a good decision in the optimizer.
+  id: totrans-185
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个算法的一个缺点是假设最低成本的计划只能在其前一级的最低成本计划中生成。此外，由于选择排序合并连接（保留其输入顺序）与其他连接方法的决定是在查询规划阶段完成的，因此我们没有这些信息来在优化器中做出良好的决策。
+- en: 'Next, we present an extended example of a multi-way join with the `cbo` and
+    `joinReorder` parameters switched off and switched on to demonstrate the speed
+    improvements:'
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们展示了一个扩展的例子，展示了关闭和打开`cbo`和`joinReorder`参数后的速度改进：
+- en: '[PRE28]'
+  id: totrans-187
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: 'We define a function benchmark to measure the execution time of our queries:'
+  id: totrans-188
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们定义了一个benchmark函数来测量我们查询的执行时间：
+- en: '[PRE29]'
+  id: totrans-189
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'In the first example, as shown, we switch off the `cbo` and `joinReorder` parameters:'
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在第一个例子中，如所示，我们关闭了`cbo`和`joinReorder`参数：
+- en: '[PRE30]'
+  id: totrans-191
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'The following is the output on the command line:'
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是在命令行上的输出：
+- en: '![](img/00303.jpeg)'
+  id: totrans-193
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00303.jpeg)'
+- en: 'In the next example, we switch on `cbo` but keep the `joinReorder` parameter
+    disabled:'
+  id: totrans-194
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一个例子中，我们打开了`cbo`但保持`joinReorder`参数禁用：
+- en: '[PRE31]'
+  id: totrans-195
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'The following is the output on the command line:'
+  id: totrans-196
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是在命令行上的输出：
+- en: '![](img/00304.jpeg)'
+  id: totrans-197
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00304.jpeg)'
+- en: Note the slight improvement in the execution time of the query with the `cbo`
+    parameter enabled.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，在启用`cbo`参数的情况下，查询的执行时间略有改善。
+- en: 'In the final example, we switch on both the `cbo` and `joinReorder` parameters:'
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在最后一个例子中，我们同时打开了`cbo`和`joinReorder`参数：
+- en: '[PRE32]'
+  id: totrans-200
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'The following is the output on the command line:'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是在命令行上的输出：
+- en: '![](img/00305.jpeg)'
+  id: totrans-202
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00305.jpeg)'
+- en: Note the substantial improvement in the execution time of the query with both
+    the parameters enabled.
+  id: totrans-203
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，在启用了这两个参数的情况下，查询的执行时间有了显著的改进。
+- en: In the next section, we will examine performance improvements achieved for various
+    `JOINs` using whole-stage code generation.
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在接下来的部分中，我们将检查使用整体代码生成实现的各种`JOINs`的性能改进。
+- en: Understanding performance improvements using whole-stage code generation
+  id: totrans-205
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用整体代码生成理解性能改进
+- en: In this section, we first present a high-level overview of whole-stage code
+    generation in Spark SQL, followed by a set of examples to show improvements in
+    various `JOINs` using Catalyst's code generation feature.
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本节中，我们首先概述了Spark SQL中整体代码生成的高级概述，然后通过一系列示例展示了使用Catalyst的代码生成功能改进各种`JOINs`的性能。
+- en: 'After we have an optimized query plan, it needs to be converted to a DAG of
+    RDDs for execution on the cluster. We use this example to explain the basic concepts
+    of Spark SQL whole-stage code generation:'
+  id: totrans-207
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们有了优化的查询计划之后，需要将其转换为RDD的DAG，以在集群上执行。我们使用这个例子来解释Spark SQL整体代码生成的基本概念：
+- en: '[PRE33]'
+  id: totrans-208
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'The preceding optimized logical plan can be viewed as a sequence of **Scan**,
+    **Filter**, **Project**, and **Aggregate** operations, as shown in the following
+    figure:'
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 优化的逻辑计划可以看作是一系列的**扫描**、**过滤**、**投影**和**聚合**操作，如下图所示：
+- en: '![](img/00306.jpeg)'
+  id: totrans-210
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00306.jpeg)'
+- en: Traditional databases will typically execute the preceding query based on the
+    Volcano Iterator Model, in which each operator implements an iterator interface,
+    and consumes records from its input operator and outputs records to the operator
+    that is sequenced after it. This model makes it easy to add new operators independent
+    of their interactions with other operators. It also promotes composability of
+    operators. However, the Volcano Model is inefficient because it involves execution
+    of many virtual function calls, for example, three calls are executed for each
+    record in the `Aggregate` function. Additionally, it requires extensive memory
+    accesses (due to reads/writes in each operator as per the iterator interface).
+    It is also challenging to leverage modern CPU features, such as pipelining, prefetching,
+    and branch prediction, on the Volcano model.
+  id: totrans-211
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 传统数据库通常基于Volcano迭代器模型执行前面的查询，其中每个操作符实现一个迭代器接口，并从其输入操作符消耗记录，并向其后顺序的操作符输出记录。这个模型使得可以轻松添加新的操作符，而不受其与其他操作符的交互影响。它还促进了操作符的可组合性。然而，Volcano模型效率低下，因为它涉及执行许多虚拟函数调用，例如，每个记录在`Aggregate`函数中执行三次调用。此外，它需要大量的内存访问（由于按照迭代器接口在每个操作符中的读/写）。在Volcano模型上利用现代CPU特性（如流水线处理、预取和分支预测）也是具有挑战性的。
+- en: 'Instead of generating iterator code for each operator, Spark SQL tries to generate
+    a single function for the set of operators in the SQL statement. For example,
+    the pseudo-code for the preceding query might look something like the following.
+    Here, the `for` loop reads over all the rows (Scan operation), the if-condition
+    roughly corresponds to the Filter condition, and the aggregate is essentially
+    the count:'
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Spark SQL不是为每个操作符生成迭代器代码，而是尝试为SQL语句中的操作符集生成一个单一函数。例如，前面查询的伪代码可能看起来像下面这样。这里，`for`循环遍历所有行（扫描操作），if条件大致对应于过滤条件，而聚合本质上是计数：
+- en: '[PRE34]'
+  id: totrans-213
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: Note that the simple code mentioned has no virtual function calls and the count
+    variable getting incremented is available in the CPU registers. This code is easily
+    understood by compilers and therefore modern hardware can be leveraged to speed
+    up queries like this one.
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，简单的代码中没有虚拟函数调用，而且增加的计数变量存储在CPU寄存器中。这段代码易于编译器理解，因此现代硬件可以利用来加速这样的查询。
+- en: The key ideas underlying whole-stage code generation include the fusing together
+    of operators, the identification of chains of operators (stages), and the compilation
+    of each stage into a single function. This results in code generation that mimics
+    hand-written optimized code for the execution of the query.
+  id: totrans-215
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 整个阶段代码生成的关键思想包括将操作符融合在一起，识别操作符链（阶段），并将每个阶段编译成单个函数。这导致生成的代码模仿手写优化代码来执行查询。
+- en: For more details on compiling query plans on modern hardware, refer to [http://www.vldb.org/pvldb/vol4/p539-neumann.pdf](http://www.vldb.org/pvldb/vol4/p539-neumann.pdf).
+  id: totrans-216
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关在现代硬件上编译查询计划的更多详细信息，请参阅[http://www.vldb.org/pvldb/vol4/p539-neumann.pdf](http://www.vldb.org/pvldb/vol4/p539-neumann.pdf)。
+- en: 'We can use `EXPLAIN CODEGEN` to explore the code generated for a query, as
+    shown:'
+  id: totrans-217
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以使用`EXPLAIN CODEGEN`来探索为查询生成的代码，如下所示：
+- en: '[PRE35]'
+  id: totrans-218
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: Here, we present a series of `JOIN` examples with whole-stage code generation
+    switched off and subsequently switched on to see the significant impact on execution
+    performance.
+  id: totrans-219
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，我们提供了一系列使用关闭和随后打开整个阶段代码生成的`JOIN`示例，以查看对执行性能的显着影响。
+- en: The examples in this section have been taken from the `JoinBenchmark.scala`
+    class available at [https://github.com/apache/spark/blob/master/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala](https://github.com/apache/spark/blob/master/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala).
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本节中的示例取自[https://github.com/apache/spark/blob/master/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala](https://github.com/apache/spark/blob/master/sql/core/src/test/scala/org/apache/spark/sql/execution/benchmark/JoinBenchmark.scala)中可用的`JoinBenchmark.scala`类。
+- en: 'In the following example, we present the details of obtaining the execution
+    times for the JOIN operations with long values:'
+  id: totrans-221
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在以下示例中，我们介绍了获取使用长值进行JOIN操作的执行时间的详细信息：
+- en: '[PRE36]'
+  id: totrans-222
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'For the following set of examples, we present only the essentials for obtaining
+    their execution times with and without whole-stage code generation. Refer to the
+    preceding example and follow the same sequence of steps to replicate the following
+    examples:'
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于以下一组示例，我们仅呈现获取其执行时间的基本要素，包括是否使用整个阶段代码生成。请参考前面的示例，并按照相同的步骤顺序复制以下示例：
+- en: '[PRE37]'
+  id: totrans-224
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: As an exercise, use the examples in this section to explore their logical and
+    physical plans, and also view and understand their execution using SparkUI.
+  id: totrans-225
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作为练习，请使用本节中的示例来探索它们的逻辑和物理计划，并使用SparkUI查看和理解它们的执行。
+- en: 'There are several Spark SQL parameter settings used in tuning tasks. `SQLConf`
+    is an internal key-value configuration store for parameters and hints used in
+    Spark SQL. In order to print all the current values of these parameters, use the
+    following statement:'
+  id: totrans-226
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在调整任务中使用了几个Spark SQL参数设置。`SQLConf`是Spark SQL中用于参数和提示的内部键值配置存储。要打印出这些参数的所有当前值，请使用以下语句：
+- en: '[PRE38]'
+  id: totrans-227
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: 'You can also use the following statement to list the extended set of all the
+    defined configuration parameters:'
+  id: totrans-228
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您还可以使用以下语句列出所有已定义配置参数的扩展集：
+- en: '[PRE39]'
+  id: totrans-229
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: Summary
+  id: totrans-230
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 摘要
+- en: In this chapter, we presented the foundational concepts related to tuning a
+    Spark application, including data serialization using encoders. We also covered
+    the key aspects of the cost-based optimizer introduced in Spark 2.2 to optimize
+    Spark SQL execution automatically. Finally, we presented some examples of `JOIN`
+    operations, and the improvements in execution times as a result of using whole-stage
+    code generation.
+  id: totrans-231
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们介绍了与调整Spark应用程序相关的基本概念，包括使用编码器进行数据序列化。我们还介绍了在Spark 2.2中引入的基于成本的优化器的关键方面，以自动优化Spark
+    SQL执行。最后，我们提供了一些`JOIN`操作的示例，以及使用整个阶段代码生成导致执行时间改进的情况。
+- en: In the next chapter, we will explore application architectures that leverage
+    Spark modules and Spark SQL in real-world applications. We will also describe
+    the deployment of some of the main processing models being used for batch processing,
+    streaming applications, and machine learning pipelines.
+  id: totrans-232
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，我们将探讨利用Spark模块和Spark SQL的应用程序架构在实际应用中的应用。我们还将描述用于批处理、流处理应用和机器学习流水线的一些主要处理模型的部署。

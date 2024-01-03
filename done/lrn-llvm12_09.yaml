@@ -1,0 +1,2065 @@
+- en: '*Chapter 7*: Advanced IR Generation'
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: '*第7章*：高级IR生成'
+- en: With the **intermediate representation** (**IR**) generation introduced in the
+    previous chapters, you can already implement most of the functionality required
+    in a compiler. In this chapter, we will look at some advanced topics that often
+    arise in terms of real-world compilers. For example, many modern languages make
+    use of exception handling, and we look at how to translate this to **low-level
+    virtual machine** (**LLVM**) IR.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在前几章介绍的**中间表示**（**IR**）生成中，您已经可以实现编译器中所需的大部分功能。在本章中，我们将研究一些通常在实际编译器中出现的高级主题。例如，许多现代语言使用异常处理，我们将看看如何将其转换为**低级虚拟机**（**LLVM**）IR。
+- en: To support the LLVM optimizer in producing better code in certain situations,
+    we add additional type metadata to the IR code, and attaching debug metadata enables
+    the compiler's user to take advantage of source-level debug tools.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了支持LLVM优化器在某些情况下生成更好的代码，我们向IR代码添加了额外的类型元数据，并附加调试元数据使编译器的用户能够利用源级调试工具。
+- en: 'In this chapter, you will learn about the following topics:'
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您将学习以下主题：
+- en: In *Throwing and catching exceptions*, you will learn how to implement exception
+    handling in your compiler.
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在*抛出和捕获异常*中，您将学习如何在编译器中实现异常处理。
+- en: In *Generating metadata for type-based alias analysis*, you attach additional
+    metadata to LLVM IR, which helps LLVM to better optimize the code.
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在*为基于类型的别名分析生成元数据*中，您将向LLVM IR附加额外的元数据，这有助于LLVM更好地优化代码。
+- en: In *Adding debug metadata*, you implement the support classes needed to add
+    debug information to the generated IR code.
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在*添加调试元数据*中，您将实现所需的支持类，以向生成的IR代码添加调试信息。
+- en: By the end of the chapter, you will acquire knowledge about exception handling
+    and about metadata for type-based alias analysis and debug information.
+  id: totrans-7
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到本章结束时，您将了解有关异常处理和基于类型的别名分析和调试信息的元数据的知识。
+- en: Technical requirements
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 技术要求
+- en: The code files for this chapter is available at [https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07)
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的代码文件可在[https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter07)找到
+- en: You can find the code in action videos at [https://bit.ly/3nllhED](https://bit.ly/3nllhED).
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以在[https://bit.ly/3nllhED](https://bit.ly/3nllhED)找到代码演示视频。
+- en: Throwing and catching exceptions
+  id: totrans-11
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 抛出和捕获异常
+- en: 'Exception handling in LLVM IR is closely tied to the platform''s support. Here,
+    we will look at the most common type of exception handling using `libunwind`.
+    Its full potential is used by C++, so we will look at an example in C++ first,
+    where the `bar()` function can throw an `int` or a `double` value, as follows:'
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM IR中的异常处理与平台的支持密切相关。在这里，我们将看到使用`libunwind`进行最常见类型的异常处理。它的全部潜力由C++使用，因此我们将首先看一个C++的示例，在该示例中，`bar()`函数可以抛出`int`或`double`值，如下所示：
+- en: '[PRE0]'
+  id: totrans-13
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'The `foo()` function calls `bar()`, but only handles a thrown `int` value.
+    It also declares that it only throws `int` values, as follows:'
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`foo()`函数调用`bar()`，但只处理抛出的`int`值。它还声明它只抛出`int`值，如下所示：'
+- en: '[PRE1]'
+  id: totrans-15
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'Throwing an exception requires two calls into the runtime library. First, memory
+    for the exception is allocated with a call to `__cxa_allocate_exception()`. This
+    function takes the number of bytes to allocate as a parameter. The exception payload
+    (the `int` or the `double` value in the example) is copied to the allocated memory.
+    The exception is then raised with a call to `__cxa_throw()`. This function takes
+    three arguments: a pointer to the allocated exception; type information about
+    the payload; and a pointer to a destructor, if the exception payload has one.
+    The `__cxa_throw()` function initiates the stack-unwinding process and never returns.
+    In LLVM IR, this is done for the `int` value, as follows:'
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 抛出异常需要两次调用运行时库。首先，使用`__cxa_allocate_exception()`调用分配异常的内存。此函数将要分配的字节数作为参数。然后将异常有效负载（例如示例中的`int`或`double`值）复制到分配的内存中。然后使用`__cxa_throw()`调用引发异常。此函数需要三个参数：指向分配的异常的指针；有关有效负载的类型信息；以及指向析构函数的指针，如果异常有效负载有一个的话。`__cxa_throw()`函数启动堆栈展开过程并且永远不会返回。在LLVM
+    IR中，这是针对`int`值完成的，如下所示：
+- en: '[PRE2]'
+  id: totrans-17
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: '`_ZTIi` is the type information describing an `int` type. For a double type,
+    it would be `_ZTId`. The call to `__cxa_throw()` is marked as a tail call because
+    it is the final call in this function, possibly enabling reuse of the current
+    stack frame.'
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`_ZTIi`是描述`int`类型的类型信息。对于double类型，它将是`_ZTId`。对`__cxa_throw()`的调用被标记为尾调用，因为它是该函数中的最终调用，可能使当前堆栈帧得以重用。'
+- en: 'So far, nothing LLVM-specific has been done. This changes in the `foo()` function,
+    because the call to `bar()` could possibly raise an exception. If it is an `int`-type
+    exception, then the control flow must be transferred to the IR code of the `catch`
+    clause. To accomplish this, an `invoke` instruction must be used instead of a
+    `call` instruction, as illustrated in the following code snippet:'
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，还没有做任何特定于LLVM的工作。这在`foo()`函数中发生了变化，因为对`bar()`的调用可能会引发异常。如果是`int`类型的异常，则必须将控制流转移到`catch`子句的IR代码。为了实现这一点，必须使用`invoke`指令而不是`call`指令，如下面的代码片段所示：
+- en: '[PRE3]'
+  id: totrans-20
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: The difference between both instructions is that `invoke` has two labels associated.
+    The first label is where execution continues if the called function ended normally,
+    usually with a `ret` instruction. In the preceding code example, this label is
+    called `%next`. If an exception occurs, then execution continues at a so-called
+    *landing pad*, with a `%lpad` label.
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 两个指令之间的区别在于`invoke`有两个关联的标签。第一个标签是如果被调用的函数正常结束，通常是使用`ret`指令。在前面的代码示例中，这个标签称为`%next`。如果发生异常，则执行将继续在所谓的*着陆垫*上，具有`%lpad`标签。
+- en: 'The landing pad is a basic block that must begin with a `landingpad` instruction.
+    The `landingpad` instruction gives LLVM information about the handled exception
+    types. For the `foo()` functions, it gives the following information:'
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 着陆坪是一个基本的块，必须以`landingpad`指令开始。`landingpad`指令为LLVM提供了有关处理的异常类型的信息。对于`foo()`函数，它提供了以下信息：
+- en: '[PRE4]'
+  id: totrans-23
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'There are three possible types of action here, outlined as follows:'
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这里有三种可能的操作类型，如下所述：
+- en: '`cleanup`: This denotes that code to clean up the current state is present.
+    Usually, this is used to call destructors of local objects. If this marker is
+    present, then the landing pad is always called during stack unwinding.'
+  id: totrans-25
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`cleanup`：这表示存在用于清理当前状态的代码。通常，这用于调用局部对象的析构函数。如果存在此标记，则在堆栈展开期间始终调用着陆坪。'
+- en: '`catch`: This is a list of type-value pairs and denotes the exception types
+    that can be handled. The landing pad is called if the thrown exception type is
+    found in this list. In the case of the `foo()` function, the value is a pointer
+    to the C++ runtime type information for the `int` type, similar to the parameter
+    of the `__cxa_throw()` function.'
+  id: totrans-26
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`catch`：这是一个类型-值对的列表，表示可以处理的异常类型。如果抛出的异常类型在此列表中找到，则调用着陆坪。对于`foo()`函数，该值是指向`int`类型的C++运行时类型信息的指针，类似于`__cxa_throw()`函数的参数。'
+- en: '`filter`: This specifies an array of exception types. The landing pad is called
+    if the exception type of the current exception is not found in the array. This
+    is used to implement the `throw()` specification. For the `foo()` function, the
+    array has only one member—the type information for the `int` type.'
+  id: totrans-27
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`filter`：这指定了一个异常类型数组。如果当前异常的异常类型在数组中找不到，则调用着陆坪。这用于实现`throw()`规范。对于`foo()`函数，该数组只有一个成员——`int`类型的类型信息。'
+- en: 'The result type of the `landingpad` instruction is a `{ i8*, i32 }` structure.
+    The first element is a pointer to the thrown exception, while the second element
+    is a type selector. Let''s extract both elements from the structure, as follows:'
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`landingpad`指令的结果类型是一个`{ i8*, i32 }`结构。第一个元素是指向抛出的异常的指针，而第二个元素是类型选择器。让我们从结构中提取这两个元素，如下所示：'
+- en: '[PRE5]'
+  id: totrans-29
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: A *type selector* is a number that helps us to identify the cause of *why the
+    landing pad is called*. It has a positive value if the current exception type
+    matches one of the exception types given in the `catch` part of the `landingpad`
+    instruction. If the current exception type does not match any of the values given
+    in the `filter` part, then the value is negative, and it is `0` if the cleanup
+    code should be called.
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '*类型选择器*是一个数字，它帮助我们识别*为什么调用着陆坪*的原因。如果当前异常类型与`landingpad`指令的`catch`部分中给定的异常类型之一匹配，则它具有正值。如果当前异常类型与`filter`部分中给定的任何值都不匹配，则该值为负值，如果应调用清理代码，则为`0`。'
+- en: 'Basically, the type selector is offset into a type information table, constructed
+    from the values given in the `catch` and `filter` parts of the `landingpad` instruction.
+    During optimization, multiple landing pads can be combined into one, which means
+    that the structure of this table is not known at the IR level. To retrieve the
+    type selector for a given type, we need to call the `@llvm.eh.typeid.for` intrinsic
+    function. We need this to check if the type selector value corresponds to the
+    type information for `int`, to be able to execute the code in the `catch (int
+    e) {}` block, as follows:'
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 基本上，类型选择器是偏移量，指向从`landingpad`指令的`catch`和`filter`部分中给定的值构造的类型信息表。在优化期间，多个着陆坪可以合并为一个，这意味着在IR级别不知道此表的结构。要检索给定类型的类型选择器，我们需要调用`@llvm.eh.typeid.for`内部函数。我们需要这样做来检查类型选择器的值是否对应于`int`的类型信息，以便能够执行`catch
+    (int e) {}`块中的代码，如下所示：
+- en: '[PRE6]'
+  id: totrans-32
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'The handing of an exception is framed by calls to `__cxa_begin_catch()` and
+    `__cxa_end_catch()`. The `__cxa_begin_catch()` function needs one argument: the
+    current exception. That is one of the values returned by the `landingpad` instruction.
+    It returns a pointer to the exception payload—an `int` value, in our case. The
+    `__cxa_end_catch()` function marks the end of exception handling and deallocates
+    the memory allocated with `__cxa_allocate_exception()`. Please note that the runtime
+    behavior is much more complicated if another exception is thrown inside the `catch`
+    block. The handling of the exception is done like this:'
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 异常处理由对`__cxa_begin_catch()`和`__cxa_end_catch()`的调用框定。`__cxa_begin_catch()`函数需要一个参数：当前异常。这是`landingpad`指令返回的值之一。它返回指向异常有效负载的指针——在我们的情况下是一个`int`值。`__cxa_end_catch()`函数标记异常处理的结束，并释放使用`__cxa_allocate_exception()`分配的内存。请注意，如果在`catch`块内抛出另一个异常，则运行时行为要复杂得多。处理异常的方式如下：
+- en: '[PRE7]'
+  id: totrans-34
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'If the type of the current exception does not match the list in the `throws()`
+    declaration, the unexpected exception handler is called. First, we need to check
+    the type selector again, as follows:'
+  id: totrans-35
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果当前异常的类型与`throws()`声明中的列表不匹配，则调用意外异常处理程序。首先，我们需要再次检查类型选择器，如下所示：
+- en: '[PRE8]'
+  id: totrans-36
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'If the value of the type selector is lower than `0` we then call the handler,
+    as follows:'
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果类型选择器的值小于`0`，则调用处理程序，如下所示：
+- en: '[PRE9]'
+  id: totrans-38
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: Again, the handler is not expected to come back.
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 同样，不希望处理程序返回。
+- en: 'There is no cleanup work needed in this case, so all the cleanup code does
+    is resume the execution of the stack unwinder, as follows:'
+  id: totrans-40
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这种情况下不需要清理工作，因此所有清理代码所做的就是恢复堆栈展开器的执行，如下所示：
+- en: '[PRE10]'
+  id: totrans-41
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'One piece is still missing: `libunwind` drives the stack unwinding, but it
+    is not tied to a single language. Language-dependent handling is done in the `personality`
+    function. For C++ on Linux, the `personality` function is called `__gxx_personality_v0()`.
+    Depending on the platform or compiler, this name can vary. Each function that
+    needs to take part in stack unwinding has a `personality` function attached. The
+    `personality` function analyzes if the function catches an exception, has a non-matching
+    filter list, or needs a cleanup call. It gives this information back to the unwinder,
+    which acts accordingly. In LLVM IR, the pointer to the `personality` function
+    is given as part of the function definition, as illustrated in the following code
+    snippet:'
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 还有一部分缺失：`libunwind`驱动堆栈展开，但它与单一语言无关。语言相关的处理在`personality`函数中完成。对于Linux上的C++，`personality`函数称为`__gxx_personality_v0()`。根据平台或编译器的不同，这个名称可能会有所不同。每个需要参与堆栈展开的函数都附有一个`personality`函数。`personality`函数分析函数是否捕获异常，是否有不匹配的过滤列表，或者是否需要清理调用。它将这些信息返回给展开器，展开器会相应地进行操作。在LLVM
+    IR中，`personality`函数的指针作为函数定义的一部分给出，如下面的代码片段所示：
+- en: '[PRE11]'
+  id: totrans-43
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: With this, the exception-handling facility is complete.
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些，异常处理功能就完成了。
+- en: To use exception handling in the compiler for your programming language, the
+    simplest strategy is to piggyback onto the existing C++ runtime functions. This
+    has also the advantage that your exceptions are interoperable with C++. A disadvantage
+    is that you tie some of the C++ runtime into the runtime of your language—most
+    notably, memory management. If you want to avoid this, then you need to create
+    your own equivalents of the `_cxa_` functions. Still, you will want to use `libunwind`,
+    which provides the stack-unwinding mechanism.
+  id: totrans-45
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要在编译器中为您的编程语言使用异常处理，最简单的策略是依附于现有的C++运行时函数。这样做的优势是您的异常与C++是可互操作的。缺点是您将一些C++运行时绑定到您的语言运行时中，尤其是内存管理。如果您想避免这一点，那么您需要创建自己的`_cxa_`函数的等价物。但是，您仍然需要使用提供堆栈展开机制的`libunwind`。
+- en: 'Let''s look at how to create this IR. We created the `calc` expression compiler
+    in [*Chapter 3*](B15647_03_ePub_RK.xhtml#_idTextAnchor048), *The Structure of
+    a Compiler*. We will now extend the code generator of the expression compiler
+    to raise and handle an exception if a division by `0` is performed. The generated
+    IR will check if the divisor of a division is `0`. If `true`, then an exception
+    will be raised. We will also add a landing pad to the function, which catches
+    the exception, prints `Divide by zero!` to the console, and ends the calculation.
+    Using exception handling is not really necessary in this simple case, but it allows
+    us to concentrate on the code generation. We add all code to the `CodeGenerator.cpp`
+    file. We begin by adding required new fields and some helper methods. We need
+    to store the LLVM declaration of the `__cxa_allocate_exception()` and `__cxa_throw()`
+    functions, consisting of the function type and the function itself. A `GlobalVariable`
+    instance is needed to hold the type information. We also need references to the
+    basic blocks holding the landing pad and a basic block containing just an `unreachable`
+    instruction, as illustrated in the following code snippet:'
+  id: totrans-46
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 让我们看看如何创建这个IR。我们在[*第3章*](B15647_03_ePub_RK.xhtml#_idTextAnchor048)中创建了`calc`表达式编译器，*编译器的结构*。现在我们将扩展表达式编译器的代码生成器，以便在执行除以`0`时引发和处理异常。生成的IR将检查除法的除数是否为`0`。如果为`true`，则会引发异常。我们还将在函数中添加一个着陆块，用于捕获异常，将`Divide
+    by zero!`打印到控制台，并结束计算。在这种简单情况下，使用异常处理并不是真正必要的，但它允许我们集中精力在代码生成上。我们将所有代码添加到`CodeGenerator.cpp`文件中。我们首先添加所需的新字段和一些辅助方法。我们需要存储`__cxa_allocate_exception()`和`__cxa_throw()`函数的LLVM声明，包括函数类型和函数本身。需要一个`GlobalVariable`实例来保存类型信息。我们还需要引用包含着陆块的基本块和只包含`unreachable`指令的基本块，如下面的代码片段所示：
+- en: '[PRE12]'
+  id: totrans-47
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'We also add a new helper function to create the IR for comparing two values.
+    The `createICmpEq()` function takes the `Left` and `Right` value to compare as
+    parameters. It creates a `compare` instruction, testing for equality of the values,
+    and a branch instruction to two basic blocks, for the equal and unequal cases.
+    The two basic blocks are returned via references in the `TrueDest` and `FalseDest`
+    parameters. A label for the new basic blocks can be given in the `TrueLabel` and
+    `FalseLabel` parameters. The code is shown in the following snippet:'
+  id: totrans-48
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们还添加了一个新的辅助函数来创建比较两个值的IR。`createICmpEq()`函数以`Left`和`Right`值作为参数进行比较。它创建一个`compare`指令，测试值的相等性，并创建一个分支指令到两个基本块，用于相等和不相等的情况。两个基本块通过`TrueDest`和`FalseDest`参数的引用返回。新基本块的标签可以在`TrueLabel`和`FalseLabel`参数中给出。代码如下所示：
+- en: '[PRE13]'
+  id: totrans-49
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'To use the functions from the runtime, we need to create several function declarations.
+    In LLVM, a function type giving the signature—as well as the function itself—must
+    be constructed. We use the `createFunc()` method to create both objects. The functions
+    need references to `FunctionType` and `Function` pointers, the name of the newly
+    declared function, and the result type. The parameter-type list is optional, and
+    the flag to indicate a variable parameter list is set to `false`, indicating that
+    there is no variable part in the parameter list. The code can be seen in the following
+    snippet:'
+  id: totrans-50
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用运行时的函数，我们需要创建几个函数声明。在LLVM中，必须构建给出签名的函数类型以及函数本身。我们使用`createFunc()`方法来创建这两个对象。函数需要引用`FunctionType`和`Function`指针，新声明函数的名称和结果类型。参数类型列表是可选的，并且用来指示可变参数列表的标志设置为`false`，表示参数列表中没有可变部分。代码可以在以下片段中看到：
+- en: '[PRE14]'
+  id: totrans-51
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: With these preparations done, we continue to generate the IR to raise an exception.
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 准备工作完成后，我们继续生成IR来引发异常。
+- en: Raising an exception
+  id: totrans-53
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 引发异常
+- en: 'To generate the IR code to raise an exception, we add an `addThrow()` method.
+    This new method needs to initialize the new fields, and then generates the IR
+    to raise an exception via the `__cxa_throw` function. The payload of the raised
+    exception is of an `int` type and can be set to an arbitrary value. Here is what
+    we need to code:'
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了生成引发异常的IR代码，我们添加了一个`addThrow()`方法。这个新方法需要初始化新字段，然后通过`__cxa_throw`函数生成引发异常的IR。引发的异常的有效载荷是`int`类型，并且可以设置为任意值。以下是我们需要编写的代码：
+- en: 'The new `addThrow()` method begins with checking if the `TypeInfo` field has
+    been initialized. If not, then a global external constant of an `i8*` type and
+    a `_ZTIi` name is created. This represents the C++ metadata describing the C++
+    `int` type. The code is illustrated in the following snippet:'
+  id: totrans-55
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 新的`addThrow()`方法首先检查`TypeInfo`字段是否已初始化。如果没有，则创建一个`i8*`类型和`_ZTIi`名称的全局外部常量。这代表描述C++
+    `int`类型的C++元数据。代码如下所示：
+- en: '[PRE15]'
+  id: totrans-56
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'The initialization continues with creating the IR declaration for `__cxa_allocate_exception()`
+    and `__cxa_throw functions()` using our `createFunc()` helper method, as follows:'
+  id: totrans-57
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 初始化继续创建`__cxa_allocate_exception()`和`__cxa_throw`函数的IR声明，使用我们的`createFunc()`辅助方法，如下所示：
+- en: '[PRE16]'
+  id: totrans-58
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'A function using exception handling needs a `personality` function, which helps
+    with the stack unwinding. We add the IR code to declare a `__gxx_personality_v0()`
+    `personality` function from the C++ library, and set it as the `personality` routine
+    of the current function. The current function is not stored as a field but we
+    can use a `Builder` instance to query the current basic block, which has the function
+    stored as a `parent` field, as illustrated in the following code snippet:'
+  id: totrans-59
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用异常处理的函数需要一个`personality`函数，它有助于堆栈展开。我们添加IR代码声明来自C++库的`__gxx_personality_v0()`
+    `personality`函数，并将其设置为当前函数的`personality`例程。当前函数没有存储为字段，但我们可以使用`Builder`实例查询当前基本块，该基本块将函数存储为`parent`字段，如下面的代码片段所示：
+- en: '[PRE17]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'Next, we create and populate the basic block for the landing pad. First, we
+    need to save the pointer to the current basic block. Then, we create a new basic
+    block, set it inside the builder to use as the basic block to insert instructions,
+    and call the `addLandingPad()` method. This method generates the IR code for handling
+    an exception and is described in the next section, *Catching an exception*. The
+    following code populates the basic block for the landing pad:'
+  id: totrans-61
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们创建并填充着陆块的基本块。首先，我们需要保存当前基本块的指针。然后，我们创建一个新的基本块，将其设置在构建器内部用作插入指令的基本块，并调用`addLandingPad()`方法。此方法生成处理异常的IR代码，并在下一节“捕获异常”中进行描述。以下代码填充了着陆块的基本块：
+- en: '[PRE18]'
+  id: totrans-62
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'The initialization part has finished with creating the basic block holding
+    an `unreachable` instruction. Again, we create a basic block and set it as an
+    insertion point at the builder. Then, we add an `unreachable` instruction to it.
+    Lastly, we set the insertion point of the builder back to the saved `SaveBB` instance
+    so that the following IR is added to the right basic block. The code is illustrated
+    in the following snippet:'
+  id: totrans-63
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 初始化部分已经完成，创建了一个包含`unreachable`指令的基本块。然后，我们创建一个基本块，并将其设置为构建器的插入点。然后，我们向其中添加一个`unreachable`指令。最后，我们将构建器的插入点设置回保存的`SaveBB`实例，以便后续的IR添加到正确的基本块。代码如下所示：
+- en: '[PRE19]'
+  id: totrans-64
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'To raise an exception, we need to allocate memory for the exception and the
+    payload via a call to the `__cxa_allocate_exception()` function. Our payload is
+    of a C++ `int` type, which usually has a size of 4 bytes. We create a constant
+    unsigned value for the size, and call the function with it as a parameter. The
+    function type and the function declaration are already initialized, so we only
+    need to create a `call` instruction, as follows:'
+  id: totrans-65
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 要引发异常，我们需要通过调用`__cxa_allocate_exception()`函数为异常和有效载荷分配内存。我们的有效载荷是C++ `int`类型，通常大小为4字节。我们为大小创建一个常量无符号值，并调用该函数作为参数。函数类型和函数声明已经初始化，所以我们只需要创建一个`call`指令，如下所示：
+- en: '[PRE20]'
+  id: totrans-66
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'Next, we store the `PayloadVal` value into the allocated memory. To do so,
+    we need to create an LLVM IR constant with a call to the `ConstantInt::get()`
+    function. The pointer to the allocated memory is of an `i8*` type, but to store
+    a value of an `i32` type we need to create a `bitcast` instruction to cast the
+    type, as follows:'
+  id: totrans-67
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们将`PayloadVal`值存储到分配的内存中。为此，我们需要使用`ConstantInt::get()`函数创建一个LLVM IR常量。分配的内存指针是`i8*`类型，但要存储`i32`类型的值，我们需要创建一个`bitcast`指令来转换类型，如下所示：
+- en: '[PRE21]'
+  id: totrans-68
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'Finally, we raise an exception with a call to the `__cxa_throw` function. Because
+    this function actually raises an exception that is also handled in the same function,
+    we need to use an `invoke` instruction instead of a `call` instruction. Unlike
+    with a `call` instruction, an `invoke` instruction ends a basic block because
+    it has two successor basic blocks. Here, these are the `UnreachableBB` and `LPadBB`
+    basic blocks. If the function raises no exception, the control flow is transferred
+    to the `UnreachableBB` basic block. Due to the design of the `__cxa_throw()` function,
+    this will never happen. The control flow is transferred to the `LPadBB` basic
+    block to handle the exception. This finishes the implementation of the `addThrow()`
+    method, as illustrated in the following code snippet:'
+  id: totrans-69
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，我们通过调用`__cxa_throw`函数引发异常。因为这个函数实际上引发的异常也在同一个函数中处理，所以我们需要使用`invoke`指令而不是`call`指令。与`call`指令不同，`invoke`指令结束一个基本块，因为它有两个后继基本块。在这里，它们是`UnreachableBB`和`LPadBB`基本块。如果函数没有引发异常，控制流将转移到`UnreachableBB`基本块。由于`__cxa_throw()`函数的设计，这永远不会发生。控制流将转移到`LPadBB`基本块以处理异常。这完成了`addThrow()`方法的实现，如下面的代码片段所示：
+- en: '[PRE22]'
+  id: totrans-70
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: Next, we add the code to generate the IR for handling an exception.
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 接下来，我们添加生成处理异常的IR代码。
+- en: Catching an exception
+  id: totrans-72
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 捕获异常
+- en: 'To generate the IR code to catch an exception, we add an `addLandingPad()`
+    method. The generated IR extracts the type information from the exception. If
+    it matches the C++ `int` type, then the exception is handled by printing `Divide
+    by zero!` to the console and returning from the function. If the type does not
+    match, we simply execute a `resume` instruction, which transfers control back
+    to the runtime. Because there are no other functions in the call hierarchy to
+    handle this exception, the runtime will terminate the application. These are the
+    steps we need to take to generate the IR to catch an exception:'
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了生成捕获异常的IR代码，我们添加了一个`addLandingPad()`方法。生成的IR从异常中提取类型信息。如果匹配C++的`int`类型，那么异常将通过向控制台打印`Divide
+    by zero!`并从函数中返回来处理。如果类型不匹配，我们简单地执行一个`resume`指令，将控制转回运行时。因为在调用层次结构中没有其他函数来处理这个异常，运行时将终止应用程序。这些是我们需要采取的步骤来生成捕获异常的IR：
+- en: 'In the generated IR, we need to call the `__cxa_begin_catch()` and `_cxa_end_catch()`
+    functions from the C++ runtime library. To print an error message, we will generate
+    a call to the `puts()` function from the C runtime library, and to get the type
+    information from the exception, we must generate a call to the `llvm.eh.typeid.for`
+    instrinsic. We need `FunctionType` and `Function` instances for all of them, and
+    we take advantage of our `createFunc()` method to create them, as follows:'
+  id: totrans-74
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在生成的IR中，我们需要从C++运行时库中调用`__cxa_begin_catch()`和`_cxa_end_catch()`函数。为了打印错误消息，我们将从C运行时库生成一个调用`puts()`函数的调用，并且为了从异常中获取类型信息，我们必须生成一个调用`llvm.eh.typeid.for`指令。我们需要为所有这些都创建`FunctionType`和`Function`实例，并且利用我们的`createFunc()`方法来创建它们，如下所示：
+- en: '[PRE23]'
+  id: totrans-75
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: 'The `landingpad` instruction is the first instruction we generate. The result
+    type is a structure containing fields of `i8*` and `i32` types. This structure
+    is generated with a call to the `StructType::get()` function. We handle an exception
+    of a C++ `int` type, and we must add this as a clause to the `landingpad` instruction.
+    The clause must be a constant of the `i8*` type, therefore we need to generate
+    a `bitcast` instruction to convert the `TypeInfo` value to this type. We store
+    the value returned from the instruction for later use in an `Exc` variable, as
+    follows:'
+  id: totrans-76
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`landingpad`指令是我们生成的第一条指令。结果类型是一个包含`i8*`和`i32`类型字段的结构。通过调用`StructType::get()`函数生成这个结构。我们处理C++
+    `int`类型的异常，必须将其作为`landingpad`指令的一个子句添加。子句必须是`i8*`类型的常量，因此我们需要生成一个`bitcast`指令将`TypeInfo`值转换为这种类型。我们将指令返回的值存储在`Exc`变量中，以备后用，如下所示：'
+- en: '[PRE24]'
+  id: totrans-77
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'Next, we extract the type selector from the returned value. With a call to
+    the `llvm.eh.typeid.for` intrinsic, we retrieve the type ID for the `TypeInfo`
+    field, representing the C++ `int` type. With this IR, we now have generated the
+    two values we need to compare to decide if we can handle the exception, as illustrated
+    in the following code snippet:'
+  id: totrans-78
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们从返回值中提取类型选择器。通过调用`llvm.eh.typeid.for`内部函数，我们检索`TypeInfo`字段的类型ID，表示C++的`int`类型。有了这个IR，我们现在已经生成了我们需要比较的两个值，以决定是否可以处理异常，如下面的代码片段所示：
+- en: '[PRE25]'
+  id: totrans-79
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'To generate the IR for the comparison, we call our `createICmpEq()` function.
+    This function also generates two basic blocks, which we store in the `TrueDest`
+    and `FalseDest` variables, as illustrated in the following code snippet:'
+  id: totrans-80
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了生成比较的IR，我们调用我们的`createICmpEq()`函数。这个函数还生成了两个基本块，我们将它们存储在`TrueDest`和`FalseDest`变量中，如下面的代码片段所示：
+- en: '[PRE26]'
+  id: totrans-81
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: 'If the two values do not match, the control flow continues at the `FalseDest`
+    basic block. This basic block only contains a `resume` instruction, to give control
+    back to the C++ runtime. This is illustrated in the following code snippet:'
+  id: totrans-82
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果两个值不匹配，控制流将在`FalseDest`基本块继续。这个基本块只包含一个`resume`指令，将控制返回给C++运行时。下面的代码片段中有示例：
+- en: '[PRE27]'
+  id: totrans-83
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'If the two values are equal, the control flow continues at the `TrueDest` basic
+    block. We first generate the IR code to extract the pointer to the exception from
+    the return value of the `landingpad` instruction, stored in the `Exc` variable.
+    Then, we generate a call to the `__cxa_begin_catch ()` function, passing the pointer
+    to the exception as a parameter. This indicates the start of the exception being
+    handled to the runtime, as illustrated in the following code snippet:'
+  id: totrans-84
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果两个值相等，控制流将在`TrueDest`基本块继续。我们首先生成IR代码，从`landingpad`指令的返回值中提取指向异常的指针，存储在`Exc`变量中。然后，我们生成一个调用`__cxa_begin_catch()`函数的调用，将指向异常的指针作为参数传递。这表示异常开始被运行时处理，如下面的代码片段所示：
+- en: '[PRE28]'
+  id: totrans-85
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: 'We handle the exception by calling the `puts()` function, to print a message
+    to the console. For this, we first generate a pointer to the string with a call
+    to the `CreateGlobalStringPtr()` function, and then pass this pointer as a parameter
+    in the generated call to the `puts()` function, as follows:'
+  id: totrans-86
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们通过调用`puts()`函数来处理异常，向控制台打印一条消息。为此，我们首先通过调用`CreateGlobalStringPtr()`函数生成一个指向字符串的指针，然后将这个指针作为参数传递给生成的`puts()`函数调用，如下所示：
+- en: '[PRE29]'
+  id: totrans-87
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'This finishes the handling of the exception, and we generate a call to the
+    `__cxa_end_catch()` function to inform the runtime about it. Lastly, we return
+    from the function with a `ret` instruction, as follows:'
+  id: totrans-88
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 这完成了异常处理，并生成了一个调用`__cxa_end_catch()`函数通知运行时的过程。最后，我们使用`ret`指令从函数中返回，如下所示：
+- en: '[PRE30]'
+  id: totrans-89
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: With the `addThrow()` and `addLandingPad()` functions, we can generate the IR
+    to raise an exception and to handle an exception. We still need to add the IR
+    to check if the divisor is `0`, which is the topic of the next section.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过`addThrow()`和`addLandingPad()`函数，我们可以生成IR来引发异常和处理异常。我们仍然需要添加IR来检查除数是否为`0`，这是下一节的主题。
+- en: Integrating the exception-handling code into the application
+  id: totrans-91
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 将异常处理代码集成到应用程序中
+- en: 'The IR for the division is generated inside the `visit(BinaryOp&)` method.
+    Instead of just generating a `sdiv` instruction, we first generate the IR to compare
+    the divisor with `0`. If the divisor is `0`, then the control flow continues in
+    a basic block raising the exception. Otherwise, the control flow continues in
+    a basic block with the `sdiv` instruction. With the help of the `createICmpEq()`
+    and `addThrow()` functions, we can code this very easily, as follows:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除法的IR是在`visit(BinaryOp&)`方法中生成的。我们首先生成IR来比较除数和`0`，而不仅仅是生成一个`sdiv`指令。如果除数是`0`，那么控制流将继续在一个基本块中引发异常。否则，控制流将在一个包含`sdiv`指令的基本块中继续。借助`createICmpEq()`和`addThrow()`函数，我们可以很容易地编写这个代码。
+- en: '[PRE31]'
+  id: totrans-93
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'The code-generation part is now complete. To build the application, you change
+    into the `build` directory and run the `ninja` tool, as follows:'
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 代码生成部分现在已经完成。要构建应用程序，您需要切换到`build`目录并运行`ninja`工具。
+- en: '[PRE32]'
+  id: totrans-95
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'After the build is finished, you can check the generated IR—for example, with
+    the `with a: 3/a` expression, as follows:'
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '构建完成后，您可以检查生成的IR，例如使用`with a: 3/a`表达式。'
+- en: '[PRE33]'
+  id: totrans-97
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: You will see the additional IR needed to raise and catch the exception.
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您将看到引发和捕获异常所需的额外IR。
+- en: 'The generated IR now depends on the C++ runtime. The easiest way to link against
+    the required libraries is to use the clang++ compiler. Rename the `rtcalc.c` file
+    with the runtime functions for the expression calculator as `rtcalc.cpp`, and
+    add `extern "C"` in front of each function inside the file. Then we can use the
+    `llc` tool to turn the generated IR into an object file and use the clang++ compiler
+    to create an executable, as follows:'
+  id: totrans-99
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 生成的IR现在依赖于C++运行时。链接所需库的最简单方法是使用clang++编译器。将用于表达式计算器的运行时函数的`rtcalc.c`文件重命名为`rtcalc.cpp`，并在文件中的每个函数前面添加`extern
+    "C"`。然后我们可以使用`llc`工具将生成的IR转换为目标文件，并使用clang++编译器创建可执行文件。
+- en: '[PRE34]'
+  id: totrans-100
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: 'Then, we can run the generated application with different values, as follows:'
+  id: totrans-101
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，我们可以使用不同的值运行生成的应用程序，如下所示：
+- en: '[PRE35]'
+  id: totrans-102
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: In the second run the input is `0`, and this raises an exception. It works as
+    expected!
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在第二次运行中，输入为`0`，这引发了一个异常。这符合预期！
+- en: We have learned how to raise and catch exceptions. The code to generate the
+    IR can be used as a blueprint for other compilers. Of course, the used type information
+    and the number of `catch` clauses depends on the input to the compiler, but the
+    IR we need to generate still follows the pattern presented in this section.
+  id: totrans-104
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们已经学会了如何引发和捕获异常。生成IR的代码可以用作其他编译器的蓝图。当然，所使用的类型信息和`catch`子句的数量取决于编译器的输入，但我们需要生成的IR仍然遵循本节中提出的模式。
+- en: Adding metadata is a way to provide further information to LLVM. In the next
+    section, we add type metadata to support the LLVM optimizer in certain situations.
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 添加元数据是向LLVM提供更多信息的一种方式。在下一节中，我们将添加类型元数据以支持LLVM优化器在某些情况下的使用。
+- en: Generating metadata for type-based alias analysis
+  id: totrans-106
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 为基于类型的别名分析生成元数据
+- en: Two pointers may point to the same memory cell, and they then alias each other.
+    Memory is not typed in the LLVM model, which makes it difficult for the optimizer
+    to decide if two pointers alias each other or not. If the compiler can prove that
+    two pointers do not alias each other, then more optimizations are possible. In
+    the next section, we will have a closer look at the problem and investigate how
+    adding additional metadata will help, before we implement this approach.
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 两个指针可能指向同一内存单元，然后它们彼此别名。在LLVM模型中，内存没有类型，这使得优化器难以确定两个指针是否彼此别名。如果编译器可以证明两个指针不会别名，那么就有可能进行更多的优化。在下一节中，我们将更仔细地研究这个问题，并探讨如何添加额外的元数据将有所帮助，然后再实施这种方法。
+- en: Understanding the need for additional metadata
+  id: totrans-108
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 理解需要额外元数据的原因
+- en: 'To demonstrate the problem, let''s look at the following function:'
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了演示问题，让我们看一下以下函数：
+- en: '[PRE36]'
+  id: totrans-110
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: The optimizer cannot decide if the `p` and `q` pointers point to the same memory
+    cell or not. During optimization this is an important analysis, called an `p`
+    and `q` point to the same memory cell, then they are aliases. If the optimizer
+    can prove that both pointers never alias each other, this enables additional optimization
+    opportunities. For example, in the `soSomething()` function, the stores can be
+    reordered without altering the result in this case.
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 优化器无法确定`p`和`q`指针是否指向同一内存单元。在优化过程中，这是一个重要的分析，称为`p`和`q`指向同一内存单元，那么它们是别名。如果优化器可以证明这两个指针永远不会别名，这将提供额外的优化机会。例如，在`soSomething()`函数中，存储可以重新排序而不改变结果。
+- en: It depends on the definition of the source language as to whether a variable
+    of one type can be an alias of another variable of a different type. Please note
+    that languages may also contain expressions that break the type-based alias assumption—for
+    example, typecasts between unrelated types.
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这取决于源语言的定义，一个类型的变量是否可以是不同类型的另一个变量的别名。请注意，语言也可能包含打破基于类型的别名假设的表达式，例如不相关类型之间的类型转换。
+- en: 'The solution chosen by the LLVM developers is to add metadata to `load` and
+    `store` instructions. The metadata has two purposes, outlined as follows:'
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM开发人员选择的解决方案是向`load`和`store`指令添加元数据。元数据有两个目的，如下所述：
+- en: First, it defines the type hierarchy based on which type may alias another type
+  id: totrans-114
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 首先，它基于类型层次结构定义了类型层次结构，其中一个类型可能是另一个类型的别名
+- en: Secondly, it describes the memory access in a `load` or `store` instruction
+  id: totrans-115
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 其次，它描述了`load`或`store`指令中的内存访问
+- en: 'Let''s have a look at the type hierarchy in C. Each type of hierarchy starts
+    with a root node, either **named** or **anonymous**. LLVM assumes that root nodes
+    with the same name describe the same type of hierarchy. You can use different
+    type hierarchies in the same LLVM modules, and LLVM makes the safe assumption
+    that these types may alias. Beneath the root node, there are nodes for scalar
+    types. Nodes for aggregate types are not attached to the root node, but they refer
+    to scalar types and other aggregate types. Clang defines the hierarchy for C as
+    follows:'
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们来看看C中的类型层次结构。每种类型层次结构都以根节点开头，可以是**命名**或**匿名**。LLVM假设具有相同名称的根节点描述相同类型的层次结构。您可以在相同的LLVM模块中使用不同的类型层次结构，LLVM会安全地假设这些类型可能会别名。在根节点下面，有标量类型的节点。聚合类型的节点不附加到根节点，但它们引用标量类型和其他聚合类型。Clang为C定义了以下层次结构：
+- en: The root node is called `Simple C/C++ TBAA`.
+  id: totrans-117
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 根节点称为“Simple C/C++ TBAA”。
+- en: Beneath the root node is the node for `char` types. This is a special type in
+    C because all pointers can be converted to a pointer to `char`.
+  id: totrans-118
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在根节点下面是`char`类型的节点。这是C中的特殊类型，因为所有指针都可以转换为指向`char`的指针。
+- en: Beneath the `char` node are nodes for the other scalar types and a type for
+    all pointers, called `any pointer`.
+  id: totrans-119
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 在`char`节点下面是其他标量类型的节点和一个名为`any pointer`的所有指针类型。
+- en: Aggregate types are defined as a sequence of member types and offsets.
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 聚合类型被定义为一系列成员类型和偏移量。
+- en: 'These metadata definitions are used in access tags attached to the `load` and
+    `store` instructions. An access tag is made up of three parts: a base type, an
+    access type, and an offset. Depending on the base type, there are two possible
+    ways the access tag describes memory access, outlined here:'
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些元数据定义用于附加到`load`和`store`指令的访问标签。访问标签由三部分组成：基本类型、访问类型和偏移量。根据基本类型，访问标签描述内存访问的方式有两种可能，如下所述：
+- en: If the base type is an aggregate type, then the access tag describes the memory
+    access of a `struct` member, having the access type and being located at a given
+    offset.
+  id: totrans-122
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果基本类型是聚合类型，则访问标签描述了`struct`成员的内存访问，具有访问类型，并位于给定偏移量处。
+- en: If the base type is a scalar type, then the access type must be the same as
+    the base type and the offset must be `0`.
+  id: totrans-123
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果基本类型是标量类型，则访问类型必须与基本类型相同，偏移量必须为`0`。
+- en: 'With these definitions, we can now define a relation on the access tags, which
+    is used to evaluate if two pointers may alias each other or not. The immediate
+    parent of a tuple (base type, offset) is determined by the base type and the offset,
+    as follows:'
+  id: totrans-124
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些定义，我们现在可以在访问标签上定义一个关系，用于评估两个指针是否可能别名。元组（基本类型，偏移量）的直接父节点由基本类型和偏移量确定，如下所示：
+- en: If the base type is a scalar type and the offset is 0, then the immediate parent
+    is (parent type, 0), with parent type being the type of the parent node as defined
+    in the type hierarchy. If the offset is not 0, then the immediate parent is undefined.
+  id: totrans-125
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如果基本类型是标量类型且偏移量为0，则直接父节点是（父类型，0），其中父类型是在类型层次结构中定义的父节点的类型。如果偏移量不为0，则直接父节点未定义。
+- en: If the base type is an aggregate type, then the immediate parent of tuple (base
+    type, offset) is the tuple (new type, new offset), with the new type being the
+    type of the member at the offset. The new offset is the offset of the new type,
+    adjusted to its new start.
+  id: totrans-126
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 如果基本类型是聚合类型，则元组（基本类型，偏移量）的直接父节点是元组（新类型，新偏移量），其中新类型是在偏移量处的成员的类型。新偏移量是新类型的偏移量，调整为其新的起始位置。
+- en: The transitive closure of this relation is the parent relation. Two-memory access
+    types—for example, (base type 1, access type 1, offset 1) and (base type 2, access
+    type 2, offset 2) —may alias if (base type 1, offset 1) and (base type 2, offset
+    2) or vice versa are related in the parent relation.
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个关系的传递闭包是父关系。例如，（基本类型1，访问类型1，偏移1）和（基本类型2，访问类型2，偏移2）这两种内存访问类型可能会别名，如果（基本类型1，偏移1）和（基本类型2，偏移2）或者反之亦然在父关系中相关联。
+- en: 'Let''s illustrate this in an example, as follows:'
+  id: totrans-128
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们通过一个例子来说明：
+- en: '[PRE37]'
+  id: totrans-129
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: Using the preceding memory-access tag definition for scalar types, the access
+    tag for parameter `i` is (`int`, `int`, `0`), and for parameter `c` it is (`char`,
+    `char`, `0`). In the type hierarchy, the parent of the node for the `int` type
+    is the `char` node, therefore the immediate parent of (`int`, `0`) is (`char`,
+    `0`), and both pointers can alias. The same is true for parameter `x` and parameter
+    `c`. But parameter `x` and `i` are not related, and hence they do not alias each
+    other. The access for the `y` member of `struct Point` is (`Point`, `float`, `4`),
+    with 4 being the offset of the `y` member in the struct. The immediate parent
+    of (`Point`, `4`) is (`float`, `0`), therefore access to `p->y` and `x` may alias,
+    and—with the same reasoning—also with parameter `c`.
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用前面对标量类型的内存访问标签定义，参数`i`的访问标签是（`int`，`int`，`0`），参数`c`的访问标签是（`char`，`char`，`0`）。在类型层次结构中，`int`类型的节点的父节点是`char`节点，因此（`int`，`0`）的直接父节点是（`char`，`0`），两个指针可能会别名。对于参数`x`和参数`c`也是如此。但是参数`x`和`i`没有关联，因此它们不会别名。`struct
+    Point`的`y`成员的访问是（`Point`，`float`，`4`），4是结构体中`y`成员的偏移量。因此（`Point`，`4`）的直接父节点是（`float`，`0`），因此`p->y`和`x`的访问可能会别名，并且根据相同的推理，也会与参数`c`别名。
+- en: To create the metadata, we use the `llvm::MDBuilder` class, which is declared
+    in the `llvm/IR/MDBuilder.h` header file. The data itself is stored in instances
+    of the `llvm::MDNode` and `llvm::MDString` classes. Using the builder class shields
+    us from the internal details of the construction.
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要创建元数据，我们使用`llvm::MDBuilder`类，该类在`llvm/IR/MDBuilder.h`头文件中声明。数据本身存储在`llvm::MDNode`和`llvm::MDString`类的实例中。使用构建器类可以保护我们免受构造的内部细节的影响。
+- en: A root node is created with a call to the `createTBAARoot()` method, which expects
+    the name of the type hierarchy as a parameter and returns the root node. An anonymous
+    unique root node can be created with the `createAnonymousTBAARoot()` method.
+  id: totrans-132
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过调用`createTBAARoot()`方法创建根节点，该方法需要类型层次结构的名称作为参数，并返回根节点。可以使用`createAnonymousTBAARoot()`方法创建匿名唯一根节点。
+- en: A scalar type is added to the hierarchy with the `createTBAAScalarTypeNode()`
+    method, which takes the name of the type and the parent node as a parameter. Adding
+    a type node for an aggregate type is slightly more complex. The `createTBAAStructTypeNode()`
+    method takes the name of the type and a list of the fields as parameters. The
+    fields are given as a `std::pair<llvm::MDNode*, uint64_t>` instance. The first
+    element indicates the type of the member and the second element indicates the
+    offset in the `struct` type.
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用`createTBAAScalarTypeNode()`方法将标量类型添加到层次结构中，该方法以类型的名称和父节点作为参数。为聚合类型添加类型节点稍微复杂一些。`createTBAAStructTypeNode()`方法以类型的名称和字段列表作为参数。字段作为`std::pair<llvm::MDNode*,
+    uint64_t>`实例给出。第一个元素表示成员的类型，第二个元素表示`struct`类型中的偏移量。
+- en: An access tag is created with the `createTBAAStructTagNode()` method, which
+    takes the base type, the access type, and the offset as parameters.
+  id: totrans-134
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用`createTBAAStructTagNode()`方法创建访问标签，该方法以基本类型、访问类型和偏移量作为参数。
+- en: Lastly, the metadata must be attached to a `load` or `store` instruction. The
+    `llvm::Instruction` class has a `setMetadata()` method, which is used to add various
+    metadata. The first parameter must be `llvm::LLVMContext::MD_tbaa` and the second
+    must be the access tag.
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，元数据必须附加到`load`或`store`指令上。`llvm::Instruction`类有一个`setMetadata()`方法，用于添加各种元数据。第一个参数必须是`llvm::LLVMContext::MD_tbaa`，第二个参数必须是访问标签。
+- en: Equipped with this knowledge, we will add metadata for `tinylang` in the next
+    section.
+  id: totrans-136
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 掌握了这些知识，我们将在下一节为`tinylang`添加元数据。
+- en: Adding TBAA metadata to tinylang
+  id: totrans-137
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 为tinylang添加TBAA元数据
+- en: 'To support TBAA, we add a new `CGTBAA` class. This class is responsible for
+    generating the metadata nodes. We make it a member of the `CGModule` class, calling
+    it `TBAA`. Every `load` and `store` instruction could be possibly annotated, and
+    we place a new function for this purpose in the `CGModule` class too. The function
+    tries to create the tag-access information. If this is successful, the metadata
+    is attached to the instruction. This design also allows us to turn off the metadata
+    generation if we do not need it—for example, in builds with the optimization turned
+    off. The code is illustrated in the following snippet:'
+  id: totrans-138
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了支持TBAA，我们添加了一个新的`CGTBAA`类。这个类负责生成元数据节点。我们将它作为`CGModule`类的成员，称之为`TBAA`。每个`load`和`store`指令都可能被注释，我们也在`CGModule`类中放置了一个新的函数来实现这个目的。该函数尝试创建标签访问信息。如果成功，元数据将附加到指令上。这种设计还允许我们在不需要元数据的情况下关闭元数据生成，例如在关闭优化的构建中。代码如下所示：
+- en: '[PRE38]'
+  id: totrans-139
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: 'We put the declaration of the new `CGTBAA` class into the `include/tinylang/CodeGen/CGTBAA.h`
+    header file and put the definition into the `lib/CodeGen/CGTBAA.cpp` file. Besides
+    the **abstract syntax tree** (**AST**) definitions, the header file needs to include
+    the files defining the metadata nodes and builder, as illustrated in the following
+    code snippet:'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将新的`CGTBAA`类的声明放入`include/tinylang/CodeGen/CGTBAA.h`头文件中，并将定义放入`lib/CodeGen/CGTBAA.cpp`文件中。除了**抽象语法树**（**AST**）定义之外，头文件还需要包括定义元数据节点和构建器的文件，如下面的代码片段所示：
+- en: '[PRE39]'
+  id: totrans-141
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: 'The `CGTBAA` class needs to store some data members. So, let''s see how to
+    do this step by step, as follows:'
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CGTBAA`类需要存储一些数据成员。因此，让我们逐步看看如何做到这一点，如下所示：'
+- en: 'First of all, we need to cache the root of the type hierarchy, like this:'
+  id: totrans-143
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们需要缓存类型层次结构的根，如下所示：
+- en: '[PRE40]'
+  id: totrans-144
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: 'To construct the metadata nodes, we need an instance of the `MDBuilder` class,
+    as follows:'
+  id: totrans-145
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了构造元数据节点，我们需要`MDBuilder`类的一个实例，如下所示：
+- en: '[PRE41]'
+  id: totrans-146
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE41]'
+- en: 'Lastly, we store the metadata generated for a type to reuse, as follows:'
+  id: totrans-147
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，我们将为类型生成的元数据存储起来以便重用，如下所示：
+- en: '[PRE42]'
+  id: totrans-148
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE42]'
+- en: 'After defining the variables required for the construction, we now add the
+    methods required to create the metadata, as follows:'
+  id: totrans-149
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在定义构造所需的变量之后，我们现在添加了创建元数据所需的方法，如下所示：
+- en: 'The constructor initializes the data members, like this:'
+  id: totrans-150
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 构造函数初始化数据成员，如下所示：
+- en: '[PRE43]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE43]'
+- en: 'We lazily instantiate the root of the type hierarchy, which we name `Simple
+    tinylang TBAA`, as illustrated in the following code snippet:'
+  id: totrans-152
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们懒惰地实例化类型层次结构的根，我们称之为`Simple tinylang TBAA`，如下面的代码片段所示：
+- en: '[PRE44]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE44]'
+- en: 'For a scalar type, we create a metadata node with the help of the `MDBuilder`
+    class based on the name of the type. The new metadata node is stored in the cache,
+    as illustrated in the following code snippet:'
+  id: totrans-154
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 对于标量类型，我们使用`MDBuilder`类根据类型的名称创建元数据节点。新的元数据节点存储在缓存中，如下面的代码片段所示：
+- en: '[PRE45]'
+  id: totrans-155
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE45]'
+- en: 'The method to create the metadata for a record is more complicated, as we have
+    to enumerate all the fields of the record. The code is shown in the following
+    snippet:'
+  id: totrans-156
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 创建记录的元数据的方法更加复杂，因为我们必须枚举记录的所有字段。代码如下所示：
+- en: '[PRE46]'
+  id: totrans-157
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE46]'
+- en: 'To return the metadata for a `tinylang` type, we need to create the type hierarchy.
+    Because the type system of `tinylang` is very restricted, we can use a simple
+    approach. Each scalar type is mapped to a unique type attached to the root node,
+    and we map all pointers to a single type. Structured types then refer to these
+    nodes. If we cannot map a type we then return `nullptr`, as follows:'
+  id: totrans-158
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了返回`tinylang`类型的元数据，我们需要创建类型层次结构。由于`tinylang`的类型系统非常受限，我们可以使用简单的方法。每个标量类型都映射到附加到根节点的唯一类型，我们将所有指针映射到单个类型。结构化类型然后引用这些节点。如果我们无法映射类型，我们将返回`nullptr`，如下所示：
+- en: '[PRE47]'
+  id: totrans-159
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE47]'
+- en: 'A general method to get the metadata is `getAccessTagInfo()`. As we only need
+    to look for a pointer type, we check for it. Otherwise, we return a `nullptr`,
+    as illustrated in the following code snippet:'
+  id: totrans-160
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 获取元数据的通用方法是`getAccessTagInfo()`。因为我们只需要查找指针类型，所以我们进行了检查。否则，我们返回`nullptr`，如下面的代码片段所示：
+- en: '[PRE48]'
+  id: totrans-161
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE48]'
+- en: 'To enable the generation of TBAA metadata, we now simply need to attach the
+    metadata to the `load` and `store` instructions we generate. For example, in `CGProcedure::writeVariable()`,
+    a store to a global variable, use a `store` instruction, as follows:'
+  id: totrans-162
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了启用TBAA元数据的生成，我们现在只需要将元数据附加到我们生成的`load`和`store`指令上。例如，在`CGProcedure::writeVariable()`中，对全局变量的存储，使用`store`指令，如下所示：
+- en: '[PRE49]'
+  id: totrans-163
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE49]'
+- en: 'To decorate the instruction, we need to replace the preceding line with the
+    following lines:'
+  id: totrans-164
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了装饰指令，我们需要用以下行替换前一行：
+- en: '[PRE50]'
+  id: totrans-165
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE50]'
+- en: With these changes in place, we have finished the generation of TBAA metadata.
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了这些变化，我们已经完成了TBAA元数据的生成。
+- en: 'In the next section, we look at a very similar topic: the generation of debug
+    metadata.'
+  id: totrans-167
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将讨论一个非常相似的主题：调试元数据的生成。
+- en: Adding debug metadata
+  id: totrans-168
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 添加调试元数据
+- en: To allow source-level debugging, we have to add debug information. Support for
+    debug information in LLVM uses debug metadata to describe the types of the source
+    language and other static information, and an intrinsic to track variable values.
+    The LLVM core libraries generate debug information in DWARF format on Unix systems
+    and in **Protein Data Bank** (**PDB**) format for Windows. We take a look at the
+    general structure in the next section.
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了允许源级调试，我们必须添加调试信息。LLVM中的调试信息支持使用调试元数据来描述源语言的类型和其他静态信息，并使用内在函数来跟踪变量值。LLVM核心库在Unix系统上生成DWARF格式的调试信息，在Windows上生成**蛋白质数据银行**（**PDB**）格式。我们将在下一节中看一下一般的结构。
+- en: Understanding the general structure of debug metadata
+  id: totrans-170
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 理解调试元数据的一般结构
+- en: To describe the static structure, LLVM uses metadata in a similar way to the
+    metadata for type-based analysis. The static structure describes the file, the
+    compilation unit, functions, lexical blocks, and the used data types.
+  id: totrans-171
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了描述静态结构，LLVM使用元数据类似于基于类型的分析的元数据。静态结构描述文件、编译单元、函数、词法块和使用的数据类型。
+- en: 'The main class we use is `llvm::DIBuilder`, and we need to use the `llvm/IR/DIBuilder`
+    include file to get the class declaration. This builder class provides an easy-to-use
+    interface to create the debug metadata. The metadata is later either added to
+    LLVM objects such as global variables or is used in calls to debug intrinsics.
+    Important metadata that the builder class can create is listed here:'
+  id: totrans-172
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们使用的主要类是`llvm::DIBuilder`，我们需要使用`llvm/IR/DIBuilder`包含文件来获取类声明。这个构建器类提供了一个易于使用的接口来创建调试元数据。稍后，元数据要么添加到LLVM对象，比如全局变量，要么在调试内部使用。构建器类可以创建的重要元数据在这里列出：
+- en: '`lvm::DIFile`: This describes a file using the filename and the absolute path
+    of the directory containing the file. You use the `createFile()` method to create
+    it. A file can contain the main compilation unit or it could contain imported
+    declarations.'
+  id: totrans-173
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`lvm::DIFile`：使用文件名和包含文件的目录的绝对路径来描述文件。您可以使用`createFile()`方法来创建它。一个文件可以包含主编译单元，也可以包含导入的声明。'
+- en: '`llvm::DICompileUnit`: This is used to describe the current compilation unit.
+    Among other things, you specify the source language, a compiler-specific producer
+    string, whether optimizations are enabled or not, and—of course—the `DIFile` in
+    which the compilation unit resides. You create it with a call to `createCompileUnit()`.'
+  id: totrans-174
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`llvm::DICompileUnit`：用于描述当前编译单元。除其他内容外，您需要指定源语言、特定于编译器的生产者字符串，是否启用优化，以及编译单元所在的`DIFile`。您可以通过调用`createCompileUnit()`来创建它。'
+- en: '`llvm::DISubprogram`: This describes a function. Important information is the
+    scope (usually a `DICompileUnit` or a `DISubprogram` for a nested function), the
+    name of the function, the mangled name of the function, and the function type.
+    It is created with a call to `createFunction()`.'
+  id: totrans-175
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`llvm::DISubprogram`：描述一个函数。重要信息是作用域（通常是`DICompileUnit`或嵌套函数的`DISubprogram`）、函数的名称、函数的重整名和函数类型。它是通过调用`createFunction()`来创建的。'
+- en: '`llvm::DILexicalBlock`: This describes a lexical block that models the block
+    scoping found in many high-level languages. You create this with a call to `createLexicalBlock()`.'
+  id: totrans-176
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`llvm::DILexicalBlock`：描述了许多高级语言中找到的块作用域的词法块。您可以通过调用`createLexicalBlock()`来创建它。'
+- en: 'LLVM makes no assumptions about the language your compiler translates. As a
+    consequence, it has no information about the data types of the language. To support
+    source-level debugging, especially displaying variable values in a debugger, type
+    information must be added too. Important constructs are listed here:'
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM不对编译器翻译的语言做任何假设。因此，它对语言的数据类型没有任何信息。为了支持源级调试，特别是在调试器中显示变量值，也必须添加类型信息。这里列出了重要的构造：
+- en: The `createBasicType()` function, returning a pointer to the `llvm::DIBasicType`
+    class, creates the metadata to describe a basic type such as `INTEGER` in `tinylang`
+    or `int` in C++. Besides the name of the type, the required parameters are the
+    size in bits and the encoding—for example, whether it is a signed or unsigned
+    type.
+  id: totrans-178
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`createBasicType()`函数返回一个指向`llvm::DIBasicType`类的指针，用于创建描述`tinylang`中的`INTEGER`或C++中的`int`等基本类型的元数据。除了类型的名称，所需的参数是位大小和编码，例如，它是有符号还是无符号类型。'
+- en: There are several ways to construct the metadata for composite data types, represented
+    by the `llvm::DIComposite` class. You use `createArrayType()`, `createStructType()`,
+    `createUnionType()`, and `createVectorType()` functions to instantiate the metadata
+    for `array`, `struct`, `union`, and `vector` data types. The functions require
+    the parameter you expect—for example, the base type and the number of subscriptions
+    for an array type, or a list of the field members of a `struct` type.
+  id: totrans-179
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 有几种方法可以构造复合数据类型的元数据，由`llvm::DIComposite`类表示。您可以使用`createArrayType()`、`createStructType()`、`createUnionType()`和`createVectorType()`函数来实例化`array`、`struct`、`union`和`vector`数据类型的元数据。这些函数需要您期望的参数，例如，数组类型的基本类型和订阅数量，或者`struct`类型的字段成员列表。
+- en: There are also methods to support enumerations, templates, classes, and so on.
+  id: totrans-180
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 还有支持枚举、模板、类等的方法。
+- en: 'The list of functions shows you that you have to add every detail of the source
+    language to the debug information. Let''s assume your instance of the `llvm::DIBuilder`
+    class is called `DBuilder`. Assume further that you have some `tinylang` source
+    in a file called `File.mod` in the `/home/llvmuser` folder. Inside the file is
+    a `Func():INTEGER` function at *line 5*, which contains a `VAR i:INTEGER` local
+    declaration at *line 7*. Let''s create the metadata for this, beginning with the
+    information for the file. You need to specify the filename and the absolute path
+    of the folder in which the file resides, as illustrated in the following code
+    snippet:'
+  id: totrans-181
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数列表显示您必须将源语言的每个细节添加到调试信息中。假设您的`llvm::DIBuilder`类的实例称为`DBuilder`。进一步假设您在名为`File.mod`的文件中有一些`tinylang`源码，位于`/home/llvmuser`文件夹中。文件中有一个在*第5行*包含在*第7行*包含一个`VAR
+    i:INTEGER`本地声明的`Func():INTEGER`函数。让我们从文件的信息开始创建这些元数据。您需要指定文件名和文件所在文件夹的绝对路径，如下面的代码片段所示：
+- en: '[PRE51]'
+  id: totrans-182
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE51]'
+- en: 'The file is a module in `tinylang` and therefore is the compilation unit for
+    LLVM. This carries a lot of information, as can be seen in the following code
+    snippet:'
+  id: totrans-183
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 文件是`tinylang`中的一个模块，因此是LLVM的编译单元。这携带了大量信息，如下面的代码片段所示：
+- en: '[PRE52]'
+  id: totrans-184
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE52]'
+- en: The debugger needs to know the source language. The DWARF standard defines an
+    enumeration with all the common values. A disadvantage is that you cannot simply
+    add a new source language. To do that, you have to create a request through the
+    DWARF committee. Be aware that the debugger and other debug tools also need support
+    for a new language—just adding a new member to the enumeration is not enough.
+  id: totrans-185
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调试器需要知道源语言。DWARF标准定义了一个包含所有常见值的枚举。一个缺点是您不能简单地添加一个新的源语言。要做到这一点，您必须通过DWARF委员会创建一个请求。请注意，调试器和其他调试工具也需要支持新语言，仅仅向枚举添加一个新成员是不够的。
+- en: In many cases, it is sufficient to choose a language that is close to your source
+    language. In the case of `tinylang` this is Modula-2, and we use `DW_LANG_Modula2`
+    for language identification. A compilation unit resides in a file, which is identified
+    by the `DbgFile` variable we created before. The debug information can carry information
+    about the producer. This can be the name of the compiler and the version information.
+    Here, we just pass a `tinylang` string. If you do not want to add this information,
+    then you can simply use an empty string as a parameter.
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在许多情况下，选择一个接近您源语言的语言就足够了。在`tinylang`的情况下，这是Modula-2，我们使用`DW_LANG_Modula2`进行语言识别。编译单元位于一个文件中，由我们之前创建的`DbgFile`变量标识。调试信息可以携带有关生产者的信息。这可以是编译器的名称和版本信息。在这里，我们只传递一个`tinylang`字符串。如果您不想添加这些信息，那么您可以简单地将一个空字符串作为参数。
+- en: The next set of information includes an `IsOptimized` flag, which should indicate
+    if the compiler has turned optimization on or not. Usually, this flag is derived
+    from the `–O` command-line switch. You can pass additional parameter settings
+    to the debugger with the `CUFlags` parameter. This is not used here, and we pass
+    an empty string. We do not use Objective-C, so we pass `0` as the Objective-C
+    runtime version. Normally, debug information is embedded in the object file we
+    are creating. If we want to write the debug information into a separate file,
+    then the `SplitName` parameter must contain the name of this file; otherwise,
+    just pass an empty string. And lastly, you can define the level of debug information
+    that should be emitted. The default setting is full debug information, indicated
+    by the use of the `FullDebug` enum value. You can also choose the `LineTablesOnly`
+    value if you want to emit only line numbers, or the `NoDebug` value for no debug
+    information at all. For the latter, it is better to not create debug information
+    in the first place.
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下一组信息包括一个`IsOptimized`标志，应指示编译器是否已经打开了优化。通常，此标志是从`-O`命令行开关派生的。您可以使用`CUFlags`参数向调试器传递附加的参数设置。这里没有使用，我们传递一个空字符串。我们不使用Objective-C，所以我们将`0`作为Objective-C运行时版本传递。通常，调试信息嵌入在我们正在创建的目标文件中。如果我们想要将调试信息写入一个单独的文件中，那么`SplitName`参数必须包含此文件的名称；否则，只需传递一个空字符串。最后，您可以定义应该发出的调试信息级别。默认设置是完整的调试信息，通过使用`FullDebug`枚举值表示。如果您只想发出行号，则可以选择`LineTablesOnly`值，或者选择`NoDebug`值以完全不发出调试信息。对于后者，最好一开始就不创建调试信息。
+- en: 'Our minimalistic source uses only the `INTEGER` data type, which is a signed
+    32-bit value. Creating the metadata for this type is straightforward, as can be
+    seen in the following code snippet:'
+  id: totrans-188
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的最小化源码只使用`INTEGER`数据类型，这是一个带符号的32位值。为此类型创建元数据是直接的，可以在以下代码片段中看到：
+- en: '[PRE53]'
+  id: totrans-189
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE53]'
+- en: 'To create the debug metadata for the function, we have to create a type for
+    the signature first, and then the metadata for the function itself. This is similar
+    to the creation of IR for a function. The signature of the function is an array
+    with all the types of the parameters in source order and the return type of the
+    function as the first element at index `0`. Usually, this array is constructed
+    dynamically. In our case, we can also construct the metadata statically. This
+    is useful for internal functions—for example, for module initializing. Typically,
+    the parameters of these functions are always known, and the compiler writer can
+    hardcode them. The code is shown in the following snippet:'
+  id: totrans-190
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要为函数创建调试元数据，我们首先必须为签名创建一个类型，然后为函数本身创建元数据。这类似于为函数创建IR。函数的签名是一个数组，其中包含源顺序中所有参数的类型以及函数的返回类型作为索引`0`处的第一个元素。通常，此数组是动态构建的。在我们的情况下，我们也可以静态构建元数据。这对于内部函数（例如模块初始化）非常有用。通常，这些函数的参数是已知的，并且编译器编写者可以硬编码它们。代码如下所示：
+- en: '[PRE54]'
+  id: totrans-191
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE54]'
+- en: Our function has an `INTEGER` return type and no further parameters, so the
+    `DbgSigTy` array contains only the pointer to the metadata for this type. This
+    static array is turned into a type array, which is then used to create the type
+    for the function.
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的函数具有`INTEGER`返回类型和没有其他参数，因此`DbgSigTy`数组仅包含指向此类型元数据的指针。这个静态数组被转换成类型数组，然后用于创建函数的类型。
+- en: 'The function itself requires more data, as follows:'
+  id: totrans-193
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数本身需要更多的数据，如下所示：
+- en: '[PRE55]'
+  id: totrans-194
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE55]'
+- en: A function belongs to a compilation unit, in our case stored in the `DbgCU`
+    variable. We need to specify the name of the function in the source file, which
+    is `Func`, and the mangled name is stored in the object file. This information
+    helps the debugger to locate the machine code of the function later on. The mangled
+    name, based on the rules of `tinylang`, is `_t4File4Func`. We also have to specify
+    the file that contains the function.
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数属于编译单元，在我们的案例中存储在`DbgCU`变量中。我们需要在源文件中指定函数的名称，即`Func`，并且搅乱的名称存储在目标文件中。这些信息帮助调试器在以后定位函数的机器代码。根据“tinylang”的规则，搅乱的名称是“_t4File4Func”。我们还需要指定包含函数的文件。
+- en: 'This may sound surprising at first, but think of the include mechanism in C
+    and C++: a function can be stored in a different file, which is then included
+    with `#include` in the main compilation unit. Here, this is not the case, and
+    we use the same file as the one the compilation unit uses. Next, the line number
+    of the function and the function type are passed. The line number of the function
+    may not be the line number where the lexical scope of the function begins. In
+    this case, you can specify a different `ScopeLine`. A function also has protection,
+    which we specify here with the `FlagPrivate` value to indicate a private function.
+    Other possible values are `FlagPublic` and `FlagProtected`, for public and protected
+    functions.'
+  id: totrans-196
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这一开始可能听起来令人惊讶，但想想C和C++中的包含机制：一个函数可以存储在不同的文件中，然后在主编译单元中用`#include`包含。在这里，情况并非如此，我们使用与编译单元相同的文件。接下来，传递函数的行号和函数类型。函数的行号可能不是函数的词法范围开始的行号。在这种情况下，您可以指定不同的`ScopeLine`。函数还有保护，我们在这里用`FlagPrivate`值指定为私有函数。其他可能的值是`FlagPublic`和`FlagProtected`，分别表示公共和受保护的函数。
+- en: Besides the protection level, there are other flags that can be specified here.
+    For example, `FlagVirtual` indicates a virtual function, and `FlagNoReturn` indicates
+    that the function does not return to the caller. You can find a complete list
+    of possible values in the `llvm/include/llvm/IR/DebugInfoFlags.def` LLVM include
+    file. And lastly, flags specific to a function can be specified. The most used
+    one is the `SPFlagLocalToUnit` value, which indicates that the function is local
+    to this compilation unit. Also often used is the `MainSubprogram` value, indicating
+    that this function is the main function of the application. You can also find
+    all possible values in the LLVM include file mentioned previously.
+  id: totrans-197
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除了保护级别，这里还可以指定其他标志。例如，`FlagVirtual`表示虚函数，`FlagNoReturn`表示函数不会返回给调用者。您可以在`llvm/include/llvm/IR/DebugInfoFlags.def`的LLVM包含文件中找到所有可能的值的完整列表。最后，还可以指定特定于函数的标志。最常用的是`SPFlagLocalToUnit`值，表示该函数是本编译单元的本地函数。还经常使用的是`MainSubprogram`值，表示该函数是应用程序的主函数。您还可以在前面提到的LLVM包含文件中找到所有可能的值。
+- en: So far, we only created the metadata referring to static data. Variables are
+    dynamic in nature, and we explore how to attach the static metadata to the IR
+    code for accessing variables in the next section.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们只创建了引用静态数据的元数据。变量是动态的，我们将在下一节中探讨如何将静态元数据附加到IR代码以访问变量。
+- en: Tracking variables and their values
+  id: totrans-199
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 跟踪变量及其值
+- en: To be useful, the type metadata described in the last section needs to be associated
+    with the variables of the source program. For a global variable, this is pretty
+    easy. The `createGlobalVariableExpression()` function of the `llvm::DIBuilder`
+    class creates the metadata to describe a global variable. This includes the name
+    of the variable in the source, the mangled name, the source file, and so on. A
+    global variable in LLVM IR is represented by an instance of the `GlobalVariable`
+    class. This class has an `addDebugInfo()` method, which associates the metadata
+    node returned from `createGlobalVariableExpression()` with the global variable.
+  id: totrans-200
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要有用，上一节中描述的类型元数据需要与源程序的变量关联起来。对于全局变量，这相当容易。`llvm::DIBuilder`类的`createGlobalVariableExpression()`函数创建了描述全局变量的元数据。这包括源中变量的名称、搅乱的名称、源文件等。LLVM
+    IR中的全局变量由`GlobalVariable`类的实例表示。该类有一个`addDebugInfo()`方法，它将从`createGlobalVariableExpression()`返回的元数据节点与全局变量关联起来。
+- en: For local variables, we need to take another approach. LLVM IR does not know
+    a class representing a local variable; it knows only about values. The solution
+    the LLVM community developed is to insert calls to intrinsic functions into the
+    IR code of a function. An intrinsic function is a function that LLVM knows about
+    and therefore can do some magic with it. In most cases, intrinsic functions do
+    not result in a subroutine call at the machine level. Here, the function call
+    is a convenient vehicle to associate the metadata with a value.
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于局部变量，我们需要采取另一种方法。LLVM IR不知道表示局部变量的类；它只知道值。LLVM社区开发的解决方案是在函数的IR代码中插入对内部函数的调用。内部函数是LLVM知道的函数，因此可以对其进行一些魔术操作。在大多数情况下，内部函数不会导致机器级别的子例程调用。在这里，函数调用是一个方便的工具，用于将元数据与值关联起来。
+- en: The most important intrinsic functions for debug metadata are `llvm.dbg.declare`
+    and `llvm.dbg.value`. The former is called once to declare the address of a local
+    variable, while the latter is called whenever a local variable is set to a new
+    value.
+  id: totrans-202
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调试元数据最重要的内部函数是`llvm.dbg.declare`和`llvm.dbg.value`。前者用于声明局部变量的地址，而后者在将局部变量设置为新值时调用。
+- en: Future LLVM versions will replace llvm.dbg.declare with the llvm.dbg.addr intrinsic
+  id: totrans-203
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 未来的LLVM版本将用llvm.dbg.addr内部函数替换llvm.dbg.declare
+- en: 'The `llvm.dbg.declare` intrinsic function makes a very strong assumption: the
+    address of the variable described in the call to the intrinsic is valid throughout
+    the lifetime of the function. This assumption makes it very hard to preserve debug
+    metadata during optimization because the real storage address can change. To solve
+    this, a new intrinsic called `llvm.dbg.addr` was designed. This intrinsic takes
+    the same parameters as `llvm.dbg.declare`, but it has less strict semantics. It
+    still describes the address of a local variable, and a frontend should generate
+    exactly one call to it.'
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`llvm.dbg.declare`内部函数做出了一个非常强烈的假设：调用中描述的变量的地址在函数的整个生命周期内都是有效的。这个假设使得在优化期间保留调试元数据变得非常困难，因为真实的存储地址可能会发生变化。为了解决这个问题，设计了一个名为`llvm.dbg.addr`的新内部函数。这个内部函数接受与`llvm.dbg.declare`相同的参数，但语义不那么严格。它仍然描述了局部变量的地址，前端应该生成对它的调用。'
+- en: During optimization, passes can replace this intrinsic with (possibly multiple)
+    calls to `llvm.dbg.value` and/or `llvm.dbg.addr` in order to preserve the debug
+    information.
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在优化期间，传递可以用（可能是多个）对`llvm.dbg.value`和/或`llvm.dbg.addr`的调用来替换这个内部函数，以保留调试信息。
+- en: The `llvm.dbg.declare` intrinsic will be deprecated and later removed when work
+    on `llvm.dbg.addr` is finished.
+  id: totrans-206
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当`llvm.dbg.addr`的工作完成后，`llvm.dbg.declare`内部函数将被弃用并最终移除。
+- en: 'How does it work? The LLVM IR representation and the programmatic creation
+    via the `llvm::DIBuilder` class differ a bit, so we look at both. Continuing our
+    example from the previous section, we allocate local storage for the `i` variable
+    inside the `Func` function with the `alloca` instruction, as follows:'
+  id: totrans-207
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 它是如何工作的？LLVM IR表示和通过`llvm::DIBuilder`类进行编程创建有些不同，因此我们需要同时看两者。继续上一节的例子，我们使用`alloca`指令在`Func`函数内为`i`变量分配局部存储空间，如下所示：
+- en: '[PRE56]'
+  id: totrans-208
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE56]'
+- en: 'After that, we add a call to the `llvm.dbg.declare` intrinsic, like this:'
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 之后，我们添加一个对`llvm.dbg.declare`内部函数的调用，如下所示：
+- en: '[PRE57]'
+  id: totrans-210
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE57]'
+- en: The first parameter is the address to the local variable. The second parameter
+    is the metadata describing the local variable, created by a call to either `createAutoVariable()`
+    for a local variable or `createParameterVariable()` for a parameter of the `llvm::DIBuilder`
+    class. The third parameter describes an address expression, which I explain later.
+  id: totrans-211
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 第一个参数是局部变量的地址。第二个参数是描述局部变量的元数据，由`llvm::DIBuilder`类的`createAutoVariable()`或`createParameterVariable()`调用创建。第三个参数描述一个地址表达式，稍后我会解释。
+- en: 'Let''s implement the IR creation. You allocate the storage for the `@i` local
+    variable with a call to the `CreateAlloca()` method of the `llvm::IRBuilder<>`
+    class, as follows:'
+  id: totrans-212
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们实现IR创建。您可以使用`llvm::IRBuilder<>`类的`CreateAlloca()`方法为`@i`局部变量分配存储空间，如下所示：
+- en: '[PRE58]'
+  id: totrans-213
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE58]'
+- en: The `LLVMCtx` variable is the used context class, and `Builder` is the used
+    instance of the `llvm::IRBuilder<>` class.
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`LLVMCtx`变量是使用的上下文类，`Builder`是`llvm::IRBuilder<>`类的实例。'
+- en: 'A local variable also needs to be described by metadata, as follows:'
+  id: totrans-215
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 局部变量也需要用元数据描述，如下所示：
+- en: '[PRE59]'
+  id: totrans-216
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE59]'
+- en: Using the values from the previous section, we specify that the variable is
+    part of the `DbgFunc` function, has the name `i`, is defined in the file named
+    by `DbgFile` at *line 7*, and has a `DbgIntTy` type.
+  id: totrans-217
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用上一节中的值，我们指定变量是`DbgFunc`函数的一部分，名称为`i`，在由`DbgFile`命名的文件中定义，位于*第7行*，类型为`DbgIntTy`。
+- en: 'Finally, we associate the debug metadata with the address of the variable using
+    the `llvm.dbg.declare` intrinsic. Using `llvm::DIBuilder` shields you from all
+    of the details of adding a call. The code is shown in the following snippet:'
+  id: totrans-218
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，我们使用`llvm.dbg.declare`内部函数将调试元数据与变量的地址关联起来。使用`llvm::DIBuilder`可以屏蔽掉添加调用的所有细节。代码如下所示：
+- en: '[PRE60]'
+  id: totrans-219
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE60]'
+- en: Again, we have to specify a source location for the variable. An instance of
+    `llvm::DILocation` is a container to hold the line and column of a location associated
+    with a scope. The `insertDeclare()` method adds a call to the intrinsic function
+    to the LLVM IR. As parameters it requires the address of the variable, stored
+    in `Val`, and the debug metadata for the variable, stored in `DbgValVar`. We also
+    pass an empty address expression and the debug location created before. As with
+    a normal instruction, we need to specify into which basic block the call is inserted.
+    If we specify a basic block, then the call is inserted at the end. Alternatively,
+    we can specify an instruction, and the call is inserted before that instruction.
+    We have the pointer to the `alloca` instruction, which is the last one that we
+    inserted into the underlying basic block. So, we use this basic block, and the
+    call gets appended after the `alloca` instruction.
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 同样，我们需要为变量指定源位置。`llvm::DILocation`的实例是一个容器，用于保存与作用域关联的位置的行和列。`insertDeclare()`方法向LLVM
+    IR添加对内部函数的调用。作为参数，它需要变量的地址（存储在`Val`中）和变量的调试元数据（存储在`DbgValVar`中）。我们还传递了一个空地址表达式和之前创建的调试位置。与普通指令一样，我们需要指定将调用插入到哪个基本块中。如果我们指定了一个基本块，那么调用将插入到末尾。或者，我们可以指定一个指令，调用将插入到该指令之前。我们有指向`alloca`指令的指针，这是我们插入到基本块中的最后一个指令。因此，我们使用这个基本块，调用将在`alloca`指令之后追加。
+- en: If a value of a local variable changes, then a call to `llvm.dbg.value` must
+    be added to the IR. You use the `insertValue()` method of `llvm::DIBuilder` to
+    do so. This works similarly for `llvm.dbg.addr`. The difference is that instead
+    of the address of the variable, now the new value is specified.
+  id: totrans-221
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果局部变量的值发生变化，那么必须在IR中添加对`llvm.dbg.value`的调用。您可以使用`llvm::DIBuilder`的`insertValue()`方法来实现。对于`llvm.dbg.addr`也是类似的。不同之处在于，现在指定的是变量的新值，而不是变量的地址。
+- en: When we implemented the IR generation for functions, we used an advanced algorithm
+    that mainly used values and avoided allocating storage for local variables. For
+    adding debug information, this only means that we use `llvm.dbg.value` much more
+    often than you see in Clang-generated IR.
+  id: totrans-222
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们为函数实现IR生成时，我们使用了一种先进的算法，主要使用值并避免为局部变量分配存储空间。为了添加调试信息，这意味着我们在Clang生成的IR中使用`llvm.dbg.value`的频率要比你看到的要高得多。
+- en: What can we do if the variable does not have dedicated storage space but is
+    part of a larger aggregate type? One situation where this can arise is with the
+    use of nested functions. To implement access to the stack frame of the caller,
+    you collect all used variables in a structure and pass a pointer to this record
+    to the called function. Inside the called function, you can refer to the variables
+    of the caller as if they were local to the function. What is different is that
+    these variables are now part of an aggregate.
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果变量没有专用存储空间，而是属于较大的聚合类型，我们可以怎么办？可能出现这种情况的一种情况是使用嵌套函数。为了实现对调用者堆栈帧的访问，您需要将所有使用的变量收集到一个结构中，并将指向此记录的指针传递给被调用的函数。在被调用的函数内部，您可以将调用者的变量视为函数的本地变量。不同的是，这些变量现在是聚合的一部分。
+- en: 'In the call to `llvm.dbg.declare`, you use an empty expression if the debug
+    metadata describes the whole memory the first parameter is pointing to. If it
+    instead describes only a part of the memory, then you need to add an expression
+    indicating which part of the memory the metadata applies to. In the case of the
+    nested frame, you need to calculate the offset into the frame. You need access
+    to a `DataLayout` instance, which you can get from the LLVM module into which
+    you are creating the IR code. If the `llvm::Module` instance is named `Mod`, the
+    variable holding the nested frame structure is named `Frame`, being of type `llvm::StructType`,
+    and you access the third member of the frame. This then gives you the offset of
+    the member, as illustrated in the following code snippet:'
+  id: totrans-224
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在调用`llvm.dbg.declare`时，如果调试元数据描述了第一个参数指向的整个内存，则使用空表达式。如果它只描述内存的一部分，则需要添加一个表达式，指示元数据适用于内存的哪一部分。在嵌套帧的情况下，需要计算到帧的偏移量。您需要访问`DataLayout`实例，可以从您正在创建IR代码的LLVM模块中获取。如果`llvm::Module`实例命名为`Mod`，则包含嵌套帧结构的变量命名为`Frame`，类型为`llvm::StructType`，并且您可以访问帧的第三个成员。然后，您可以得到成员的偏移量，如下面的代码片段所示：
+- en: '[PRE61]'
+  id: totrans-225
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE61]'
+- en: 'The expression is created from a sequence of operations. To access the third
+    member of the frame, the debugger needs to add the offset to the base pointer.
+    You need to create an array and this information—for example, in this way:'
+  id: totrans-226
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 表达式是从一系列操作中创建的。为了访问帧的第三个成员，调试器需要将偏移量添加到基指针。您需要创建一个数组和这个信息，例如：
+- en: '[PRE62]'
+  id: totrans-227
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE62]'
+- en: 'From this array, you can create an expression that you then pass to `llvm.dbg.declare`
+    instead of the empty expression, as follows:'
+  id: totrans-228
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 从这个数组中，您可以创建一个表达式，然后将其传递给`llvm.dbg.declare`，而不是空表达式，如下所示：
+- en: '[PRE63]'
+  id: totrans-229
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE63]'
+- en: You are not limited to this offset operation. DWARF knows many different operators,
+    and you can create fairly complex expressions. You can find a complete list of
+    operators in the `llvm/include/llvm/BinaryFormat/Dwarf.def` LLVM include file.
+  id: totrans-230
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您不仅限于此偏移操作。DWARF知道许多不同的操作符，您可以创建相当复杂的表达式。您可以在`llvm/include/llvm/BinaryFormat/Dwarf.def`
+    LLVM包含文件中找到操作符的完整列表。
+- en: You are now able to create debug information for variables. To enable the debugger
+    to follow the control flow in the source, you also need to provide line-number
+    information, which is the topic of the next section.
+  id: totrans-231
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，您可以为变量创建调试信息。为了使调试器能够跟踪源代码中的控制流，您还需要提供行号信息，这是下一节的主题。
+- en: Adding line numbers
+  id: totrans-232
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 添加行号
+- en: A debugger allows a programmer to step line by line through an application.
+    For this, the debugger needs to know which machine instructions belong to which
+    line in the source code. LLVM allows a source location to be added to each instruction.
+    In the previous section, we created location information of the `llvm::DILocation`
+    type. A debug location has more information than just the line, column, and scope.
+    If needed, the scope into which this line is inlined can be specified. It is also
+    possible to indicate that this debug location belongs to implicit code—that is,
+    code that the frontend has generated but that is not in the source code.
+  id: totrans-233
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调试器允许程序员逐行浏览应用程序。为此，调试器需要知道哪些机器指令属于源代码中的哪一行。LLVM允许在每条指令中添加源位置。在上一节中，我们创建了`llvm::DILocation`类型的位置信息。调试位置具有比行、列和作用域更多的信息。如果需要，可以指定此行内联的作用域。还可以指示此调试位置属于隐式代码，即前端生成的但不在源代码中的代码。
+- en: Before it can be attached to an instruction, we must wrap the debug location
+    in an `llvm::DebugLoc` object. To do so, you simply pass the location information
+    obtained from the `llvm::DILocation` class to the `llvm::DebugLoc` constructor.
+    With this wrapping, it is possible for LLVM to track the location information.
+    While the location in the source obviously does not change, the generated machine
+    code for a source-level statement or expression can be dropped during optimization.
+    Encapsulation helps to deal with these possible changes.
+  id: totrans-234
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在将调试位置附加到指令之前，我们必须将调试位置包装在`llvm::DebugLoc`对象中。为此，您只需将从`llvm::DILocation`类获得的位置信息传递给`llvm::DebugLoc`构造函数。通过这种包装，LLVM可以跟踪位置信息。虽然源代码中的位置显然不会改变，但是源级语句或表达式的生成机器代码可能会在优化期间被丢弃。封装有助于处理这些可能的更改。
+- en: Adding line-number information mostly boils down to retrieving the line-number
+    information from the AST and adding it to the generated instructions. The `llvm::Instruction`
+    class has the `setDebugLoc()` method, which attaches the location information
+    to the instruction.
+  id: totrans-235
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 将行号信息添加到生成的指令中主要是从AST中检索行号信息，并将其添加到生成的指令中。`llvm::Instruction`类有`setDebugLoc()`方法，它将位置信息附加到指令上。
+- en: In the next section, we add the generation of debug information to our `tinylang`
+    compiler.
+  id: totrans-236
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一节中，我们将向我们的`tinylang`编译器添加调试信息的生成。
+- en: Adding debug support to tinylang
+  id: totrans-237
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 为tinylang添加调试支持
+- en: We encapsulate the generation of debug metadata in the new `CGDebugInfo` class.
+    We put the declaration into the `tinylang/CodeGen/CGDebugInfo.h` header file and
+    the definition into the `tinylang/CodeGen/CGDebugInfo.cpp` file.
+  id: totrans-238
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将调试元数据的生成封装在新的`CGDebugInfo`类中。我们将声明放入`tinylang/CodeGen/CGDebugInfo.h`头文件中，将定义放入`tinylang/CodeGen/CGDebugInfo.cpp`文件中。
+- en: The `CGDebugInfo` class has five important members. We need a reference to the
+    code generator for the module, `CGM`, because we need to convert types from AST
+    representation to LLVM types. Of course, we also need an instance of the `llvm::DIBuilder`
+    class, called `DBuilder`, as in the previous sections. A pointer to the instance
+    of the compile unit is also needed, and we store it in a member called `CU`.
+  id: totrans-239
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CGDebugInfo`类有五个重要成员。我们需要模块的代码生成器`CGM`的引用，因为我们需要将AST表示的类型转换为LLVM类型。当然，我们还需要`llvm::DIBuilder`类的实例`DBuilder`，就像前面的部分一样。还需要编译单元的指针，并将其存储在名为`CU`的成员中。'
+- en: 'To avoid repeated creation of the debug metadata for types, we also add a map
+    to cache this information. The member is called `TypeCache`. And lastly, we need
+    a way to manage the scope information, for which we create a stack based on the
+    `llvm::SmallVector<>` class, called `ScopeStack`. Thus we have the following code:'
+  id: totrans-240
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了避免重复创建类型的调试元数据，我们还添加了一个用于缓存这些信息的映射。成员称为`TypeCache`。最后，我们需要一种管理作用域信息的方法，为此我们基于`llvm::SmallVector<>`类创建了一个名为`ScopeStack`的堆栈。因此，我们有以下代码：
+- en: '[PRE64]'
+  id: totrans-241
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE64]'
+- en: 'The following methods of the `CGDebugInfo` class all make use of these members:'
+  id: totrans-242
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CGDebugInfo`类的以下方法都使用了这些成员：'
+- en: 'First, we need to create the compile unit, which we do in the constructor.
+    We also create a file containing the compile unit here. Later, we can refer to
+    the file through the `CU` member. The code for the constructor is shown in the
+    following snippet:'
+  id: totrans-243
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们需要在构造函数中创建编译单元。我们还在这里创建包含编译单元的文件。稍后，我们可以通过`CU`成员引用该文件。构造函数的代码如下所示：
+- en: '[PRE65]'
+  id: totrans-244
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE65]'
+- en: 'Very often, we need to provide a line number. This can be derived from the
+    source manager location, which is available is most AST nodes. The source manager
+    can convert this into a line number, as follows:'
+  id: totrans-245
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们经常需要提供行号。这可以从源管理器位置派生，大多数AST节点都可以使用。源管理器可以将其转换为行号，如下所示：
+- en: '[PRE66]'
+  id: totrans-246
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE66]'
+- en: 'Information about a scope is held on a stack. We need methods to open and close
+    a scope and to retrieve the current scope. The compilation unit is the global
+    scope, which we add automatically, as follows:'
+  id: totrans-247
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 作用域的信息保存在堆栈上。我们需要方法来打开和关闭作用域，并检索当前作用域。编译单元是全局作用域，我们会自动添加它，如下所示：
+- en: '[PRE67]'
+  id: totrans-248
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE67]'
+- en: 'We create a method for each category of the type we need to transform. The
+    `getPervasiveType()` method creates the debug metadata for basic types. Note in
+    the following code snippet the use of the encoding parameter, declaring the `INTEGER`
+    type as a signed type and the `BOOLEAN` type encoded as a Boolean type:'
+  id: totrans-249
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们为需要转换的类型的每个类别创建一个方法。`getPervasiveType()`方法为基本类型创建调试元数据。请注意以下代码片段中对编码参数的使用，声明`INTEGER`类型为有符号类型，`BOOLEAN`类型编码为布尔类型：
+- en: '[PRE68]'
+  id: totrans-250
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE68]'
+- en: 'If the type name is simply renamed, then we map this to a type definition.
+    Here, we need to make the first use of the scope and line-number information,
+    as follows:'
+  id: totrans-251
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 如果类型名称只是重命名，那么我们将其映射到类型定义。在这里，我们需要首次使用作用域和行号信息，如下所示：
+- en: '[PRE69]'
+  id: totrans-252
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE69]'
+- en: 'Creating the debug information for an array requires specification about the
+    size and the alignment. We retrieve this data from the `DataLayout` class. We
+    also need to specify the index range of the array. We can do this with the following
+    code:'
+  id: totrans-253
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为数组创建调试信息需要指定大小和对齐方式。我们从`DataLayout`类中检索这些数据。我们还需要指定数组的索引范围。我们可以使用以下代码来实现：
+- en: '[PRE70]'
+  id: totrans-254
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE70]'
+- en: 'Using all these single methods, we create a central method to create the metadata
+    for a type. This metadata is also responsible for caching the data. The code can
+    be seen in the following snippet:'
+  id: totrans-255
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用所有这些单个方法，我们创建一个中心方法来为类型创建元数据。这个元数据还负责缓存数据。代码可以在以下代码片段中看到：
+- en: '[PRE71]'
+  id: totrans-256
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE71]'
+- en: 'We also need to add a method to emit metadata for global variables, as follows:'
+  id: totrans-257
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们还需要添加一个方法来发出全局变量的元数据，如下所示：
+- en: '[PRE72]'
+  id: totrans-258
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE72]'
+- en: 'To emit the debug information for procedures, we first need to create the metadata
+    for the procedure type. For this, we need a list of the types of the parameter,
+    with the return type being the first entry. If the procedure has no return type,
+    then we use an unspecified type called `void`, as in C. If a parameter is a reference,
+    then we need to add the reference type; otherwise, we add the type to the list.
+    The code is illustrated in the following snippet:'
+  id: totrans-259
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 要为过程发出调试信息，我们首先需要为过程类型创建元数据。为此，我们需要参数类型的列表，返回类型是第一个条目。如果过程没有返回类型，则使用一个称为`void`的未指定类型，就像C语言一样。如果参数是引用，则需要添加引用类型；否则，我们将类型添加到列表中。代码如下所示：
+- en: '[PRE73]'
+  id: totrans-260
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE73]'
+- en: 'For the procedure itself, we can now create the debug information using the
+    procedure type created in the last step. A procedure also opens a new scope, so
+    we push the procedure onto the scope stack. We also associate the LLVM function
+    object with the new debug information, as follows:'
+  id: totrans-261
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 对于过程本身，我们现在可以使用上一步创建的过程类型创建调试信息。过程还会打开一个新的作用域，因此我们将该过程推送到作用域堆栈上。我们还将LLVM函数对象与新的调试信息关联起来，如下所示：
+- en: '[PRE74]'
+  id: totrans-262
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE74]'
+- en: 'When the end of a procedure is reached, we must inform the builder to finalize
+    the construction of debug information for this procedure. We also need to remove
+    the procedure from the scope stack. We can do this with the following code:'
+  id: totrans-263
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 当到达过程的结束时，我们必须通知构建器完成该过程的调试信息的构建。我们还需要从作用域堆栈中移除该过程。我们可以使用以下代码来实现：
+- en: '[PRE75]'
+  id: totrans-264
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE75]'
+- en: 'Lastly, when we are finished with adding the debug information, we need to
+    add the `finalize()` method onto the builder. The generated debug information
+    is then validated. This is an important step during development as it helps you
+    to find wrongly generated metadata. The code can be seen in the following snippet:'
+  id: totrans-265
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，当我们完成添加调试信息时，我们需要将`finalize()`方法添加到构建器上。然后验证生成的调试信息。这是开发过程中的重要步骤，因为它可以帮助您找到错误生成的元数据。代码可以在以下代码片段中看到：
+- en: '[PRE76]'
+  id: totrans-266
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE76]'
+- en: 'Debug information should only be generated if the user requested it. We will
+    need a new command-line switch for this. We will add this to the file of the `CGModule`
+    class, and we will also use it inside this class, as follows:'
+  id: totrans-267
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 只有在用户请求时才应生成调试信息。我们将需要一个新的命令行开关来实现这一点。我们将把这个开关添加到`CGModule`类的文件中，并且在这个类内部也会使用它，如下所示：
+- en: '[PRE77]'
+  id: totrans-268
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE77]'
+- en: 'The `CGModule` class holds an instance of the `std::unique_ptr<CGDebugInfo>`
+    class. The pointer is initialized in the constructor, regarding the setting of
+    the command-line switch, as follows:'
+  id: totrans-269
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`CGModule`类持有`std::unique_ptr<CGDebugInfo>`类的实例。指针在构造函数中初始化，关于命令行开关的设置如下：'
+- en: '[PRE78]'
+  id: totrans-270
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE78]'
+- en: 'In the getter method we return the pointer, like this:'
+  id: totrans-271
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在getter方法中，我们返回指针，就像这样：
+- en: '[PRE79]'
+  id: totrans-272
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE79]'
+- en: 'A common pattern when generating the debug metadata is to retrieve the pointer
+    and check if it is valid. For example, after we have created a global variable,
+    we add the debug information in this way:'
+  id: totrans-273
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 生成调试元数据时的常见模式是检索指针并检查其是否有效。例如，在创建全局变量后，我们以这种方式添加调试信息：
+- en: '[PRE80]'
+  id: totrans-274
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE80]'
+- en: 'In order to add line-number information, we need to add a `getDebugLoc()` conversion
+    method into the `CGDebugInfo` class, which turns the location information from
+    the AST into the debug metadata, as follows:'
+  id: totrans-275
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了添加行号信息，我们需要在`CGDebugInfo`类中添加一个`getDebugLoc()`转换方法，将AST中的位置信息转换为调试元数据，如下所示：
+- en: '[PRE81]'
+  id: totrans-276
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE81]'
+- en: 'A utility function in the `CGModule` class can then be called to add the line-number
+    information to an instruction, as follows:'
+  id: totrans-277
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后可以调用`CGModule`类中的实用函数来将行号信息添加到指令中，如下所示：
+- en: '[PRE82]'
+  id: totrans-278
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE82]'
+- en: In this way, you can add the debug information for your own compiler.
+  id: totrans-279
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过这种方式，您可以为自己的编译器添加调试信息。
+- en: Summary
+  id: totrans-280
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, you learned how throwing and catching exceptions works in LLVM
+    and about which IR code you need to generate to exploit this feature. To enhance
+    the scope of IR, you learned how you can attach various metadata to instructions.
+    Metadata for type-based aliases provides additional information to the LLVM optimizer
+    and helps with certain optimizations to produce better machine code. Users always
+    appreciate the possibility of using a source-level debugger, and through adding
+    debug information to the IR code you are able to provide this important feature
+    of a compiler.
+  id: totrans-281
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您了解了在LLVM中如何抛出和捕获异常，以及需要生成哪些IR代码来利用此功能。为了增强IR的范围，您学习了如何将各种元数据附加到指令上。基于类型的别名的元数据为LLVM优化器提供了额外的信息，并有助于进行某些优化以生成更好的机器代码。用户总是欣赏使用源级调试器的可能性，通过向IR代码添加调试信息，您可以提供编译器的这一重要功能。
+- en: Optimizing the IR code is a core task of LLVM. In the next chapter, we will
+    learn how the pass manager works and how we can influence the optimization pipeline
+    the pass manager governs.
+  id: totrans-282
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 优化IR代码是LLVM的核心任务。在下一章中，我们将学习通道管理器的工作原理以及如何影响通道管理器管理的优化流水线。

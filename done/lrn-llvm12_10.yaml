@@ -1,0 +1,1485 @@
+- en: '*Chapter 8*: Optimizing IR'
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: '*第8章*：优化 IR'
+- en: LLVM uses a series of Passes to optimize the **intermediate representation**
+    (**IR**). A Pass performs an operation on a unit of IR, either a function or a
+    module. The operation can be a transformation, which changes the IR in a defined
+    way, or an analysis, which collects information such as dependencies. A series
+    of Passes is called the **Pass pipeline**. The Pass manager executes the Pass
+    pipeline on the IR that our compiler produces. Therefore, it is important that
+    we know what the Pass manager does and how to construct a Pass pipeline. The semantics
+    of a programming language might require the development of new Passes, and we
+    must add these Passes to the pipeline.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM 使用一系列 Passes 来优化**中间表示**（**IR**）。Pass 对 IR 单元执行操作，可以是函数或模块。操作可以是转换，以定义的方式更改
+    IR，也可以是分析，收集依赖关系等信息。一系列 Passes 称为**Pass 管道**。Pass 管理器在我们的编译器生成的 IR 上执行 Pass 管道。因此，我们需要了解
+    Pass 管理器的作用以及如何构建 Pass 管道。编程语言的语义可能需要开发新的 Passes，并且我们必须将这些 Passes 添加到管道中。
+- en: 'In this chapter, we will cover the following topics:'
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们将涵盖以下主题：
+- en: Introducing the LLVM Pass manager
+  id: totrans-3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 介绍 LLVM Pass 管理器
+- en: Implementing a Pass using the new Pass manager
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用新 Pass 管理器实现 Pass
+- en: Adapting a Pass for use with the old Pass manager
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 为旧 Pass 管理器使用 Pass
+- en: Adding an optimization pipeline to your compiler
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 向您的编译器添加优化管道
+- en: By the end of the chapter, you will know how to develop a new Pass and how to
+    add it to a Pass pipeline. You will have also acquired the knowledge required
+    to set up the Pass pipeline in your own compiler.
+  id: totrans-7
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章结束时，您将了解如何开发新的 Pass 以及如何将其添加到 Pass 管道中。您还将获得设置自己编译器中 Pass 管道所需的知识。
+- en: Technical requirements
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 技术要求
+- en: The source code for this chapter is available at [https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter08](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter08)
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章的源代码可在[https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter08](https://github.com/PacktPublishing/Learn-LLVM-12/tree/master/Chapter08)找到
+- en: You can find the code in action videos at [https://bit.ly/3nllhED](https://bit.ly/3nllhED)
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以在[https://bit.ly/3nllhED](https://bit.ly/3nllhED)找到代码的实际应用视频
+- en: Introducing the LLVM Pass manager
+  id: totrans-11
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 介绍 LLVM Pass 管理器
+- en: The LLVM core libraries optimize the IR your compiler creates and turn it into
+    object code. This giant task is broken down into separate steps, called **Passes**.
+    These Passes need to be executed in the right order, which is the objective of
+    the Pass manager.
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM 核心库优化编译器创建的 IR 并将其转换为目标代码。这项巨大的任务被分解为称为**Passes**的单独步骤。这些 Passes 需要按正确的顺序执行，这是
+    Pass 管理器的目标。
+- en: But why not hardcode the order of the Passes? Well, the user of your compiler
+    usually expects that your compiler provides a different level of optimization.
+    Developers prefer a faster compilation speed over-optimization during development
+    time. The final application should run as fast as possible, and your compiler
+    should be able to perform sophisticated optimizations, with longer compilation
+    times accepted. A different level of optimization means a different number of
+    optimization Passes that need to be executed. And, as a compiler writer, you might
+    want to provide your own Passes to take advantage of your knowledge of the source
+    language. For example, you might want to replace well-known library functions
+    with inline IR or, if possible, with the computed result of that function. For
+    C, such a Pass is part of the LLVM core libraries, but for other languages, you
+    will need to provide it yourself. And introducing your own Passes, you might need
+    to reorder or add some Passes. For example, if you know that the operation of
+    your Pass leaves some IR code unreachable, then you should also run the dead code
+    removal Pass after your own Pass. The Pass manager helps you to organize these
+    requirements.
+  id: totrans-13
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 但是为什么不硬编码 Passes 的顺序呢？嗯，您的编译器的用户通常期望您的编译器提供不同级别的优化。开发人员更喜欢在开发时间内更快的编译速度而不是优化。最终应用程序应尽可能快地运行，您的编译器应能够执行复杂的优化，接受更长的编译时间。不同级别的优化意味着需要执行不同数量的优化
+    Passes。作为编译器编写者，您可能希望提供自己的 Passes，以利用您对源语言的了解。例如，您可能希望用内联 IR 或者可能的话用该函数的计算结果替换已知的库函数。对于
+    C，这样的 Pass 是 LLVM 核心库的一部分，但对于其他语言，您需要自己提供。并且引入自己的 Passes，您可能需要重新排序或添加一些 Passes。例如，如果您知道您的
+    Pass 的操作使一些 IR 代码不可达，则还应在您自己的 Pass 之后运行死代码删除 Pass。Pass 管理器帮助您组织这些要求。
+- en: 'A Pass is often categorized according to the scope in which it works:'
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Pass 通常根据其工作范围进行分类：
+- en: A *function Pass* takes a single function as input and performs its work on
+    this function only.
+  id: totrans-15
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '*函数 Pass*接受单个函数作为输入，并仅对该函数执行其工作。'
+- en: A *module Pass* takes a whole module as input. Such a Pass performs its work
+    on the given module and can be used for intraprocedural operations inside this
+    module.
+  id: totrans-16
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '*模块 Pass*接受整个模块作为输入。这样的 Pass 在给定模块上执行其工作，并且可以用于模块内的程序内操作。'
+- en: A *call graph* Pass traverses the functions of a call graph in bottom-up order.
+  id: totrans-17
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '*调用图* Pass 按自底向上的顺序遍历调用图的函数。'
+- en: Besides the IR code, a Pass might also consume, produce, or invalidate some
+    analysis results. There are a lot of different analyses performed; for example,
+    alias analysis or the construction of a dominator tree. The dominator tree helps
+    move invariant code out of a loop, so a Pass performing such a transformation
+    can only run after the dominator tree has been created. Another Pass might perform
+    a transformation that could invalidate the existing dominator tree.
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除了 IR 代码之外，Pass 还可能消耗、产生或使一些分析结果无效。进行了许多不同的分析；例如，别名分析或支配树的构建。支配树有助于将不变的代码移出循环，因此只有在支配树创建后才能运行执行此类转换的
+    Pass。另一个 Pass 可能执行一个转换，这可能会使现有的支配树无效。
+- en: 'Under the hood, the Pass manager ensures the following:'
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在幕后，Pass 管理器确保以下内容：
+- en: Analysis results are shared among Passes. This requires you to keep track of
+    which Pass requires which analysis, and of the state of each analysis. The goal
+    is to avoid needless recomputation of analyses and to free up the memory held
+    by the analysis results as soon as possible.
+  id: totrans-20
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 分析结果在Passes之间共享。这要求您跟踪哪个Pass需要哪个分析，以及每个分析的状态。目标是避免不必要的分析重新计算，并尽快释放分析结果所占用的内存。
+- en: The Passes are executed in a pipeline fashion. For example, if several function
+    Passes should be executed in sequence, then the Pass manager runs each of these
+    function Passes on the first function. It will then run all function Passes on
+    the second function, and so on. The underlying idea here is to improve the cache
+    behavior, as the compiler performs transformations on only a limited set of data
+    (that is, one IR function) and then moves on to the next limited set of data.
+  id: totrans-21
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: Pass以管道方式执行。例如，如果应该按顺序执行多个函数Pass，那么Pass管理器将在第一个函数上运行每个函数Pass。然后它将在第二个函数上运行所有函数Pass，依此类推。这里的基本思想是改善缓存行为，因为编译器仅对有限的数据集（即一个IR函数）执行转换，然后转移到下一个有限的数据集。
+- en: 'There are two Pass managers in LLVM, as follows:'
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM中有两个Pass管理器，如下：
+- en: The old (or legacy) Pass manager
+  id: totrans-23
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 旧的（或传统的）Pass管理器
+- en: The new Pass manager
+  id: totrans-24
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 新的Pass管理器
+- en: The future belongs to the new Pass manager, but the transition is not yet complete.
+    A number of crucial Passes, such as object code emission, have not yet been migrated
+    to the new Pass manager, so it is important to understand both Pass managers.
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 未来属于新的Pass管理器，但过渡尚未完成。一些关键的Pass，如目标代码发射，尚未迁移到新的Pass管理器，因此了解两个Pass管理器非常重要。
+- en: The old Pass manager requires a Pass to inherit from a base class, for example,
+    from the `llvm::FunctionPass` class for a function Pass. In contrast, the new
+    Pass manager relies on a concept-based approach, requiring inheritance from the
+    special `llvm::PassInfo<>` mixin class only. The dependence between Passes was
+    not expressed explicitly with the old Pass manager. In the new Pass manager, it
+    needs to be explicitly coded. The new Pass manager also features a different approach
+    to handling analysis and allows the specification of an optimization pipeline
+    through a textual representation on the command line. Some LLVM users reported
+    a reduction of compile of up to 10% just by switching from the old to the new
+    Pass manager, which is a very convincing argument for using the new Pass manager.
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 旧的Pass管理器需要一个Pass从一个基类继承，例如，从`llvm::FunctionPass`类继承一个函数Pass。相比之下，新的Pass管理器依赖于基于概念的方法，只需要从特殊的`llvm::PassInfo<>`
+    mixin类继承。旧的Pass管理器中Passes之间的依赖关系没有明确表达。在新的Pass管理器中，需要明确编码。新的Pass管理器还采用了不同的分析处理方法，并允许通过命令行上的文本表示来指定优化管道。一些LLVM用户报告说，仅通过从旧的Pass管理器切换到新的Pass管理器，编译时间就可以减少高达10%，这是使用新的Pass管理器的非常有说服力的论点。
+- en: First, we will implement a Pass for the new Pass manager and explore how to
+    add it to the optimization pipeline. Later, we will take a look at how to use
+    a Pass with the old Pass manager, too.
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，我们将为新的Pass管理器实现一个Pass，并探索如何将其添加到优化管道中。稍后，我们将看看如何在旧的Pass管理器中使用Pass。
+- en: Implementing a Pass using the new Pass manager
+  id: totrans-28
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 使用新的Pass管理器实现Pass
+- en: A Pass can perform arbitrary complex transformations on the LLVM IR. To illustrate
+    the mechanics of adding a new Pass, our new Pass only counts the number of IR
+    instructions and basic blocks. We name the Pass `countir`. Adding the Pass to
+    the LLVM source tree or as a standalone Pass differs slightly, so we will do both
+    in the following sections. Let's begin by adding a new Pass to the LLVM source
+    tree.
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Pass可以对LLVM IR执行任意复杂的转换。为了说明添加新Pass的机制，我们的新Pass只计算IR指令和基本块的数量。我们将Pass命名为`countir`。将Pass添加到LLVM源树或作为独立的Pass略有不同，因此我们将在以下部分都进行。
+- en: Adding a Pass to the LLVM source tree
+  id: totrans-30
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 将Pass添加到LLVM源树
+- en: Let's start by adding the new Pass to the LLVM source. This is the right approach
+    if we later want to publish the new Pass in the LLVM tree.
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们从将新Pass添加到LLVM源开始。如果我们以后想要在LLVM树中发布新的Pass，这是正确的方法。
+- en: The source of Passes that perform transformations on the LLVM IR is located
+    in the `llvm-project/llvm/lib/Transforms` folder, and the header files are in
+    the `llvm-project/llvm/include/llvm/Transforms` folder. Because there are so many
+    Passes, they are sorted into subfolders after the category they fit in.
+  id: totrans-32
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对LLVM IR执行转换的Pass的源代码位于`llvm-project/llvm/lib/Transforms`文件夹中，头文件位于`llvm-project/llvm/include/llvm/Transforms`文件夹中。由于Pass太多，它们被分类到适合它们的类别的子文件夹中。
+- en: 'For our new Pass, we create a new folder, called `CountIR`, in both locations.
+    First, let''s implement the `CountIR.h` header file:'
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于我们的新Pass，在两个位置都创建一个名为`CountIR`的新文件夹。首先，让我们实现`CountIR.h`头文件：
+- en: 'As usual, we need to make sure that the file can be included multiple times.
+    Additionally, we need to include the Pass manager definition:'
+  id: totrans-34
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 像往常一样，我们需要确保文件可以被多次包含。此外，我们需要包含Pass管理器的定义：
+- en: '[PRE0]'
+  id: totrans-35
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'Because we are inside the LLVM source, we put our new `CountIR` class into
+    the `llvm` namespace. The class inherits from the `PassInfoMixin` template. This
+    template only adds some boilerplate code, such as a `name()` method. It is not
+    used the determine the type of Pass:'
+  id: totrans-36
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 因为我们在LLVM源代码中，所以我们将新的`CountIR`类放入`llvm`命名空间中。该类继承自`PassInfoMixin`模板。该模板仅添加了一些样板代码，例如`name()`方法。它不用于确定Pass的类型。
+- en: '[PRE1]'
+  id: totrans-37
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'At runtime, the `run(`) method of the task will be called. The signature of
+    the `run()` method determines the type of Pass. Here, the first argument is a
+    reference to the `Function` type, so this is a function Pass:'
+  id: totrans-38
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在运行时，将调用任务的`run()`方法。`run()`方法的签名确定Pass的类型。这里，第一个参数是对`Function`类型的引用，因此这是一个函数Pass：
+- en: '[PRE2]'
+  id: totrans-39
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'Finally, we need to close the class, the namespace, and the header guard:'
+  id: totrans-40
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，我们需要关闭类、命名空间和头文件保护：
+- en: '[PRE3]'
+  id: totrans-41
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: Of course, the definition of our new Pass is so simple because we have only
+    performed a trivial task.
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，我们的新Pass的定义是如此简单，因为我们只执行了一个微不足道的任务。
+- en: Let's continue with the implementation of the Pass inside the `CountIIR.cpp`
+    file. LLVM supports the collection of statistical information about a Pass if
+    compiled in debug mode. For our Pass, we will make use of this infrastructure.
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们继续在`CountIIR.cpp`文件中实现Pass。LLVM支持在调试模式下收集有关Pass的统计信息。对于我们的Pass，我们将利用这个基础设施。
+- en: 'We begin the source by including our own header file and the required LLVM
+    header files:'
+  id: totrans-44
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们首先包含我们自己的头文件和所需的LLVM头文件：
+- en: '[PRE4]'
+  id: totrans-45
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: 'To shorten the source, we tell the compiler that we are using the `llvm` namespace:'
+  id: totrans-46
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了缩短源代码，我们告诉编译器我们正在使用`llvm`命名空间：
+- en: '[PRE5]'
+  id: totrans-47
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'The built-in debug infrastructure of LLVM requires that we define a debug type,
+    which is a string. This string is later shown in the printed statistic:'
+  id: totrans-48
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: LLVM的内置调试基础设施要求我们定义一个调试类型，即一个字符串。这个字符串稍后将显示在打印的统计信息中：
+- en: '[PRE6]'
+  id: totrans-49
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: 'We define two counter variables with the `STATISTIC` macro. The first parameter
+    is the name of the counter variable, and the second parameter is the text that
+    will be printed in the statistic:'
+  id: totrans-50
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们使用`STATISTIC`宏定义了两个计数器变量。第一个参数是计数器变量的名称，第二个参数是将在统计中打印的文本：
+- en: '[PRE7]'
+  id: totrans-51
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'Inside the `run()` method, we loop through all of the basic blocks of the function
+    and increment the corresponding counter. We do the same for all instructions of
+    a basic block. To prevent a compiler from warning us about unused variables, we
+    insert a no-op use of the `I` variable. Because we only count and do not alter
+    the IR, we tell the caller that we have preserved all existing analyses:'
+  id: totrans-52
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在`run()`方法中，我们循环遍历函数的所有基本块，并递增相应的计数器。我们对基本块的所有指令也是一样的。为了防止编译器警告我们关于未使用的变量，我们插入了对`I`变量的无操作使用。因为我们只计数而不改变IR，我们告诉调用者我们已经保留了所有现有的分析：
+- en: '[PRE8]'
+  id: totrans-53
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'So far, we have implemented the functionality of our new Pass. We will reuse
+    this implementation later for an out-of-tree Pass. For the solution inside the
+    LLVM tree, we must change several files in LLVM to announce the existence of the
+    new Pass:'
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们已经实现了新Pass的功能。我们稍后将重用这个实现来进行一个树外的Pass。对于LLVM树内的解决方案，我们必须更改LLVM中的几个文件来宣布新Pass的存在：
+- en: 'First, we need to add a `CMakeLists.txt` file to the source folder. This file
+    contains the build instructions for a new LLVM library name, `LLVMCountIR`. The
+    new library needs to link against the LLVM `Support` component because we use
+    the debug and statistic infrastructure, and against the LLVM `Core` component,
+    which contains the definition of the LLVM IR:'
+  id: totrans-55
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 首先，我们需要在源文件夹中添加一个`CMakeLists.txt`文件。这个文件包含了一个新的LLVM库名`LLVMCountIR`的构建指令。新库需要链接LLVM的`Support`组件，因为我们使用了调试和统计基础设施，以及LLVM的`Core`组件，其中包含了LLVM
+    IR的定义：
+- en: '[PRE9]'
+  id: totrans-56
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'In order to make this new library part of the build, we need to add the folder
+    into the `CMakeLists.txt` file of the parent folder, which is the `llvm-project/llvm/lib/Transforms/CMakeList.txt`
+    file. Then, add the following line:'
+  id: totrans-57
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了使这个新库成为构建的一部分，我们需要将该文件夹添加到父文件夹的`CMakeLists.txt`文件中，即`llvm-project/llvm/lib/Transforms/CMakeList.txt`文件。然后，添加以下行：
+- en: '[PRE10]'
+  id: totrans-58
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'The `PassBuilder` class needs to know about our new Pass. To do this, we add
+    the following line into the `include` section of the `llvm-project/llvm/lib/Passes/PassBuilder.cpp`
+    file:'
+  id: totrans-59
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`PassBuilder`类需要知道我们的新Pass。为此，我们在`llvm-project/llvm/lib/Passes/PassBuilder.cpp`文件的`include`部分添加以下行：'
+- en: '[PRE11]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'As the last step, we need to update the Pass registry, which is in the `llvm-project/llvm/lib/Passes/PassRegistry.def`
+    file. Look for the section in which function Passes are defined, for example,
+    by searching for the `FUNCTION_PASS` macro. Inside this section, you add the following
+    line:'
+  id: totrans-61
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 作为最后一步，我们需要更新Pass注册表，这在`llvm-project/llvm/lib/Passes/PassRegistry.def`文件中。查找定义函数Pass的部分，例如通过搜索`FUNCTION_PASS`宏。在这个部分中，添加以下行：
+- en: '[PRE12]'
+  id: totrans-62
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'We have now made all the necessary changes. Follow the build instructions from
+    [*Chapter 1*](B15647_01_ePub_RK.xhtml#_idTextAnchor015), *Installing LLVM,* in
+    the *Building with CMake* section, to recompile LLVM. To test the new Pass, we
+    store the following IR code inside the `demo.ll` file in our `build` folder. The
+    code has two functions and, in sum, three instructions and two basic blocks:'
+  id: totrans-63
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们现在已经做出了所有必要的更改。按照[*第1章*](B15647_01_ePub_RK.xhtml#_idTextAnchor015)中的构建说明，*使用CMake构建*部分，重新编译LLVM。要测试新的Pass，我们将以下IR代码存储在我们的`build`文件夹中的`demo.ll`文件中。代码有两个函数，总共三条指令和两个基本块：
+- en: '[PRE13]'
+  id: totrans-64
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'We can use the new Pass with the `opt` utility. To run the new Pass, we will
+    utilize the `--passes="countir"` option. To get the statistical output, we need
+    to add the `--stats` option. Because we do not need the resulting bitcode, we
+    also specify the `--disable-output` option:'
+  id: totrans-65
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们可以使用`opt`实用程序来使用新的Pass。要运行新的Pass，我们将利用`--passes="countir"`选项。要获得统计输出，我们需要添加`--stats`选项。因为我们不需要生成的位码，我们还指定了`--disable-output`选项：
+- en: '[PRE14]'
+  id: totrans-66
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: We run our news Pass, and the output matches our expectations. We have successfully
+    extended LLVM!
+  id: totrans-67
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们运行我们的新Pass，输出符合我们的期望。我们已经成功扩展了LLVM！
+- en: 'Running a single Pass helps with debugging. With the `–-passes` option, you
+    cannot only name a single Pass but describe a whole pipeline. For example, the
+    default pipeline for optimization level 2 is named `default<O2>`. You can run
+    the `countir` Pass before the default pipeline with the `–-passes="module(countir),default<O2>"`
+    argument. The Pass names in such a pipeline description must be of the same type.
+    The default pipeline is a module Pass and our `countir` Pass is a function Pass.
+    To create a module pipeline from both, first, we must create a module Pass containing
+    the `countir` Pass. That is done with `module(countir)`. You can add more function
+    Passes to this module Pass by specifying them in a comma-separated list. In the
+    same way, the module Passes can be combined. To study the effects of this, you
+    can use the `inline` and `countir` Passes: running them in a different order,
+    or as a module Pass, will give you a different statistical output.'
+  id: totrans-68
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 运行单个Pass有助于调试。使用`--passes`选项，您不仅可以命名单个Pass，还可以描述整个流水线。例如，优化级别2的默认流水线被命名为`default<O2>`。您可以在默认流水线之前使用`--passes="module(countir),default<O2>"`参数运行`countir`
+    Pass。这样的流水线描述中的Pass名称必须是相同类型的。默认流水线是一个模块Pass，我们的`countir` Pass是一个函数Pass。要从这两者创建一个模块流水线，首先我们必须创建一个包含`countir`
+    Pass的模块Pass。这是通过`module(countir)`来完成的。您可以通过以逗号分隔的列表指定更多的函数Passes添加到这个模块Pass中。同样，模块Passes也可以组合。为了研究这一点的影响，您可以使用`inline`和`countir`
+    Passes：以不同的顺序运行它们，或者作为模块Pass，将给出不同的统计输出。
+- en: Adding a new Pass to the LLVM source tree makes sense if you plan to publish
+    your Pass as a part of LLVM. If you do not plan to do this, or if you want to
+    distribute your Pass independently of LLVM, then you can create a Pass plugin.
+    In the next section, we will view the steps to do this.
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 将新的Pass添加到LLVM源代码树中是有意义的，如果您计划将您的Pass作为LLVM的一部分发布。如果您不打算这样做，或者希望独立于LLVM分发您的Pass，那么您可以创建一个Pass插件。在下一节中，我们将查看如何执行这些步骤。
+- en: Adding a new Pass as a plugin
+  id: totrans-70
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 作为插件添加新的Pass
+- en: 'To provide a new Pass as a plugin, we will create a new project that uses LLVM:'
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了将新的Pass作为插件提供，我们将创建一个使用LLVM的新项目：
+- en: 'Let''s begin by creating a new folder, called `countirpass`, in our source
+    folder. The folder will have the following structure and files:'
+  id: totrans-72
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 让我们从在我们的源文件夹中创建一个名为`countirpass`的新文件夹开始。该文件夹将具有以下结构和文件：
+- en: '[PRE15]'
+  id: totrans-73
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'Note that we have reused the functionality from the previous section, with
+    some small adaptions. The `CountIR.h` header file is now in a different location,
+    so we change the name of the symbol that is used as a guard. We also do not use
+    the `llvm` namespace, because we are now outside the LLVM source. As a result
+    of this change, the header file becomes the following:'
+  id: totrans-74
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 请注意，我们已经重用了上一节的功能，只是做了一些小的调整。`CountIR.h`头文件现在位于不同的位置，所以我们改变了用作守卫的符号的名称。我们也不再使用`llvm`命名空间，因为我们现在不在LLVM源代码之内。由于这个改变，头文件变成了以下内容：
+- en: '[PRE16]'
+  id: totrans-75
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: 'We can copy the `CountIR.cpp` implementation file from the previous section.
+    Small changes are needed here, too. Because the path of our header file has changed,
+    we need to replace the `include` directive with the following:'
+  id: totrans-76
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们可以从上一节复制`CountIR.cpp`实现文件。这里也需要做一些小的改动。因为我们的头文件路径已经改变，所以我们需要用以下内容替换`include`指令：
+- en: '[PRE17]'
+  id: totrans-77
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'We also need to register the new Pass at the Pass builder. This happens when
+    the plugin is loaded. The Pass plugin manager calls the special function, `llvmGetPassPluginInfo()`,
+    which performs the registration. For this implementation, we require two additional
+    `include` files:'
+  id: totrans-78
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们还需要在Pass builder中注册新的Pass。这是在插件加载时发生的。Pass插件管理器调用特殊函数`llvmGetPassPluginInfo()`，进行注册。对于这个实现，我们需要两个额外的`include`文件：
+- en: '[PRE18]'
+  id: totrans-79
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'The user specifies the Passes to run on the command line with the `–-passes`
+    option. The `PassBuilder` class extracts the Pass names from the string. In order
+    to create an instance of the named Pass, the `PassBuilder` class maintains a list
+    of callbacks. Essentially, the callbacks are called with the Pass name and a Pass
+    manager. If the callback knows the Pass name, then it adds an instance of this
+    Pass to the Pass manager. For our Pass, we need to provide such a callback function:'
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 用户可以使用`--passes`选项在命令行上指定要运行的Passes。`PassBuilder`类从字符串中提取Pass名称。为了创建命名Pass的实例，`PassBuilder`类维护一个回调函数列表。基本上，回调函数会以Pass名称和Pass管理器作为参数进行调用。如果回调函数知道Pass名称，那么它会将这个Pass的实例添加到Pass管理器中。对于我们的Pass，我们需要提供这样一个回调函数：
+- en: '[PRE19]'
+  id: totrans-81
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: 'Of course, we need to register this function as the `PassBuilder` instance.
+    After the plugin is loaded, a registration callback is called for exactly this
+    purpose. Our registration function is as follows:'
+  id: totrans-82
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 当然，我们需要将这个函数注册为`PassBuilder`实例。插件加载后，将为此目的调用注册回调。我们的注册函数如下：
+- en: '[PRE20]'
+  id: totrans-83
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'Finally, each plugin needs to provide the mentioned `llvmGetPassPluginInfo()`
+    function. This function returns a structure with four elements: the LLVM plugin
+    API version used by our plugin, a name, the version number of the plugin, and
+    the registration callback. The plugin API requires that the function uses the
+    `extern "C"` convention. This is to avoid problems with C++ name mangling. The
+    function is very simple:'
+  id: totrans-84
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，每个插件都需要提供上述`llvmGetPassPluginInfo()`函数。这个函数返回一个结构，包含四个元素：我们的插件使用的LLVM插件API版本、名称、插件的版本号和注册回调。插件API要求函数使用`extern
+    "C"`约定。这是为了避免C++名称混淆的问题。这个函数非常简单：
+- en: '[PRE21]'
+  id: totrans-85
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'The implementation of one separate function for each callback helps us to understand
+    what is going on. If your plugin provides several Passes, then you can extend
+    the `RegisterCB` callback function to register all of the Passes. Often, you can
+    find a very compact approach. The following `llvmGetPassPluginInfo()` function
+    combines `PipelineParsingCB()`, `RegisterCB()`, and `llvmGetPassPluginInfo()`
+    from earlier into a single function. It does so by making use of lambda functions:'
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为每个回调实现一个单独的函数有助于我们理解正在发生的事情。如果您的插件提供了多个Passes，那么您可以扩展`RegisterCB`回调函数以注册所有Passes。通常，您可以找到一个非常紧凑的方法。以下的`llvmGetPassPluginInfo()`函数将`PipelineParsingCB()`、`RegisterCB()`和之前的`llvmGetPassPluginInfo()`合并为一个函数。它通过使用lambda函数来实现：
+- en: '[PRE22]'
+  id: totrans-87
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'Now, we only need to add the build files. The `lib/CMakeLists.txt` file contains
+    just one command to compile the source file. The LLVM-specific command, `add_llvm_library()`,
+    ensures that the same compiler flags that were used to build LLVM are utilized:'
+  id: totrans-88
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在，我们只需要添加构建文件。`lib/CMakeLists.txt`文件只包含一个命令来编译源文件。LLVM特定的命令`add_llvm_library()`确保使用用于构建LLVM的相同编译器标志：
+- en: '[PRE23]'
+  id: totrans-89
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: The top-level `CMakeLists.txt` file is more complex.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 顶层的`CMakeLists.txt`文件更加复杂。
+- en: 'As usual, we set the required CMake version and the project name. Additionally,
+    we set the `LLVM_EXPORTED_SYMBOL_FILE` variable to `ON`. This is necessary to
+    make the plugin work on Windows:'
+  id: totrans-91
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 像往常一样，我们设置所需的CMake版本和项目名称。此外，我们将`LLVM_EXPORTED_SYMBOL_FILE`变量设置为`ON`。这对于使插件在Windows上工作是必要的：
+- en: '[PRE24]'
+  id: totrans-92
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: 'Next, we look for the LLVM installation. We also print information about the
+    found version to the console:'
+  id: totrans-93
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们寻找LLVM安装。我们还将在控制台上打印有关找到的版本的信息：
+- en: '[PRE25]'
+  id: totrans-94
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'Now, we can add the `cmake` folder from LLVM to the search path. We include
+    the LLVM-specific files, `ChooseMSVCCRT` and `AddLLVM`, which provide additional
+    commands:'
+  id: totrans-95
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在，我们可以将LLVM的`cmake`文件夹添加到搜索路径中。我们包括LLVM特定的文件`ChooseMSVCCRT`和`AddLLVM`，它们提供了额外的命令：
+- en: '[PRE26]'
+  id: totrans-96
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: 'The compiler needs to know about the required definitions and the LLVM paths:'
+  id: totrans-97
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 编译器需要了解所需的定义和LLVM路径：
+- en: '[PRE27]'
+  id: totrans-98
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'Finally, we add our own include and source folders:'
+  id: totrans-99
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 最后，我们添加自己的包含和源文件夹：
+- en: '[PRE28]'
+  id: totrans-100
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: 'Having implemented all of the required files, we can now create the `build`
+    folder beside the `countirpass` folder. First, change to the build directory and
+    create the build files:'
+  id: totrans-101
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 在实现了所有必需的文件之后，我们现在可以在`countirpass`文件夹旁边创建`build`文件夹。首先，切换到构建目录并创建构建文件：
+- en: '[PRE29]'
+  id: totrans-102
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'Then, you can compile the plugin, as follows:'
+  id: totrans-103
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 然后，您可以编译插件，如下所示：
+- en: '[PRE30]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'You use the plugin with the `opt` utility, which is the `opt` utility produces
+    an optimized version of the input file. To use the plugin with it, you need to
+    specify an additional parameter to load the plugin:'
+  id: totrans-105
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 您可以使用`opt`实用程序使用插件，`opt`实用程序会生成输入文件的优化版本。要使用插件，您需要指定一个额外的参数来加载插件：
+- en: '[PRE31]'
+  id: totrans-106
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: The output is the same as the previous version. Congratulations; the Pass plugin
+    works!
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 输出与以前版本相同。恭喜，Pass插件有效！
+- en: So far, we have only created a Pass for the new Pass manager. In the next section,
+    we will also extend the Pass for the old Pass manager.
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止，我们只为新Pass管理器创建了一个Pass。在下一节中，我们还将扩展旧Pass管理器的Pass。
+- en: Adapting a Pass for use with the old Pass manager
+  id: totrans-109
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 调整Pass以与旧Pass管理器一起使用
+- en: The future belongs to the new Pass manager, and it makes no sense to develop
+    a new Pass for the old Pass manager exclusively. However, during the ongoing transition
+    phase, it would be useful if a Pass could work with both Pass managers, as most
+    of the Passes in LLVM already do.
+  id: totrans-110
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 未来属于新Pass管理器，为旧Pass管理器专门开发新Pass是没有意义的。然而，在进行过渡阶段期间，如果一个Pass可以与两个Pass管理器一起工作，那将是有用的，因为LLVM中的大多数Pass已经这样做了。
+- en: The old Pass manager requires a Pass that has been derived from certain base
+    classes. For example, a function Pass must derive from the `FunctionPass` base
+    class. There are more differences, too. The method run by the Pass manager is
+    named `runOnFunction()`, and an `ID` for the Pass must also be provided. The strategy
+    we follow here is to create a separate class that we can use with the old Pass
+    manager and refactor the source code in a way that the functionality can be used
+    with both Pass managers.
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 旧Pass管理器需要一个从特定基类派生的Pass。例如，函数Pass必须从`FunctionPass`基类派生。还有更多的不同之处。Pass管理器运行的方法被命名为`runOnFunction()`，还必须提供Pass的`ID`。我们在这里遵循的策略是创建一个单独的类，可以与旧Pass管理器一起使用，并以一种可以与两个Pass管理器一起使用的方式重构源代码。
+- en: 'We use the Pass plugin as a base. In the `include/CountIR.h` header file, we
+    add a new class definition, as follows:'
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将Pass插件用作基础。在`include/CountIR.h`头文件中，我们添加一个新的类定义，如下所示：
+- en: 'The new class needs to derive from the `FunctionPass` class, so we include
+    an additional header to get the class definition:'
+  id: totrans-113
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 新类需要从`FunctionPass`类派生，因此我们包含一个额外的头文件来获取类定义：
+- en: '[PRE32]'
+  id: totrans-114
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: 'We name the new class `CountIRLegacyPass`. The class needs an ID for the internal
+    LLVM machinery, and we initialize the parent class with it:'
+  id: totrans-115
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们将新类命名为`CountIRLegacyPass`。该类需要内部LLVM机制的ID，并用其初始化父类：
+- en: '[PRE33]'
+  id: totrans-116
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'In order to implement the Pass functionality, two functions must be overridden.
+    The `runOnFunction()` method is called for every LLVM IR function and implements
+    our counting functionality. The `getAnalysisUsage()` method is used to announce
+    that all of the analysis results are saved:'
+  id: totrans-117
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了实现Pass功能，必须重写两个函数。`runOnFunction()`方法用于每个LLVM IR函数，并实现我们的计数功能。`getAnalysisUsage()`方法用于宣布所有分析结果都已保存：
+- en: '[PRE34]'
+  id: totrans-118
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: 'With the changes to the header file now complete, we can enhance the implementation
+    inside the `lib/CountIR.cpp` file. To reuse the counting functionality, we move
+    the source code into a new function:'
+  id: totrans-119
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在头文件的更改已经完成，我们可以增强`lib/CountIR.cpp`文件中的实现。为了重用计数功能，我们将源代码移入一个新的函数：
+- en: '[PRE35]'
+  id: totrans-120
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: 'The method for the new Pass manager needs to be updated in order to use the
+    new function:'
+  id: totrans-121
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 新Pass管理器的方法需要更新，以便使用新功能：
+- en: '[PRE36]'
+  id: totrans-122
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'In the same way, we implement the method for the old Pass manager. With the
+    `false` return value, we indicate that the IR did not change:'
+  id: totrans-123
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 以同样的方式，我们实现了旧Pass管理器的方法。通过返回`false`值，我们表明IR没有发生变化：
+- en: '[PRE37]'
+  id: totrans-124
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: 'To preserve the existing analysis results, the `getAnalysisUsage()` method
+    must be implemented in the following way. This is similar to the `PreservedAnalyses::all()`
+    return value in the new Pass manager. If you do not implement this method, then
+    all analysis results are thrown away by default:'
+  id: totrans-125
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了保留现有的分析结果，必须以以下方式实现`getAnalysisUsage()`方法。这类似于新Pass管理器中`PreservedAnalyses::all()`的返回值。如果不实现此方法，则默认情况下会丢弃所有分析结果：
+- en: '[PRE38]'
+  id: totrans-126
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: 'The `ID` field can be initialized with an arbitrary value because LLVM uses
+    the address of the field. The common value is `0`, so we use it too:'
+  id: totrans-127
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`ID`字段可以用任意值初始化，因为LLVM使用字段的地址。通常值为`0`，所以我们也使用它：'
+- en: '[PRE39]'
+  id: totrans-128
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: 'Only the Pass registration is missing now. To register the new Pass, we need
+    to provide a static instance of the `RegisterPass<>` template. The first argument
+    is the name of the command-line option to invoke the new Pass. The second argument
+    is the name of the Pass, which is used, among other things, as information for
+    the user when invoking the `-help` option:'
+  id: totrans-129
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在只缺少Pass注册。要注册新Pass，我们需要提供`RegisterPass<>`模板的静态实例。第一个参数是调用新Pass的命令行选项的名称。第二个参数是Pass的名称，用于在调用`-help`选项时向用户提供信息等：
+- en: '[PRE40]'
+  id: totrans-130
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: 'These changes are enough to allow us to invoke our new Pass under the old Pass
+    manager and the new Pass manager. To test the addition, change back into the `build`
+    folder and compile the Pass:'
+  id: totrans-131
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 这些变化足以让我们在旧Pass管理器和新Pass管理器下调用我们的新Pass。为了测试这个添加，切换回`build`文件夹并编译Pass：
+- en: '[PRE41]'
+  id: totrans-132
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE41]'
+- en: 'To load the plugin for use with the old Pass manager, we need to use the `--load`
+    option. Our new Pass is invoked with the `--countir` option:'
+  id: totrans-133
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了在旧Pass管理器中加载插件，我们需要使用`--load`选项。我们的新Pass是使用`--countir`选项调用的：
+- en: '[PRE42]'
+  id: totrans-134
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE42]'
+- en: Tip
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 提示
+- en: Please also check, in the command line from the previous section, that the invocation
+    of our Pass with the new Pass manager still works fine!
+  id: totrans-136
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请还要检查，在上一节的命令行中，使用新Pass管理器调用我们的Pass是否仍然正常工作！
+- en: Being able to run our new Pass with an LLVM-provided tool is nice, but ultimately,
+    we want to run it inside our compiler. In the next section, we will explore how
+    to set up an optimization pipeline and how to customize it.
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 能够使用LLVM提供的工具运行我们的新Pass是很好的，但最终，我们希望在我们的编译器内运行它。在下一节中，我们将探讨如何设置优化流水线以及如何自定义它。
+- en: Adding an optimization pipeline to your compiler
+  id: totrans-138
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 向您的编译器添加优化流水线
+- en: Our `tinylang` compiler, which was developed in the previous chapters, performs
+    no optimizations on the created IR code. In the following sections, we will add
+    an optimization pipeline to the compiler to perform this exactly.
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们的`tinylang`编译器，在前几章中开发，对创建的IR代码不进行任何优化。在接下来的章节中，我们将向编译器添加一个优化流水线，以实现这一点。
+- en: Creating an optimization pipeline with the new Pass manager
+  id: totrans-140
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 使用新Pass管理器创建优化流水线
+- en: Central to the setup of the optimization pipeline is the `PassBuilder` class.
+    This class knows about all of the registered Passes and can construct a Pass pipeline
+    from a textual description. We use this class to either create the Pass pipeline
+    from a description given on the command line or use a default pipeline based on
+    the requested optimization level. We also support the use of Pass plugins, such
+    as the `countir` Pass plugin, which we discussed in the previous section. With
+    this, we mimic part of the functionality of the `opt` tool and also use similar
+    names for the command-line options.
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 优化流水线设置的核心是`PassBuilder`类。这个类知道所有注册的Pass，并可以根据文本描述构建Pass流水线。我们使用这个类来从命令行给出的描述创建Pass流水线，或者使用基于请求的优化级别的默认流水线。我们还支持使用Pass插件，例如我们在上一节中讨论的`countir`
+    Pass插件。通过这样做，我们模仿了`opt`工具的部分功能，并且还使用了类似的命令行选项名称。
+- en: The `PassBuilder` class populates an instance of a `ModulePassManager` class,
+    which is the Pass manager to hold the constructed Pass pipeline and actually run
+    it. The code generation Passes still use the old Pass manager; therefore, we have
+    to retain the old Pass manager for this purpose.
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`PassBuilder`类填充了一个`ModulePassManager`类的实例，这是用于保存构建的Pass流水线并实际运行它的Pass管理器。代码生成Pass仍然使用旧Pass管理器；因此，我们必须保留旧Pass管理器以实现这一目的。'
+- en: 'For the implementation, we extend the `tools/driver/Driver.cpp` file from our
+    `tinylang` compiler:'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于实现，我们扩展了我们的`tinylang`编译器中的`tools/driver/Driver.cpp`文件：
+- en: 'We use new classes, so we begin by adding new `include` files. The `llvm/Passes/PassBuilder.h`
+    file provides the definition of the `PassBuilder` class. The `llvm/Passes/PassPlugin.h`
+    file is required for plugin support. Finally, the `llvm/Analysis/TargetTransformInfo.h`
+    file provides a Pass that connects IR-level transformations with target-specific
+    information:'
+  id: totrans-144
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们使用新的类，因此我们首先添加新的`include`文件。`llvm/Passes/PassBuilder.h`文件提供了`PassBuilder`类的定义。`llvm/Passes/PassPlugin.h`文件是插件支持所需的。最后，`llvm/Analysis/TargetTransformInfo.h`文件提供了一个将IR级别转换与特定目标信息连接起来的Pass：
+- en: '[PRE43]'
+  id: totrans-145
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE43]'
+- en: 'To use certain features of the new Pass manager, we add three command-line
+    options, using the same names as the `opt` tool. The `--passes` option enables
+    the textual specification of the Pass pipeline, and the `--load-pass-plugin` option
+    enables the use of Pass plugins. If the `--debug-pass-manager` option is given,
+    then the Pass manager prints out information about the executed Passes:'
+  id: totrans-146
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了使用新Pass管理器的某些功能，我们添加了三个命令行选项，使用与`opt`工具相同的名称。`--passes`选项允许Pass流水线的文本规范，`--load-pass-plugin`选项允许使用Pass插件。如果给出`--debug-pass-manager`选项，则Pass管理器会打印有关执行的Pass的信息：
+- en: '[PRE44]'
+  id: totrans-147
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE44]'
+- en: 'The user influences the construction of the Pass pipeline with the optimization
+    level. The `PassBuilder` class supports six different optimization levels: one
+    level with no optimization, three levels for optimizing the speed, and two levels
+    for reducing the size. We capture all of these levels in one command-line option:'
+  id: totrans-148
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 用户通过优化级别影响Pass流水线的构建。`PassBuilder`类支持六个不同的优化级别：一个无优化级别，三个用于优化速度的级别，以及两个用于减小大小的级别。我们在一个命令行选项中捕获所有这些级别：
+- en: '[PRE45]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE45]'
+- en: 'The plugin mechanism of LLVM supports a static plugin registry, which is created
+    during the configuration of the project. To make use of this registry, we include
+    the `llvm/Support/Extension.def` database file to create the prototype for the
+    functions, which returns the plugin information:'
+  id: totrans-150
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: LLVM的插件机制支持静态插件注册表，在项目配置期间创建。为了利用这个注册表，我们包括`llvm/Support/Extension.def`数据库文件来创建返回插件信息的函数的原型：
+- en: '[PRE46]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE46]'
+- en: 'We replace the existing `emit()` function with a new version. We declare the
+    required `PassBuilder` instance at top of the function:'
+  id: totrans-152
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们用新版本替换现有的`emit()`函数。我们在函数顶部声明所需的`PassBuilder`实例：
+- en: '[PRE47]'
+  id: totrans-153
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE47]'
+- en: 'To implement the support for the Pass plugins given on the command line, we
+    loop through the list of plugin libraries given by the user and try to load the
+    plugin. We emit an error message if this fails; otherwise, we register the Passes:'
+  id: totrans-154
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了实现对命令行上给出的Pass插件的支持，我们循环遍历用户给出的插件库列表，并尝试加载插件。如果失败，我们会发出错误消息；否则，我们注册Passes：
+- en: '[PRE48]'
+  id: totrans-155
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE48]'
+- en: 'The information from the static plugin registry is used in a similar way to
+    register those plugins with our `PassBuilder` instance:'
+  id: totrans-156
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 静态插件注册表中的信息类似地用于向我们的`PassBuilder`实例注册这些插件：
+- en: '[PRE49]'
+  id: totrans-157
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE49]'
+- en: 'We need to declare variables for the different analysis managers. The only
+    parameter is the debug flag:'
+  id: totrans-158
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们需要声明不同分析管理器的变量。唯一的参数是调试标志：
+- en: '[PRE50]'
+  id: totrans-159
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE50]'
+- en: 'Next, we populate the analysis managers with calls to the respective `register`
+    method on the `PassBuilder` instance. Through this call, the analysis manager
+    is populated with the default analysis Passes and also runs registration callbacks.
+    We also make sure that the function analysis manager uses the default alias-analysis
+    pipeline and that all analysis managers know about each other:'
+  id: totrans-160
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 接下来，我们通过在`PassBuilder`实例上调用相应的`register`方法来填充分析管理器。通过这个调用，分析管理器填充了默认的分析Passes，并且还运行注册回调。我们还确保函数分析管理器使用默认的别名分析管道，并且所有分析管理器都知道彼此：
+- en: '[PRE51]'
+  id: totrans-161
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE51]'
+- en: 'The `MPM` module Pass manager holds the Pass pipeline that we construct. The
+    instance is initialized with the debug flag:'
+  id: totrans-162
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: '`MPM`模块Pass管理器保存我们构建的Pass管道。该实例使用调试标志进行初始化：'
+- en: '[PRE52]'
+  id: totrans-163
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE52]'
+- en: 'We implement two different ways to populate the module Pass manager with the
+    Pass pipeline. If the user provided a Pass pipeline on the command line, that
+    is, they used the `--passes` option, then we use this as the Pass pipeline:'
+  id: totrans-164
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们实现了两种不同的方法来填充模块Pass管理器与Pass管道。如果用户在命令行上提供了Pass管道，也就是说，他们使用了`--passes`选项，那么我们将使用这个作为Pass管道：
+- en: '[PRE53]'
+  id: totrans-165
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE53]'
+- en: 'Otherwise, we use the chosen optimization level to determine the Pass pipeline
+    to construct. The name of the default Pass pipeline is `default`, and it takes
+    the optimization level as a parameter:'
+  id: totrans-166
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 否则，我们使用选择的优化级别来确定要构建的Pass管道。默认Pass管道的名称是`default`，它将优化级别作为参数：
+- en: '[PRE54]'
+  id: totrans-167
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE54]'
+- en: 'The Pass pipeline to run transformations on the IR code is now set up. We need
+    an open file to write the result to. The system assembler and LLVM IR output are
+    text based, so we should set the `OF_Text` flag for both of them:'
+  id: totrans-168
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在设置了在IR代码上运行转换的Pass管道。我们需要打开一个文件来写入结果。系统汇编器和LLVM IR输出都是基于文本的，因此我们应该为它们都设置`OF_Text`标志：
+- en: '[PRE55]'
+  id: totrans-169
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE55]'
+- en: 'For the code generation, we have to use the old Pass manager. We simply declare
+    the `CodeGenPM` instances and add the Pass that makes target-specific information
+    available at the IR transformation level:'
+  id: totrans-170
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 对于代码生成，我们必须使用旧的Pass管理器。我们只需声明`CodeGenPM`实例并添加使目标特定信息在IR转换级别可用的Pass：
+- en: '[PRE56]'
+  id: totrans-171
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE56]'
+- en: 'To output the LLVM IR, we add a Pass that just prints the IR into a stream:'
+  id: totrans-172
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 为了输出LLVM IR，我们添加了一个只打印IR到流中的Pass：
+- en: '[PRE57]'
+  id: totrans-173
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE57]'
+- en: 'Otherwise, we let the `TargetMachine` instance add the required code generation
+    Passes, directed by the `FileType` value that we Pass as an argument:'
+  id: totrans-174
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 否则，我们让`TargetMachine`实例添加所需的代码生成Passes，由我们作为参数传递的`FileType`值指导：
+- en: '[PRE58]'
+  id: totrans-175
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE58]'
+- en: 'After all of this preparation, we are now ready to execute the Passes. First,
+    we run the optimization pipeline on the IR module. Next, the code generation Passes
+    are run. Of course, after all this work, we want to keep the output file:'
+  id: totrans-176
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 经过所有这些准备，我们现在准备执行Passes。首先，我们在IR模块上运行优化管道。接下来，运行代码生成Passes。当然，在所有这些工作之后，我们希望保留输出文件：
+- en: '[PRE59]'
+  id: totrans-177
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE59]'
+- en: 'That was a lot of code, but it was straightforward. Of course, we also have
+    to update the dependencies in the `tools/driver/CMakeLists.txt` build file. Besides
+    adding the target components, we add all the transformation and code generation
+    components from LLVM. The names roughly resemble the directory names where the
+    source is located. The component name is translated to the link library name during
+    the configuration process:'
+  id: totrans-178
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 这是很多代码，但很简单。当然，我们还必须更新`tools/driver/CMakeLists.txt`构建文件中的依赖项。除了添加目标组件外，我们还从LLVM中添加所有转换和代码生成组件。名称大致类似于源代码所在的目录名称。在配置过程中，组件名称将被转换为链接库名称：
+- en: '[PRE60]'
+  id: totrans-179
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE60]'
+- en: 'Our compiler driver supports plugins, and we announce the following support:'
+  id: totrans-180
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们的编译器驱动程序支持插件，并宣布以下支持：
+- en: '[PRE61]'
+  id: totrans-181
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE61]'
+- en: 'In the same way as before, we have to link against our own libraries:'
+  id: totrans-182
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 与以前一样，我们必须链接到我们自己的库：
+- en: '[PRE62]'
+  id: totrans-183
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE62]'
+- en: These are necessary additions to the source code and the build system.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些是源代码和构建系统的必要补充。
+- en: 'To build the extended compiler, change into your `build` directory and type
+    in the following:'
+  id: totrans-185
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 要构建扩展的编译器，请进入您的`build`目录并输入以下内容：
+- en: '[PRE63]'
+  id: totrans-186
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE63]'
+- en: Changes to the files of the build system are automatically detected, and `cmake`
+    is run before we compile and link our changed source. In case you need to rerun
+    the configuration step, please follow the instructions located in [*Chapter 2*](B15647_02_ePub_RK.xhtml#_idTextAnchor032),
+    *Touring the LLVM Source,* in the *Compiling the tinylang application* section.
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 构建系统的文件更改会自动检测到，并且在编译和链接我们更改的源代码之前运行`cmake`。如果您需要重新运行配置步骤，请按照[*第2章*](B15647_02_ePub_RK.xhtml#_idTextAnchor032)中的说明，*LLVM源代码漫游*，*编译tinylang应用程序*部分中的说明进行操作。
+- en: Since we have used the options for the `opt` tool as a blueprint, you should
+    try running `tinylang` with the options to load a Pass plugin and run the Pass,
+    as we did in the previous sections.
+  id: totrans-188
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 由于我们已经使用`opt`工具的选项作为蓝图，您应该尝试使用加载Pass插件并运行Pass的选项来运行`tinylang`，就像我们在前面的部分中所做的那样。
+- en: With the current implementation, we can either run a default Pass pipeline or
+    construct one ourselves. The latter is very flexible but, in almost all cases,
+    overkill. The default pipeline runs very well for C-like languages. What is missing
+    is a way to extend the Pass pipeline. In the next section, we will explain how
+    to implement this.
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过当前的实现，我们可以运行默认的Pass管道或自己构建一个。后者非常灵活，但在几乎所有情况下都是过度的。默认管道非常适用于类似C的语言。缺少的是扩展Pass管道的方法。在下一节中，我们将解释如何实现这一点。
+- en: Extending the Pass pipeline
+  id: totrans-190
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 扩展Pass管道
+- en: 'In the previous section, we used the `PassBuilder` class to create a Pass pipeline,
+    either from a user-provided description or a predefined name. Now, we will look
+    at another way to customize the Pass pipeline: using **extension points**.'
+  id: totrans-191
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上一节中，我们使用`PassBuilder`类从用户提供的描述或预定义名称创建Pass管道。现在，我们将看另一种自定义Pass管道的方法：使用**扩展点**。
+- en: 'During the construction of the Pass pipeline, the Pass builder allows you to
+    add Passes contributed by the user. These places are called extension points.
+    A number of extension points exist, such as the following:'
+  id: totrans-192
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在构建Pass管道期间，Pass构建器允许您添加用户贡献的Passes。这些地方被称为扩展点。存在许多扩展点，例如以下：
+- en: The pipeline start extension point allows you to add Passes at the beginning
+    of the pipeline.
+  id: totrans-193
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 管道开始扩展点允许您在管道开始时添加Passes。
+- en: The peephole extension point allows you to add Passes after each instance of
+    the instruction combiner Pass.
+  id: totrans-194
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 窥孔扩展点允许您在指令组合器Pass的每个实例之后添加Passes。
+- en: Other extension points exist, too. To employ an extension point, you register
+    a callback. During the construction of the Pass pipeline, your callback is run
+    at the defined extension point and can add a Pass to the given Pass manager.
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 还存在其他扩展点。要使用扩展点，您需要注册一个回调。在构建Pass管道期间，您的回调在定义的扩展点处运行，并可以向给定的Pass管理器添加Pass。
+- en: 'To register a callback for the pipeline start extension point, you call the
+    `registerPipelineStartEPCallback()` method of the `PassBuilder` class. For example,
+    to add our `CountIRPass` Pass to the beginning of the pipeline, you need to adapt
+    the Pass to be used as a module Pass with a call to the `createModuleToFunctionPassAdaptor()`
+    template function, and then add the Pass to the module Pass manager:'
+  id: totrans-196
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要为管道开始扩展点注册回调，您需要调用`PassBuilder`类的`registerPipelineStartEPCallback()`方法。例如，要将我们的`CountIRPass`
+    Pass添加到管道的开头，您需要将Pass调整为使用`createModuleToFunctionPassAdaptor()`模板函数作为模块Pass，并将Pass添加到模块Pass管理器中：
+- en: '[PRE64]'
+  id: totrans-197
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE64]'
+- en: You can add this snippet in the Pass pipeline setup code at any point before
+    the pipeline is created, that is, before the `parsePassPipeline()` method is called.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以在创建管道之前的任何时间点将此片段添加到Pass管道设置代码中，也就是在调用`parsePassPipeline()`方法之前。
+- en: 'A very natural extension to what we have done in the previous section is to
+    let the user Pass a pipeline description for an extension point on the command
+    line. The `opt` tool allows this, too. Let''s do this for the pipeline start extension
+    point. First, we add the following code to the `tools/driver/Driver.cpp` file:'
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上一节所做的工作的自然扩展是让用户通过命令行传递管道描述。`opt`工具也允许这样做。让我们为管道开始扩展点做这个。首先，我们将以下代码添加到`tools/driver/Driver.cpp`文件中：
+- en: 'We add a new command line for the user to specify the pipeline description.
+    Again, we take the option name from the `opt` tool:'
+  id: totrans-200
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 我们为用户添加了一个新的命令行，用于指定管道描述。同样，我们从`opt`工具中获取选项名称：
+- en: '[PRE65]'
+  id: totrans-201
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE65]'
+- en: 'Using a lambda function as a callback is the most convenient way. To parse
+    the pipeline description, we call the `parsePassPipeline()` method of the `PassBuilder`
+    instance. The Passes are added to the `PM` Pass manager and given as an argument
+    to the lambda function. If there is an error, we print an error message without
+    stopping the application. You can add this snippet after the call to the `crossRegisterProxies()`
+    method:'
+  id: totrans-202
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 使用lambda函数作为回调是最方便的方式。为了解析管道描述，我们调用`PassBuilder`实例的`parsePassPipeline()`方法。Passes被添加到`PM`
+    Pass管理器，并作为参数传递给lambda函数。如果出现错误，我们会打印错误消息而不会停止应用程序。您可以在调用`crossRegisterProxies()`方法之后添加此片段：
+- en: '[PRE66]'
+  id: totrans-203
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE66]'
+- en: Tip
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 提示
+- en: To allow the user to add Passes at every extension point, you need to add the
+    preceding code snippet for each extension point.
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了允许用户在每个扩展点添加Passes，您需要为每个扩展点添加前面的代码片段。
+- en: It's now a good time to try out the different `pass manager` options. With the
+    `--debug-pass-manager` option, you can follow which Passes are executed in which
+    order. You can print the IR before or after each Pass is invoked using the `--print-before-all`
+    and `--print-after-all` options. If you create your own Pass pipeline, then you
+    can insert the `print` Pass in points of interest. For example, try the `--passes="print,inline,print"`
+    option. You can also use the `print` Pass to explore the various extension points.
+  id: totrans-206
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 现在是尝试不同`pass manager`选项的好时机。使用`--debug-pass-manager`选项，您可以跟踪执行Passes的顺序。您可以使用`--print-before-all`和`--print-after-all`选项在每次调用Pass之前或之后打印IR。如果您创建自己的Pass管道，那么您可以在感兴趣的点插入`print`
+    Pass。例如，尝试`--passes="print,inline,print"`选项。您还可以使用`print` Pass来探索各种扩展点。
+- en: '[PRE67]'
+  id: totrans-207
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE67]'
+- en: Of course, it is possible to add more than one Pass to the Pass manager in this
+    fashion. The `PassBuilder` class also uses the `addPass()` method during the construction
+    of the Pass pipeline.
+  id: totrans-208
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当然，也可以以这种方式向Pass管理器添加多个Pass。`PassBuilder`类在构建Pass管道期间还使用`addPass()`方法。
+- en: New functionality in LLVM 12 – running extension point callbacks
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: LLVM 12中的新功能-运行扩展点回调
+- en: Because the Pass pipeline is not populated for optimization level `O0`, the
+    registered extension points are not called. If you use the extension points to
+    register Passes, which should also run at the `O0` level, this is problematic.
+    In LLVM 12, the new `runRegisteredEPCallbacks()` method can be called to run the
+    registered extension point callbacks, resulting in a Pass manager populated only
+    with the Passes registered through the extension points.
+  id: totrans-210
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 因为Pass管道在优化级别`O0`下没有填充，所以注册的扩展点不会被调用。如果您使用扩展点来注册应该在`O0`级别运行的Passes，这将是有问题的。在LLVM
+    12中，可以调用新的`runRegisteredEPCallbacks()`方法来运行已注册的扩展点回调，从而使Pass管理器仅填充通过扩展点注册的Passes。
+- en: With the addition of the optimization pipeline to `tinylang`, you can create
+    an optimizing compiler such as clang. The LLVM community works on improving the
+    optimizations and the optimization pipeline with each release. Because of this,
+    it is very seldom that the default pipeline is not used. Most often, new Passes
+    are added to implement certain semantics of the programming language.
+  id: totrans-211
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过将优化管道添加到“tinylang”中，您可以创建一个类似clang的优化编译器。LLVM社区致力于在每个发布版本中改进优化和优化管道。因此，默认情况下很少不使用默认管道。通常情况下，会添加新的Passes来实现编程语言的某些语义。
+- en: Summary
+  id: totrans-212
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, you learned how to create a new Pass for LLVM. You ran the
+    Pass using a Pass pipeline description and an extension point. You extended your
+    compiler with the construction and execution of a Pass pipeline similar to clang,
+    turning `tinylang` into an optimizing compiler. The Pass pipeline allows you to
+    add Passes at extension points, and you learned how to register Passes at these
+    points. This enables you to extend the optimization pipeline with your own developed
+    Passes or existing Passes.
+  id: totrans-213
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，您学会了如何为LLVM创建新的Pass。您使用Pass管道描述和扩展点运行了Pass。您通过构建和执行类似clang的Pass管道来扩展了您的编译器，将“tinylang”变成了一个优化编译器。Pass管道允许您在扩展点添加Passes，并且您学会了如何在这些点注册Passes。这使您能够使用自己开发的Passes或现有Passes扩展优化管道。
+- en: In the next chapter, we will explore how LLVM generates machine instructions
+    from the optimized IR.
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，我们将探讨LLVM如何从优化的IR生成机器指令。

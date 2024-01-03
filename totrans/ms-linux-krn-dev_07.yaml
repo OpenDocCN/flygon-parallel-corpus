@@ -1,0 +1,959 @@
+- en: Virtual Memory Management
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 虚拟内存管理
+- en: 'In the first chapter, we had brief discussion about an important abstraction
+    called a *process.* We had discussed the process virtual address space and its
+    isolation, and also have traversed thorough the memory management subsystem and
+    gained a thorough understanding of various data structures and algorithms that
+    go into physical memory management. In this chapter, let''s extend our discussion
+    on memory management with details of virtual memory management and page tables.
+    We will look into the following aspects of the virtual memory subsystem:'
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在第一章中，我们简要讨论了一个重要的抽象概念，称为*进程*。我们已经讨论了进程虚拟地址空间及其隔离，并且已经深入了解了涉及物理内存管理的各种数据结构和算法。在本章中，让我们通过虚拟内存管理和页表的详细信息来扩展我们对内存管理的讨论。我们将研究虚拟内存子系统的以下方面：
+- en: Process virtual address space and its segments
+  id: totrans-2
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 进程虚拟地址空间及其段
+- en: Memory descriptor structure
+  id: totrans-3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 内存描述符结构
+- en: Memory mapping and VMA objects
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 内存映射和VMA对象
+- en: File-backed memory mappings
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 文件支持的内存映射
+- en: Page cache
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 页缓存
+- en: Address translation with page tables
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 使用页表进行地址转换
+- en: Process address space
+  id: totrans-8
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 进程地址空间
+- en: 'The following diagram depicts the layout of a typical process address space
+    in Linux systems, which is composed of a set of virtual memory segments:'
+  id: totrans-9
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表描述了Linux系统中典型进程地址空间的布局，由一组虚拟内存段组成：
+- en: '![](img/00043.jpeg)'
+  id: totrans-10
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00043.jpeg)'
+- en: 'Each segment is physically mapped to one or more linear memory blocks (made
+    out of one or more pages), and appropriate address translation records are placed
+    in a process page table. Before we get into the complete details of how the kernel
+    manages memory maps and constructs page tables, let''s understand in brief each
+    segment of the address space:'
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每个段都被物理映射到一个或多个线性内存块（由一个或多个页面组成），并且适当的地址转换记录被放置在进程页表中。在我们深入了解内核如何管理内存映射和构建页表的完整细节之前，让我们简要了解一下地址空间的每个段：
+- en: '**Stack** is the topmost segment, which expands downward. It contains **stack
+    frames** that hold local variables and function parameters; a new frame is created
+    on top of the stack upon entry into a called function, and is destroyed when the
+    current function returns. Depending on the level of nesting of the function calls,
+    there is always a need for the stack segment to dynamically expand to accommodate
+    new frames. Such expansion is handled by the virtual memory manager through **page
+    faults**: when the process attempts to touch an unmapped address at the top of
+    the stack, the system triggers a page fault, which is handled by the kernel to
+    check whether it is appropriate to grow the stack. If the current stack utilization
+    is within `RLIMIT_STACK`, then it is considered appropriate and the stack is expanded.
+    However, if the current utilization is maximum with no further scope to expand,
+    then a segmentation fault signal is delivered to the process.'
+  id: totrans-12
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**栈**是最顶部的段，向下扩展。它包含**栈帧**，用于保存局部变量和函数参数；在调用函数时，在栈顶创建一个新的帧，在当前函数返回时销毁。根据函数调用的嵌套级别，栈段始终需要动态扩展以容纳新的帧。这种扩展由虚拟内存管理器通过**页错误**处理：当进程尝试触及栈顶的未映射地址时，系统触发页错误，由内核处理以检查是否适合扩展栈。如果当前栈利用率在`RLIMIT_STACK`范围内，则认为适合扩展栈。然而，如果当前利用率已达到最大值，没有进一步扩展的空间，那么会向进程发送段错误信号。'
+- en: '**Mmap** is a segment below the stack; this segment is primarily used for mapping
+    file data from page cache into process address space. This segment is also used
+    for mapping shared objects or dynamic libraries. User-mode processes can initiate
+    new mappings through the `mmap()` API. The Linux kernel also supports anonymous
+    memory mapping through this segment, which serves as an alternative mechanism
+    for dynamic memory allocations to store process data.'
+  id: totrans-13
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**Mmap**是栈下面的一个段；这个段主要用于将文件数据从页缓存映射到进程地址空间。这个段也用于映射共享对象或动态库。用户模式进程可以通过`mmap()`API启动新的映射。Linux内核还支持通过这个段进行匿名内存映射，这是一种用于存储进程数据的动态内存分配的替代机制。'
+- en: '**Heap** segment provides address space for dynamic memory allocation that
+    allows a process to store runtime data. The kernel provides the `brk()` family
+    of APIs, through which user-mode processes can expand or shrink the heap at runtime.
+    However, most programming-language-specific standard libraries implement heap
+    management algorithms for efficient utilization of heap memory. For instance,
+    GNU glibc implements heap management that offers the `malloc()` family of functions
+    for allocations.'
+  id: totrans-14
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**堆**段提供了动态内存分配的地址空间，允许进程存储运行时数据。内核提供了`brk()`系列API，通过它用户模式进程可以在运行时扩展或收缩堆。然而，大多数编程语言特定的标准库实现了堆管理算法，以有效利用堆内存。例如，GNU
+    glibc实现了堆管理，提供了`malloc()`系列函数进行分配。'
+- en: 'The lower segments of the address space--**BSS**, **Data**, and **Text**--are
+    related to the binary image of the process:'
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 地址空间的较低段--**BSS**、**Data**和**Text**--与进程的二进制映像相关：
+- en: The **BSS** stores **uninitialized** static variables, whose values are not
+    initialized in the program code. The BSS is set up through anonymous memory mapping.
+  id: totrans-16
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**BSS**存储**未初始化**的静态变量，这些变量的值在程序代码中未初始化。BSS是通过匿名内存映射设置的。'
+- en: The **data** segment contains global and static variables initialized in program
+    source code. This segment is enumerated by mapping part of the program binary
+    image that contains initialized data; this mapping is created of type **private
+    memory mapping**, which ensures that changes to data variables' memory are not
+    reflected on the disk file.
+  id: totrans-17
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**数据**段包含在程序源代码中初始化的全局和静态变量。这个段通过映射包含初始化数据的程序二进制映像的部分来枚举；这种映射是以**私有内存映射**类型创建的，确保对数据变量内存的更改不会反映在磁盘文件上。'
+- en: The **text** segment is also enumerated by mapping the program binary file from
+    memory; this mapping is of type `RDONLY`, resulting in a segmentation fault to
+    be triggered on an attempt to write into this segment.
+  id: totrans-18
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '**文本**段也通过从内存映射程序二进制文件来枚举；这种映射的类型是`RDONLY`，试图写入此段将触发分段错误。'
+- en: The kernel supports the address space randomization facility, which if enabled
+    during build allows the VM subsystem to randomize start locations for **stack**,
+    **mmap**, and **heap** segments for each new process. This provides processes
+    with much-needed security from malicious programs that are capable of injecting
+    faults. Hacker programs are generally hard-coded with fixed start addresses of
+    memory segments of a valid process; with address space randomization, such malicious
+    attacks would fail. However, text segments enumerated from the binary file of
+    the application program are mapped to a fixed address as per the definition of
+    the underlying architecture; this is configured into the linker script, which
+    is applied while constructing the program binary file.
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核支持地址空间随机化功能，如果在构建过程中启用，允许VM子系统为每个新进程随机化**堆栈**、**mmap**和**堆**段的起始位置。这为进程提供了免受恶意程序注入故障的安全性。黑客程序通常使用固定的有效进程内存段的起始地址进行硬编码；通过地址空间随机化，这种恶意攻击将失败。然而，从应用程序的二进制文件枚举的文本段被映射到固定地址，根据底层架构的定义，这被配置到链接器脚本中，在构建程序二进制文件时应用。
+- en: Process memory descriptor
+  id: totrans-20
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 进程内存描述符
+- en: 'The kernel maintains all information on process memory segments and the corresponding
+    translation table in a memory descriptor structure, which is of type `struct mm_struct`.
+    The process descriptor structure `task_struct` contains a pointer `*mm` to the
+    memory descriptor for the process. We shall discuss a few important elements of
+    the memory descriptor structure:'
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核在内存描述符结构中维护了有关进程内存段和相应翻译表的所有信息，该结构的类型为`struct mm_struct`。进程描述符结构`task_struct`包含指向进程内存描述符的指针`*mm`。我们将讨论内存描述符结构的一些重要元素：
+- en: '[PRE0]'
+  id: totrans-22
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: '`mmap_base` refers to the start of the mmap segment in the virtual address
+    space, and `task_size` contains the total size of the task in the virtual memory
+    space. `mm_users` is an atomic counter that holds the count of LWPs that share
+    this memory descriptor, `mm_count` holds the count of the number of processes
+    currently using this descriptor, and the VM subsystem ensures that a memory descriptor
+    structure is only released when `mm_count` is zero. The `start_code` and `end_code`
+    fields contain the start and end virtual addresses for the code block mapped from
+    the program''s binary file. Similarly, `start_data` and `end_data` mark the beginning
+    and end of the initialized data region mapped from the program''s binary file.'
+  id: totrans-23
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`mmap_base`指的是虚拟地址空间中mmap段的起始位置，`task_size`包含虚拟内存空间中任务的总大小。`mm_users`是一个原子计数器，保存共享此内存描述符的LWP的计数，`mm_count`保存当前使用此描述符的进程数，并且VM子系统确保只有在`mm_count`为零时才释放内存描述符结构。`start_code`和`end_code`字段包含从程序的二进制文件映射的代码块的起始和结束虚拟地址。类似地，`start_data`和`end_data`标记了从程序的二进制文件映射的初始化数据区域的开始和结束。'
+- en: 'The `start_brk` and `brk` fields represent the start and current end addresses
+    of the heap segment; while `start_brk` remains constant throughout the process
+    lifetime, `brk` is re-positioned while allocating and releasing heap memory. Therefore,
+    the total size of the active heap at a given moment in time is the size of the
+    memory between the `start_brk` and `brk` fields. The elements `arg_start` and
+    `arg_end` contain locations of the command-line argument list, and `env_start`
+    and `env_end` contain the start and end locations for environment variables:'
+  id: totrans-24
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`start_brk`和`brk`字段表示堆段的起始和当前结束地址；虽然`start_brk`在整个进程生命周期中保持不变，但`brk`在分配和释放堆内存时会重新定位。因此，在特定时刻活动堆的总大小是`start_brk`和`brk`字段之间内存的大小。元素`arg_start`和`arg_end`包含命令行参数列表的位置，`env_start`和`env_end`包含环境变量的起始和结束位置：'
+- en: '![](img/00044.jpeg)'
+  id: totrans-25
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00044.jpeg)'
+- en: Each linear memory region mapped to a segment in virtual address space is represented
+    through a descriptor of type `struct vm_area_struct`. Each VM area region is mapped
+    with a virtual address interval that contains a start and end virtual addresses
+    along with other attributes. The VM subsystem maintains a linked list of `vm_area_struct(VMA)`
+    nodes representing current regions; this list is sorted in ascending order, with
+    the first node representing the start virtual address interval and the node that
+    follows containing the next address interval, and so on. The memory descriptor
+    structure includes a pointer `*mmap`, which refers to this list of VM areas currently
+    mapped.
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在虚拟地址空间中映射到段的每个线性内存区域都通过类型为`struct vm_area_struct`的描述符表示。每个VM区域区域都映射有包含起始和结束虚拟地址以及其他属性的虚拟地址间隔。VM子系统维护一个表示当前区域的`vm_area_struct(VMA)`节点的链表；此列表按升序排序，第一个节点表示起始虚拟地址间隔，后面的节点包含下一个地址间隔，依此类推。内存描述符结构包括一个指针`*mmap`，它指向当前映射的VM区域列表。
+- en: The VM subsystem will need to scan the `vm_area` list while performing various
+    operations on VM regions such as looking for a specific address within mapped
+    address intervals, or appending a new VMA instance representing a new mapping.
+    Such operations could be time consuming and inefficient especially for cases where
+    a large number of regions are mapped into the list. As a workaround, the VM subsystem
+    maintains a red-black tree for efficient access of `vm_area` objects. The memory
+    descriptor structure includes the root node of the red-black tree `mm_rb`. With
+    this arrangement, new VM regions can be quickly appended by searching the red-black
+    tree for the region preceding the address interval for the new region; this eliminates
+    the need to explicitly scan the linked list.
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: VM子系统在执行对VM区域的各种操作时需要扫描`vm_area`列表，例如在映射地址间隔内查找特定地址，或附加表示新映射的新VMA实例。这样的操作可能耗时且低效，特别是对于大量区域映射到列表的情况。为了解决这个问题，VM子系统维护了一个红黑树，用于高效访问`vm_area`对象。内存描述符结构包括红黑树的根节点`mm_rb`。通过这种安排，可以通过搜索红黑树来快速附加新的VM区域，而无需显式扫描链接列表。
+- en: '`struct vm_area_struct` is defined in the kernel header `<linux/mm_types.h>`:'
+  id: totrans-28
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`struct vm_area_struct` 在内核头文件`<linux/mm_types.h>`中定义：'
+- en: '[PRE1]'
+  id: totrans-29
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: '`vm_start` contains the start virtual address (lower address) of the region,
+    which is the address of the first valid byte of the mapping, and `vm_end` contains
+    the virtual address of the first byte beyond the mapped region (higher address).
+    Thus, the length of the mapped memory region can be computed by subtracting `vm_start`
+    from `vm_end`. The pointers `*vm_next` and `*vm_prev` refer to the next and previous
+    VMA list, while the `vm_rb` element is for representing this VMA under the red-black
+    tree. The `*vm_mm` pointer refers back to the process memory descriptor structure.'
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`vm_start` 包含区域的起始虚拟地址（较低地址），即映射的第一个有效字节的地址，`vm_end` 包含映射区域之外的第一个字节的虚拟地址（较高地址）。因此，可以通过从`vm_start`减去`vm_end`来计算映射内存区域的长度。指针`*vm_next`
+    和 `*vm_prev` 指向下一个和上一个VMA列表，而`vm_rb` 元素用于表示红黑树下的这个VMA。指针`*vm_mm` 指回进程内存描述符结构。'
+- en: '`vm_page_prot` contains access permissions for the pages in the region. `vm_flags`
+    is a bit field that contains properties for memory in the mapped region. Flag
+    bits are defined in the kernel header `<linux/mm.h>`.'
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`vm_page_prot` 包含区域中页面的访问权限。`vm_flags` 是一个位字段，包含映射区域内存的属性。标志位在内核头文件`<linux/mm.h>`中定义。'
+- en: '| **Flag bits** | **Description** |'
+  id: totrans-32
+  prefs: []
+  type: TYPE_TB
+  zh: '**标志位** | **描述**'
+- en: '| `VM_NONE` | Indicates inactive mapping. |'
+  id: totrans-33
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_NONE` | 表示非活动映射。'
+- en: '| `VM_READ` | If set, pages in the mapped area are readable. |'
+  id: totrans-34
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_READ` | 如果设置，映射区域中的页面是可读的。'
+- en: '| `VM_WRITE` | If set, pages in the mapped area are writable. |'
+  id: totrans-35
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_WRITE` | 如果设置，映射区域中的页面是可写的。'
+- en: '| `VM_EXEC` | This is set to mark a memory region as executable. Memory blocks
+    containing executable instructions are set with this flag along with `VM_READ`.
+    |'
+  id: totrans-36
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_EXEC` | 设置为将内存区域标记为可执行。包含可执行指令的内存块与`VM_READ`一起设置此标志。'
+- en: '| `VM_SHARED` | If set, pages in the mapped region are shared. |'
+  id: totrans-37
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_SHARED` | 如果设置，映射区域中的页面是共享的。'
+- en: '| `VM_MAYREAD` | Flag to indicate that `VM_READ` can be set on a currently
+    mapped region. This flag is for use with the `mprotect()` system call. |'
+  id: totrans-38
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_MAYREAD` | 用于指示当前映射区域可以设置`VM_READ`。此标志用于`mprotect()`系统调用。'
+- en: '| `VM_MAYWRITE` | Flag to indicate that `VM_WRITE` can be set on a currently
+    mapped region. This flag is for use with the `mprotect()` system call. |'
+  id: totrans-39
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_MAYWRITE` | 用于指示当前映射区域可以设置`VM_WRITE`。此标志用于`mprotect()`系统调用。'
+- en: '| `VM_MAYEXEC` | Flag to indicate that `VM_EXEC` can be set on currently mapped
+    region. This flag is for use with the `mprotect()` system call. |'
+  id: totrans-40
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_MAYEXEC` | 用于指示当前映射区域可以设置`VM_EXEC`。此标志用于`mprotect()`系统调用。'
+- en: '| `VM_GROWSDOWN` | Mapping can grow downward; the stack segment is assigned
+    this flag. |'
+  id: totrans-41
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_GROWSDOWN` | 映射可以向下增长；堆栈段被分配了这个标志。'
+- en: '| `VM_UFFD_MISSING` | This flag is set to indicate to VM subsystem that `userfaultfd`
+    is enabled for this mapping, and is set to track page missing faults. |'
+  id: totrans-42
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_UFFD_MISSING` | 设置此标志以指示VM子系统为此映射启用了`userfaultfd`，并设置为跟踪页面丢失故障。'
+- en: '| `VM_PFNMAP` | This flag is set to indicate that the memory region is mapped
+    though PFN tracked pages, unlike regular page frames with page descriptors. |'
+  id: totrans-43
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_PFNMAP` | 设置此标志以指示内存区域是通过PFN跟踪页面映射的，而不是具有页面描述符的常规页面帧。'
+- en: '| `VM_DENYWRITE` | Set to indicate that the current file mapping is not writable.
+    |'
+  id: totrans-44
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_DENYWRITE` | 设置以指示当前文件映射不可写。'
+- en: '| `VM_UFFD_WP` | This flag is set to indicate to the VM subsystem that `userfaultfd`
+    is enabled for this mapping, and is set to track write-protect faults. |'
+  id: totrans-45
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_UFFD_WP` | 设置此标志以指示VM子系统为此映射启用了`userfaultfd`，并设置为跟踪写保护故障。'
+- en: '| `VM_LOCKED` | Set when corresponding pages in the mapped memory region are
+    locked. |'
+  id: totrans-46
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_LOCKED` | 当映射内存区域中的相应页面被锁定时设置。'
+- en: '| `VM_IO` | Set when the device I/O area is mapped. |'
+  id: totrans-47
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_IO` | 当设备I/O区域被映射时设置。'
+- en: '| `VM_SEQ_READ` | Set when a process declares its intention to access the memory
+    area within the mapped region sequentially. |'
+  id: totrans-48
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_SEQ_READ` | 当进程声明其意图以顺序方式访问映射区域内的内存区域时设置。'
+- en: '| `VM_RAND_READ` | Set when a process declares its intention to access the
+    memory area within the mapped region at random. |'
+  id: totrans-49
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_RAND_READ` | 当进程声明其意图在映射区域内以随机方式访问内存区域时设置。'
+- en: '| `VM_DONTCOPY` | Set to indicate to the VM to disable copying this VMA on
+    `fork()`. |'
+  id: totrans-50
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_DONTCOPY` | 设置以指示VM在`fork()`上禁用复制此VMA。'
+- en: '| `VM_DONTEXPAND` | Set to indicate that the current mapping cannot expand
+    on `mremap()`. |'
+  id: totrans-51
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_DONTEXPAND` | 设置以指示当前映射在`mremap()`上不能扩展。'
+- en: '| `VM_LOCKONFAULT` | Lock pages in the memory map when they are faulted in.
+    This flag is set when a process enables `MLOCK_ONFAULT` with the `mlock2()` system
+    call. |'
+  id: totrans-52
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_LOCKONFAULT` | 当进程使用`mlock2()`系统调用启用`MLOCK_ONFAULT`时，当页面被故障时锁定内存映射中的页面。设置此标志。'
+- en: '| `VM_ACCOUNT` | The VM subsystem performs additional checks to ensure there
+    is memory available when performing operations on VMAs with this flag. |'
+  id: totrans-53
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_ACCOUNT` | VM子系统执行额外的检查，以确保在对具有此标志的VMA执行操作时有可用内存。'
+- en: '| `VM_NORESERVE` | Whether the VM should suppress accounting. |'
+  id: totrans-54
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_NORESERVE` | VM是否应该抑制记账。'
+- en: '| `VM_HUGETLB` | Indicates that the current mapping contains huge TLB pages.
+    |'
+  id: totrans-55
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_HUGETLB` | 表示当前映射包含巨大的TLB页面。'
+- en: '| `VM_DONTDUMP` | If set, the current VMA is not included in the core dump.
+    |'
+  id: totrans-56
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_DONTDUMP` | 如果设置，当前VMA不会包含在核心转储中。'
+- en: '| `VM_MIXEDMAP` | Set when the VMA mapping contains both traditional page frames
+    (managed through the page descriptor) and PFN-managed pages. |'
+  id: totrans-57
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_MIXEDMAP` | 当VMA映射包含传统页面帧（通过页面描述符管理）和PFN管理的页面时设置。'
+- en: '| `VM_HUGEPAGE` | Set when the VMA is marked with `MADV_HUGEPAGE` to instruct
+    the VM that pages under this mapping must be of type Transparent Huge Pages (THP).
+    This flag works only with private anonymous mappings. |'
+  id: totrans-58
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_HUGEPAGE` | 当VMA标记为`MADV_HUGEPAGE`时设置，以指示VM页面在此映射下必须是透明巨大页面（THP）类型。此标志仅适用于私有匿名映射。'
+- en: '| `VM_NOHUGEPAGE` | Set when the VMA is marked with `MADV_NOHUGEPAGE`. |'
+  id: totrans-59
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_NOHUGEPAGE` | 当VMA标记为`MADV_NOHUGEPAGE`时设置。'
+- en: '| `VM_MERGEABLE` | Set when the VMA is marked with `MADV_MERGEABLE`, which
+    enables the kernel same-page merging (KSM) facility. |'
+  id: totrans-60
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_MERGEABLE` | 当VMA标记为`MADV_MERGEABLE`时设置，这使得内核可以进行同页合并（KSM）。'
+- en: '| `VM_ARCH_1` | Architecture-specific extensions. |'
+  id: totrans-61
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_ARCH_1` | 架构特定的扩展。'
+- en: '| `VM_ARCH_2` | Architecture-specific extensions. |'
+  id: totrans-62
+  prefs: []
+  type: TYPE_TB
+  zh: '`VM_ARCH_2` | 架构特定的扩展。'
+- en: 'The following figure depicts the typical layout of a `vm_area` list as pointed
+    to by the memory descriptor structure of the process:'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 下图描述了由进程的内存描述符结构指向的`vm_area`列表的典型布局：
+- en: '![](img/00045.jpeg)'
+  id: totrans-64
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00045.jpeg)'
+- en: As depicted here, some memory regions mapped into the address space are file-backed
+    (code regions form the application binary file, shared library, shared memory
+    mappings, and so on). File buffers are managed by the kernel's page cache framework,
+    which implements its own data structures to represent and manage file caches.
+    The page cache tracks mappings to file regions by various user-mode process through
+    an `address_space` data structure. The `shared` element of the `vm_area_struct`
+    object enumerates this VMA into a red-black tree associated with the address space.
+    We'll discuss more about the page cache and `address_space` objects in the next
+    section.
+  id: totrans-65
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如图所示，映射到地址空间的一些内存区域是文件支持的（代码区域形成应用程序二进制文件，共享库，共享内存映射等）。文件缓冲区由内核的页面缓存框架管理，该框架实现了自己的数据结构来表示和管理文件缓存。页面缓存通过`address_space`数据结构跟踪对文件区域的映射，通过各种用户模式进程。`vm_area_struct`对象的`shared`元素将此VMA枚举到与地址空间关联的红黑树中。我们将在下一节中更多地讨论页面缓存和`address_space`对象。
+- en: Regions of the virtual address space such as heap, stack, and mmap are allocated
+    through anonymous memory mappings. The VM subsystem groups all VMA instances of
+    the process that represent anonymous memory regions into a list and represents
+    them through a descriptor of type `struct anon_vma`. This structure enables quick
+    access to all of the process VMAs that map anonymous pages; the `*anon_vma` pointer
+    of each anonymous VMA structure refers to the `anon_vma` object.
+  id: totrans-66
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 堆，栈和mmap等虚拟地址空间的区域是通过匿名内存映射分配的。VM子系统将表示进程的所有匿名内存区域的VMA实例分组到一个列表中，并通过`struct
+    anon_vma`类型的描述符表示它们。该结构使得可以快速访问映射匿名页面的所有进程VMAs；每个匿名VMA结构的`*anon_vma`指针指向`anon_vma`对象。
+- en: However, when a process forks a child, all anonymous pages of the caller address
+    space are shared with the child process under copy-on-write (COW). This causes
+    new VMAs to be created (for the child) that represent the same anonymous memory
+    regions of the parent. The memory manager would need to locate and track all VMAs
+    that refer to the same regions for it to be able to support unmap and swap-out
+    operations. As a solution, the VM subsystem uses another descriptor called `struct
+    anon_vma_chain` that links all `anon_vma` structures of a process group. The `anon_vma_chain`
+    element of the VMA structure is a list element of the anonymous VMA chain.
+  id: totrans-67
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然而，当一个进程fork一个子进程时，调用者地址空间的所有匿名页面都在写时复制（COW）下与子进程共享。这会导致创建新的VMAs（对于子进程），它们表示父进程的相同匿名内存区域。内存管理器需要定位和跟踪所有引用相同区域的VMAs，以便支持取消映射和交换操作。作为解决方案，VM子系统使用另一个称为`struct
+    anon_vma_chain`的描述符，它链接进程组的所有`anon_vma`结构。VMA结构的`anon_vma_chain`元素是匿名VMA链的列表元素。
+- en: 'Each VMA instance is bound to a descriptor of type `vm_operations_struct`,
+    which contains operations performed on the current VMA. The `*vm_ops` pointer
+    of the VMA instance refers to the operations object:'
+  id: totrans-68
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每个VMA实例都绑定到`vm_operations_struct`类型的描述符，其中包含对当前VMA执行的操作。VMA实例的`*vm_ops`指针指向操作对象：
+- en: '[PRE2]'
+  id: totrans-69
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: The routine assigned to the `*open()` function pointer is invoked when the VMA
+    is enumerated into the address space. Similarly, the routine assigned to the `*close()`
+    function pointer is invoked when the VMA is detached from the virtual address
+    space. The function assigned to the `*mremap()` interface is executed when the
+    memory area mapped by the VMA is to be resized. When the physical region mapped
+    by the VMA is inactive, the system triggers a page fault exception, and the function
+    assigned to the `*fault()` pointer is invoked by the kernel's page-fault handler
+    to read corresponding data of the VMA region into the physical page.
+  id: totrans-70
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`*open()`函数指针分配的例程在VMA枚举到地址空间时被调用。同样，`*close()`函数指针分配的例程在VMA从虚拟地址空间中分离时被调用。`*mremap()`接口分配的函数在VMA映射的内存区域需要调整大小时执行。当VMA映射的物理区域处于非活动状态时，系统会触发页面故障异常，并且内核的页面故障处理程序会通过`*fault()`指针调用分配给VMA区域的相应数据。'
+- en: The kernel supports direct access operations (DAX) for files on storage devices
+    that are similar to memory, such as nvrams, flash storage, and other persistent
+    memory devices. Drivers for such storage devices are implemented to perform all
+    read and write operations directly on storage, without any caching. When a user
+    process attempts to map a file from a DAX storage device, the underlying disk
+    driver directly maps the corresponding file pages to process the virtual address
+    space. For optimal performance, user-mode processes can map large files from DAX
+    storage by enabling `VM_HUGETLB`. Due to the large page sizes supported, page
+    faults on DAX file maps cannot be handled through regular page fault handlers,
+    and filesystems supporting DAX need to assign appropriate fault handlers to the
+    `*pmd_fault()` pointer of the VMA.
+  id: totrans-71
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核支持对类似于内存的存储设备上的文件进行直接访问操作（DAX），例如nvrams、闪存存储和其他持久性内存设备。为这类存储设备实现的驱动程序执行所有读写操作，而无需任何缓存。当用户进程尝试从DAX存储设备映射文件时，底层磁盘驱动程序直接将相应的文件页面映射到进程的虚拟地址空间。为了获得最佳性能，用户模式进程可以通过启用`VM_HUGETLB`来从DAX存储中映射大文件。由于支持的页面大小较大，无法通过常规页面错误处理程序处理DAX文件映射上的页面错误，支持DAX的文件系统需要将适当的错误处理程序分配给VMA的`*pmd_fault()`指针。
+- en: Managing virtual memory areas
+  id: totrans-72
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 管理虚拟内存区域
+- en: The kernel's VM subsystem implements various operations to manipulate the virtual
+    memory regions of a process; these include functions to create, insert, modify,
+    locate, merge, and delete VMA instances. We will discuss a few of the important
+    routines.
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核的VM子系统实现了各种操作，用于操作进程的虚拟内存区域；这些包括创建、插入、修改、定位、合并和删除VMA实例的函数。我们将讨论一些重要的例程。
+- en: Locating a VMA
+  id: totrans-74
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 定位VMA
+- en: The `find_vma()` routine locates the first region in the VMA list that satisfies
+    the condition for a given address (`addr < vm_area_struct->vm_end`).
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`find_vma()`例程定位VMA列表中满足给定地址条件的第一个区域（`addr < vm_area_struct->vm_end`）。'
+- en: '[PRE3]'
+  id: totrans-76
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: The function first checks for the requested address in the recently accessed
+    `vma` found in the per-thread `vma` cache. On a match, it returns the address
+    of the VMA, else it steps into the red-black tree to locate the appropriate VMA.
+    The root node of the tree is located in `mm->mm_rb.rb_node`. Through the helper
+    function `rb_entry()`, each node is verified for the address within the virtual
+    address interval of the VMA. If the target VMA with a lower start address and
+    higher end address than the specified address is located, the function returns
+    the address of the VMA instance. If the appropriate VMA is still not found, the
+    search continues its lookup into the left or right child nodes of the `rbtree`.
+    When a suitable VMA is found, a pointer to it is updated to the `vma` cache (anticipating
+    the next call to `find_vma()` to locate the neighboring address in the same region),
+    and it returns the address of the VMA instance.
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该函数首先在每个线程的`vma`缓存中查找最近访问的`vma`中的请求地址。如果匹配，则返回VMA的地址，否则进入红黑树以定位适当的VMA。树的根节点位于`mm->mm_rb.rb_node`中。通过辅助函数`rb_entry()`，验证每个节点是否在VMA的虚拟地址间隔内。如果找到了起始地址较低且结束地址较高的目标VMA，函数将返回VMA实例的地址。如果仍然找不到适当的VMA，则搜索将继续查找`rbtree`的左侧或右侧子节点。当找到合适的VMA时，将其指针更新到`vma`缓存中（预期下一次调用`find_vma()`来定位同一区域中相邻的地址），并返回VMA实例的地址。
+- en: When a new region is added immediately before or after an existing region (and
+    therefore also between two existing regions), the kernel merges the data structures
+    involved into a single structure —but, of course, only if the access permissions
+    for all the regions involved are identical and contiguous data is mapped from
+    the same backing store.
+  id: totrans-78
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当一个新区域被添加到一个现有区域之前或之后（因此也在两个现有区域之间），内核将涉及的数据结构合并为一个结构——当然，前提是所有涉及的区域的访问权限相同，并且连续的数据从相同的后备存储器中映射。
+- en: Merging VMA regions
+  id: totrans-79
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 合并VMA区域
+- en: 'When a new VMA is mapped immediately before or after an existing VMA with identical
+    access attributes and data from a file-backed memory region, it is more optimal
+    to merge them into a single VMA structure. `vma_merge()` is a helper function
+    that is invoked to merge surrounding VMAs with identical attributes:'
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当一个新的VMA被映射到一个具有相同访问属性和来自文件支持的内存区域的现有VMA之前或之后时，将它们合并成一个单独的VMA结构更为优化。`vma_merge()`是一个辅助函数，用于合并具有相同属性的周围的VMAs：
+- en: '[PRE4]'
+  id: totrans-81
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: '`*mm` refers to the memory descriptor of the process whose VMAs are to be merged;
+    `*prev` refers to a VMA whose address interval precedes the new region; and the
+    `addr`, `end`, and `vm_flags` contain the start, end, and flags of the new region.
+    `*file` refers to the file instance whose memory region is mapped to the new region,
+    and `pgoff` specifies the offset of the mapping within the file data.'
+  id: totrans-82
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`*mm`指的是要合并其VMAs的进程的内存描述符；`*prev`指的是其地址间隔在新区域之前的VMA；`addr`、`end`和`vm_flags`包含新区域的开始、结束和标志。`*file`指的是将其内存区域映射到新区域的文件实例，`pgoff`指定了文件数据中的映射偏移量。'
+- en: 'This function first checks if the new region can be merged with the predecessor:'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该函数首先检查新区域是否可以与前驱合并：
+- en: '[PRE5]'
+  id: totrans-84
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: 'For this, it invokes a helper function `can_vma_merge_after()`, which checks
+    if the end address of the predecessor corresponds to the start address of the
+    new region, and if access flags are identical for both regions, it also checks
+    offsets of file mappings to ensure that they are contiguous in file region, and
+    that both regions do not contain any anonymous mappings:'
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为此，它调用一个辅助函数`can_vma_merge_after()`，该函数检查前驱的结束地址是否对应于新区域的开始地址，以及两个区域的访问标志是否相同，还检查文件映射的偏移量，以确保它们在文件区域中是连续的，并且两个区域都不包含任何匿名映射：
+- en: '[PRE6]'
+  id: totrans-86
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: It then checks if merging is a possibility with the successor region; for this
+    it invokes the helper function `can_vma_merge_before()`. This function carries
+    out similar checks as before and if both the predecessor and the successor regions
+    are found identical, then `is_mergeable_anon_vma()` is invoked to check if any
+    anonymous mappings of the predecessor can be merged with those of the successor.
+    Finally, another helper function `__vma_adjust()` is invoked to perform the final
+    merging, which manipulates the VMA instances appropriately.
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后检查是否可以与后继区域合并；为此，它调用辅助函数`can_vma_merge_before()`。此函数执行与之前类似的检查，如果发现前任和后继区域都相同，则调用`is_mergeable_anon_vma()`来检查是否可以将前任的任何匿名映射与后继的合并。最后，调用另一个辅助函数`__vma_adjust()`来执行最终合并，该函数适当地操作VMA实例。
+- en: Similar types of helper functions exist for creating, inserting, and deleting
+    memory regions, which are invoked as helper functions from `do_mmap()` and `do_munmap()`,
+    called when user-mode applications attempt to `mmap()` and `unmap()` memory regions,
+    respectively. We will not discuss details of these helper routines any further.
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 存在类似的辅助函数用于创建、插入和删除内存区域，这些函数作为`do_mmap()`和`do_munmap()`的辅助函数被调用，当用户模式应用程序尝试对内存区域进行`mmap()`和`unmap()`时。我们将不再讨论这些辅助例程的详细信息。
+- en: struct address_space
+  id: totrans-89
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: struct address_space
+- en: Memory caches are an integral part of modern memory management. In simple words,
+    a **cache** is a collection of pages used for specific needs. Most operating systems
+    implement a **buffer cache***,* which is a framework that manages a list of memory
+    blocks for caching persistent storage disk blocks. The buffer cache allows filesystems
+    to minimize disk I/O operations by grouping and deferring disk sync until appropriate
+    time.
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内存缓存是现代内存管理的一个重要组成部分。简单来说，**缓存**是用于特定需求的页面集合。大多数操作系统实现了**缓冲缓存**，这是一个管理用于缓存持久存储磁盘块的内存块列表的框架。缓冲缓存允许文件系统通过分组和延迟磁盘同步来最小化磁盘I/O操作，直到适当的时间。
+- en: The Linux kernel implements a **page cache** as a mechanism for caching; in
+    simple words, the page cache is a collection of page frames that are dynamically
+    managed for caching disk files and directories, and support virtual memory operations
+    by providing pages for swapping and demand paging. It also handles pages allocated
+    for special files, such as IPC shared memory and message queues. Application file
+    I/O calls such as read and write cause the underlying filesystem to perform the
+    relevant operation on pages in the page cache. Read operations on an unread file
+    cause the requested file data to be fetched from disk into pages of the page cache,
+    and write operations update the relevant file data in cached pages, which are
+    then marked *dirty* and flushed to disk at specific intervals.
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Linux内核实现了**页面缓存**作为缓存的机制；简单来说，页面缓存是动态管理的页面帧集合，用于缓存磁盘文件和目录，并通过提供页面进行交换和需求分页来支持虚拟内存操作。它还处理为特殊文件分配的页面，例如IPC共享内存和消息队列。应用程序文件I/O调用，如读取和写入，会导致底层文件系统对页面缓存中的页面执行相关操作。对未读文件的读取操作会导致请求的文件数据从磁盘获取到页面缓存中的页面，而写操作会更新缓存页面中相关文件数据，然后标记为*脏*并在特定间隔刷新到磁盘。
+- en: 'Groups of pages in cache that contain data of a specific disk file are represented
+    through a descriptor of type `struct address_space`, so each `address_space` instance
+    serves as an abstraction for a set of pages owned by either a file `inode` or
+    block device file `inode`:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 缓存中包含特定磁盘文件数据的页面组通过`struct address_space`类型的描述符表示，因此每个`address_space`实例都用作由文件`inode`或块设备文件`inode`拥有的页面集合的抽象：
+- en: '[PRE7]'
+  id: totrans-93
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: The `*host` pointer refers to the owner `inode` whose data is contained in the
+    pages represented by the current `address_space` object. For instance, if a page
+    in the cache contains data of a file managed by the Ext4 filesystem, the corresponding
+    VFS `inode` of the file stores the `address_space` object in its `i_data` field.
+    The `inode` of the file and the corresponding `address_space` object is stored
+    in the `i_data` field of the VFS `inode` object. The `nr_pages` field contains
+    the count of pages under this `address_space`.
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`*host`指针指的是拥有者`inode`，其数据包含在当前`address_space`对象表示的页面中。例如，如果缓存中的一个页面包含由Ext4文件系统管理的文件的数据，文件的相应VFS
+    `inode`将在其`i_data`字段中存储`address_space`对象。文件的`inode`和相应的`address_space`对象存储在VFS
+    `inode`对象的`i_data`字段中。`nr_pages`字段包含此`address_space`下页面的计数。'
+- en: For efficient management of file pages in cache, the VM subsystem needs to track
+    all virtual address mappings to regions of the same `address_space`; for instance,
+    a number of user-mode processes might map pages of a shared library into their
+    address space through `vm_area_struct` instances. The `i_mmap` field of the `address_space`
+    object is the root element of a red-black tree that contains all `vm_area _struct`
+    instances currently mapped to this `address_space`; since each `vm_area_struct`
+    instance refers back to the memory descriptor of the respective process, it would
+    always be possible to track process references.
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了有效管理缓存中的文件页面，VM子系统需要跟踪到同一`address_space`区域的所有虚拟地址映射；例如，一些用户模式进程可能通过`vm_area_struct`实例将共享库的页面映射到它们的地址空间中。`address_space`对象的`i_mmap`字段是包含当前映射到此`address_space`的所有`vm_area_struct`实例的红黑树的根元素；由于每个`vm_area_struct`实例都指回相应进程的内存描述符，因此始终可以跟踪进程引用。
+- en: 'All physical pages containing file data under the `address_space` object are
+    organized through a radix tree for efficient access; the `page_tree` field is
+    an instance of `struct radix_tree_root` that serves a root element for the radix
+    tree of pages. This structure is defined in the kernel header `<linux/radix-tree.h>`:'
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`address_space`对象下包含文件数据的所有物理页面通过基数树进行有效访问的组织；`page_tree`字段是`struct radix_tree_root`的一个实例，用作基数树的根元素。此结构在内核头文件`<linux/radix-tree.h>`中定义：'
+- en: '[PRE8]'
+  id: totrans-97
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'Each node of the radix tree is of type `struct radix_tree_node`; the `*rnode`
+    pointer of the previous structure refers to the first node element of the tree:'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 树的每个节点都是`struct radix_tree_node`类型；前一个结构的`*rnode`指针指向树的第一个节点元素：
+- en: '[PRE9]'
+  id: totrans-99
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: The `offset` field specifies the node slot offset in the parent, `count` holds
+    the total count of child nodes, and `*parent` is a pointer to the parent node.
+    Each node can refer to 64 tree nodes (specified by the macro `RADIX_TREE_MAP_SIZE`)
+    through the slots array, where unused slot entries are initialized with NULL.
+  id: totrans-100
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`offset`字段指定了父节点中的节点槽偏移量，`count`保存了子节点的总数，`*parent`是指向父节点的指针。每个节点可以通过槽数组引用64个树节点（由宏`RADIX_TREE_MAP_SIZE`指定），其中未使用的槽条目初始化为NULL。'
+- en: 'For efficient management of pages under an address space, it is important for
+    the memory manager to set a clear distinction between clean and dirty pages; this
+    is made possible through **tags** assigned for pages of each node of the `radix`
+    tree. The tagging information is stored in the `tags` field of the node structure,
+    which is a two-dimensional array . The first dimension of the array distinguishes
+    between the possible tags, and the second contains a sufficient number of elements
+    of unsigned longs so that there is a bit for each page that can be organized in
+    the node. Following is the list of tags supported:'
+  id: totrans-101
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了有效管理地址空间下的页面，内存管理器需要在干净页面和脏页面之间设置清晰的区别；这通过为`radix`树的每个节点的页面分配**标签**来实现。标记信息存储在节点结构的`tags`字段中，这是一个二维数组。数组的第一维区分可能的标签，第二维包含足够数量的无符号长整型元素，以便每个可以在节点中组织的页面都有一个位。以下是支持的标签列表：
+- en: '[PRE10]'
+  id: totrans-102
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: 'The Linux `radix` tree API provides various operation interfaces to `set`,
+    `clear,` and `get` tags:'
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Linux的`radix`树API提供了各种操作接口来`set`、`clear`和`get`标签：
+- en: '[PRE11]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: 'The following diagram depicts the layout of pages under the `address_space`
+    object:'
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表描述了`address_space`对象下页面的布局：
+- en: '![](img/00046.jpeg)'
+  id: totrans-106
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00046.jpeg)'
+- en: 'Each address space object is bound to a set of functions that implement various
+    low-level operations between address space pages and the back-store block device.
+    The `a_ops` pointer of the `address_space` structure refers to the descriptor
+    containing address space operations. These operations are invoked by VFS to initiate
+    data transfers between pages in cache associated with an address map and back-store
+    block device:'
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每个地址空间对象都绑定了一组实现地址空间页面和后端存储块设备之间各种低级操作的函数。`address_space`结构的`a_ops`指针指向包含地址空间操作的描述符。这些操作由VFS调用，以启动与地址映射和后端存储块设备关联的缓存中的页面之间的数据传输：
+- en: '![](img/00047.jpeg)'
+  id: totrans-108
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00047.jpeg)'
+- en: Page tables
+  id: totrans-109
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 页表
+- en: All access operations on process virtual address regions are put through address
+    translation before reaching the appropriate physical memory regions. The VM subsystem
+    maintains page tables to translate linear page addresses into physical addresses.
+    Even though the page table layout is architecture specific, for most architectures,
+    the kernel uses a four-level paging structure, and we will consider the x86-64
+    kernel page table layout for this discussion.
+  id: totrans-110
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在到达适当的物理内存区域之前，对进程虚拟地址区域的所有访问操作都经过地址转换。VM子系统维护页表，将线性页地址转换为物理地址。尽管页表布局是特定于体系结构的，但对于大多数体系结构，内核使用四级分页结构，我们将考虑x86-64内核页表布局进行讨论。
+- en: 'The following diagram depicts the layout of the page table for x86-64:'
+  id: totrans-111
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下图表描述了x86-64的页表布局：
+- en: '![](img/00048.jpeg)'
+  id: totrans-112
+  prefs: []
+  type: TYPE_IMG
+  zh: '![](img/00048.jpeg)'
+- en: 'The address of the page global directory, which is the top-level page table,
+    is initialized into control register cr3\. This is a 64-bit register following
+    bit break-up:'
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 页全局目录的地址，即顶层页表，被初始化为控制寄存器cr3。这是一个64位寄存器，按位分解如下：
+- en: '| Bits | Description |'
+  id: totrans-114
+  prefs: []
+  type: TYPE_TB
+  zh: '| 位 | 描述 |'
+- en: '| 2:0 | Ignored |'
+  id: totrans-115
+  prefs: []
+  type: TYPE_TB
+  zh: '| 2:0 | 忽略 |'
+- en: '| 4:3 | Page level write-through and page-level cache disable |'
+  id: totrans-116
+  prefs: []
+  type: TYPE_TB
+  zh: '| 4:3 | 页级写穿和页级缓存禁用 |'
+- en: '| 11:5 | Reserved |'
+  id: totrans-117
+  prefs: []
+  type: TYPE_TB
+  zh: '| 11:5 | 保留 |'
+- en: '| 51:12 | Address of page global directory |'
+  id: totrans-118
+  prefs: []
+  type: TYPE_TB
+  zh: '| 51:12 | 页全局目录的地址 |'
+- en: '| 63:52 | Reserved |'
+  id: totrans-119
+  prefs: []
+  type: TYPE_TB
+  zh: '| 63:52 | 保留 |'
+- en: 'Out of 64 bit-wide linear addresses supported by x86-64, Linux currently uses
+    48 bits that enable 256 TB of linear address space, which is considered large
+    enough for current use. This 48-bit linear address is split into five parts, with
+    the first 12 bits containing the offset of the memory location in the physical
+    frame and rest of the parts containing offsets into appropriate page table structures:'
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在x86-64支持的64位宽线性地址中，Linux目前使用了48位，可以支持256 TB的线性地址空间，这被认为对于当前的使用已经足够大。这48位线性地址分为五部分，前12位包含物理帧中内存位置的偏移量，其余部分包含适当页表结构的偏移量：
+- en: '| **Linear address bits** | **Description** |'
+  id: totrans-121
+  prefs: []
+  type: TYPE_TB
+  zh: '| **线性地址位** | **描述** |'
+- en: '| 11:0 (12 bits) | Index of physical page |'
+  id: totrans-122
+  prefs: []
+  type: TYPE_TB
+  zh: '| 11:0 (12 bits) | 物理页的索引 |'
+- en: '| 20:12 (9 bits) | Index of page table |'
+  id: totrans-123
+  prefs: []
+  type: TYPE_TB
+  zh: '| 20:12 (9 bits) | 页表的索引 |'
+- en: '| 29:21 (9 bits) | Index of page middle directory |'
+  id: totrans-124
+  prefs: []
+  type: TYPE_TB
+  zh: '| 29:21 (9 bits) | 页中间目录的索引 |'
+- en: '| 38:30 (9 bits) | Index of page upper directory |'
+  id: totrans-125
+  prefs: []
+  type: TYPE_TB
+  zh: '| 38:30 (9 bits) | 页上层目录的索引 |'
+- en: '| 47:39 (9 bits) | Index of page global directory |'
+  id: totrans-126
+  prefs: []
+  type: TYPE_TB
+  zh: '| 47:39 (9 bits) | 页全局目录的索引 |'
+- en: Each of the page table structures can support 512 records, of which each record
+    provides the base address of the next-level page structure. During translation
+    of a given linear address, MMU extracts the top 9 bits containing the index into
+    the page global directory (PGD), which is then added to the base address of PGD
+    (found in cr3); this lookup results in the discovery of the base address for page
+    upper directory (PUD). Next, MMU retrieves the PUD offset (9 bits) found in the
+    linear address, and adds it to the base address of PUD structure to reach the
+    PUD entry (PUDE) that yields the base address of page middle directory (PMD).
+    The PMD offset found in the linear address is then added to the base address of
+    PMD to reach the relevant PMD entry (PMDE), which yields the base address of the
+    page table. The page table offset (9 bits) found in the linear address is then
+    added to the base address discovered from the PMD entry to reach the page table
+    entry (PTE), which in turn yields the start address of the physical frame of the
+    requested data. Finally, the page offset (12 bits) found in the linear address
+    is added to the PTE discovered base address to reach the memory location to be
+    accessed.
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每个页表结构都可以支持512条记录，每条记录都提供下一级页结构的基地址。在翻译给定的线性地址时，MMU提取包含页全局目录（PGD）索引的前9位，然后将其加到PGD的基地址（在cr3中找到）；这个查找结果会发现页上级目录（PUD）的基地址。接下来，MMU检索线性地址中找到的PUD偏移量（9位），并将其加到PUD结构的基地址，以达到PUD条目（PUDE），从而得到页中间目录（PMD）的基地址。然后将线性地址中找到的PMD偏移量加到PMD的基地址，以达到相关的PMD条目（PMDE），从而得到页表的基地址。然后将线性地址中找到的页表偏移量（9位）加到从PMD条目中发现的基地址，以达到页表条目（PTE），进而得到所请求数据的物理帧的起始地址。最后，将线性地址中找到的页偏移量（12位）加到PTE发现的基地址，以达到要访问的内存位置。
+- en: Summary
+  id: totrans-128
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 摘要
+- en: In this chapter, we focused on specifics of virtual memory management with respect
+    to process virtual address space and memory maps. We discussed critical data structures
+    of the VM subsystem, memory descriptor structure (`struct mm_struct`), and VMA
+    descriptor (`struct vm_area_struct`). We looked at the page cache and its data
+    structures (`struct address_space`) used in reverse mapping of file buffers into
+    various process address spaces. Finally, we explored the page table layout of
+    Linux, which is widely used in many architectures. Having gained a thorough understanding
+    of filesystems and virtual memory management, in the next chapter, we will extend
+    this discussion into the IPC subsystem and its resources.
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们关注了虚拟内存管理的具体内容，涉及进程虚拟地址空间和内存映射。我们讨论了VM子系统的关键数据结构，内存描述符结构（`struct mm_struct`）和VMA描述符（`struct
+    vm_area_struct`）。我们看了看页缓存及其数据结构（`struct address_space`），用于将文件缓冲区在各种进程地址空间中进行反向映射。最后，我们探讨了Linux的页表布局，这在许多架构中被广泛使用。在对文件系统和虚拟内存管理有了深入了解之后，在下一章中，我们将把这个讨论扩展到IPC子系统及其资源。

@@ -1,0 +1,959 @@
+- en: Chapter 3. Trident Topologies and Sensor Data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we will explore Trident topologies. Trident provides a higher-level
+    abstraction on top of Storm. Trident abstracts away the details of transactional
+    processing and state management. Specifically, Trident provides batching of tuples
+    into a discrete set of transactions. Additionally, Trident provides abstractions
+    that allow topologies to perform operations on the data such as functions, filters,
+    and aggregations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will use the sensor data as an example to gain a better understanding of
+    Trident. Often, the sensor data forms streams that are read from many different
+    locations. Some traditional examples include the weather or traffic information,
+    but the pattern extends to a wide range of sources. For example, applications
+    that run on cell phones generate a plethora of event information. Processing event
+    streams from phones is another instance of sensor data processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The sensor data contains events emitted by many devices, often forming a never-ending
+    stream. This is a perfect use case for Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Trident topologies
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Trident spouts
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Trident operations – filters and functions
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Trident aggregators – Combiners and Reducers
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The Trident state
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Examining our use case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To better understand both the Trident topologies, as well as using Storm with
+    sensor data, we will implement a Trident topology that collects medical reports
+    to identify the outbreak of a disease.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The topology will process diagnosis events that contain the following pieces
+    of information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Latitude | Longitude | Timestamp | Diagnosis Code (ICD9-CM) |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 39.9522 | -75.1642 | 03/13/2013 at 3:30 PM | 320.0 (*Hemophilus meningitis*)
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 40.3588 | -75.6269 | 03/13/2013 at 3:50 PM | 324.0 (*Intracranial abscess*)
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Each event will include the **Global Positioning System** (**GPS**) coordinates
+    of the occurrence. The latitude and longitude are specified in the decimal format.
+    The event also contains the ICD9-CM code, which indicates the diagnosis and a
+    timestamp for the event. A complete list of ICD-9-CM codes are available at:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://www.icd9data.com/](http://www.icd9data.com/.) .'
+  prefs: []
+  type: TYPE_NORMAL
+- en: To detect an outbreak, the system will count the occurrences of specific disease
+    codes within a geographic location over a specified period of time. To simplify
+    things for this example, we will map every diagnosis event to the closest city.
+    In a real system, you would most likely perform more sophisticated geospatial
+    clustering of the events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, for the example, we will group the occurrences by hour since epoch. In
+    a real-world system, you would most likely use a sliding window and calculate
+    a trend against the moving average.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we will use a simple threshold to determine if there is an outbreak.
+    If the count of occurrences for the hour is greater than some threshold, the system
+    will send an alert and dispatch the National Guard.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To maintain a historical record, we will also persist the number of occurrences
+    for each city, hour, and disease.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Trident topologies
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To fulfill these requirements, we will need to count the occurrences in our
+    topologies. This can be challenging while using standard Storm topologies because
+    tuples can get replayed, which leads to double counting. As we will see in the
+    next few sections, Trident provides primitives to solve this problem.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will use the following topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Introducing Trident topologies](img/8294OS_03_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The code for the preceding topology is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding code shows the wiring between the different Trident functions.
+    First, the `DiagnosisEventSpout` function emits the events. The events are then
+    filtered by the `DiseaseFilter` function, which filters out occurrences of diseases
+    that we are not concerned with. After that, the event is associated with a city
+    in the `CityAssignment` function. Then, the `HourAssignment` function assigns
+    an hour to the event and adds a key to the tuple, which comprises the city, hour,
+    and disease code. We then group by this key, which enables the counting and persisting
+    of those counts in the `persistAggregate` function step in the topology. The counts
+    are then passed along to the `OutbreakDetector` function, which thresholds the
+    count, emitting an alert when the threshold is exceeded. Finally, the `DispatchAlert`
+    function receives the alert, logs a message, and terminates the program. In the
+    following section, we will take a deeper look into each of these steps.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Trident spouts
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's first take a look at the spout in the topology. In contrast to Storm,
+    Trident introduces the concept of **batches**. Unlike Storm spouts, Trident spouts
+    must emit tuples in batches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Each batch is given its own unique transaction identifier. A spout determines
+    the composition of a batch based on the constraints of its contract. There are
+    three types of contracts for spouts: **Non-transactional**, **Transactional**,
+    and **Opaque**.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Non-transactional spouts provide no guarantee on the composition of the batches
+    and might overlap. Two different batches might contain the same tuples. Transactional
+    spouts guarantee that batches are non-overlapping and that the same batch always
+    contains the same tuples. Opaque spouts guarantee that batches are non-overlapping,
+    but the contents of a batch may change.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is depicted in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Spout type | Batches may overlap | Batch contents may change |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Non-transactional | X | X |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Opaque |   | X |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Transactional |   |   |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The interface for a spout looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: In Trident, the spout does not actually emit the tuples. Instead, the work is
+    broken down between the `BatchCoordinator` and `Emitter` functions. The `Emitter`
+    function is responsible for emitting the tuples, and the `BatchCoordinator` function
+    is responsible for batch management and metadata such that the `Emitter` function
+    can properly replay batches.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `TridentSpout` function simply provides accessor methods to the `BatchCoordinator`
+    and `Emitter` functions and declares the fields that the spout will emit. The
+    following is the listing of the `DiagnosisEventSpout` function for our example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: As shown in the `getOutputFields()` method in the preceding code, in our example
+    topology, the spout emits a single field called `event`, which contains the `DiagnosisEvent`
+    class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `BatchCoordinator` class implements the following interface:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `BatchCoordinator` class is a generic class. The generic class is the metadata
+    that is required to replay a batch. In our example, the spout emits random events
+    and thus the metadata is ignored. However, in real-world systems, the metadata
+    might contain the identifiers of the messages or objects that comprise a batch.
+    With that information, the opaque and transactional spouts can abide to their
+    contracts and ensure that the contents of batches do not overlap, and in the case
+    of the transactional spout, the batch contents do not change.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `BatchCoordinator` class is implemented as a Storm Bolt operating in a single
+    thread. Storm persists the metadata in Zookeeper. It notifies the coordinator
+    when each transaction is complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our example, if we do no coordination, the following is the coordination
+    used in the `DiagnosisEventSpout` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The second component in a Trident spout is the `Emitter` function. The `Emitter`
+    function performs the function of the Storm spout using a collector to emit tuples.
+    The only distinction is that it uses a `TridentCollector` class, and the tuples
+    must be included in a batch that was initialized by the `BatchCoordinator` class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The interface for an `Emitter` function looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As shown in the preceding code, the `Emitter` function has only one job—to
+    emit the tuples for a given batch. To do this, the function is passed the metadata
+    for the batch (which was constructed by the coordinator), information about the
+    transaction, and the collector, which is what the `Emitter` function uses to emit
+    the tuples. The listing for the `DiagnosisEventEmitter` class is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: The work is performed in the `emitBatch()` method. For this example, we will
+    randomly assign a latitude and longitude, keeping it roughly within the United
+    States, and we will use the `System.currentTimeMillis()` method for the timestamp
+    on the diagnosis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In real life, ICD-9-CM codes sparsely populate a range between 000 and 999\.
+    For this example, we will only use diagnosis codes between 320 and 327\. These
+    codes are listed as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Code | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 320 | Bacterial meningitis |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 321 | Meningitis due to other organisms |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 322 | Meningitis of unspecified cause |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 323 | Encephalitis myelitis and encephalomyelitis |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 324 | Intracranial and intraspinal abscess |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 325 | Phlebitis and thrombophlebitis of intracranial venous sinuses |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 326 | Late effects of intracranial abscess or pyogenic infection |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 327 | Organic sleep disorders |'
+  prefs: []
+  type: TYPE_TB
+- en: One of these diagnosis codes is randomly assigned to the event.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this example, we will use an object to encapsulate the diagnosis event. Just
+    as easily, we could have emitted each of the components as a separate field in
+    the tuple. There is a balancing act between object encapsulation and use of fields
+    in the tuple. Often, it is a good idea to keep the number of fields down to a
+    manageable number, but it also makes sense to include data used for the control
+    flow and/or grouping as fields in the tuple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our example, the `DiagnosisEvent` class is the key piece of data on which
+    the topology is operating. That object looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: The object is a simple JavaBean. Time is stored as a long variable, which is
+    the time since the epoch. The latitude and longitude are each stored as doubles.
+    The `diagnosisCode` class is stored as a string, just in case the system needs
+    to be able to process other types of codes that are not based on ICD-9, such as
+    alphanumeric codes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At this point, the topology is able to emit events. In a real implementation,
+    we might integrate the topology into a medical claims processing engine or an
+    electronic health records system at the point of practice.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Trident operations – filters and functions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that we have events being generated, the next step is to add the logic
+    components that implement the business process. In Trident, these are known as
+    **operations**. In our topology, we are using two different types of operations:
+    filters and functions.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Operations are applied to streams via methods on the `Stream` object. In this
+    example, we use the following methods on the `Stream` object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note that the methods in the preceding code return forms of the `Stream` objects
+    or `TridentState` that can be used to create additional streams. With this, operations
+    can be chained together using fluent-style Java.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let''s take another look at the critical lines in our example topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Typically, operations are applied by declaring a set of input fields and a set
+    of output fields also known as **function fields**. The second line of the topology
+    in the preceding code declares that we want `CityAssignment` to execute on each
+    tuple in the stream. From that tuple, `CityAssignment` will operate on the `event`
+    field and emit a function field labelled `city`, which is appended to the tuple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each operation has slightly different fluent-style syntax, which depends on
+    what information the operation requires. In the following sections, we will cover
+    the details of the syntax and the semantics of the different operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Trident filters
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The first piece of logic in our topology is a **filter**, which ignores disease
+    events that are not of concern. In this example, the system will focus on meningitis.
+    From the previous table, the only meningitis codes are 320, 321, and 322.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To filter events based on codes, we will leverage a Trident filter. Trident
+    makes this easy by providing a `BaseFilter` class that we can subclass to filter
+    tuples that the system does not care about. The `BaseFilter` class implements
+    the `Filter` interface, which looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To filter tuples in a stream, the application simply implements this interface
+    by extending the `BaseFilter` class. In the example, we will filter events using
+    the following filter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, we will extract the `DiagnosisEvent` class from the tuple
+    and examine the disease code. Since all the meningitis codes are less than or
+    equal to 322, and we are not emitting any other codes, we simply check to see
+    if the code is less than 322 to determine if the event relates to meningitis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Returning `True` from a `Filter` operation will result in the tuple flowing
+    along to downstream operations. If the method returns `False`, the tuple will
+    not flow to downstream operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our topology, we apply the filter to each tuple in the stream using the
+    `each(inputFields, filter)` method on the stream. The following line in our topology
+    applies the filter to the stream:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Introducing Trident functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: In addition to filters, Storm provides an interface for generic functions. Functions
+    are similar to Storm bolts in that they consume tuples and optionally emit new
+    tuples. One distinction is that Trident functions are additive. The values emitted
+    by functions are fields that are added to the tuple. They do not remove or mutate
+    existing fields.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The interface for a function looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Similar to a Storm bolt, the function implements a single method that contains
+    the logic for that function. The function implementation can optionally use the
+    `TridentCollector` to emit the tuple passed into the function. In this way, functions
+    can also be used to filter tuples.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first function in our topology is the `CityAssignment` function that looks
+    like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this function, we use a static initializer to create a map of the cities
+    we care about. For sample data, the function has a map that contains the coordinates
+    for Philadelphia (PHL), New York City (NYC), San Francisco (SF), and Los Angeles
+    (LA).
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the `execute()` method, the function loops through the cities and calculates
+    the distance between the event and the city. In a real system, a geospatial index
+    is likely more efficient.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once the function determines the closest city, it emits the code for that city
+    in the last few lines of the method. Remember that in Trident, instead of the
+    function declaring what fields it will emit, the fields are declared when the
+    operation is attached to the stream as the third parameter in the function call.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The number of function fields declared must align with the number of values
+    emitted by the function. If they do not align, Storm will throw an `IndexOutOfBoundsException`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The next function in our topology, `HourAssignment`, is used to convert the
+    timestamp into an hour since epoch, which can then be used to group occurrences
+    temporally. The code for `HourAssignment` looks as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: We overload this function slightly by emitting both the *hours* as well as a
+    composite key comprising the city, diagnosis code, and the hour. Effectively,
+    this acts as a unique identifier for each aggregate count, which we will discuss
+    more in detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The final two functions in our topology detect the outbreak and alert us about
+    it. The code for the `OutbreakDetector` class is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function extracts the count for the specific city, disease, and hour and
+    sees if it has exceeded the threshold. If it has, it emits a new field that contains
+    an alert. In the preceding code, notice that this function effectively acts as
+    a filter but was implemented as a function because we wanted to add an additional
+    field to the tuple that contains the alert. Since filters do not mutate the tuple,
+    we must use a function that allows us to not only filter but also add new fields.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The final function in our topology simply dispatches the alert (and terminates
+    the program). The listing for this topology is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: This function is straightforward. It simply extracts the alert, logs the message,
+    and terminates the program.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing Trident aggregators – Combiners and Reducers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Akin to functions, **aggregators** allow topologies to combine tuples. Unlike
+    functions, they replace tuple fields and values. There are three different types
+    of aggregators: `CombinerAggregator`, `ReducerAggregator`, and `Aggregator`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: CombinerAggregator
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'A `CombinerAggregator` is used to combine a set of tuples into a single field.
+    It has the following signature:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: Storm calls the `init()` method with each tuple, and then repeatedly calls the
+    `combine()` method until the partition is processed. The values passed into the
+    `combine()` method are partial aggregations, the result of combining the values
+    returned by calls to `init()`. Partitions are discussed more in the following
+    sessions, but a partition is effectively a subset of a stream of tuples that resides
+    on the same host. After combing the values from processing the tuples, Storm emits
+    the result of combining those values as a single new field. If a partition is
+    empty, then Storm emits the value returned by the `zero()`method.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ReducerAggregator
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The `ReducerAggregator` has a slightly different signature:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Storm calls the `init()` method to retrieve the initial value. Then `reduce()`
+    is called with each tuple until the partition is fully processed. The first parameter
+    into the `reduce()` method is the cumulative partial aggregation. The implementation
+    should return the result of incorporating the tuple into that partial aggregation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Aggregator
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The most general aggregation operation is the `Aggregator`. The signature for
+    `Aggregator` is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `Aggregator` interface's `aggregate()` method is similar to the `execute()`
+    method of a `Function` interface, but it also includes a parameter for the value.
+    This allows the `Aggregator` to accumulate a value as it processes the tuples.
+    Notice that with an `Aggregator`, since the collector is passed into both the
+    `aggregate()` method as well as the `complete()` method, you can emit any arbitrary
+    number of tuples.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our example topology, we leveraged a built-in aggregator named `Count`.
+    The implementation for `Count` looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We apply both grouping and counting in our example topology to count the occurrences
+    of a disease during a specific hour near a particular city. The specific lines
+    that accomplish this are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Recall that Storm partitions the stream across the available hosts. This is
+    shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Aggregator](img/8294OS_03_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'The `groupBy()` method forces a repartitioning of the data. It groups all the
+    tuples that share the same value for the named field into the same partition.
+    To do this, Storm must send the like tuples to the same host. The following diagram
+    shows the repartitioning of the preceding data based on our `groupBy()` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Aggregator](img/8294OS_03_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: After repartitioning, the `aggregate` function is run on each group within each
+    partition. In our example, we are grouping by city, hour, and disease code (using
+    the key). Then, the `Count` aggregator is executed on each group, which in turn
+    emits the occurrence count for downstream consumers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Introducing the Trident state
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now that we have the counts for each aggregation, we want to persist with that
+    information for further analysis. In Trident, persistence first starts with state
+    management. Trident has a first-level primitive for state, but like the Storm
+    API, it makes a few assumptions about what is being stored as state or how that
+    state is persisted. At the highest level, Trident exposes a `State` interface
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: As mentioned previously, Trident groups tuples into batches. Each batch has
+    its own transaction identifier. In the preceding interface, Trident informs the
+    `State` object when the state is being committed and when the commit should complete.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Like functions, there are methods on the `Stream` objects that introduce state-based
+    operations into a topology. More specifically, there are two types of streams
+    in Trident: `Stream` and `GroupedStream`. A `GroupedStream` is the result of performing
+    a `groupBy` operation. In our topology, we group by the key generated by the `HourAssignment`
+    function.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'On the `Stream` object, the following methods allow the topology to read and
+    write state information:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `stateQuery()` method creates an input stream from state, and the various
+    flavors of the `partitionPersist()` method allow a topology to update state information
+    from tuples in a stream. The `partitionPersist()` method operates on each partition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In addition to the methods on the `Stream` object, the `GroupedStream` object
+    allows a topology to aggregate statistics from a set of tuples and simultaneously
+    persist with the collected information to state. The following are the state-related
+    methods on a `GroupedStream` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: Like the base `Stream` object, the `stateQuery()` method creates an input stream
+    from state. The various flavors of `persistAggregate()` allow a topology to update
+    state information from tuples in a stream. Notice that the `GroupedStream` methods
+    take an `Aggregator`, which it first applies before writing that information to
+    the `State` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now let''s consider applying these functions to our example. In our system,
+    we would like to persist with the occurrence counts by city, disease code, and
+    hour. This would enable a report similar to the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Disease | City | Date | Time | Occurrence Count |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Bacterial meningitis | San Francisco | 3/12/2013 | 3:00 PM | 12 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Bacterial meningitis | San Francisco | 3/12/2013 | 4:00 PM | 50 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Bacterial meningitis | San Francisco | 3/12/2013 | 5:00 PM | 100 |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Smallpox | New York | 3/13/2013 | 5:00 PM | 6 |'
+  prefs: []
+  type: TYPE_TB
+- en: 'To achieve this, we want to persist with the counts that we generate in the
+    aggregation. We can use the `GroupedStream` interface (shown previously) returned
+    by the `groupBy` function and call the `persistAggregate` method. Specifically,
+    the following is the call we make in the example topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To understand persistence, we will first focus on the first parameter to this
+    method. Trident uses a factory pattern to generate instances of `State`. The `OutbreakTrendFactory`
+    is the factory our topology provides to Storm. The listing for `OutbreakTrendFactory`
+    is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The factory returns the `State` object that Storm uses to persist with information.
+    In Storm, there are three types of state. Each type is described in the following
+    table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **State type** | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Non-Transactional** | For persistence mechanisms that do not have rollback
+    capabilities and where updates are permanent and commits are ignored. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Repeat Transactional** | For persistence that is idempotent, provided the
+    batch contains the same tuples. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Opaque Transactional** | Updates are based on the previous value, which
+    makes the persistence resilient to changes in batch composition. |'
+  prefs: []
+  type: TYPE_TB
+- en: To support counting and state updates in a distributed environment where batches
+    can be replayed, Trident sequences state updates and uses different state update
+    patterns to tolerate replays and faults. These are described in the following
+    sections.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Repeat Transactional state
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: For the Repeat Transactional state, the last committed batch identifier is stored
+    with the data. The state is updated if and only if the batch identifier being
+    applied is the next in sequence. If it is equal to or lower than the persisted
+    identifier, then the update is ignored because it has already been applied.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To illustrate this approach, consider the following sequence of batches where
+    the state update is an aggregate count of the occurrences of that key as it is
+    in our example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Batch # | State Update |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 1 | {SF:320:378911 = 4} |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2 | {SF:320:378911 = 10} |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 | {SF:320:378911 = 8} |'
+  prefs: []
+  type: TYPE_TB
+- en: 'The batches then complete processing in the following order:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 1 à 2 à 3 à 3 (replayed)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This would result in the following state modifications, where the middle column
+    is the persistence of the batch identifier indicating the most recent batch incorporated
+    in the state:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Completed Batch # | State |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 1 | { Batch = 1 } | { SF:320:378911 = 4 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2 | { Batch = 2 } | { SF:320:378911 = 14 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 | { Batch = 3 } | { SF:320:378911 = 22 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 (Replayed) | { Batch = 3 } | { SF:320:378911 = 22 } |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Notice that when batch #3 completes the replay, it has no effect on the state
+    because Trident has already incorporated its update in the state. For the Repeat
+    Transactional state to function properly, batch contents cannot change between
+    replays.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Opaque state
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The approach used in the Repeat Transactional state relies on the batch composition
+    remaining constant, which may not be possible if a system encounters a fault.
+    If the spout is emitting from a source that may have a partial failure, some of
+    the tuples emitted in the initial batch might not be available for re-emission.
+    The Opaque state allows the changing of batch composition by storing both current
+    and previous states.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Assume that we have the same batches as in the previous example, but this time
+    when Batch 3 is replayed, the aggregate count will be different since it contains
+    a different set of tuples as shown in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Batch # | State update |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 1 | {SF:320:378911 = 4} |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2 | {SF:320:378911 = 10} |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 | {SF:320:378911 = 8} |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 (Replayed) | {SF:320:378911 = 6} |'
+  prefs: []
+  type: TYPE_TB
+- en: 'With Opaque state, the state would update as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Completed batch # | Batch committed | Previous state | Current state |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 1 | 1 | {} | { SF:320:378911 = 4 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 2 | 2 | { SF:320:378911 = 4 } | { SF:320:378911 = 14 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 (Applies) | 3 | { SF:320:378911 = 14 } | { SF:320:378911 = 22 } |'
+  prefs: []
+  type: TYPE_TB
+- en: '| 3 (Replayed) | 3 | { SF:320:378911 = 14 } | { SF:320:378911 = 20 } |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Notice that Opaque state stores the previous state information. Thus, when
+    batch #3 is replayed, it can retransition the state using the new aggregate count.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may wonder why we would reapply the batch if it had already been committed.
+    The scenario we are concerned with is one whereby the state update succeeded,
+    but the downstream processing failed. In our example topology, perhaps the alert
+    failed to dispatch. Under such circumstances, Trident would retry the batch. Now,
+    in the worst-case scenario, when the spout was asked to re-emit the batch, one
+    or more sources of data may be unavailable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the case of a Transactional spout, it would need to wait until all the sources
+    were again available. An Opaque Transactional spout would be able to emit the
+    portion of the batch that was available, and processing could continue. Since
+    Trident relies on sequential application of batches to state, it is imperative
+    that no single batch be delayed, because that delays all processing in the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Given this approach, the choice of state should be based on the spout so as
+    to guarantee idempotent behavior and not over-count or corrupt the state. The
+    following table shows the possible pairings to guarantee idempotent behavior:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Type of Spout | Non-Transactional state | Opaque State | Repeat Transactional
+    state |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Non-Transactional spout |   |   |   |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Opaque spout |   | X |   |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Transactional spout |   | X | X |'
+  prefs: []
+  type: TYPE_TB
+- en: 'Fortunately, Storm provides map implementations that shield the persistence
+    layer from the complexities of the state management. Specifically, Trident provides
+    `State` implementations that maintain the additional information to adhere to
+    the guarantees outlined previously. The objects are named appropriately: `NonTransactionalMap`,
+    `TransactionalMap`, and `OpaqueMap`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Returning to our example, since we have no transactional guarantees, we chose
+    to use a `NonTransactionalMap` as our `State` object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `OutbreakTrendState` object looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As shown in the preceding code, to leverage the `MapState` objects, we simply
+    pass a backing map. In our example, this is the `OutbreakTrendBackingMap`. The
+    code for that object is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: In our example topology, we do not actually persist with the values. We simply
+    put them in a `ConcurrentHashMap`. Obviously, that would not work across multiple
+    hosts. The `BackingMap` is a clever abstraction, however. Simply changing the
+    backing map instance that we pass into the constructor of the `MapState` object
+    changes the persistence layer. We will see this in action in later chapters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Executing the topology
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The `OutbreakDetectionTopology` class has the following main method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Executing this method will submit the topology to a local cluster. The spout
+    will immediately start emitting diagnosis events, which the `Count` aggregator
+    will collect. The threshold in the `OutbreakDetector` class is set such that the
+    count will quickly exceed the threshold, at which point the program terminates
+    with the following set of commands:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice that the coordinator is notified upon successful completion of the batches,
+    and within a few batches, the threshold is exceeded, and the system instructs
+    us with an error message, `Dispatch the National Guard!`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we created a topology that processes diagnosis information
+    to identify anomalies, which would indicate an outbreak. This same data flow could
+    be applied to any type of data, including weather, seismic information, or traffic
+    data. We exercised the fundamental primitives in Trident to construct a system
+    that is capable of counting events even if batches are replayed. Later on in this
+    book, we will leverage these same constructs and patterns to perform similar functions.
+  prefs: []
+  type: TYPE_NORMAL

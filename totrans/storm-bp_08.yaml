@@ -1,0 +1,914 @@
+- en: Chapter 8. Natural Language Processing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Some people believe Storm will eventually replace Hadoop as demand increases
+    for real-time analytics and data processing. In this chapter, we will see how
+    Storm and Hadoop actually complement each other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although Storm blurs the lines between traditional **On-Line Transactional Processing**
+    (**OLTP**) and **On-Line Analytical Processing** (**OLAP**), it can handle a high
+    volume of transactions while performing aggregations and dimensional analysis
+    typically associated with data warehouses. It is often the case that you still
+    need additional infrastructure to perform historical analysis and to support ad
+    hoc queries across the entire dataset. Additionally, batch processing is often
+    used to correct anomalies where the OLTP system cannot ensure consistency in the
+    event of failures. This is exactly what we encountered in the Storm-Druid integration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For these reasons, batch processing infrastructure is often paired with real-time
+    infrastructure. Hadoop provides us with such a batch processing framework. In
+    this chapter, we will implement an architecture that supports historical and ad
+    hoc analyses via batch processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This chapter covers the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CAP theorem
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lambda architectures
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: OLTP and OLAP integration
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: An introduction to Hadoop
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Motivating a Lambda architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: First, from a logical perspective, let's take a look at the Storm-Druid integration.
+    Storm, and more specifically Trident, is able to perform distributed analytics
+    because it isolates state transitions. To do this, Storm makes certain assumptions
+    about the underlying persistence mechanisms for state. Storm assumes that the
+    persistence mechanism is both *consistent* and *available*. Specifically, Storm
+    assumes that once a state transition is made, that new state is shared, consistent
+    across all nodes, and immediately available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'From the CAP theorem, we know that it is difficult for any distributed system
+    to provide all three of the following guarantees simultaneously:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Consistency**: The state is the same across all nodes'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Availability**: The system can respond to a query with either success or
+    failure'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Partition Tolerance**: The system continues to respond despite loss of communication
+    or partial system failure'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: More and more, web-scale architectures integrate persistence mechanisms that
+    take a relaxed approach to Consistency in order to meet Availability and Partition
+    Tolerance requirements. Often, these systems do so because the coordination required
+    to provide transactional consistency across the entire system becomes untenable
+    in large distributed systems. Performance and throughput are more important.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Druid made these same trade-offs. If we take a look at the persistence model
+    for Druid, we see a few different stages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Motivating a Lambda architecture](img/8294OS_08_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: First, Druid consumes the data via the `Firehose` interface and places that
+    data in the memory. Second, the data is persisted to the disk and the `Firehose`
+    implementation is notified via the `Runnable` interface. Finally, this data is
+    pushed to **Deep Storage**, which makes the data available to other parts of the
+    system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, if we consider the implications of inconsistent data to fault tolerance,
+    we see that the data is at risk until it is persisted in Deep Storage. If we lose
+    that node, we lose the analytics for all the data on that node we have consumed
+    thus far via Storm, because we have already acknowledged the tuples.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One obvious solution to this problem is to push the segment to Deep Storage
+    prior to acknowledging the tuples in Storm. This would be acceptable, but it would
+    create a tenuous relationship between Storm and Druid. Specifically, batch sizes
+    and timeouts would need to align with segment sizes and the timing of Druid's
+    segment push to Deep Storage. If described in another way, the throughput of our
+    transactional processing system would be limited and intimately tied to the system
+    we are using for analytical processing. In the end, that is a dependency we most
+    likely do not want.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, we still want real-time analytics and are willing to tolerate those
+    analytics missing some portion of the data in the unlikely event of a partial
+    system failure. From this perspective, this integration is satisfactory. Ideally
+    though, we would have a mechanism to correct and recover from any fault. To do
+    this, we will introduce an offline batch processing mechanism to recover and correct
+    data in the event of a failure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For this to work, we will first persist the data prior to sending the data to
+    Druid. Our batch processing system will read the data from that persistence mechanism
+    offline. The batch processing system will be able to correct/update any data that
+    the system may have lost during real-time processing. Combining these approaches,
+    we can achieve the throughput we need during real-time processing with analytics
+    that are accurate until there is a system failure and a mechanism that corrects
+    those analytics if/when a failure occurs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The de facto standard for distributed batch processing is Hadoop. Thus, we
+    will incorporate the use of Hadoop for historical (that is, non-real-time) analytics.
+    The following diagram depicts the pattern we will use here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Motivating a Lambda architecture](img/8294OS_08_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The preceding pattern shows how we can integrate OLTP and OLAP systems successfully
+    while mostly providing consistent and complete analytics in real time with high
+    throughput, availability, and partitioning. It also simultaneously provides mechanisms
+    to account for partial system failures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The other gap that this approach fills is the ability to introduce new analytics
+    into the system. Since the Storm-Druid integration focuses on the real-time problem,
+    there is no easy way to introduce new analyses into the system. Hadoop closes
+    that gap since it can run over the historical data to populate new dimensions
+    or perform additional aggregations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Nathan Marz, the original author of Storm, refers to this approach as a **Lambda
+    architecture**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Examining our use case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now, let's apply this pattern to the field of **Natural Language Processing**
+    (**NLP**). In this use case, we will search Twitter for relevant tweets for a
+    phrase (for example, "Apple Jobs"). The system will then process those tweets
+    trying to find the most relevant words. Using Druid to aggregate the terms, we
+    will be able to trend the most relevant words over time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's define the problem a little more. Given a search phrase *p*, using the
+    Twitter API, we will find the most relevant sets of Tweets, *T*. For each tweet,
+    *t* in *T*, we will count the occurrences of each word, *w*. We will compare the
+    frequency of that word in the tweets with the frequency of that word in a sample
+    of English text, *E*. The system will then rank those words and display the top
+    20 results.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Mathematically, this equates to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Examining our use case](img/equation_1.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Here, the frequency of a word *w* in a corpus *C* is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Examining our use case](img/equation_2.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Since we are only concerned with the relative frequency, and the total count
+    of words in *T* and words in *E* are constant across all words, we can ignore
+    them in the equations, reducing the complexity of the problem to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Examining our use case](img/equation_3.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'For the denominator, we will use a freely available word frequency list from
+    the following link:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://invokeit.wordpress.com/frequency-word-lists/](http://invokeit.wordpress.com/frequency-word-lists/)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We will use Storm to process the results of the Twitter search and enrich the
+    tuple with the count information for the denominator. Druid will then count the
+    occurrences for the numerator, and we will use a post-aggregation function to
+    perform the actual relevance calculation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Realizing a Lambda architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: For this use case, we are focusing on a distributed computing pattern that integrates
+    a real-time processing platform (that is, Storm) with an analytics engine (that
+    is, Druid); we then pair it with an offline batch processing mechanism (that is,
+    Hadoop) to ensure we have accurate historical metrics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While that remains the focus, the other key goal we are trying to achieve is
+    continuous availability and fault tolerance. More specifically, the system should
+    tolerate the permanent loss of a node or even a data center. To achieve this kind
+    of availability and fault tolerance, we need to focus a bit more on the persistence.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a live system, we would use a distributed storage mechanism for persistence,
+    ideally a storage mechanism that supported replication across data centers. Thus,
+    even in a disastrous scenario, whereby a data center is entirely lost, the system
+    can recover without losing data. When interacting with the persistent store, the
+    client will demand a consistency level that replicates data across multiple data
+    centers within the transaction.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For this discussion, assume we are using Cassandra as our persistence mechanism.
+    With Cassandra, which has tunable consistency, writes will use a consistency level
+    of `EACH_QUORUM`. This ensures that a copy of the data is written consistently
+    to all data centers. Of course, this introduces the overhead of interdata center
+    communication on each write. For less critical applications, `LOCAL_QUORUM` is
+    most likely acceptable, which avoids the latency of interdata center communication.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Another benefit of using a distributed storage engine such as Cassandra is
+    that a separate ring/cluster could be set up for offline / batch processing. Hadoop
+    could then use that ring as the input, allowing the system to reingest the historical
+    data without impacting transactional processing. Consider the following architecture
+    diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Realizing a Lambda architecture](img/8294OS_08_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: In the preceding diagram, we have two physical data centers, each with a Cassandra
+    cluster servicing the transactional processing within Storm. This ensures that
+    any write from the topology will replicate in real time to the data center, either
+    before the tuple is acknowledged, if we use `EACH_QUORUM` consistency, or lazily,
+    if we use `LOCAL_QUORUM`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Additionally, we have a third *virtual* data center supporting the offline batch
+    processing. **Ring 3** is a Cassandra cluster that is physically collocated with
+    **Ring 1** but is configured as a second data center within Cassandra. When we
+    run the Hadoop job to process the historical metrics, we can use a `LOCAL_QUORUM`.
+    Since local quorum seeks to gain consensus within the local data center, read
+    traffic from Hadoop will not cross over into our transactional processing cluster.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In general, this is a great pattern to deploy if your organization has data
+    scientists/stewards that are running analyses on your data. Often, these jobs
+    are data intensive. Isolating this workload from the transactional system is important.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Additionally, and arguably just as important as our ability to tolerate faults
+    in the system, this architecture allows us to introduce new analytics into the
+    system that we did not have at the time of data ingestion. Hadoop can run over
+    all the relevant historical data using a new analytics configuration to populate
+    new dimensions or perform additional aggregations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing the topology for our use case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'For this example, we will again use Trident and build on the topology that
+    we constructed in the previous chapter. The Trident topology is depicted as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Designing the topology for our use case](img/8294OS_08_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The `TwitterSpout` performs the search against the Twitter API periodically,
+    emitting the tweets that it returns into a Trident stream. The `TweetSplitterFunction`
+    then parses the tweets and emits a tuple for each word in the tweets. The `WordFrequencyFunction`
+    enriches each tuple with the count for that word from a random sample of the English
+    language. Finally, we let Druid consume that information to perform the aggregations
+    over time. Druid partitions the data into temporal slices and persists that data
+    as described previously.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this case, because the persistence mechanism is our means of addressing fault
+    tolerance/system failure, the persistence mechanism should distribute storage
+    and provide both consistency and high-availability. Additionally, Hadoop should
+    be capable of using the persistence mechanism as an input into a map/reduce job.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With its tunable consistency and support for Hadoop, Cassandra makes for an
+    ideal persistence mechanism for this pattern. Since Cassandra and polyglot persistence
+    are covered elsewhere, we will keep this example simple and use the local file
+    storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the design
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let's first examine the real-time portion of the system beginning with the spout
+    through to the Druid persistence. The topology is straightforward and mimics topologies
+    we have written in previous chapters.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are the critical lines of the topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In the end, after parsing and enrichment, the tuples have four fields as shown
+    in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Field name | Use |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `searchphrase` | This field contains the search phrase being ingested. This
+    is the phrase sent to the Twitter API. In reality, the system would most likely
+    be monitoring multiple search phrases at a time. In this system, the value is
+    hardcoded. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `tweet` | This field contains tweets that are returned when searching the
+    Twitter API for `searchphrase`. There is a 1:n relationship between `searchphrase`
+    and `tweet`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `word` | After parsing, this field contains the words found in the tweets.
+    There is a 1:n relationship between `tweet` and `word`. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `baseline` | This field contains the count associated with the word in an
+    ordinary sampled text. There is a 1:1 relationship between `word` and `baseline`.
+    |'
+  prefs: []
+  type: TYPE_TB
+- en: TwitterSpout/TweetEmitter
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now, let's take a look at the spout/emitter. For this example, we will use the
+    Twitter4J API, and the `Emitter` function is not much more than a thin glue layer
+    between that API and the Storm API. As shown previously, it simply invokes the
+    Twitter API using Twitter4J and emits all the results as a single batch within
+    Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In a more complex scenario, one might also tap into the `Twitter Firehose`
+    and use a queue to buffer the live updates before emitting them into Storm. The
+    following are the key lines in the `Emitter` portion of the spout:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: This section covers the functions used in the topology. In this example, all
+    the functions can either have side effects (for example, persistence) or they
+    add fields and values to the tuple.
+  prefs: []
+  type: TYPE_NORMAL
+- en: TweetSplitterFunction
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'The first function that the tweet passes through is the `TweetSplitterFunction`.
+    This function simply parses the tweet and emits one tuple per word in the tweet.
+    The code for this function is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: In a more sophisticated NLP system, this function will do more than simply split
+    the tweet by whitespace. An NLP system would most likely try to parse the tweet,
+    assigning parts of speech to the words and associating them with one another.
+    Although, instant messages and tweets typically lack the traditional grammatical
+    constructs that parsers are trained on, the system might still use elementary
+    associations such as the distance between the words. In such systems, instead
+    of word frequencies, systems use n-gram frequencies where each n-gram comprises
+    multiple words.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To learn about the use of n-grams, visit [http://books.google.com/ngrams](http://books.google.com/ngrams).
+  prefs: []
+  type: TYPE_NORMAL
+- en: WordFrequencyFunction
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Now we move on to the `WordFrequencyFunction`. This function enriches the tuple
+    with the `baseline` count. This is the number of times the word was encountered
+    in a random sampled text.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The key code for this function is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The constructor in the code loads the word counts into the memory. The file
+    format of `en.txt` is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Each line contains the word and the frequency count for that word. Again, since
+    we are only worried about relative counts, we need not consider the total counts
+    in the corpus. However, if we were calculating a true likelihood, we would need
+    to consider the overall total word count as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `execute` method of the function is straightforward and simply adds the
+    baseline count to the tuple. However, if we examine the method that retrieves
+    the count from the `HashMap` class, notice that it includes a `DEFAULT_BASELINE`.
+    This is the value used when the system encounters a word that was not in the original
+    corpus.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Since Twitter feeds contain many abbreviations, acronyms, and other terms that
+    are not found typically in standard text, the `DEFAULT_BASELINE` becomes an important
+    configuration parameter. In some cases, unique words are important and unique
+    because they pertain to the `searchphrase` field. Others are anomalies because
+    the sample corpus differs from the target corpus.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Ideally, the raw baseline counts would be drawn from the same source that the
+    analytics are targeting. In this case, it would be ideal to have both word and
+    n-gram counts calculated using the entire `Twitter Firehose`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: PersistenceFunction
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We will not go into the details of a full multidata center Cassandra deployment
+    here. Instead, for this example, we will keep it simple and use the local file
+    storage. The code for the `PersistenceFunction` is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the preceding code, the function simply persists the tuple in the native
+    format that Druid expects to consume in the Hadoop indexing job. This code is
+    inefficient in that we are opening up the file for writing each time. Alternatively,
+    we could have implemented additional `StateFactory` and `State` objects that persisted
+    the tuples; however, since this is just an example, we can tolerate the inefficient
+    file access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Additionally, notice that we generate a timestamp here that is not re-emitted
+    with the tuple. Ideally, we would generate a timestamp and add it to the tuple,
+    which would then be used downstream by Druid to align the temporal partitioning.
+    For this example, we will accept the discrepancy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Even though this function does not enrich the tuple at all, it must still re-emit
+    the tuple. Since functions can also act as filters, it is the obligation of the
+    function to declare which tuples are passed downstream.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The function writes the following lines to the `nlp.json` file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Examining the analytics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The Druid integration is the same that was used in the previous chapter. As
+    a brief recap, this integration comprises the `StateFactory`, `StateUpdater`,
+    and `State` implementations. The `State` implementation then communicates with
+    a `StormFirehoseFactory` implementation and a `StormFirehose` implementation for
+    Druid. At the heart of this implementation is the `StormFirehose` implementation,
+    which maps the tuples into input rows for Druid. The listing for this method is
+    shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Looking at this method, there are two key data structures: `theMap` and `dimensions`.
+    The first contains the data values for the row. The second contains the dimensions
+    for that row, which is what Druid will use to perform the aggregations, and determines
+    what queries you can run against the data. In this case, we will use the `searchphrase`
+    and `word` fields as dimensions. This will allow us to perform counts and groupings
+    in our queries, as we will see in a moment.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, let's look at the Druid configuration for ingesting the data. We will
+    largely use the same configuration for the embedded real-time server that we used
+    in the previous chapter. Segments will be pushed to Cassandra for Deep Storage,
+    while MySQL is used to write the segment metadata.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are the key configuration parameters from `runtime.properties`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This configuration points to the `realtime.spec` file, which is what specifies
+    the details of the analytics performed by the real-time server. The following
+    is the `realtime.spec` file for this use case:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In addition to the temporal granularities, we also specify the aggregators
+    in this file. This tells Druid how to aggregate metrics between rows. Without
+    aggregators, Druid cannot collapse the data. In this use case, there are two aggregators:
+    `wordcount` and `maxbaseline`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `wordcount` field counts instances of rows that have the same values along
+    the dimensions provided. Referring back to the `StormFirehose` implementation,
+    the two dimensions are `searchphrase` and `word`. Thus, Druid can collapse the
+    rows, adding a field named `wordcount`, which will contain the total count of
+    the number of instances of that word found for that `searchphrase` and for that
+    temporal slice.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `maxbaseline` field contains the baseline for that word. In reality, the
+    value for this is the same for each row. We simply use `max` as a convenient function
+    to propagate the value into an aggregation that we can then use when we query
+    the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Now, let''s look at the query. The following is the query we use to retrieve
+    the most relevant words:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: The query needs to align with the `realtime.spec` file. At the bottom of the
+    query, we specify the time interval in which we are interested. At the top of
+    the file, we specify the dimensions in which we are interested, followed by the
+    aggregations that allow Druid to collapse the rows to match the granularity requested.
+    In this use case, the aggregations exactly match the aggregations that we are
+    performing when indexing the data in real time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Specifically, we introduce the `totalcount` field, which contains the sum of
+    `wordcount`. This will therefore contain the total number of instances observed
+    for that `word` and `searchphrase` combination. Additionally, we perform the same
+    trick with `baseline` to pass that value through.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, in this query, we include a post aggregation, which will combine the
+    aggregations into a relevant score. The post aggregation divides the total count
+    observed in the tweets by the baseline frequency.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following is a simple Ruby file that processes the results of the query
+    and returns the top 20 words:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Notice that the URL we are using to access the server is the port of the embedded
+    real-time server. In production, the queries go through a broker node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Executing this script results in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you change the dimensions or metrics you are capturing, be sure to delete
+    the local directory that the real-time server is using to cache the data. Otherwise,
+    the real-time server may re-read old data that does not have the dimensions and/or
+    metrics needed to fulfill the query; additionally, the query will fail because
+    Druid is unable to find requisite metrics or dimensions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Batch processing / historical analysis
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Now, let's turn our attention to the batch processing mechanism. For this, we
+    will use Hadoop. Although a complete description of Hadoop is well beyond the
+    scope of this section, we will give a brief overview of Hadoop alongside the Druid-specific
+    setup.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hadoop provides two major components: a distributed file system and a distributed
+    processing framework. The distributed file system is aptly named the **Hadoop
+    Distributed Filesystem** (**HDFS**). The distributed processing framework is known
+    as MapReduce. Since we chose to leverage Cassandra as our storage mechanism in
+    the hypothetical system architecture, we will not need HDFS. We will, however,
+    use the MapReduce portion of Hadoop to distribute the processing across all of
+    the historical data.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In our simple example, we will run a local Hadoop job that will read the local
+    file written in our `PersistenceFunction`. Druid comes with a Hadoop job that
+    we will use in this example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hadoop
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before we jump to loading data, a quick overview of MapReduce is warranted.
+    Although Druid comes prepackaged with a convenient MapReduce job to accommodate
+    historical data, generally speaking, large distributed systems will need custom
+    jobs to perform analyses over the entire data set.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An overview of MapReduce
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'MapReduce is a framework that breaks processing into two phases: a map phase
+    and a reduce phase. In the map phase, a function is applied to the entire set
+    of input data, one element at a time. Each application of the `map` function results
+    in a set of tuples, each containing a key and a value. Tuples with similar keys
+    are then combined via the `reduce` function. The `reduce` function emits another
+    set of tuples, typically by combining the values associated with the key.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The canonical "Hello World" example for MapReduce is the word count. Given a
+    set of documents that contain words, count the occurrences of each word. (Ironically,
+    this is very similar to our NLP example.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are Ruby functions that express the `map` and `reduce` functions
+    for the word count example. The `map` function looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The `map` function yields the following output, given the supplied input is
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The corresponding `reduce` function looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The MapReduce function would then group the values for each key and pass them
+    to the preceding `reduce` function as follows, resulting in the total word count:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: The Druid setup
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: With Hadoop as the background, let's take a look at our setup for Druid. In
+    order for Druid to consume data from a Hadoop job, we need to start **Master**
+    and **Compute** nodes (also known as **Historical** nodes). To do this, we will
+    create a directory structure that has the Druid self-contained job at its root,
+    with subdirectories that contain the configuration files for both the Master and
+    Compute servers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This directory structure looks like the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The runtime properties for the Master and Compute nodes are largely the same
+    as the real-time node with a few notable differences. They both include settings
+    to cache segments as shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Also, note that if you are running the Master and Compute servers on the same
+    machine, you will need to change the ports so that they do not conflict as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Druid packages all the server components and their dependencies into a single
+    self-contained JAR file. Using this JAR file, you can start the Master and Compute
+    servers with the following commands.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For the Compute node, we use the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For the Master node, we use the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: Once both nodes are running, we are ready to load data with the Hadoop job.
+  prefs: []
+  type: TYPE_NORMAL
+- en: HadoopDruidIndexer
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: With our servers up and running, we can examine the internals of the Druid MapReduce
+    job. The `HadoopDruidIndexer` function uses a JSON configuration file much like
+    the `realtime.spec` file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The file is specified on the command line when the Hadoop job is started, as
+    shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The following is the `batchConfig.json` file we used in this example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: Much of the configuration will look familiar. The two fields of particular interest
+    are the `pathSpec` and `rollupSpec` fields. The `pathSpec` field contains the
+    location of the file that was written by the `PersistenceFunction`. The `rollupSpec`
+    field contains the same aggregation functions that we included in the `realtime.spec`
+    file during transactional processing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Additionally, notice that the timestamp column and format are specified, which
+    aligns with the field that we are outputting in the persisted file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `HadoopDruidIndexer` function loads the preceding configuration file and
+    performs the `map`/`reduce` functions to construct the index. If we look more
+    closely at that job, we can see the specific functions it is running.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Hadoop jobs are started using the Hadoop job class. Druid runs a couple of
+    jobs to index the data, but we will focus on the `IndexGeneratorJob`. In the `IndexGeneratorJob`,
+    Druid configures the job with the following lines:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: The preceding properties are set on nearly all Hadoop jobs. They set the input
+    and output classes for each phase of the processing and the classes that implement
+    the `Mapper` and `Reducer` interfaces.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For a complete description of Hadoop job configurations, visit the following
+    URL: [http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration](http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The job configuration also specifies the input paths, which specify the files
+    or other data sources for processing. Within the call to `config.addInputPaths`,
+    Druid adds the files from the `pathSpec` field to the Hadoop configuration for
+    processing, as shown in the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can see that out-of-the-box, Druid only supports instances of `FileInputFormat`.
+    As an exercise for the reader, it might be fun to enhance the `DruidHadoopIndexer`
+    function to support direct reads from Cassandra, as envisioned in the hypothetical
+    architecture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Looking back at the job configuration, the `Mapper` class used by Druid is the
+    `IndexGeneratorMapper` class, and the `Reducer` class is the `IndexGeneratorReducer`
+    class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let's first have a look at the `map` function within the `IndexGeneratorMapper`
+    class. The `IndexGeneratorMapper` class actually subclasses from `HadoopDruidIndexerMapper`,
+    which contains the implementation of the `map` method, delegating it to the `IndexGeneratorMapper`
+    class to emit the actual values, as we see in the following code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Within `HadoopDruidIndexerMapper`, we see the `map` method implementation as
+    follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can see that the superclass `map` method handles rows that do not parse,
+    marking them invalid, and checks to see if the row contains the necessary data
+    to carry out the map. Specifically, the superclass ensures that the row contains
+    a timestamp. The map requires the timestamp because it partitions the data into
+    time slices (that is, buckets) as we see in the `abstract` method call to `innerMap`,
+    which is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: The key line in this method and in any Hadoop-based `map` function is the call
+    to `context.write` that emits the tuple from the `map` function. In this case,
+    the `map` function is emitting a key of the type `SortableBytes`, which represents
+    the bucket for the metric and the actual text read from the input source as the
+    value.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'At this point, after the map phase completes, we have parsed the file, constructed
+    our buckets, and partitioned the data into those buckets, sorted by timestamp.
+    Each bucket is then processed via calls to the `reduce` method, which is shown
+    as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see, the `reduce` method contains the meat of the analytics. It constructs
+    the index based on the aggregations in the roll up specification and dimensions
+    specified in the batch configuration file. The final lines of the method write
+    the segment to a disk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the end, when you run the `DruidHadoopIndexer` class, you will see something
+    similar to the following code snippet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Notice that the segment added is named `historical`. To query the data loaded
+    by the `historical` / batch processing mechanism, update the query to specify
+    the historical data source and use the port of the Compute node. Provided everything
+    is loaded properly, you will receive the aggregations we saw originally with the
+    real-time server; an example of this is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: Now, if we schedule the Hadoop job to run periodically, the historical index
+    will lag the real-time index but will continually update the index, correcting
+    errors and accounting for any system failures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we saw that pairing a batch processing mechanism with a real-time
+    processing engine such as Storm provides a more complete and robust overall solution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We examined an approach to implementing a Lambda architecture. Such an approach
+    delivers real-time analytics supported by a batch processing system retroactively
+    correcting the analytics. Additionally, we saw how to configure a multidata center
+    system architecture to isolate the offline processing from the transactional system
+    while also providing continuous availability and fault tolerance via distributed
+    storage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The chapter also included an introduction to Hadoop, using Druid's implementation
+    as an example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will take an existing batch process that leverages Pig
+    and Hadoop and demonstrate what it takes to convert that into a real-time system.
+    At the same time, we will demonstrate how to deploy Storm onto the Hadoop infrastructure
+    using Storm-YARN.
+  prefs: []
+  type: TYPE_NORMAL

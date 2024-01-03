@@ -1,0 +1,944 @@
+- en: Chapter 7. Integrating Druid for Financial Analytics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we will extend the use of Trident to create a real-time financial
+    analytics dashboard. The system will process financial messages to provide stock
+    pricing information over time at various levels of granularity. The system will
+    demonstrate integration with a non-transactional system using custom state implementations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the previous example, we used Trident to tally running totals of events over
+    time. It was sufficient for the simple use case that analyzed only a single dimension
+    of the data, but the architectural design was not flexible. To introduce a new
+    dimension would have required Java development and the deployment of new code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traditionally, data warehousing techniques and business intelligence platforms
+    are used to compute and store dimensional analytics. The warehouses are deployed
+    as part of an **On-line Analytics Processing** (**OLAP**) system, which is separated
+    out from the **On-line Transaction Processing** (**OLTP**). Data propagates down
+    to the OLAP system, but typically after some lag. This is a sufficient model for
+    retrospective analytics, but does not suffice in situations that require real-time
+    analytics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Similarly, other approaches use batch-processing techniques to empower data
+    scientists. Data scientists use languages such as PIG to express their queries.
+    Then, these queries compile down into jobs that run over large sets of data. Fortunately,
+    they run on platforms such as Hadoop that distribute the processing across many
+    machines, but this still introduces a substantial delay.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both of these approaches fall short for financial systems, which cannot afford
+    such a lag in the availability of the analytics. The overhead alone of spinning
+    up a batch-processing job might be too much of a delay for the real-time demands
+    of a financial system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we will extend our use of Storm to deliver a flexible system
+    that requires only minimal effort to introduce new dimensions, while simultaneously
+    providing real-time analytics. By that, we mean only a short delay between data
+    ingestion and availability of the dimensional analytics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this chapter, we will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Custom state implementations
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Integration with non-transactional storage
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use of ZooKeeper for distributed state
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Druid and real-time aggregate analytics
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Use case
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In our use case, we will tap into orders for shares of stock in a financial
+    system. Using this information, we will deliver pricing information over time,
+    which is available via a **REpresentational State Transfer** (**REST**) interface.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The canonical message format in the financial industry is the **Financial Information
+    eXchange** (**FIX**) format. The specification for this format can be found at
+    [http://www.fixprotocol.org/](http://www.fixprotocol.org/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'An example FIX message is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: FIX messages are essentially streams of key-value pairs. The ASCII character
+    01, which is **Start of Header** (**SOH**), delimits the pairs. FIX refers to
+    the keys as tags. As shown in the preceding message, tags are identified by integers.
+    Each tag has an associated field name and data type. For a full reference of tag
+    types go to [http://www.fixprotocol.org/FIXimate3.0/en/FIX.4.2/fields_sorted_by_tagnum.html](http://www.fixprotocol.org/FIXimate3.0/en/FIX.4.2/fields_sorted_by_tagnum.html).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The important fields for our use case are shown in the following table:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Tag ID | Field name | Description | Data type |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `11` | `CIOrdID` | This is the unique identifier for message. | String |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `35` | `MsgType` | This is the type of the FIX message. | String |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `44` | `Price` | This is the stock price per share. | Price |'
+  prefs: []
+  type: TYPE_TB
+- en: '| `55` | `Symbol` | This is the stock symbol. | String |'
+  prefs: []
+  type: TYPE_TB
+- en: FIX is a layer on top of the TCP/IP protocol. Thus, in a real system, these
+    messages are received over TCP/IP. For ease of integration with Storm, the system
+    could queue those messages in Kafka. However, for our example, we will simply
+    ingest a file filled with the FIX messages. FIX supports multiple message types.
+    Some are used for control messages (for example, Logon, Heartbeat, and so on).
+    We will filter out those messages, passing only the types that include price information
+    to the analytics engine.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Integrating a non-transactional system
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: To extend on our previous example, we could develop a framework for the configuration
+    that would allow the user to specify the dimensions along which they would like
+    to aggregate events. Then, we could use that configuration in our topology to
+    maintain a set of in-memory data sets to accumulate the aggregations, but any
+    in-memory store is susceptible to faults. To address fault-tolerance, we could
+    then make those aggregations persist in a database.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We would need to anticipate and support all the different types of aggregations
+    the user would like to perform (for example, sum, average, geospatial, and so
+    on). This seems like a substantial endeavor.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Fortunately, there are options for real-time analytics engines. One popular
+    open-source option is Druid. The following article is taken from their whitepaper
+    found at [http://static.druid.io/docs/druid.pdf](http://static.druid.io/docs/druid.pdf):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Druid is an open source, real-time analytical data store that supports fast
+    ad-hoc queries on large-scale data sets. The system combines a column-oriented
+    data layout, a shared-nothing architecture, and an advanced indexing structure
+    to allow for the arbitrary exploration of billion-row tables with sub-second latencies.
+    Druid scales horizontally and is the core engine of the Metamarkets data analytics
+    platform.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: From that excerpt, Druid exactly fits our requirements. Now, the challenge is
+    integrating it with Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Druid's technology stack fits naturally into a Storm-based ecosystem. Like Storm,
+    it uses ZooKeeper to coordinate between its nodes. Druid also supports direct
+    integration with Kafka. For some cases, this may be appropriate. In our example,
+    to demonstrate integration of a non-transactional system, we will integrate Druid
+    with Storm directly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will include a brief description of Druid here. However, for more detailed
+    information on Druid, refer to the following website:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/metamx/druid/wiki](https://github.com/metamx/druid/wiki)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Druid collects information via its **Real-time** nodes. Based on a configurable
+    granularity, the **Real-time** nodes collect the event information into segments
+    that are persisted permanently in a deep storage mechanism. Druid persistently
+    stores the metadata for those segments in MySQL. The **Master** node recognizes
+    the new segment, identifies **Compute** nodes for that segment based on rules,
+    and notifies the **Compute** nodes to pull the new segment. A **Broker** node
+    sits in front of the **Compute** nodes, receives `REST` queries from consumers,
+    and distributes those queries to the appropriate **Compute** nodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Thus, an architecture that integrates Storm with Druid looks similar to what
+    is shown in the following diagram:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Integrating a non-transactional system](img/8294OS_07_01.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: As depicted in the preceding diagram, there are three data storage mechanisms
+    involved. The **MySQL** database is a simple metadata repository. It contains
+    all the metadata information for all of the segments. The **Deep Storage** mechanism
+    contains the actual segment information. Each segment contains a merged index
+    of the events for a specific time period based on the dimensions and aggregations
+    defined in a configuration file. As such, segments can be large (for example,
+    2 GB blobs). In our example, we will use Cassandra as our deep storage mechanism.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, the third data storage mechanism is **ZooKeeper**. The storage in **ZooKeeper**
+    is transient and is used for control information only. When a new segment is available,
+    the **Master** node writes an ephemeral node in **ZooKeeper**. The **Compute**
+    Node is subscribed to the same path, and the ephemeral node triggers the **Compute**
+    node to pull the new segment. After the segment is successfully retrieved, the
+    **Compute** node removes the ephemeral node from **ZooKeeper**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For our example, the entire sequence of events is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Integrating a non-transactional system](img/8294OS_07_02.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The preceding diagram lays out the event processing downstream from Storm. What
+    is important to recognize in many real-time analytics engines is the inability
+    to revert a transaction. The analytics systems are highly optimized to process
+    speed and aggregation. The sacrifice is transactional integrity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If we re-examine Trident''s state classifications, there are three different
+    flavors of state: Transactional, Opaque, and Non-Transactional. A Transactional
+    state requires the contents of each batch to be constant over time. An Opaque
+    Transactional state can tolerate batch composition changing over time. Finally,
+    a Non-Transactional state cannot guarantee exactly one semantic at all.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Summarizing the Javadoc for the `storm.trident.state.State` object, there are
+    three different kinds of state:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| **Non-Transactional state** | In this state, commits are ignored.No rollback
+    can be done.Updates are permanent. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Repeat Transactional state** | The system is idempotent as long as all
+    batches are identical. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| **Opaque Transactional state** | State transitions are incremental. The previous
+    state is stored along with the batch identifier to tolerate changing batch composition
+    in the event of replay. |'
+  prefs: []
+  type: TYPE_TB
+- en: It is important to realize that introducing state into a topology effectively
+    sequences any writes to storage. This can impact performance dramatically. When
+    possible, the best approach is to ensure the entire system is idempotent. If all
+    writes are idempotent, then you need not introduce transactional storage (or state)
+    at all, because the architecture naturally tolerates tuple replay.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Often, if state persistence is backed by a database over which you control
+    the schema, you can adjust the schema to add the additional information to participate
+    in transactions: last committed batch identifier for repeat transactional and
+    previous state for opaque transactional. Then, in the state implementation, you
+    can leverage this information to ensure that your state object aligns with the
+    type of spout you are using.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, this is not always the case, especially in systems that perform aggregations
+    such as counting, summing, averaging, and so on. Counter mechanisms in Cassandra
+    have exactly this constraint. It is impossible to undo an addition to a counter,
+    and it is impossible to make the addition idempotent. If a tuple is replayed,
+    the counter is again incremented, and you have most likely overcounted elements
+    in the system. For this reason, any state implementation backed by Cassandra counters
+    is considered non-transactional.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Likewise, Druid is non-transactional. Once Druid consumes an event, the event
+    cannot be undone. Thus, if a batch within Storm is partially consumed by Druid
+    and then the batch is replayed, or the composition changes, there is no way for
+    the aggregate dimensional analytics to recover. For this reason, it is interesting
+    to consider integration between Druid and Storm, the steps we can take to address
+    replays, and the power of such a coupling.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In short, to connect Storm to Druid, we will leverage the characteristics of
+    a transactional spout to minimize the risk of overcounting when connecting to
+    a non-transactional state mechanism like Druid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The topology
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With the architectural concepts in place, let''s return to the use case. To
+    keep things focused on the integration, we will keep the topology simple. The
+    following diagram depicts the topology:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The topology](img/8294OS_07_03.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The **FIX Spout** emits tuples containing simple FIX messages. Then the filter
+    checks the type of the message, filtering for stock orders that contain pricing
+    information. Then, those filtered tuples flow to the `DruidState` object, which
+    is the bridge to Druid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code for this simple topology is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: The spout
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There are many parsers for the FIX message format. In the spout, we will use
+    the FIX Parser, which is a Google project. For more information on this project,
+    you can refer to [https://code.google.com/p/fixparser/](https://code.google.com/p/fixparser/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just like the previous chapter, the spout itself is straightforward. It simply
+    returns references to a coordinator and an emitter, as shown in the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'As shown in the preceding code, the `Spout` declares a single output field:
+    `message`. This will contain the `FixMessageDto` object that is generated by the
+    `Emitter`, as shown in the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: From the preceding code, you can see that we reparse the file for each batch.
+    As we stated previously, in a real-time system we will probably receive the messages
+    via TCP/IP and queue them in Kafka. Then, we would use the Kafka spout to emit
+    the messages. It is a matter of preference; but, to fully encapsulate the data
+    processing in Storm, the system would most likely queue the raw message text.
+    In that design, we would parse the text in a function rather than the spout.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although this `Spout` is only sufficient for this example, note that the composition
+    of each batch is the same. Specifically, each batch contains all messages from
+    the file. Since our state design relies on this characteristic, in a real system,
+    we would need to use `TransactionalKafkaSpout`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The filter
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Like the spout, the filter is straightforward. It examines the `msgType` object
+    and filters messages that are not fill orders. Fill orders are effectively stock
+    purchase receipts. They contain the average price executed for that trade and
+    the symbol for the stock purchased. The following code is the filter for this
+    message type:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: This provides a good opportunity to point out the importance of serializability
+    in Storm. Note that in the preceding code the filter is operating on a `FixMessageDto`
+    object. It would have been easier to simply use the `SimpleFixMessage` object,
+    but `SimpleFixMessage` is not serializable. This will not cause any problems when
+    running on a local cluster. However, since tuples are exchanged between hosts
+    during data processing in Storm, all the elements within a tuple must be serializable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Developers often commit changes to data objects within tuples that are not
+    serializable. This causes downstream deployment issues. To ensure that all objects
+    in a tuple remain serializable, add unit tests that verify that objects are serializable.
+    The test is a simple one; use the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: The state design
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now, let us proceed to the most interesting aspects of this example. In order
+    to integrate Druid with Storm, we will embed a real-time Druid server into our
+    topology and implement the necessary interfaces to connect the tuple stream to
+    it. To mitigate the inherent risks of connecting to a non-transactional system,
+    we leverage ZooKeeper to persist state information. That persistence will not
+    prevent anomalies due to failures, but it will help identify what data is at risk
+    when a failure occurs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The high-level design is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The state design](img/8294OS_07_04.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: At a high level, Storm creates state objects within worker JVM processes by
+    using a factory. A state object is created for every partition in the batch. The
+    state factory object ensures that the real-time server is running before it returns
+    any state objects and starts the server if it is not running. The state object
+    then buffers those messages until Storm calls commit. When Storm calls commit,
+    the state object unblocks the Druid **Firehose**. This sends the signals to Druid
+    that the data is ready for aggregation. Then, we block Storm in the commit method,
+    while the real-time server begins pulling the data via the **Firehose**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To ensure that every partition is processed at most once, we associate a partition
+    identifier with each partition. The partition identifier is a combination of the
+    batch identifier and the partition index, which uniquely identifies a set of data
+    since we are using a transactional spout.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Firehose** persists the identifier in **ZooKeeper** to maintain the state
+    of the partition.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There are three states in **ZooKeeper**:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| State | Description |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| inProgress | This `Zookeeper` path contains the partition identifiers that
+    Druid is processing. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Limbo | This `Zookeeper` path contains the partition identifiers that Druid
+    consumed in their entirety, but which may not be committed. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Completed | This `Zookeeper` path contains the partition identifiers that
+    Druid successfully committed. |'
+  prefs: []
+  type: TYPE_TB
+- en: While a batch is in process, the **Firehose** writes the partition identifier
+    to the inProgress path. When Druid has pulled the entirety of a Storm partition,
+    the partition identifier is moved to **Limbo**, and we release Storm to continue
+    processing while we wait for the commit message from Druid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Upon receiving the commit message from Druid, the **Firehose** moves the partition
+    identifier to the **Completed** path. At this point, we assume the data has been
+    written to disk. We are still susceptible to losing data in the event of a disk
+    failure. However, if we assume that we can reconstruct the aggregations using
+    batch processing, then this is most likely an acceptable risk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following state machine captures the different phases of processing:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The state design](img/8294OS_07_05.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'As depicted in the diagram, there is a loop between **Buffering Messages**
+    and **Aggregating Messages**. The main control loop switches rapidly between these
+    two states, splitting its time between the Storm processing loop and the Druid
+    aggregation loop. The states are mutually exclusive: either the system is aggregating
+    a batch, or it is buffering the next batch.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The third state is triggered when Druid has written the information to disk.
+    When that happens (as we will see later), the **Firehose** is notified and we
+    can update our persistence mechanism to indicate that the batch was safely processed.
+    Until that commit is called, the batches consumed by Druid must remain in **Limbo**.
+  prefs: []
+  type: TYPE_NORMAL
+- en: While in **Limbo**, no assumptions can be made about the data. Druid may or
+    may not have aggregated the records.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the event of a failure, Storm may leverage other `TridentState` instances
+    to complete the processing. Thus, for every partition, the **Firehose** must execute
+    the following steps:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The **Firehose** must check to see if the partition was already completed. If
+    so, the partition is a replay, probably due to a downstream failure. Since the
+    batch is guaranteed to have the same contents as before, it can safely be ignored
+    since Druid has already aggregated its contents. The system may log a warning
+    message.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The **Firehose** must check to see if the partition is in limbo. If this is
+    the case, then Druid fully consumed the partition, but never called commit or
+    the system failed after commit was called but before the **Firehose** updated
+    **ZooKeeper**. The system should raise an alert. It should not attempt to complete
+    the batch since it was fully consumed by Druid and we do not know the status of
+    the aggregation. It simply returns, enabling Storm to continue to the next batch.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The **Firehose** must check to see if the partition is in progress. If this
+    is the case, then for some reason, somewhere on the network, the partition is
+    being processed by another instance. This should not happen during ordinary processing.
+    In this case, the system should raise an alert for this partition. In our simple
+    system, we will simply proceed, leaving it to our offline batch processing to
+    correct the aggregation.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: In many large scale real-time systems, the users are willing to tolerate slight
+    discrepancies in the real-time analytics as long as the skews are infrequent and
+    can be remedied fairly quickly.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is important to note that this approach succeeds because we are using a transactional
+    spout. The transactional spout guarantees that each batch has the same composition.
+    Furthermore, for this approach to work, each partition within the batch must have
+    the same composition. This is true if and only if the partitioning in the topology
+    is deterministic. With deterministic partitioning and a transactional spout, each
+    partition will contain the same data, even in the event of a replay. Had we used
+    shuffle grouping, this approach would not work. Our example topology is deterministic.
+    This guarantees that a batch identifier, when combined with a partition index,
+    represents a consistent set of data over time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'With the design in place, we can turn our attention to the implementation.
+    The sequence diagram for the implementation is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Implementing the architecture](img/8294OS_07_06.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: The preceding diagram implements the state machine shown in the design. Once
+    the real-time server is started, Druid polls the `StormFirehose` object using
+    the `hasMore()` method. The contract with Druid specifies that the `Firehose`
+    object's implementation should block until data is available. While Druid is polling
+    and the `Firehose` object is blocking, Storm delivers tuples into the `DruidState`
+    object`'s` message buffer. When the batch is complete, Storm calls the `commit()`
+    method on the `DruidState` object. At that point, the PartitionStatus is updated.
+    The partition is put in progress and the implementation unblocks the `StormFirehose`
+    object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Druid begins pulling data from the `StormFirehose` object via the `nextRow()`
+    method. When the `StormFirehose` object exhausts the contents of the partition,
+    it places the partition in limbo, and releases control back to Storm.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, when the commit method is called on the StormFirehose, the implementation
+    returns a `Runnable`, which is what Druid uses to notify a Firehose that the partition
+    is persisted. When Druid calls `run()`, the implementation moves the partition
+    to completion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: DruidState
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: First, we will look at the Storm side of the equation. In the previous chapter,
+    we extended the `NonTransactionalMap` class to persist a state. That abstraction
+    shielded us from the details of sequential batch processing. We simply implemented
+    the `IBackingMap` interface to support the `multiGet` and `multiPut` calls, and
+    the superclass took care of the rest.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this scenario, we need more control over the persistence process than what
+    the default implementations provide. Instead, we need to implement the base `State`
+    interfaces ourselves. The following class diagram depicts the class hierarchy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![DruidState](img/8294OS_07_07.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: As evident in the diagram, the `DruidStateFactory` class manages the embedded
+    real-time node. An argument could be made for the updater managing the embedded
+    server. However, since there should be only a single instance of the real-time
+    server per JVM and that instance needs to exist before any state objects, the
+    lifecycle management of the embedded server seemed to fit more naturally in the
+    factory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following code snippet contains the relevant sections of the `DruidStateFactory`
+    class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Without going into too much detail, the preceding code starts a real-time node
+    if one had not been started already. Also, it registers the `StormFirehoseFactory`
+    class with that real-time node.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The factory also implements the `StateFactory` interface from Storm, which
+    allows Storm to use this factory to create new `State` objects. The `State` object
+    itself is fairly simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: As you can see in the preceding code, the `State` object is a message buffer.
+    It delegates the actual commit logic to the `Firehose` object, which we will examine
+    shortly. However, there are a few critical lines in this class that implement
+    the failure detection we outlined earlier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The conditional logic in the `commit()` method on the `State` object checks
+    the ZooKeeper status to determine if this partition was already successfully processed
+    (`inCompleted`), failed to commit (`inLimbo`), or failed during processing (`inProgress`).
+    We will dive deeper into the state storage when we examine the `DruidPartitionStatus`
+    object.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It is also important to note that the `commit()` method is called by Storm directly,
+    but the `aggregateMessage()` method is called by the updater. Even though Storm
+    should never call those methods concurrently, we chose to use a thread-safe vector
+    anyway.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The DruidStateUpdater code is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: As shown in the preceding code, the updater simply loops through the tuples
+    and passes them to the state object to buffer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementing the StormFirehose object
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Before we turn our attention to the Druid side of the implementation, we should
+    probably take a step back and discuss Druid in more detail. Druid feeds are configured
+    via a spec file. In our example, this is `realtime.spec`, as shown in the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: For our example, the important elements in the preceding spec file are `schema`
+    and `firehose`. The `schema` element defines the data and the aggregations that
+    Druid should perform on that data. In our example, Druid will count the number
+    of times we see a stock symbol in the `orders` field and track the total price
+    paid in the `totalPrice` field. The `totalPrice` field will be used to calculate
+    the running stock price average over time. Additionally, you need to specify an
+    `indexGranularity` object that specifies the temporal granularity of the index.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `firehose` element contains the configuration for the `Firehose` object.
+    As we saw in the `StateFactory` interface, an implementation registers a `FirehoseFactory`
+    class with Druid when the real-time server is started. That factory is registered
+    as a `Jackson` subtype. When the real-time spec file is parsed, the type in the
+    `firehose` element of the JSON is used to link back to the appropriate `FirehoseFactory`
+    for a stream of data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For more information on the JSON polymorphism, refer to the following website:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[http://wiki.fasterxml.com/JacksonPolymorphicDeserialization](http://wiki.fasterxml.com/JacksonPolymorphicDeserialization)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For more information on the spec file, refer to the following website:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[https://github.com/metamx/druid/wiki/Realtime](https://github.com/metamx/druid/wiki/Realtime)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, we can turn our attention to the Druid side of the implementation. `Firehose`
+    is the main interface one must implement to contribute data into a Druid real-time
+    server.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code for our `StormFirehoseFactory` class is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: The factory implementation is straightforward. In this case, we simply return
+    a static singleton object. Note that the object is annotated with `@JsonTypeName`
+    and `@JsonCreator`. As stated in the preceding code, `Jackson` is the means through
+    which `FirehoseFactory` objects are registered. Thus, the name specified as the
+    `@JsonTypeName` must align with the type specified in the spec file.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The meat of the implementation is in the `StormFirehose` class. Within this
+    class, there are four critical methods that we will examine one by one: `hasMore()`,
+    `nextRow()`, `commit()`, and `sendMessages()`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The `sendMessages()` method is the entry point into the `StormFirehose` class.
+    It is effectively the handoff point between Storm and Druid. The code for this
+    method is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: This method is synchronized to prevent concurrency issues. Note that it does
+    not do anything more than copy the message buffer into a queue and notify the
+    `hasMore()` method to release the batch. Then, it blocks waiting for Druid to
+    fully consume the batch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Then, the flow proceeds to the `nextRow()` method, which is shown as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: This method pulls a message off of the queue. If it is not null, the data is
+    added to a map that is passed along to Druid as a `MapBasedInputRow` method. If
+    there are no remaining messages in the queue, the `sendMessages()` method that
+    we examined in the preceding code is released. From Storm's perspective, the batch
+    is complete. Druid now owns the data. However, from a system perspective, the
+    data is in limbo because Druid may not have persisted the data to disk. We are
+    at a risk of losing the data entirely in the event of a hardware failure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Druid will then poll the `hasMore()` method, which is shown in the following
+    code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: Since the queue is empty, the method will block until `sendMessage()` is called
+    again.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This leaves only one remaining piece of the puzzle, the `commit()` method.
+    It is shown in the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: This method returns `Runnable`, which is called by Druid after it's finished
+    persisting the messages. Although all the other methods in the `Firehose` object
+    are called from a single thread, the `Runnable` is called from a different thread
+    and, therefore, must be thread-safe. For that reason, we copy the transactions
+    in limbo into a separate list and pass it into the `Runnable` object's constructor.
+    As you can see in the following code, the `Runnable` does nothing but moves the
+    transactions into the completed state in `Zookeeper`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Implementing the partition status in ZooKeeper
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Now that we have examined all of the code, we can take a look at how the state
+    is persisted in ZooKeeper. This enables the system to coordinate the distributed
+    processing, especially in the event of a failure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The implementation leverages ZooKeeper to persist the partition-processing status.
+    ZooKeeper is another open source project. For more information, you can refer
+    to [http://zookeeper.apache.org/](http://zookeeper.apache.org/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: ZooKeeper maintains a tree of nodes. Each node has an associated path, much
+    like a file system. The implementation uses ZooKeeper through a framework called
+    Curator. For more information, you can refer to [http://curator.incubator.apache.org/](http://curator.incubator.apache.org/).
+  prefs: []
+  type: TYPE_NORMAL
+- en: When connecting to ZooKeeper through Curator, you supply a namespace. Effectively,
+    this is the top-level node under which the application data is stored. In our
+    implementation, the namespace is `stormdruid`. The application then maintains
+    three paths underneath that, where it stores batch status information.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The paths correspond to the states described in the design and are as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`/stormdruid/current`: This corresponds to the current state'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/stormdruid/limbo`: This corresponds to the limbo state'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`/stormdruid/completed`: This corresponds to the completed state'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In our implementation, all ZooKeeper's interactions for partition status are
+    run through the `DruidPartitionStatus` class.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The code for this class is as follows:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: In the interest of space, we have only shown the constructor and the methods
+    related to the limbo status. In the constructor, the client connects to ZooKeeper
+    and creates the three base paths as described in the preceding code. Then, it
+    provides query methods to test if a transaction is in progress, limbo, or completed.
+    It also provides methods that move a transaction between those states.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Executing the implementation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Enough with the code, let's get on with the demo! We start the topology using
+    the main method of the `FinancialAnalyticsTopology` class. For a better demo,
+    we introduce random prices between zero and one hundred. (Refer back to the `Emitter`
+    code.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Once the topology is started, you will see the following output:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can interrogate the processing from multiple dimensions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Using the ZooKeeper client, you can examine the status of transactions. Take
+    a look at the following listing; it shows the transaction/batch identifiers and
+    their statuses:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For alerting and monitoring, please note the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If ever there is more than one batch in the `current` path, then alerts should
+    go out
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: If ever there are batch identifiers in `limbo` that are not sequential, or substantially
+    behind the current identifier, alerts should go out
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'To clean up the state in ZooKeeper, you can execute the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'To monitor the segment propagation, you can use the MySQL client. Using the
+    default schema, you will find segments by selecting them out of the `prod_segments`
+    table with the following code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: Examining the analytics
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now, the moment we have all been waiting for; we can see average stock prices
+    over time by using the REST API that Druid provides. To use the REST API, it is
+    not necessary to run a full-blown Druid cluster. You will only be able to query
+    the data seen by the singular embedded real-time node, but each node is capable
+    of servicing requests and this makes testing easier. Using curl, you can issue
+    a query of a real-time node using the following command:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The final parameter of the `curl` statement references a file, the contents
+    of which will be included as the body of the `POST` request. The file contains
+    the following details:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'There are two types of aggregations happening in Druid. There are aggregations
+    that happen as part of the indexing and there are aggregations that happen at
+    query time. The aggregations that happen during indexing are defined in the spec
+    file. If you recall, we had two aggregations in the spec file:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The events we are aggregating have two fields: `symbol` and `price`. The preceding
+    aggregations are applied at indexing time, and introduce two additional fields:
+    `totalPrice` and `orders`. Recall that `totalPrice` is the sum of the prices on
+    each event for that slice of time. The `orders` field contains the total count
+    of events in that slice of time.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Then, when we perform the query, Druid applies a second set of aggregations
+    based on the `groupBy` statement. In our query, we group by `symbol` at a granularity
+    of a minute. The aggregations then introduce two new fields: `cumulativeCount`
+    and `cumulativePrice`. These fields contain the sums of the previous aggregations.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we introduce a `postaggregation` method to calculate the average for
+    that slice of time. The `postaggregation` method divides (`""fn":"/"`) the two
+    cumulative fields to yield a new `avg_price` field.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Issuing the `curl` statement to a running server results in the following response:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: Since we updated the code to generate random prices between zero and one hundred,
+    it is no surprise that the averages are approximately fifty. (Woo hoo!)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we gained a deeper appreciation for the Trident State API.
+    We created a direct implementation of the `State` and `StateUpdater` interfaces
+    instead of relying on default implementations. Specifically, we implemented these
+    interfaces to bridge the gap between a transactional spout and a non-transactional
+    system, namely Druid. Although it is impossible to establish exactly-once semantics
+    into a non-transactional store, we put mechanisms in place to alert when the system
+    encounters issues. Ostensibly, upon failure we could then use a batch processing
+    mechanism to reconstruct any suspect aggregation segments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For future investigation, it would be beneficial to establish an idempotent
+    interface between Storm and Druid. To do this, we could publish a single segment
+    for each batch within Storm. Since segment propagation is atomic within Druid,
+    this would give us a mechanism to commit each batch atomically to Druid. Additionally,
+    batches could then be processed in parallel, improving throughput. Druid supports
+    an ever-expanding set of query types and aggregation mechanisms. It is incredibly
+    powerful, and the marriage of Storm and Druid is a powerful one.
+  prefs: []
+  type: TYPE_NORMAL

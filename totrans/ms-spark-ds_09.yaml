@@ -1,0 +1,1250 @@
+- en: Chapter 9.  News Dictionary and Real-Time Tagging System
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: While a hierarchical data warehouse stores data in files of folders, a typical
+    Hadoop based system relies on a flat architecture to store your data. Without
+    proper data governance or a clear understanding of what your data is all about,
+    there is an undeniable chance of turning data lakes into swamps, where an interesting
+    dataset such as GDELT would be nothing more than a folder containing a vast amount
+    of unstructured text files. For that reason, data classification is probably one
+    of the most widely used machine learning techniques in large scale organizations
+    as it allows users to properly categorize and label their data, publish these
+    categories as part of their metadata solutions, and therefore access specific
+    information in the most efficient way. Without a proper tagging mechanism executed upfront,
+    ideally at ingest, finding all news articles about a specific topic would require
+    parsing the entire dataset looking for specific keywords. In this chapter, we
+    will be describing an innovative way of labeling incoming GDELT data in a non-supervised
+    way and in near real time using both Spark Streaming and the 1% Twitter firehose.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We will cover the following topics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bootstrapping a Naive Bayes classifier using Stack Exchange data
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Lambda versus Kappa architecture for real-time streaming applications
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Kafka and Twitter4J within a Spark Streaming application
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Thread safety when deploying models
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Using Elasticsearch as a caching layer
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The mechanical Turk
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Data classification is a supervised learning technique. This means that you
+    can only predict the labels and categories you have learned from a training dataset.
+    Because the latter has to be properly labeled, this becomes the main challenge
+    which we will be addressing in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Human intelligence tasks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: None of our data, within the context of news articles, has been properly labeled
+    upfront; there is strictly nothing we can learn out of it. Common sense for data
+    scientists is to start labeling some input records manually, records that will
+    serve as a training dataset. However, because the number of classes may be relatively
+    large, at least in our case (hundreds of labels), the amount of data to label
+    could be significant (thousands of articles) and would require tremendous effort.
+    A first solution is to outsource this laborious task to a "Mechanical Turk", the
+    term being used as reference to one of the most famous hoaxes in history where
+    an *automated* chess player fooled most of the world leaders ([https://en.wikipedia.org/wiki/The_Turk](https://en.wikipedia.org/wiki/The_Turk)).
+    This commonly describes a process that can be done by a machine, but in reality
+    it is done by a hidden person, hence a Human Intelligence Task.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the readers information, a Mechanical Turk initiative has been started at
+    Amazon ([https://www.mturk.com/mturk/welcome](https://www.mturk.com/mturk/welcome)),
+    where individuals can register to perform human intelligence tasks such as labeling
+    input data or detecting sentiment of a text content. Crowdsourcing this task could
+    be one viable solution assuming you can share this internal (and potentially confidential)
+    dataset to a third party. An alternative solution described here is to bootstrap
+    a classification model using a pre-existing labeled dataset.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Bootstrapping a classification model
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: A text classification algorithm usually learns from term frequencies vectors;
+    a possible approach is to train a model using external resources with a similar
+    context. For instance, one could classify unlabeled IT related content using categories
+    learned from a full dump of the Stack Overflow website. Because Stack Exchange
+    is not only reserved for IT professionals, one could find various datasets in
+    many different contexts that would serve many purposes ([https://archive.org/download/stackexchange](https://archive.org/download/stackexchange)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Learning from Stack Exchange
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We will demonstrate here how to bootstrap a simple Naive Bayes classification
+    model using the home brewing related dataset from the Stack Exchange website:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: We create a few methods that pull both the body and labels from all XML documents,
+    extract the clean text content out of the HTML encoded body (using the Goose scraper
+    introduced in [Chapter 6](ch06.xhtml "Chapter 6. Scraping Link-Based External
+    Data"), *Scraping Link-Based External Data*) and finally convert our RDD of XML
+    documents into a Spark DataFrame. The different methods are not reported here,
+    but they can be found in our code repository. One needs to note that Goose scraper
+    can be used offline by providing the HTML content (as a string) alongside a dummy
+    URL.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We provide the reader with a convenient `parse` method that can be used for
+    pre-processing any `Post.xml` data from the Stack Exchange website. This function
+    is part of our `StackBootstraping` code available in our code repository:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Building text features
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'With our beer content properly labeled, the remaining process is to bootstrap
+    the algorithm itself. For that purpose, we use a simple Naive Bayes classification
+    algorithm that determines the conditional probability of a label given an item''s
+    features. We first collect all distinct labels, assign a unique identifier (as
+    `Double`), and broadcast our label dictionary to the Spark executors:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: As introduced earlier, make sure that large collections that are used inside
+    a Spark transformation have been broadcast to all Spark executors. This reduces
+    the cost associated to network transfer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A `LabeledPoint` is composed of both a label (as `Double`) and features (as
+    `Vector`). A common practice to build features out of text content is to build
+    term frequency vectors, where each word across all documents corresponds to a
+    specific dimension. With around hundreds of thousands of dimensions (the estimated
+    number of words in English is 1,025,109), this highly dimensional space will be
+    particularly inefficient for most machine learning algorithms. In fact, when Naive
+    Bayes multiplies probabilities (lower than 1), there is a certain risk of reaching
+    0 due to machine precision issue (numerical underflow as described in [Chapter
+    14](ch14.xhtml "Chapter 14. Scalable Algorithms"), *Scalable Algorithm*). Data
+    scientists overcome that constraint using the principle of dimensionality reduction,
+    projecting a sparse vector into a denser space while preserving distance measures
+    (the principle of dimensionality reduction will be covered in [Chapter 10](ch10.xhtml
+    "Chapter 10. Story De-duplication and Mutation"), *Story De-duplication and Mutation*).
+    Although we can find many algorithms and techniques for that purpose, we will use
+    the hashing utility provided by Spark.
+  prefs: []
+  type: TYPE_NORMAL
+- en: With a vector size of *n* (default of 2^(20)), its `transform` method groups
+    all words in *n* different buckets in respect to their hash values, and sums up
+    the bucket frequencies to build denser vectors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Prior to a dimensionality reduction, which can be an expensive operation, vector
+    size can be greatly reduced by stemming and cleaning the text content. We use
+    the Apache Lucene analyzer here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We remove all punctuation and numbers and feed the plain text object to a Lucene
+    analyzer, collecting each clean word as a `CharTermAttribute`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'With this approach, we transform the text [Mastering Spark for Data Science
+    - V1] into [master spark data science], hence reducing the number of words (therefore
+    dimensions) from our input vectors. Finally, we normalize our term frequency vector
+    using the MLlib `normalizer` class:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Hash functions can lead to dramatic overestimates due to collisions (two different
+    words of complete different meanings could share a same hash value). We will be
+    discussing the Random Indexing technique in [Chapter 10](ch10.xhtml "Chapter 10. Story
+    De-duplication and Mutation"), *Story De-duplication and Mutation*, in order to
+    limit the number of collisions while preserving the distance measure.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Training a Naive Bayes model
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We train a Naive Bayes algorithm as follows and test our classifier using a
+    test dataset that we did not include in the training data points. We finally display
+    the first five predictions in the following example. The labels on the left-hand
+    side are the original labels from our test content; on the right-hand side are
+    the results of the Naive Bayes classification. An `ipa` has been predicted as
+    `hangover`, validating with certainty the accuracy of our classification algorithm:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'For convenience, we abstract all these methods and expose the following ones
+    within a `Classifier` object that will be used later:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We have demonstrated how to export labeled data from external sources, how
+    to build a term frequency vector, and how to train a simple Naive Bayes classification
+    model. The high level workflow used here is represented in the following figure
+    and is common for most classification use cases:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Training a Naive Bayes model](img/image_09_001.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 1: Classification workflow'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The next step is to start classifying the original unlabeled data (assuming
+    our content is still brewery related). This closes the introduction of Naive Bayes
+    classification and how a bootstrapped model could steal ground truth from external
+    resources. Both these techniques will be used in our classification system in
+    the following section.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Laziness, impatience, and hubris
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Here comes the second of our main challenges that we will be facing within our
+    context of news articles. Assuming someone spent days manually labeling data,
+    this would solve our classification problem for known categories at a particular
+    point in time, and would probably only be valid when back-testing our data. Who
+    knows what the news headline would be on tomorrow's newspaper; no one can define
+    all the fine-grained labels and topics that will be covered in the near future
+    (although broader categories can still be defined). This would require lots of
+    effort to constantly re-evaluate, retrain and redeploy our model whenever a new
+    trending topic arises. As a concrete example, no one was talking about the topic
+    of Brexit a year ago; this topic is now heavily mentioned in news articles.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'From our experience, data scientists should bear in mind a famous quote from
+    Larry Wall, inventor of the Perl programming language:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*"We will encourage you to develop the three great virtues of a programmer,
+    laziness, impatience and hubris".*'
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '*Laziness* makes you go to great efforts to reduce overall energy expenditure'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Impatience* makes you write programs that don''t just react to your needs but
+    anticipates them'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Hubris* makes you write programs that people won''t want to say bad things
+    about'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We want to avoid efforts related to both the preparation and the maintenance
+    of a classification model (laziness) and to programmatically anticipate the arising
+    of new topics (impatience), though this could sound like an ambitious task (but
+    what is hubris if not an excessive pride in achieving the impossible?). Social
+    networks are a fantastic place to steal ground truth from. In fact, when people
+    tweet news articles, they unconsciously help us label our data. We do not need
+    to pay for Mechanical Turks when we potentially have millions of users doing the
+    job for us. In other terms, we crowdsource the labeling of GDELT data to Twitter
+    users.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Any article mentioned on Twitter will help us build a term frequency vector
+    while the associated hashtags will be used as proper labels. In the following
+    example, adorable news about President Obama meeting Prince George wearing a bathrobe
+    has been classified as [#Obama] and [#Prince] [http://www.wfmynews2.com/entertainment/adorable-prince-george-misses-bedtime-meets-president-obama/149828772](http://www.wfmynews2.com/entertainment/adorable-prince-george-misses-bedtime-meets-president-obama/149828772):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Laziness, impatience, and hubris](img/image_09_002.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 2: President Obama meets Prince George, #Obama, #Prince'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the following example, we pay tribute to all of music''s great losses of
+    2016 by machine learning topics [#DavidBowie], [#Prince], [#GeorgeMichael], and
+    [#LeonardCohen] within the same news article from The Guardian [https://www.theguardian.com/music/2016/dec/29/death-stars-musics-greatest-losses-of-2016](https://www.theguardian.com/music/2016/dec/29/death-stars-musics-greatest-losses-of-2016):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Laziness, impatience, and hubris](img/image_09_003.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 3: Music''s great losses in 2016 - source'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using this approach, our algorithm will be constantly and automatically re-evaluated,
+    learning from arising topics on its own, hence working in a non-supervised way
+    (although being a supervised learning algorithm in the proper sense).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Designing a Spark Streaming application
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Building a real-time application differs from batch processing in terms of architecture
+    and components involved. While the latter can easily be built bottom-up, where
+    programmers add functionalities and components when needed, the former usually
+    needs to be built top-down with a solid architecture in place. In fact, due to
+    the constraints of volume and velocity (or veracity in a streaming context), an
+    inadequate architecture will prevent programmers from adding new functionalities.
+    One always needs a clear understanding of how streams of data are interconnected,
+    how and where they are processed, cached, and retrieved.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A tale of two architectures
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'In terms of stream processing using Apache Spark, there are two emerging architectures
+    that should be considered: Lambda architecture and Kappa architecture. Before
+    we delve into the details of the two architectures, let''s discuss the problems
+    they are trying to solve, what they have in common, and in what context you would
+    use each.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The CAP theorem
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'For years, engineers working on highly-distributed systems have been concerned
+    with handling network outages. The following is a scenario of particular interest,
+    consider:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The CAP theorem](img/image_09_004.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 4: Distributed system outage'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Normal operation of a typical distributed system is where users perform actions
+    and the system uses techniques, such as replication, caching, and indexing, to
+    ensure correctness and timely response. But what happens when something goes wrong:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![The CAP theorem](img/image_09_005.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 5: Distributed system split brain syndrome'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, a network outage has effectively prevented users from performing their
+    actions safely. Yes, a simple network failure causes a complication that not only
+    affects the function and performance as you might expect but also the correctness
+    of the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In fact, the system now suffers from what is known as *split brain syndrome*.
+    In this situation, the two parts of the system are no longer able to talk to each
+    other, so any modifications performed by users on one side are not visible on
+    the opposite side. It's almost like there are two separate systems, each maintaining
+    their own internal state, which would become quite different over time. Crucially,
+    a user may report different answers when running the same queries on either side.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is but one example in the general case of failure within a distributed
+    system, and although much time has been devoted to solving these problems, there
+    are still only three practical approaches:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Prevent users from making any updates until the underlying problem is resolved
+    and in the meantime preserve the current state of the system (last known state
+    before failure) as correct (that is, sacrifice *partition tolerance*).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Allow users to continue doing updates as before, but accept that answers may
+    be different and will have to converge at some point when the underlying problem
+    is corrected (that is, sacrifice *consistency*).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Shift all users onto one part of the system and allow them to continue doing
+    updates as before. The other part of the system is treated as failed and a partial
+    reduction of processing power is accepted until the problem is resolved - the
+    system may become less responsive as a result (that is, sacrifice *Availability*).
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The preceding conjuncture is more formally stated as CAP theorem ([http://nathanmarz.com/blog/how-to-beat-the-cap-theorem.html](http://nathanmarz.com/blog/how-to-beat-the-cap-theorem.html)).
+    It reasons that in an environment where failures are a fact of life and you cannot
+    sacrifice functionality (1) you must choose between having consistent answers
+    (2) or full capability (3). You cannot have both as it's a trade-off.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: In fact, it's more correct here to describe "failures" as the more general term,
+    "partition tolerance", as this type of failure could refer to any division of
+    the system - a network outage, server reboot, a full disk, and so on - it is not
+    necessarily specifically network problems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Needless to say this is a simplification, but nonetheless, most data processing
+    systems will fit into one of these broad categories in the event of a failure.
+    Furthermore, it turns out that most traditional database systems favor consistency,
+    achieving this using well-understood computer science methods such as transactions,
+    write-ahead logs, and pessimistic locking.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, in today's online world, where users expect 24/7 access to services,
+    many of which are revenue-generating; Internet of Things or real-time decision
+    making, a scalable fault-tolerant approach is required. Consequently, there has
+    been a surge in efforts to produce alternatives that ensure availability in the
+    event of failure (indeed the Internet itself was born from this very need).
+  prefs: []
+  type: TYPE_NORMAL
+- en: It turns out that striking the right balance between implementing highly-available
+    systems that also provide an acceptable level of consistency is a challenge. In
+    order to manage the necessary trade-offs, approaches tend to provide weaker definitions
+    of consistency, that is, *eventual consistency* where stale data is usually tolerated
+    for a short while, and over time the correct data is agreed upon. Yet even with
+    this compromise, they still require the use of far more complicated techniques
+    hence they are more difficult to build and maintain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: With more onerous implementations, vector-clocks and read-repair are involved
+    in order to handle concurrency and prevent data corruption
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Greeks are here to help
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Both Lambda and Kappa architectures provide simpler solutions to the previously
+    described problems. They advocate the use of modern big data technologies, such
+    as Apache Spark and Apache Kafka as the basis for consistent available processing
+    systems, where logic can be developed without the need to reason about failure.
+    They are applicable in situations with the following characteristics:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An unbounded, inbound stream of information, potentially from multiple sources
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Analytical processing over a very large, cumulative dataset
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: User queries with time-based guarantees on data consistency
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Zero-tolerance for degradation of performance or downtime
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Where you have these conditions, you can consider either architecture as a
+    general candidate. Each adheres to the following core principles that help simplify
+    issues around data consistency, concurrent access, and prevention of data corruption:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '**Data immutability**: Data is only ever created or read. It is never updated
+    or deleted. Treating data this way greatly simplifies the model required to keep
+    your data consistent.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '**Human fault tolerance**: When fixing or upgrading software during the normal
+    course of the software development lifecycle, it is often necessary to deploy
+    new versions of analytics and replay historical data through the system in order
+    to produce revised answers. Indeed, when managing systems dealing directly with
+    data of this capability is often critical. The batch layer provides a durable
+    store of historical data and hence allows for any mistakes to be recovered.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: It's these principles that form the basis of their eventually-consistent solutions
+    without the need to worry about complexities such as read-repairs or vector-clocks; they're
+    definitely more developer-friendly architectures!
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, let's discuss some of the reasons to choose one over the other. Let's first
+    consider the Lambda architecture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Importance of the Lambda architecture
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The Lambda architecture, as first proposed by Nathan Marz, typically ls something
+    like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Importance of the Lambda architecture](img/image_09_006.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 6: Lambda architecture'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In essence, data is dual-routed into two layers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A **Batch layer** capable of computing a snapshot at a given point in time
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A **Real-Time layer** capable of processing incremental changes since the last
+    snapshot
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The **Serving layer** is then used to merge these two views of the data together
+    producing a single up-to-date version of the truth.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In addition to the previously described general characteristics, Lambda architecture
+    is most suitable when you have either of the following specific conditions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Complex or time-consuming bulk or batch algorithms that have no equivalent or
+    alternative incremental iterative algorithm (and approximations are not acceptable)
+    so you need a batch layer.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Guarantees on data consistency cannot be met by the batch layer alone, regardless
+    of parallelism of the system, so you need a real-time layer. For example, you
+    have:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Low latency write-reads
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Arbitrarily wide ranges of data, that is, years
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Heavy data skew
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Where you have either one of these conditions, you should consider using the
+    Lambda architecture. However, before going ahead, be aware that it brings with
+    it the following qualities that may present challenges:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Two data pipelines: There are separate workflows for batch and stream processing
+    and, although where possible you can attempt to reuse core logic and libraries,
+    the flows themselves must be managed individually at runtime.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Complex code maintenance: For all but simple aggregations, the algorithms in
+    the batch and real time layers will need to be different. This is particularly
+    true for machine learning algorithms, where there is an entire field devoted to
+    this study called online machine learning ([https://en.wikipedia.org/wiki/Online_machine_learning](https://en.wikipedia.org/wiki/Online_machine_learning)),
+    which can involve implementing incremental iterative algorithms, or approximation
+    algorithms, outside of existing frameworks.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Increased complexity in the serving layer: Aggregations, unions, and joins
+    are necessary in the serving layer in order to merge deltas with aggregations.
+    Engineers should be careful that this does not split out into consuming systems.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Despite these challenges, the Lambda architecture is a robust and useful approach
+    that has been implemented successfully in many institutions and organizations,
+    including Yahoo!, Netflix, and Twitter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Importance of the Kappa architecture
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The Kappa architecture takes simplification one step further by putting the
+    concept of a *distributed log* at its center. This allows the removal of the batch
+    layer altogether and consequently creates a vastly simpler design. There are many
+    different implementations of Kappa, but generally it looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Importance of the Kappa architecture](img/image_09_007.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7: Kappa architecture'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In this architecture, the distributed log essentially provides the characteristics
+    of data immutability and re-playability. By introducing the concept of *mutable
+    state store* in the processing layer, it unifies the computation model by treating
+    all processing as stream processing, even batch, which is considered just a special
+    case of stream. Kappa architecture is most suitable when you have either of the
+    following specific conditions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Guarantees on data consistency can be met using the existing batch algorithm
+    by increasing parallelism of the system to reduce latency
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Guarantees on data consistency can be met by implementing incremental iterative
+    algorithms
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'If either one of these options is viable, then Kappa architecture should provide
+    a modern, scalable approach to meet your batch and streaming requirements. However,
+    it''s worth considering the constraints and challenges of the technologies chosen
+    for any implementation you may decide on. The potential limitations include:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Exactly-once semantics: Many popular distributed messaging systems, such as
+    Apache Kafka, don''t currently support exactly-once message delivery semantics.
+    This means that, for now, consuming systems have to deal with receiving data duplicates
+    themselves. This is typically done by using checkpoints, unique keys, idempotent
+    writes, or other such de-duplication techniques, but it does increase complexity
+    and hence makes the solution more difficult to build and maintain.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Out of order event handling: Many streaming implementations, such as Apache
+    Spark, do not currently support updates ordered by the event time, instead they
+    use the processing time, that is, the time the event was first observed by the
+    system. Consequently, updates could be received out of order and the system needs
+    to be able to handle this. Again, this increases code complexity and makes the
+    solution more difficult to build and maintain.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'No strong consistency, that is, linearizability: As all updates are applied
+    asynchronously, there are no guarantees that write will take effect immediately
+    (although they will be eventually consistent). This means that in some circumstances
+    you would not immediately be able to "read your writes".'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the next chapter, we will discuss incremental iterative algorithms, how data
+    skew or server failures affect consistency, and how the back-pressure features
+    in Spark Streaming can help reduce failures. With regards to what has been explained
+    in this section, we will build our classification system following a Kappa architecture.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Consuming data streams
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Similar to a batch processing job, we create a new Spark application using
+    a `SparkConf` object and a context. In a streaming application, the context is
+    created using a batch size parameter that will be used for any incoming stream
+    (both GDELT and Twitter layers, part of the same context, will both be tied to
+    the same batch size). GDELT data being published every 15 minutes, our batch size
+    will be naturally 15 minutes as we want to predict categories in a pseudo real-time
+    basis:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: Creating a GDELT data stream
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: There are many ways of publishing external data into a Spark streaming application.
+    One could open a simple socket and start publishing data over the netcat utility, or
+    could be streaming data through a Flume agent monitoring an external directory.
+    Production systems usually use Kafka as a default broker for both its high throughput
+    and its overall reliability (data is replicated over multiple partitions). Surely,
+    we could be using the same Apache NiFi stack as described in [Chapter 10](ch10.xhtml
+    "Chapter 10. Story De-duplication and Mutation"), *Story De-duplication and Mutation*,
+    but we want to describe here a much easier route simply by "piping" articles URLs
+    (extracted from GDELT records) into our Spark application through a Kafka topic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a Kafka topic
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Creating a new Kafka topic is quite easy (in a test environment). Extra care
+    must be taken on production environments by choosing the right number of partitions
+    and replication factors. Also note that a proper zookeeper quorum must be installed
+    and configured. We start the Kafka server and create a topic named `gzet`, using
+    one partition only and a replication factor of 1:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: Publishing content to a Kafka topic
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'We can feed the Kafka queue by piping content to the `kafka-console-producer`
+    utility. We use `awk`, `sort`, and `uniq` commands as we are only interested in
+    the distinct URLs from GDELT records (`URL` is the last field of our tab separated
+    values, hence the `$NF`):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: For convenience, we create a simple bash script that listens for new files on
+    the GDELT website, downloads and extracts content to a temporary directory, and
+    executes the preceding command. The script can be found in our code repository
+    (`gdelt-stream.sh`).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Consuming Kafka from Spark Streaming
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Kafka is an official source of Spark Streaming, available using the following
+    dependency:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We define the number of Spark partitions that will be used for processing data
+    from the gzet topic (10 here) together with the zookeeper quorum. We return the
+    message itself (the URLs piped to our Kafka producer) in order to build our stream
+    of article URLs:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: '![Consuming Kafka from Spark Streaming](img/image_09_008.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 8: GDELT online layer'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the preceding figure we show how GDELT data will be processed in batches
+    by listening to a Kafka topic. Each batch will be analyzed and the articles downloaded
+    using the HTML parser described in [Chapter 6](ch06.xhtml "Chapter 6. Scraping
+    Link-Based External Data"), *Scraping Link-Based External Data*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Creating a Twitter data stream
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The obvious constraint of using Twitter is the constraint of scale. With over
+    500 million tweets a day, our application needs to be written in the most distributed
+    and scalable way in order to handle the large amount of input data. Furthermore,
+    if only 2% of these tweets contained a reference to an external URL, we would
+    still have a million URLs to fetch and analyze per day (in addition to the thousands
+    coming from GDELT). Because we do not have a dedicated architecture to handle
+    this veracity of data for the purpose of this book, we will be using the 1% firehose
+    provided for free by Twitter. One simply needs to register a new application on
+    the Twitter website ([https://apps.twitter.com](https://apps.twitter.com)) and
+    retrieve both its associated application settings and authorization tokens. Note,
+    however, that the Twitter connector is no longer part of core Spark Streaming
+    since version `2.0.0`. As part of the Apache Bahir project ([http://bahir.apache.org/](http://bahir.apache.org/)),
+    it can be used with the following maven `dependency`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Because Spark Streaming uses `twitter4j` in the background, the configuration
+    is done using the `ConfigurationBuilder` object from the `twitter4j` libraries:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We create our data stream by supplying an array of keywords (can be specific
+    hashtags). In our case, we want to listen to all 1%, no matter the keywords or
+    hashtags used (discovering new hashtags is actually part of our application),
+    hence providing an empty array:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: Processing Twitter data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The second main constraint of using Twitter is the constraint of noise. When
+    most classification models are trained against dozens of different classes, we
+    will be working against hundreds of thousands of distinct hashtags per day. We
+    will be focusing on popular topics only, meaning the trending topics occurring
+    within a defined batch window. However, because a 15 minute batch size on Twitter
+    will not be sufficient enough to detect trends, we will apply a 24-hour moving
+    window where all hashtags will be observed and counted, and where only the most
+    popular ones will be kept.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Processing Twitter data](img/image_09_009.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 9: Twitter online layer, batch and window size'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using this approach, we reduce the noise of unpopular hashtags, making our classifier
+    much more accurate and scalable, and significantly reducing the number of articles
+    to fetch as we only focus on trending URLs mentioned alongside popular topics.
+    This allows us to save lots of time and resources spent analyzing irrelevant data
+    (with regards to a classification model).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Extracting URLs and hashtags
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We extract both the clean hashtags (that are more than x characters long and
+    that do not contain numbers; yet another measure of reducing noise) and references
+    to valid URLs. Note the Scala `Try` method that catches any exception when testing
+    a `URL` object. Only the tweets matching both of these two conditions will be
+    kept:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: Keeping popular hashtags
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The basic idea of this step is to execute a simple word count over a 24h time
+    window. We extract all hashtags, assign a value of 1, and count the number of
+    occurrences using a reduce function. In a streaming context, the `reduceByKey`
+    function can be applied over a window (that must be larger than the batch size)
+    using `reduceByKeyAndWindow` method. Although this term frequency dictionary will
+    always be available at each batch, the current top ten hashtags are printed out
+    every 15 minutes, data will be counted over a larger period (24h):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In a batch processing context, one could easily join an RDD of hashtags with
+    the Twitter RDD in order to keep only the "hottest" tweets (tweets mentioning
+    an article alongside a popular hashtag). In a streaming context, data streams
+    cannot be joined as each stream contains several RDDs. Instead, we transform a
+    `DStream` with another one using the `transformWith` function that takes an anonymous
+    function as an argument and applies it on each of their RDDs. We transform our
+    Twitter stream with our hashtag stream by applying a function that filters out
+    the unpopular tweets. Note that we use Spark context to broadcast our current
+    top *n* hashtags (limited to the top 100 here):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Because the returned stream will only contain the "hottest" URLs, the amount
+    of data should be drastically reduced. Although we cannot guarantee at this stage
+    whether or not the URL points to a proper text content (could be a YouTube video
+    or a simple image), at least we know we won't waste effort fetching content about
+    useless topics.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Expanding shortened URLs
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'URLs available on Twitter are shortened. The only way to detect the true source
+    programmatically is to "open the box" for all of them, wasting, sadly, lots of
+    time and effort on potentially irrelevant content. It is also worth mentioning
+    that many web scrapers would not handle shortened URLs efficiently (including
+    Goose scraper). We expand URLs by opening an HTTP connection, disabling redirects,
+    and looking at the `Location` header. We also provide the method with a list of
+    "untrusted" sources, sources that are, for the context of a classification model,
+    not providing any useful content (such as videos from [https://www.youtube.com](https://www.youtube.com)):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Similar to what has been done in the previous chapter, we thoroughly catch any
+    possible exceptions arising from an HTTP connection. Any uncaught exception (could
+    be a simple 404 error) would make this task re-evaluate on different Spark executors
+    before raising a fatal exception, exiting our Spark application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Fetching HTML content
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We''ve already introduced web scrapers in a previous chapter, using Goose library
+    recompiled for Scala 2.11\. We will create a method that takes a `DStream` as
+    input instead of an RDD, and only keep the valid text content with at least 500
+    words. We will finally return a stream of text alongside the associated hashtags
+    (the popular ones):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We apply the same approach for GDELT data where all the content (text, title,
+    description, and so on) will also be returned. Note the `reduceByKey` method,
+    which acts as a distinct function for our data stream:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]'
+  prefs: []
+  type: TYPE_PRE
+- en: Using Elasticsearch as a caching layer
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Our ultimate goal is to train a new classifier at each batch (every 15 minutes).
+    However, the classifier will be trained using more than just the few records we
+    downloaded within that current batch. We somehow have to cache the text content
+    over a larger period of time (set to 24h) and retrieve it whenever we need to
+    train a new classifier. With Larry Wall''s quote in mind, we will try to be as
+    lazy as possible maintaining the data consistency over this online layer. The
+    basic idea is to use a **Time to live** (**TTL**) parameter that will seamlessly
+    drop any outdated record. The Cassandra database provides this feature out of
+    the box (so does HBase or Accumulo), but Elasticsearch is already part of our
+    core architecture and can easily be used for that purpose. We will create the
+    following mapping for the `gzet`/`twitter` index with the `_ttl` parameter enabled:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE23]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Our records will exist on Elasticsearch for a period of 24h (the TTL value
+    is defined on insert) after which any record will simply be discarded. As we delegate
+    the maintenance tasks to Elasticsearch, we can safely pull all possible records
+    from our online cache without worrying too much about any outdated value. All
+    the retrieved data will be used as a training set for our classifier. The high
+    level process is reported in the following figure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Using Elasticsearch as a caching layer](img/image_09_010.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 10: Using Elasticsearch as a caching layer'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For each RDD in our data stream, we retrieve all existing records from the previous
+    24h, cache our current set of Twitter content, and train a new classifier. Converting
+    a data stream into RDDs is a simple operation using the `foreachRDD` function.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We persist current records into Elasticsearch using the `saveToEsWithMeta`
+    function from the Elasticsearch API. This function accepts the `TTL` parameter
+    as part of the metadata map (set to 24h, in seconds, and formatted as String):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It is worth executing a simple check on Elasticsearch in order to make sure
+    that the `TTL` parameter has been properly set, and is effectively decreasing
+    every second. Once it has reached 0, the indexed document should be dropped. The
+    following simple command prints out the `_ttl` value for document ID [`AVRr9LaCoYjYhZG9lvBl`]
+    every second. This uses a simple `jq` utility ([https://stedolan.github.io/jq/download](https://stedolan.github.io/jq/download)/)
+    to parse JSON objects from the command line:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE25]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'All the online records (records with unexpired TTL) can be retrieved into an
+    RDD using the following function. Similar to what we''ve done in [Chapter 7](ch07.xhtml
+    "Chapter 7. Building Communities"), *Building communities*, extracting lists from
+    Elasticsearch is far easier using JSON parsing than Spark DataFrame:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We download all Twitter contents from our caching layer while saving our current
+    batch. The remaining process is to train our classification algorithm. This method
+    is discussed in the following section:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE27]'
+  prefs: []
+  type: TYPE_PRE
+- en: Classifying data
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The remaining part of our application is to start classifying data. As introduced
+    earlier, the reason for using Twitter was to steal ground truth from external
+    resources. We will train a Naive Bayes classification model using Twitter data
+    while predicting categories of the GDELT URLs. The convenient side of using a
+    Kappa architecture approach is that we do not have to worry much about exporting
+    some common pieces of code across different applications or different environments.
+    Even better, we do not have to export/import our model between a batch and a speed
+    layer (both GDELT and Twitter, sharing the same Spark context, are part of the
+    same physical layer). We could save our model to HDFS for auditing purposes, but
+    we simply need to pass a reference to a Scala object between both classes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Training a Naive Bayes model
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We''ve already introduced both the concept of bootstrapping a Naive Bayes model
+    using Stack Exchange datasets and the use of a `Classifier` object that builds
+    `LabeledPoints` out of text content. We will create a `ClassifierModel` case class
+    that wraps both a Naive Bayes model and its associated labels dictionary and exposes
+    both a `predict` and a `save` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE28]'
+  prefs: []
+  type: TYPE_PRE
+- en: Because more than one hashtag could be necessary to fully describe an article
+    content, we will predict instead a probability distribution using the `predictProbabilities`
+    function. We convert our label identifier (as `Double`) to the original category
+    (as `String`) using the label dictionary we saved alongside the model. Finally
+    we can save, for auditing purposes only, both our model and the label dictionary
+    into HDFS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: All MLlib models support both a save and a load function. Data will be persisted
+    as `ObjectFile` in HDFS, and can be easily retrieved and deserialized. Using ML
+    library, objects are saved into parquet format. One would need, however, to save
+    additional pieces of information; such as in our example, the label dictionary
+    used for training that model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Thread safety
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our `Classifier` is a singleton object, and, as per the singleton pattern,
+    should be thread safe. That means that parallel threads should not modify a same
+    state using, for instance, a setter method. In our current architecture, only
+    Twitter will be training and updating a new model every 15 minutes, models that
+    will be only used by the GDELT service (no concurrent update). However, there
+    are two important things to take into consideration:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Firstly, our model has been trained using distinct labels (hashtags found in
+    a 24h time window, extracted every 15 minutes). A new model will be trained against
+    an updated dictionary. Both the model and the labels are tightly coupled, and
+    therefore must be synchronized. In the unlikely event of GDELT pulling labels
+    while Twitter is updating a model, our predictions will be inconsistent. We ensure
+    thread safety by wrapping both labels and models within our same `ClassifierModel`
+    case class.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'The second (although less critical) concern is that our process is parallel.
+    That means that similar tasks will be executed simultaneously from different executors,
+    on different chunks of data. At a point in time, we would need to ensure that
+    all models are the same version on each executor, although predicting a particular
+    chunk of data with a slightly less up-to-date model will still technically be
+    valid (as long as the model and labels are synchronized). We illustrate this statement
+    with the two following examples. The first one cannot guarantee consistency of
+    models across executors:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The second example (used by default by Spark) broadcasts a model to all executors
+    at once, hence guaranteeing the overall consistency of the predicting phase:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'In our `Classifier` singleton object, we define our model as a global variable
+    (as optional as it may not exist yet) that will be updated after each call to
+    the `train` method:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Coming back to our Twitter stream, for each RDD, we build our training set (abstracted
+    within our `Classifier`), train a new model, and then save it to HDFS:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE32]'
+  prefs: []
+  type: TYPE_PRE
+- en: Predict the GDELT data
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Using the `Classifier` singleton object, we can access the latest model published
+    from the Twitter processor. For each RDD, for each article, we simply predict
+    the hashtags probability distribution that describes each article''s text content:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We only keep probabilities higher than 25% and publish each article together
+    with its predicted hashtags into our Elasticsearch cluster. Publishing the results
+    officially marks the end of our classification application. We report the full
+    architecture here:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Predict the GDELT data](img/image_09_011.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 11: An innovative way of tagging news articles'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our Twitter mechanical Turk
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The accuracy of a classification algorithm should be measured against a test
+    dataset, meaning a labeled dataset that was not included in the training phase.
+    We do not have access to such a dataset (this is the reason we bootstrapped our
+    model initially), hence we cannot compare the original versus predicted categories.
+    Instead of the true accuracy, we can estimate an overall confidence level by visualizing
+    our results. With all our data on Elasticsearch, we build a Kibana dashboard with
+    an additional plugin for tag cloud visualizations ([https://github.com/stormpython/tagcloud](https://github.com/stormpython/tagcloud)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The following figure shows the number of GDELT articles that were analyzed and
+    predicted on May 1, 2016\. Around 18,000 articles have been downloaded in less
+    than 24h (by batch interval of 15 minutes). At each batch, we observe no more
+    than 100 distinct predicted hashtags; this is fortunate as we only kept the top
+    100 popular hashtags occurring within a 24h time window. Besides, it gives us
+    hints about both GDELT and Twitter following a relatively normal distribution
+    (batches are not skewed around a particular category).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Our Twitter mechanical Turk](img/image_09_012.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 12: Predicted articles on May 1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In addition to these 18,000 articles, we also extracted around 700 Twitter text
+    content labeled against our 100 popular hashtags, making each topic covered by
+    seven articles on average. Although this training set is already a good start
+    for the content of this book, we could probably expand it by being less restrictive
+    in terms content or by grouping similar hashtags into broader categories. We could
+    also increase the TTL value on Elasticsearch. Increasing the number of observations
+    while limiting Twitter noise should definitely improve the overall model accuracy.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We observe the most popular hashtags in that particular window to be [#mayday]
+    and [#trump]. We also observe at least as many [#nevertrump] as [#maga], hence
+    satisfying both of the two US political parties. This will be confirmed using
+    the US election data in [Chapter 11](ch11.xhtml "Chapter 11. Anomaly Detection
+    on Sentiment Analysis"), *Anomaly Detection on Sentiment Analysis*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Finally, we select a particular hashtag and retrieve all its associated keywords.
+    This is important as it basically validates the consistency of our classification
+    algorithm. Our hope is that for each hashtag coming from Twitter, the significant
+    terms from GDELT will be consistent enough and should all be related to the same
+    hashtag meaning. We focus on the [**#trump**] tag and access the Trump cloud in
+    the following figure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Our Twitter mechanical Turk](img/image_09_013.jpg)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 13: The #Trump cloud'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We observe most of the significant terms (every article predicted as [**#trump**])
+    to be all about the presidential campaign, the United States, primary, and so
+    on. It also contains names of candidates running for the presidential (Hillary
+    Clinton and Ted Cruz). Although we still find some articles and keywords that
+    are not Donald Trump related, this validates a certain consistency to our algorithm.
+    For many records (more than 30% of them), the results were even above all our
+    initial expectations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Although we were impressed with many of the overall model consistencies, we
+    appreciate that we certainly did not build the most accurate classification system
+    ever. Crowd sourcing this task to millions of users was an ambitious task and
+    by far not the easiest way of getting clearly defined categories. However, this
+    simple proof of concept shows us a few important things:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It technically validates our Spark Streaming architecture.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: It validates our assumption of bootstrapping GDELT using an external dataset.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: It made us lazy, impatient, and proud.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: It learns without any supervision and eventually gets better at every batch.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'No data scientist can build a fully functional and highly accurate classification
+    system in just a few weeks, especially not on dynamic data; a proper classifier
+    needs to be evaluated, trained, re-evaluated, tuned, and retrained for at least
+    the first few months, and then re-evaluated every half a year at the very least.
+    Our goal here was to describe the components involved in a real-time machine learning
+    application and to help data scientists sharpen their creative minds (out-of-the-box
+    thinking is the #1 virtue of a modern data scientist).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: In the next chapter, we will be focusing on article mutation and story de-duplication;
+    how likely is a topic to evolve over time, how likely is a clique of people (or
+    community) likely to mutate over time? By de-duplicating articles into stories,
+    stories into epics, can we predict the possible outcomes based on previous observations?
+  prefs: []
+  type: TYPE_NORMAL

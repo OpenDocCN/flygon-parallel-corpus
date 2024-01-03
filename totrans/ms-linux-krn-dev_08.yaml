@@ -1,0 +1,1756 @@
+- en: Kernel Synchronization and Locking
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 内核同步和锁定
+- en: Kernel address space is shared by all user-mode processes, which enables concurrent
+    access to kernel services and data structures. For reliable functioning of the
+    system, it is imperative that kernel services be implemented to be re-entrant.
+    Kernel code paths accessing global data structures need to be synchronized to
+    ensure consistency and validity of shared data. In this chapter, we will get into
+    details of various resources at the disposal of kernel programmers for synchronization
+    of kernel code paths and protection of shared data from concurrent access.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核地址空间由所有用户模式进程共享，这使得可以并发访问内核服务和数据结构。为了系统的可靠运行，内核服务必须实现为可重入的。访问全局数据结构的内核代码路径需要同步，以确保共享数据的一致性和有效性。在本章中，我们将详细介绍内核程序员用于同步内核代码路径和保护共享数据免受并发访问的各种资源。
+- en: 'This chapter will cover the following topics:'
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章将涵盖以下主题：
+- en: Atomic operations
+  id: totrans-3
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 原子操作
+- en: Spinlocks
+  id: totrans-4
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 自旋锁
+- en: Standard mutexes
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 标准互斥锁
+- en: Wait/wound mutex
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 等待/伤害互斥锁
+- en: Semaphores
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 信号量
+- en: Sequence locks
+  id: totrans-8
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 序列锁
+- en: Completions
+  id: totrans-9
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 完成
+- en: Atomic operations
+  id: totrans-10
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 原子操作
+- en: A computation operation is considered to be **atomic** if it appears to the
+    rest of the system to occur instantaneously. Atomicity guarantees indivisible
+    and uninterruptible execution of the operation initiated. Most CPU instruction
+    set architectures define instruction opcodes that can perform atomic read-modify-write
+    operations on a memory location. These operations have a succeed-or-fail definition,
+    that is, they either successfully change the state of the memory location or fail
+    with no apparent effect. These operations are handy for manipulation of shared
+    data atomically in a multi-threaded scenario. They also serve as foundational
+    building blocks for implementation of exclusion locks, which are engaged to protect
+    shared memory locations from concurrent access by parallel code paths.
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 计算操作被认为是**原子的**，如果它在系统的其余部分看起来是瞬间发生的。原子性保证了操作的不可分割和不可中断的执行。大多数CPU指令集架构定义了可以在内存位置上执行原子读-修改-写操作的指令操作码。这些操作具有成功或失败的定义，即它们要么成功地改变内存位置的状态，要么失败而没有明显的影响。这些操作对于在多线程场景中原子地操作共享数据非常有用。它们还用作实现排他锁的基础构建块，这些锁用于保护共享内存位置免受并行代码路径的并发访问。
+- en: Linux kernel code uses atomic operations for various use cases, such as reference
+    counters in shared data structures *(*which are used to track concurrent access
+    to various kernel data structures), wait-notify flags, and for enabling exclusive
+    ownership of data structures to a specific code path. To ensure portability of
+    kernel services that directly deal with atomic operations, the kernel provides
+    a rich library of architecture-neutral interface macros and inline functions that
+    serve as abstractions to processor-dependent atomic instructions. Relevant CPU-specific
+    atomic instructions under these neutral interfaces are implemented by the architecture
+    branch of the kernel code.
+  id: totrans-12
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Linux内核代码使用原子操作来处理各种用例，例如共享数据结构中的引用计数器（用于跟踪对各种内核数据结构的并发访问），等待-通知标志，以及为特定代码路径启用数据结构的独占所有权。为了确保直接处理原子操作的内核服务的可移植性，内核提供了丰富的与体系结构无关的接口宏和内联函数库，这些函数库用作处理器相关的原子指令的抽象。这些中立接口下的相关CPU特定原子指令由内核代码的体系结构分支实现。
+- en: Atomic integer operations
+  id: totrans-13
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 原子整数操作
+- en: 'Generic atomic operation interfaces include support for integer and bitwise
+    operations. Integer operations are implemented to operate on special kernel-defined
+    types called `atomic_t` (32-bit integer) and `atomic64_t` (64-bit integer). Definitions
+    for these types can be found in the generic kernel header `<linux/types.h>`:'
+  id: totrans-14
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通用原子操作接口包括对整数和位操作的支持。整数操作被实现为操作特殊的内核定义类型，称为`atomic_t`（32位整数）和`atomic64_t`（64位整数）。这些类型的定义可以在通用内核头文件`<linux/types.h>`中找到：
+- en: '[PRE0]'
+  id: totrans-15
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'The implementation provides two groups of integer operations; one set applicable
+    on 32 bit and the other group for 64 bit atomic variables. These interface operations
+    are implemented as a set of macros and inline functions. Following is a summarized
+    list of operations applicable on `atomic_t` type variables:'
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该实现提供了两组整数操作；一组适用于32位，另一组适用于64位原子变量。这些接口操作被实现为一组宏和内联函数。以下是适用于`atomic_t`类型变量的操作的摘要列表：
+- en: '| **Interface macro/Inline function** | **Description** |'
+  id: totrans-17
+  prefs: []
+  type: TYPE_TB
+  zh: '**接口宏/内联函数** | **描述**'
+- en: '| `ATOMIC_INIT(i)` | Macro to initialize an atomic counter |'
+  id: totrans-18
+  prefs: []
+  type: TYPE_TB
+  zh: '`ATOMIC_INIT(i)` | 用于初始化原子计数器的宏'
+- en: '| `atomic_read(v)` | Read value of the atomic counter `v` |'
+  id: totrans-19
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_read(v)` | 读取原子计数器`v`的值'
+- en: '| `atomic_set(v, i)` | Atomically set counter `v` to value specified in `i`
+    |'
+  id: totrans-20
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_set(v, i)` | 原子性地将计数器`v`设置为`i`中指定的值'
+- en: '| `atomic_add(int i, atomic_t *v)` | Atomically add `i` to counter `v` |'
+  id: totrans-21
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_add(int i, atomic_t *v)` | 原子性地将`i`添加到计数器`v`中'
+- en: '| `atomic_sub(int i, atomic_t *v)` | Atomically subtract `i` from counter `v`
+    |'
+  id: totrans-22
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_sub(int i, atomic_t *v)` | 原子性地从计数器`v`中减去`i`'
+- en: '| `atomic_inc(atomic_t *v)` | Atomically increment counter `v` |'
+  id: totrans-23
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_inc(atomic_t *v)` | 原子性地增加计数器`v`'
+- en: '| `atomic_dec(atomic_t *v)` | Atomically decrement counter `v` |'
+  id: totrans-24
+  prefs: []
+  type: TYPE_TB
+  zh: '`atomic_dec(atomic_t *v)` | 原子性地减少计数器`v`'
+- en: 'Following is a list of functions that perform relevant **read-modify-write**
+    (**RMW**) operations and return the result (that is, they return the value that
+    was written to the memory address after the modification):'
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是执行相关**读-修改-写**（**RMW**）操作并返回结果的函数列表（即，它们返回修改后写入内存地址的值）：
+- en: '| **Operation** | **Description** |'
+  id: totrans-26
+  prefs: []
+  type: TYPE_TB
+  zh: '**操作** | **描述**'
+- en: '| `bool atomic_sub_and_test(int i, atomic_t *v)` | Atomically subtracts `i`
+    from `v` and returns `true` if the result is zero, or `false` otherwise |'
+  id: totrans-27
+  prefs: []
+  type: TYPE_TB
+  zh: '`bool atomic_sub_and_test(int i, atomic_t *v)` | 原子性地从`v`中减去`i`，如果结果为零则返回`true`，否则返回`false`'
+- en: '| `bool atomic_dec_and_test(atomic_t *v)` | Atomically decrements `v` by 1
+    and returns `true` if the result is 0, or `false` for all other cases |'
+  id: totrans-28
+  prefs: []
+  type: TYPE_TB
+  zh: '`bool atomic_dec_and_test(atomic_t *v)` | 原子性地将`v`减1，并在结果为0时返回`true`，否则对所有其他情况返回`false`'
+- en: '| `bool atomic_inc_and_test(atomic_t *v)` | Atomically adds `i` to `v` and
+    returns `true` if the result is 0, or `false` for all other cases |'
+  id: totrans-29
+  prefs: []
+  type: TYPE_TB
+  zh: '`bool atomic_inc_and_test(atomic_t *v)` | 原子地将`i`添加到`v`，如果结果为0则返回`true`，否则返回`false`'
+- en: '| `bool atomic_add_negative(int i, atomic_t *v)` | Atomically adds `i` to `v`
+    and returns `true` if the result is negative, or `false` when result is greater
+    than or equal to zero |'
+  id: totrans-30
+  prefs: []
+  type: TYPE_TB
+  zh: '`bool atomic_add_negative(int i, atomic_t *v)` | 原子地将`i`添加到`v`，如果结果为负数则返回`true`，如果结果大于或等于零则返回`false`'
+- en: '| `int atomic_add_return(int i, atomic_t *v)` | Atomically adds `i` to `v`
+    and returns the result |'
+  id: totrans-31
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_add_return(int i, atomic_t *v)` | 原子地将`i`添加到`v`，并返回结果'
+- en: '| `int atomic_sub_return(int i, atomic_t *v)` | Atomically subtracts `i` from
+    `v` and returns the result |'
+  id: totrans-32
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_sub_return(int i, atomic_t *v)` | 原子地从`v`中减去`i`，并返回结果'
+- en: '| `int atomic_fetch_add(int i, atomic_t *v)` | Atomically adds `i` to `v` and
+    return pre-addition value at `v` |'
+  id: totrans-33
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_fetch_add(int i, atomic_t *v)` | 原子地将`i`添加到`v`，并返回`v`中的加法前值'
+- en: '| `int atomic_fetch_sub(int i, atomic_t *v)` | Atomically subtracts `i` from
+    `v`, and return pre-subtract value at `v` |'
+  id: totrans-34
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_fetch_sub(int i, atomic_t *v)` | 原子地从`v`中减去`i`，并返回`v`中的减法前值'
+- en: '| `int atomic_cmpxchg(atomic_t *v, int old,` int new) | Reads the value at
+    location `v`, and checks if it is equal to `old`*;* if `true`, swaps value at
+    `v` with `*new*`, and always returns value read at `v` |'
+  id: totrans-35
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_cmpxchg(atomic_t *v, int old,` int new) | 读取位置`v`处的值，并检查它是否等于`old`；如果为`true`，则交换`v`处的值与`*new*`，并始终返回在`v`处读取的值'
+- en: '| `int atomic_xchg(atomic_t *v, int new)` | Swaps the old value stored at location
+    `v` with `new`, and returns old value `v` |'
+  id: totrans-36
+  prefs: []
+  type: TYPE_TB
+  zh: '`int atomic_xchg(atomic_t *v, int new)` | 用`new`交换存储在位置`v`处的旧值，并返回旧值`v`'
+- en: For all of these operations, 64-bit variants exist for use with `atomic64_t`;
+    these functions have the naming convention `atomic64_*()`.
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于所有这些操作，都存在用于`atomic64_t`的64位变体；这些函数的命名约定为`atomic64_*()`
+- en: Atomic bitwise operations
+  id: totrans-38
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 原子位操作
+- en: 'Kernel-provided generic atomic operation interfaces also include bitwise operations.
+    Unlike integer operations, which are implemented to operate on the `atomic(64)_t`
+    type, these bit operations can be applied on any memory location. The arguments
+    to these operations are the position of the bit or bit number, and a pointer with
+    a valid address. The bit range is 0-31 for 32-bit machines and 0-63 for 64-bit
+    machines. Following is a summarized list of bitwise operations available:'
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核提供的通用原子操作接口还包括位操作。与整数操作不同，整数操作被实现为在`atomic(64)_t`类型上操作，这些位操作可以应用于任何内存位置。这些操作的参数是位的位置或位数，以及一个具有有效地址的指针。32位机器的位范围为0-31，64位机器的位范围为0-63。以下是可用的位操作的摘要列表：
+- en: '| **Operation interface** | **Description** |'
+  id: totrans-40
+  prefs: []
+  type: TYPE_TB
+  zh: '**操作接口** | **描述**'
+- en: '| `set_bit(int nr, volatile unsigned long *addr)` | Atomically set the bit
+    `nr` in location starting from `addr` |'
+  id: totrans-41
+  prefs: []
+  type: TYPE_TB
+  zh: '`set_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子设置位`nr`'
+- en: '| `clear_bit(int nr, volatile unsigned long *addr)` | Atomically clear the
+    bit `nr` in location starting from `addr` |'
+  id: totrans-42
+  prefs: []
+  type: TYPE_TB
+  zh: '`clear_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子清除位`nr`'
+- en: '| `change_bit(int nr, volatile unsigned long *addr)` | Atomically flip the
+    bit `nr` in the location starting from `addr` |'
+  id: totrans-43
+  prefs: []
+  type: TYPE_TB
+  zh: '`change_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子翻转位`nr`'
+- en: '| `int test_and_set_bit(int nr, volatile unsigned long *addr)` | Atomically
+    set the bit `nr` in the location starting from `addr`, and return old value at
+    the `nr^(th)` bit |'
+  id: totrans-44
+  prefs: []
+  type: TYPE_TB
+  zh: '`int test_and_set_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子设置位`nr`，并返回`nr^(th)`位的旧值'
+- en: '| `int test_and_clear_bit(int nr, volatile unsigned long *addr)` | Atomically
+    clear the bit `nr` in the location starting from `addr`, and return old value
+    at the `nr``^(th)` bit |'
+  id: totrans-45
+  prefs: []
+  type: TYPE_TB
+  zh: '`int test_and_clear_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子清除位`nr`，并返回`nr``^(th)`位的旧值'
+- en: '| `int test_and_change_bit(int nr, volatile unsigned long *addr)` | Atomically
+    flip the bit `nr` in the location starting from `addr`, and return old value at
+    the `nr^(th)` bit |'
+  id: totrans-46
+  prefs: []
+  type: TYPE_TB
+  zh: '`int test_and_change_bit(int nr, volatile unsigned long *addr)` | 在从`addr`开始的位置上原子翻转位`nr`，并返回`nr^(th)`位的旧值'
+- en: For all the operations with a return type, the value returned is the old state
+    of the bit that was read out of the memory address before the specified modification
+    happened. Non-atomic versions of these operations also exist; they are efficient
+    and useful for cases that might need bit manipulations, initiated from code statements
+    in a mutually exclusive critical block. These are declared in the kernel header
+    `<linux/bitops/non-atomic.h>`.
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于所有具有返回类型的操作，返回的值是在指定修改发生之前从内存地址中读取的位的旧状态。这些操作也存在非原子版本；它们对于可能需要位操作的情况是高效且有用的，这些情况是从互斥临界块中的代码语句发起的。这些在内核头文件`<linux/bitops/non-atomic.h>`中声明。
+- en: Introducing exclusion locks
+  id: totrans-48
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 引入排他锁
+- en: Hardware-specific atomic instructions can operate only on CPU word- and doubleword-size
+    data; they cannot be directly applied on shared data structures of custom size.
+    For most multi-threaded scenarios, often it can be observed that shared data is
+    of custom sizes, for example, a structure with *n* elements of various types.
+    Concurrent code paths accessing such data usually comprise a bunch of instructions
+    that are programmed to access and manipulate shared data; such access operations
+    must be executed *atomically* to prevent races. To ensure atomicity of such code
+    blocks, mutual exclusion locks are used. All multi-threading environments provide
+    implementation of exclusion locks that are based on exclusion protocols. These
+    locking implementations are built on top of hardware-specific atomic instructions.
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 硬件特定的原子指令只能操作CPU字和双字大小的数据；它们不能直接应用于自定义大小的共享数据结构。对于大多数多线程场景，通常可以观察到共享数据是自定义大小的，例如，一个具有*n*个不同类型元素的结构。访问这些数据的并发代码路径通常包括一堆指令，这些指令被编程为访问和操作共享数据；这样的访问操作必须被*原子地*执行，以防止竞争。为了确保这些代码块的原子性，使用了互斥锁。所有多线程环境都提供了基于排他协议的互斥锁的实现。这些锁定实现是建立在硬件特定的原子指令之上的。
+- en: The Linux kernel implements operation interfaces for standard exclusion mechanisms
+    such as mutual and reader-writer exclusions. It also contains support for various
+    other contemporary lightweight and lock-free synchronization mechanisms. Most
+    kernel data structures and other shared data elements such as shared buffers and
+    device registers are protected from concurrent access through appropriate exclusion-locking
+    interfaces offered by the kernel. In this section we will explore available exclusions
+    and their implementation details.
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Linux内核实现了标准排斥机制的操作接口，如互斥和读写排斥。它还包含对各种其他当代轻量级和无锁同步机制的支持。大多数内核数据结构和其他共享数据元素，如共享缓冲区和设备寄存器，都通过内核提供的适当排斥锁接口受到并发访问的保护。在本节中，我们将探讨可用的排斥机制及其实现细节。
+- en: Spinlocks
+  id: totrans-51
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 自旋锁
+- en: '**Spinlocks** are one of the simplest and lightweight mutual exclusion mechanisms
+    widely implemented by most concurrent programming environments. A spinlock implementation
+    defines a lock structure and operations that manipulate the lock structure. The
+    lock structure primarily hosts an atomic lock counter among other elements, and
+    operations interfaces include:'
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**自旋锁**是大多数并发编程环境中广泛实现的最简单和轻量级的互斥机制之一。自旋锁实现定义了一个锁结构和操作，用于操作锁结构。锁结构主要包含原子锁计数器等元素，操作接口包括：'
+- en: An **initializer routine**, that initializes a spinlock instance to the default
+    (unlock) state
+  id: totrans-53
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 一个**初始化例程**，用于将自旋锁实例初始化为默认（解锁）状态
+- en: A **lock routine**, that attempts to acquire spinlock by altering the state
+    of the lock counter atomically
+  id: totrans-54
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 一个**锁例程**，通过原子地改变锁计数器的状态来尝试获取自旋锁
+- en: An **unlock routine**, that releases the spinlock by altering counter into unlock
+    state
+  id: totrans-55
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 一个**解锁例程**，通过将计数器改变为解锁状态来释放自旋锁
+- en: When a caller context attempts to acquire spinlock while it is locked (or held
+    by another context), the lock function iteratively polls or spins for the lock
+    until available, causing the caller context to hog the CPU until lock is acquired.
+    It is due to this fact that this exclusion mechanism is aptly named spinlock.
+    It is therefore advised to ensure that code within critical sections is atomic
+    or non-blocking, so that lock can be held for a short, deterministic duration,
+    as it is apparent that holding a spinlock for a long duration could prove disastrous.
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当调用者尝试在锁定时（或被另一个上下文持有）获取自旋锁时，锁定函数会迭代地轮询或自旋直到可用，导致调用者上下文占用CPU直到获取锁。正是由于这个事实，这种排斥机制被恰当地命名为自旋锁。因此建议确保关键部分内的代码是原子的或非阻塞的，以便锁定可以持续一个短暂的、确定的时间，因为显然持有自旋锁很长时间可能会造成灾难。
+- en: As discussed, spinlocks are built around processor-specific atomic operations;
+    the architecture branch of the kernel implements core spinlock operations (assembly
+    programmed). The kernel wraps the architecture-specific implementation through
+    a generic platform-neutral interface that is directly usable by kernel service;
+    this enables portability of the service code which engages spinlocks for protection
+    of shared resources.
+  id: totrans-57
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如讨论的那样，自旋锁是围绕处理器特定的原子操作构建的；内核的架构分支实现了核心自旋锁操作（汇编编程）。内核通过一个通用的平台中立接口包装了架构特定的实现，该接口可以直接被内核服务使用；这使得使用自旋锁保护共享资源的服务代码具有可移植性。
+- en: 'Generic spinlock interfaces can be found in the kernel header `<linux/spinlock.h>`
+    while architecture-specific definitions are part of `<asm/spinlock.h>`. The generic
+    interface provides a bunch of `lock()` and `unlock()` operations, each implemented
+    for a specific use case. We will discuss each of these interfaces in the sections
+    to follow; for now, let''s begin our discussion with the standard and most basic
+    variants of `lock()` and `unlock()` operations offered by the interface. The following
+    code sample shows the usage of a basic spinlock interface:'
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通用自旋锁接口可以在内核头文件 `<linux/spinlock.h>` 中找到，而特定架构的定义是 `<asm/spinlock.h>` 的一部分。通用接口提供了一系列针对特定用例实现的
+    `lock()` 和 `unlock()` 操作。我们将在接下来的章节中讨论这些接口中的每一个；现在，让我们从接口提供的标准和最基本的 `lock()` 和
+    `unlock()` 操作变体开始我们的讨论。以下代码示例展示了基本自旋锁接口的使用：
+- en: '[PRE1]'
+  id: totrans-59
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: 'Let''s examine the implementation of these functions under the hood:'
+  id: totrans-60
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们来看看这些函数的实现细节：
+- en: '[PRE2]'
+  id: totrans-61
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: 'Kernel code implements two variants of spinlock operations; one suitable for
+    SMP platforms and the other for uniprocessor platforms. Spinlock data structure
+    and operations related to the architecture and type of build (SMP and UP) are
+    defined in various headers of the kernel source tree. Let''s familiarize ourselves
+    with the role and importance of these headers:'
+  id: totrans-62
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核代码实现了两种自旋锁操作的变体；一种适用于SMP平台，另一种适用于单处理器平台。自旋锁数据结构和与架构和构建类型（SMP和UP）相关的操作在内核源树的各个头文件中定义。让我们熟悉一下这些头文件的作用和重要性：
+- en: '`<include/linux/spinlock.h>` contains generic spinlock/rwlock declarations.'
+  id: totrans-63
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`<include/linux/spinlock.h>` 包含了通用的自旋锁/rwlock声明。'
+- en: 'The following headers are related to SMP platform builds:'
+  id: totrans-64
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下头文件与SMP平台构建相关：
+- en: '`<asm/spinlock_types.h>` contains `arch_spinlock_t/arch_rwlock_t` and initializers'
+  id: totrans-65
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<asm/spinlock_types.h>` 包含了 `arch_spinlock_t/arch_rwlock_t` 和初始化程序'
+- en: '`<linux/spinlock_types.h>` defines the generic type and initializers'
+  id: totrans-66
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_types.h>` 定义了通用类型和初始化程序'
+- en: '`<asm/spinlock.h>` contains the `arch_spin_*()` and similar low-level operation
+    implementations'
+  id: totrans-67
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<asm/spinlock.h>` 包含了 `arch_spin_*()` 和类似的低级操作实现'
+- en: '`<linux/spinlock_api_smp.h>` contains the prototypes for the `_spin_*()` APIs'
+  id: totrans-68
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_api_smp.h>` 包含了 `_spin_*()` API 的原型'
+- en: '`<linux/spinlock.h>` builds the final `spin_*()` APIs'
+  id: totrans-69
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock.h>` 构建了最终的 `spin_*()` API'
+- en: 'The following headers are related to uniprocessor (UP) platform builds:'
+  id: totrans-70
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下头文件与单处理器（UP）平台构建相关：
+- en: '`<linux/spinlock_type_up.h>` contains the generic, simplified UP spinlock type'
+  id: totrans-71
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_type_up.h>` 包含了通用的、简化的UP自旋锁类型'
+- en: '`<linux/spinlock_types.h>` defines the generic type and initializers'
+  id: totrans-72
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_types.h>` 定义了通用类型和初始化程序'
+- en: '`<linux/spinlock_up.h>` contains the `arch_spin_*()` and similar version of
+    UP builds (which are NOPs on non-debug, non-preempt builds)'
+  id: totrans-73
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_up.h>`包含了`arch_spin_*()`和UP版本的类似构建（在非调试、非抢占构建上是NOP）'
+- en: '`<linux/spinlock_api_up.h>` builds the `_spin_*()` APIs'
+  id: totrans-74
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock_api_up.h>`构建了`_spin_*()`API'
+- en: '`<linux/spinlock.h>` builds the final `spin_*()` APIs'
+  id: totrans-75
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: '`<linux/spinlock.h>`构建了最终的`spin_*()`APIs'
+- en: The generic kernel header `<linux/spinlock.h>` contains a conditional directive
+    to decide on the appropriate (SMP or UP) API to pull.
+  id: totrans-76
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通用内核头文件`<linux/spinlock.h>`包含一个条件指令，以决定拉取适当的（SMP或UP）API。
+- en: '[PRE3]'
+  id: totrans-77
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: 'The `raw_spin_lock()` and `raw_spin_unlock()` macros dynamically expand to
+    the appropriate version of spinlock operations based on the type of platform (SMP
+    or UP) chosen in the build configuration. For SMP platforms, `raw_spin_lock()`
+    expands to the `__raw_spin_lock()` operation implemented in the kernel source
+    file `kernel/locking/spinlock.c`. Following is the locking operation code defined
+    with a macro:'
+  id: totrans-78
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`raw_spin_lock()`和`raw_spin_unlock()`宏会根据构建配置中选择的平台类型（SMP或UP）动态扩展为适当版本的自旋锁操作。对于SMP平台，`raw_spin_lock()`会扩展为内核源文件`kernel/locking/spinlock.c`中实现的`__raw_spin_lock()`操作。以下是使用宏定义的锁定操作代码：'
+- en: '[PRE4]'
+  id: totrans-79
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: This routine is composed of nested loop constructs, an outer `for` loop construct,
+    and an inner `while` loop that spins until the specified condition is satisfied.
+    The first block of code in the outer loop attempts to acquire lock atomically
+    by invoking the architecture-specific `##_trylock()` routine. Notice that this
+    function is invoked with kernel preemption disabled on the local processor. If
+    lock is acquired successfully, it breaks out of the loop construct and the call
+    returns with preemption turned off. This ensures that the caller context holding
+    the lock is not preemptable during execution of a critical section. This approach
+    also ensures that no other context can contend for the same lock on the local
+    CPU until the current owner releases it.
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这个例程由嵌套的循环结构组成，一个外部`for`循环结构和一个内部`while`循环，它会一直旋转，直到指定的条件满足为止。外部循环的第一个代码块通过调用特定于体系结构的`##_trylock()`例程来原子地尝试获取锁。请注意，此函数在本地处理器上禁用内核抢占时被调用。如果成功获取锁，则跳出循环结构，并且调用返回时关闭了抢占。这确保了持有锁的调用者上下文在执行临界区时不可抢占。这种方法还确保了在当前所有者释放锁之前，没有其他上下文可以在本地CPU上争夺相同的锁。
+- en: However, if it fails to acquire lock, preemption is enabled through the `preempt_enable()`
+    call, and the caller context enters the inner loop. This loop is implemented through
+    a conditional `while` that spins until lock is found to be available. Each iteration
+    of the loop checks for lock, and when it detects that the lock is not available
+    yet, it invokes an architecture-specific relax routine (which executes a CPU-specific
+    nop instruction) before spinning again to check for lock. Recall that during this
+    time preemption is enabled; this ensures that the caller context is preemptable
+    and does not hog CPU for long duration, which can happen especially when lock
+    is highly contended. It also allows the possibility of two or more threads scheduled
+    on the same CPU to contend for the same lock, possibly by preempting each other.
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然而，如果它未能获取锁，通过`preempt_enable()`调用启用了抢占，并且调用者上下文进入内部循环。这个循环是通过一个条件`while`实现的，它会一直旋转，直到发现锁可用为止。循环的每次迭代都会检查锁，并且当它检测到锁还不可用时，会调用一个特定于体系结构的放松例程（执行特定于CPU的nop指令），然后再次旋转以检查锁。请记住，在此期间抢占是启用的；这确保了调用者上下文是可抢占的，并且不会长时间占用CPU，尤其是在锁高度争用的情况下可能发生。这也允许同一CPU上调度的两个或更多线程争夺相同的锁，可能通过相互抢占来实现。
+- en: 'When a spinning context detects that lock is available through `raw_spin_can_lock()`,
+    it breaks out of the `while` loop, causing the caller to iterate back to the beginning
+    of the outer loop (`for` loop) where it again attempts to grab lock through `##_trylock()`
+    by disabling preemption:'
+  id: totrans-82
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当旋转上下文检测到锁可用时，它会跳出`while`循环，导致调用者迭代回外部循环（`for`循环）的开始处，再次尝试通过`##_trylock()`来抓取锁，同时禁用抢占：
+- en: '[PRE5]'
+  id: totrans-83
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: Unlike the SMP variant, spinlock implementation for UP platforms is quite simple;
+    in fact, the lock routine just disables kernel preemption and puts the caller
+    into a critical section. This works since there is no possibility of another context
+    to contend for the lock with preemption suspended.
+  id: totrans-84
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 与SMP变体不同，UP平台的自旋锁实现非常简单；实际上，锁例程只是禁用内核抢占并将调用者放入临界区。这是因为在暂停抢占的情况下，没有其他上下文可能会争夺锁。
+- en: Alternate spinlock APIs
+  id: totrans-85
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 备用自旋锁API
+- en: Standard spinlock operations that we discussed so far are suitable for the protection
+    of shared resources that are accessed only from the process context kernel path.
+    However, there might be scenarios where a specific shared resource or data might
+    be accessed from both the process and interrupt context code of a kernel service.
+    For instance, think of a device driver service that might contain both process
+    context and interrupt context routines, both programmed to access the shared driver
+    buffer for execution of appropriate I/O operations.
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止我们讨论的标准自旋锁操作适用于仅从进程上下文内核路径访问的共享资源的保护。然而，可能存在一些场景，其中特定的共享资源或数据可能会从内核服务的进程上下文和中断上下文代码中访问。例如，考虑一个设备驱动程序服务，可能包含进程上下文和中断上下文例程，都编程来访问共享的驱动程序缓冲区以执行适当的I/O操作。
+- en: 'Let''s presume that a spinlock was engaged to protect the driver''s shared
+    resource from concurrent access, and all routines of the driver service (both
+    process and interrupt context) seeking access to the shared resource are programmed
+    with appropriate critical sections using standard `spin_lock()` and `spin_unlock()`
+    operations. This strategy would ensure protection of the shared resource by enforcing
+    exclusion, but can cause a *hard lock condition* on the CPU at random times, due
+    to *lock* contention by the interrupt path code on the same CPU where the *lock*
+    was held by a process context path. To further understand this, let''s assume
+    the following events occur in the same order:'
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 假设使用自旋锁来保护驱动程序的共享资源免受并发访问，并且驱动程序服务的所有例程（包括进程和中断上下文）都使用标准的`spin_lock()`和`spin_unlock()`操作编程了适当的临界区。这种策略将通过强制排斥来确保共享资源的保护，但可能会导致CPU在随机时间出现*硬锁定条件*，因为中断路径代码在同一CPU上争夺*锁*。为了进一步理解这一点，让我们假设以下事件按相同顺序发生：
+- en: Process context routine of the driver acquires *lock (*using the standard `spin_lock()`
+    call).
+  id: totrans-88
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 驱动程序的进程上下文例程获取*锁（*使用标准的`spin_lock()`调用*）。
+- en: While the critical section is in execution, an interrupt occurs and is driven
+    to the local CPU, causing the process context routine to preempt and give away
+    the CPU for interrupt handlers.
+  id: totrans-89
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 关键部分正在执行时，发生中断并被驱动到本地CPU，导致进程上下文例程被抢占并让出CPU给中断处理程序。
+- en: Interrupt context path of the driver (ISR) starts and tries to acquire *lock
+    (*using the standard `spin_lock()` call*),* which then starts to spin for *lock*
+    to be available.
+  id: totrans-90
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+  zh: 驱动程序的中断上下文路径（ISR）开始并尝试获取*锁（*使用标准的`spin_lock()`调用*），*然后开始自旋等待*锁*可用。
+- en: For the duration of the ISR, the process context is preempted and can never
+    resume execution, resulting in a *lock* that can never be released, and the CPU
+    is hard locked with a spinning interrupt handler that never yields.
+  id: totrans-91
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在ISR的持续时间内，进程上下文被抢占并且永远无法恢复执行，导致*锁*永远无法释放，并且CPU被一个永远不会放弃的自旋中断处理程序硬锁定。
+- en: 'To prevent such occurrences, the process context code needs to disable interrupts
+    on the current processor while it takes the *lock.* This will ensure that an interrupt
+    can never preempt the current context until the completion of the critical section
+    and lock release*.* Note that interrupts can still occur but are routed to other
+    available CPUs, on which the interrupt handler can spin until *lock* becomes available.
+    The spinlock interface provides an alternate locking routine `spin_lock_irqsave()`,
+    which disables interrupts on the current processor along with kernel preemption.
+    The following snippet shows the routine''s underlying code:'
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了防止这种情况发生，进程上下文代码需要在获取*锁*时禁用当前处理器上的中断。这将确保中断在临界区和锁释放*之前*永远无法抢占当前上下文。请注意，中断仍然可能发生，但会路由到其他可用的CPU上，在那里中断处理程序可以自旋，直到*锁*变为可用。自旋锁接口提供了另一种锁定例程`spin_lock_irqsave()`，它会禁用当前处理器上的中断以及内核抢占。以下代码片段显示了该例程的基础代码：
+- en: '[PRE6]'
+  id: totrans-93
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: '`local_irq_save()` is invoked to disable hard interrupts for the current processor;
+    notice how on failure to acquire the lock, interrupts are enabled by calling `local_irq_restore()`.
+    Note that a `lock` taken by the caller using `spin_lock_irqsave()` needs to be
+    unlocked using `spin_lock_irqrestore()`, which enables both kernel preemption
+    and interrupts for the current processor before releasing lock.'
+  id: totrans-94
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 调用`local_irq_save()`来禁用当前处理器的硬中断；请注意，如果未能获取锁，则通过调用`local_irq_restore()`来启用中断。请注意，使用`spin_lock_irqsave()`获取的锁需要使用`spin_lock_irqrestore()`来解锁，这会在释放锁之前为当前处理器启用内核抢占和中断。
+- en: Similar to hard interrupt handlers, it is also possible for soft interrupt context
+    routines such as *softirqs, tasklets,* and other such *bottom halves* to contend
+    for a *lock* held by the process context code on the same processor. This can
+    be prevented by disabling the execution of *bottom halves* while acquiring *lock*
+    in the process context. `spin_lock_bh()` is another variant of the locking routine
+    that takes care of suspending the execution of interrupt context bottom halves
+    on the local CPU.
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 与硬中断处理程序类似，软中断上下文例程（如*softirqs，tasklets*和其他*bottom halves*）也可能争夺同一处理器上由进程上下文代码持有的*锁*。这可以通过在进程上下文中获取*锁*时禁用*bottom
+    halves*的执行来防止。`spin_lock_bh()`是另一种锁定例程的变体，它负责挂起本地CPU上的中断上下文bottom halves的执行。
+- en: '[PRE7]'
+  id: totrans-96
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: '`local_bh_disable()` suspends bottom half execution for the local CPU. To release
+    a *lock* acquired by `spin_lock_bh()`, the caller context will need to invoke
+    `spin_unlock_bh()`, which releases spinlock and BH lock for the local CPU.'
+  id: totrans-97
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`local_bh_disable()`挂起本地CPU的bottom half执行。要释放由`spin_lock_bh()`获取的*锁*，调用者上下文将需要调用`spin_unlock_bh()`，这将释放本地CPU的自旋锁和BH锁。'
+- en: 'Following is a summarized list of the kernel spinlock API interface:'
+  id: totrans-98
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是内核自旋锁API接口的摘要列表：
+- en: '| **Function** | **Description** |'
+  id: totrans-99
+  prefs: []
+  type: TYPE_TB
+  zh: '| **函数** | **描述** |'
+- en: '| `spin_lock_init()` | Initialize spinlock |'
+  id: totrans-100
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_lock_init()` | 初始化自旋锁 |'
+- en: '| `spin_lock()` | Acquire lock, spins on contention |'
+  id: totrans-101
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_lock()` | 获取锁，在竞争时自旋 |'
+- en: '| `spin_trylock()` | Attempt to acquire lock, returns error on contention |'
+  id: totrans-102
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_trylock()` | 尝试获取锁，在竞争时返回错误 |'
+- en: '| `spin_lock_bh()` | Acquire lock by suspending BH routines on the local processor,
+    spins on contention |'
+  id: totrans-103
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_lock_bh()` | 通过挂起本地处理器上的BH例程来获取锁，在竞争时自旋 |'
+- en: '| `spin_lock_irqsave()` | Acquire lock by suspending interrupts on the local
+    processor by saving current interrupt state, spins on contention |'
+  id: totrans-104
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_lock_irqsave()` | 通过保存当前中断状态来挂起本地处理器上的中断来获取锁，在竞争时自旋 |'
+- en: '| `spin_lock_irq()` | Acquire lock by suspending interrupts on the local processor,
+    spins on contention |'
+  id: totrans-105
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_lock_irq()` | 通过挂起本地处理器上的中断来获取锁，在竞争时自旋 |'
+- en: '| `spin_unlock()` | Release the lock |'
+  id: totrans-106
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_unlock()` | 释放锁 |'
+- en: '| `spin_unlock_bh()` | Release lock and enable bottom half for the local processor
+    |'
+  id: totrans-107
+  prefs: []
+  type: TYPE_TB
+  zh: '| `spin_unlock_bh()` | 释放本地处理器的锁并启用bottom half |'
+- en: '| `spin_unlock_irqrestore()` | Release lock and restore local interrupts to
+    previous state |'
+  id: totrans-108
+  prefs: []
+  type: TYPE_TB
+  zh: '`spin_unlock_irqrestore()` | 释放锁并将本地中断恢复到先前的状态'
+- en: '| `spin_unlock_irq()` | Release lock and restore interrupts for the local processor
+    |'
+  id: totrans-109
+  prefs: []
+  type: TYPE_TB
+  zh: '`spin_unlock_irq()` | 释放锁并恢复本地处理器的中断'
+- en: '| `spin_is_locked()` | Return state of the lock, nonzero if lock is held or
+    zero if lock is available |'
+  id: totrans-110
+  prefs: []
+  type: TYPE_TB
+  zh: '`spin_is_locked()` | 返回锁的状态，如果锁被持有则返回非零，如果锁可用则返回零'
+- en: Reader-writer spinlocks
+  id: totrans-111
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 读写器自旋锁
+- en: Spinlock implementation discussed until now protects shared data by enforcing
+    standard mutual exclusion between concurrent code paths racing for shared data
+    access. This form of exclusion is not suitable for the protection of shared data
+    which is often read by concurrent code paths, with infrequent writers or updates.
+    Reader-writer locks enforce exclusion between reader and writer paths; this allows
+    concurrent readers to share lock and a reader task will need to wait for the lock
+    while a writer owns the lock. Rw-locks enforce standard exclusion between concurrent
+    writers, which is desired.
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 到目前为止讨论的自旋锁实现通过强制并发代码路径之间的标准互斥来保护共享数据的访问。这种形式的排斥不适合保护经常被并发代码路径读取的共享数据，而写入或更新很少。读写锁强制在读取器和写入器路径之间进行排斥；这允许并发读取器共享锁，而读取任务将需要等待锁，而写入器拥有锁。Rw-locks强制在并发写入器之间进行标准排斥，这是期望的。
+- en: 'Rw-locks are represented by `struct rwlock_t` declared in kernel header `<linux/rwlock_types.h>`:'
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Rw-locks由在内核头文件`<linux/rwlock_types.h>`中声明的`struct rwlock_t`表示：
+- en: '[PRE8]'
+  id: totrans-114
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: rwlocks can be initialized statically through the macro `DEFINE_RWLOCK(v_rwlock)`
+    or dynamically at runtime through `rwlock_init(v_rwlock)`.
+  id: totrans-115
+  prefs: []
+  type: TYPE_NORMAL
+  zh: rwlocks可以通过宏`DEFINE_RWLOCK(v_rwlock)`静态初始化，也可以通过`rwlock_init(v_rwlock)`在运行时动态初始化。
+- en: Reader code paths will need to invoke the `read_lock` routine.
+  id: totrans-116
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 读取器代码路径将需要调用`read_lock`例程。
+- en: '[PRE9]'
+  id: totrans-117
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'Writer code paths use the following:'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 写入器代码路径使用以下内容：
+- en: '[PRE10]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: Both read and write lock routines spin when lock is contended. The interface
+    also offers non-spinning versions of lock functions called `read_trylock()` and
+    `write_trylock()`. It also offers interrupt-disabling versions of the locking
+    calls, which are handy when either the read or write path happens to execute in
+    interrupt or bottom-half context.
+  id: totrans-120
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当锁有争用时，读取和写入锁例程都会自旋。该接口还提供了称为`read_trylock()`和`write_trylock()`的非自旋版本的锁函数。它还提供了锁定调用的中断禁用版本，当读取或写入路径恰好在中断或底半部上下文中执行时非常方便。
+- en: 'Following is a summarized list of interface operations:'
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是接口操作的摘要列表：
+- en: '| **Function** | **Description** |'
+  id: totrans-122
+  prefs: []
+  type: TYPE_TB
+  zh: '**函数** | **描述**'
+- en: '| `read_lock()` | Standard read lock interface, spins on contention |'
+  id: totrans-123
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_lock()` | 标准读锁接口，当有争用时会自旋'
+- en: '| `read_trylock()` | Attempts to acquire lock, returns error if lock is unavailable
+    |'
+  id: totrans-124
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_trylock()` | 尝试获取锁，如果锁不可用则返回错误'
+- en: '| `read_lock_bh()` | Attempts to acquire lock by suspending BH execution for
+    the local CPU, spins on contention |'
+  id: totrans-125
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_lock_bh()` | 通过挂起本地CPU的BH执行来尝试获取锁，当有争用时会自旋'
+- en: '| `read_lock_irqsave()` | Attempts to acquire lock by suspending interrupts
+    for the current CPU by saving current state of local interrupts, spins on contention
+    |'
+  id: totrans-126
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_lock_irqsave()` | 通过保存本地中断的当前状态来尝试通过挂起当前CPU的中断来获取锁，当有争用时会自旋'
+- en: '| `read_unlock()` | Releases read lock |'
+  id: totrans-127
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_unlock()` | 释放读锁'
+- en: '| `read_unlock_irqrestore()` | Releases lock held and restores local interrupts
+    to the previous state |'
+  id: totrans-128
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_unlock_irqrestore()` | 释放持有的锁并将本地中断恢复到先前的状态'
+- en: '| `read_unlock_bh()` | Releases read lock and enables BH on the local processor
+    |'
+  id: totrans-129
+  prefs: []
+  type: TYPE_TB
+  zh: '`read_unlock_bh()` | 释放读锁并在本地处理器上启用BH'
+- en: '| `write_lock()` | Standard write lock interface, spins on contention |'
+  id: totrans-130
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_lock()` | 标准写锁接口，当有争用时会自旋'
+- en: '| `write_trylock()` | Attempts to acquire lock, returns error on contention
+    |'
+  id: totrans-131
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_trylock()` | 尝试获取锁，如果有争用则返回错误'
+- en: '| `write_lock_bh()` | Attempts to acquire write lock by suspending bottom halves
+    for the local CPU, spins on contention |'
+  id: totrans-132
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_lock_bh()` | 尝试通过挂起本地CPU的底半部来获取写锁，当有争用时会自旋'
+- en: '| `wrtie_lock_irqsave()` | Attempts to acquire write lock by suspending interrupts
+    for the local CPU by saving current state of local interrupts,. spins on contention
+    |'
+  id: totrans-133
+  prefs: []
+  type: TYPE_TB
+  zh: '`wrtie_lock_irqsave()` | 通过保存本地中断的当前状态来尝试通过挂起本地CPU的中断来获取写锁，当有争用时会自旋'
+- en: '| `write_unlock()` | Releases write lock |'
+  id: totrans-134
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_unlock()` | 释放写锁'
+- en: '| `write_unlock_irqrestore()` | Releases lock and restores local interrupts
+    to the previous state |'
+  id: totrans-135
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_unlock_irqrestore()` | 释放锁并将本地中断恢复到先前的状态'
+- en: '| `write_unlock_bh()` | Releases write lock and enables BH on the local processor
+    |'
+  id: totrans-136
+  prefs: []
+  type: TYPE_TB
+  zh: '`write_unlock_bh()` | 释放写锁并在本地处理器上启用BH'
+- en: Underlying calls for all of these operations are similar to that of spinlock
+    implementations and can be found in headers specified in the aforementioned spinlock
+    section.
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 所有这些操作的底层调用与自旋锁实现的类似，并且可以在前面提到的自旋锁部分指定的头文件中找到。
+- en: Mutex locks
+  id: totrans-138
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 互斥锁
+- en: 'Spinlocks by design are better suited for scenarios where *lock* is held for
+    short, fixed intervals of time, since *busy-waiting* for an indefinite duration
+    would have a dire impact on performance of the system. However, there are ample
+    situations where a *lock* is held for longer, non-deterministic durations; **sleeping
+    locks** are precisely designed to be engaged for such situations. Kernel mutexes
+    are an implementation of sleeping locks: when a caller task attempts to acquire
+    a mutex that is unavailable (already owned by another context), it is put into
+    sleep and moved out into a wait queue, forcing a context switch allowing the CPU
+    to run other productive tasks. When the mutex becomes available, the task in the
+    wait queue is woken up and moved by the unlock path of the mutex, which can then
+    attempt to *lock* the mutex.'
+  id: totrans-139
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 自旋锁的设计更适用于锁定持续时间短、固定的情况，因为无限期的忙等待会对系统的性能产生严重影响。然而，有许多情况下锁定持续时间较长且不确定；**睡眠锁**正是为这种情况而设计的。内核互斥锁是睡眠锁的一种实现：当调用任务尝试获取一个不可用的互斥锁（已被另一个上下文拥有），它会被置于休眠状态并移出到等待队列，强制进行上下文切换，从而允许CPU运行其他有生产力的任务。当互斥锁变为可用时，等待队列中的任务将被唤醒并通过互斥锁的解锁路径移动，然后尝试*锁定*互斥锁。
+- en: 'Mutexes are represented by `struct mutex`, defined in `include/linux/mutex.h`
+    and corresponding operations implemented in the source file `kernel/locking/mutex.c`:'
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 互斥锁由`include/linux/mutex.h`中定义的`struct mutex`表示，并且相应的操作在源文件`kernel/locking/mutex.c`中实现：
+- en: '[PRE11]'
+  id: totrans-141
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: In its basic form, each mutex contains a 64-bit `atomic_long_t` counter (`owner`),
+    which is used both for holding lock state, and to store a reference to the task
+    structure of the current task owning the lock. Each mutex contains a wait-queue
+    (`wait_list`), and a spin lock(`wait_lock`) that serializes access to `wait_list`.
+  id: totrans-142
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在其基本形式中，每个互斥锁都包含一个64位的`atomic_long_t`计数器（`owner`），用于保存锁定状态，并存储当前拥有锁的任务结构的引用。每个互斥锁都包含一个等待队列（`wait_list`）和一个自旋锁（`wait_lock`），用于对`wait_list`进行串行访问。
+- en: The mutex API interface provides a set of macros and functions for initialization,
+    lock, unlock, and to access the status of the mutex. These operation interfaces
+    are defined in `<include/linux/mutex.h>`.
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 互斥锁API接口提供了一组宏和函数，用于初始化、锁定、解锁和访问互斥锁的状态。这些操作接口在`<include/linux/mutex.h>`中定义。
+- en: A mutex can be declared and initialized with the macro `DEFINE_MUTEX(name)`.
+  id: totrans-144
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 可以使用宏`DEFINE_MUTEX(name)`声明和初始化互斥锁。
+- en: There is also an option of initializing a valid mutex dynamically through `mutex_init(mutex)`.
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 还有一种选项，可以通过`mutex_init(mutex)`动态初始化有效的互斥锁。
+- en: 'As discussed earlier, on contention, lock operations put the caller thread
+    into sleep, which requires the caller thread to be put into `TASK_INTERRUPTIBLE`,
+    `TASK_UNINTERRUPTIBLE`, or `TASK_KILLABLE` states, before moving it into the mutex
+    wait list. To support this, the mutex implementation offers two variants of lock
+    operations, one for **uninterruptible** and other for **interruptible** sleep.
+    Following is a list of standard mutex operations with a short description for
+    each:'
+  id: totrans-146
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如前所述，在争用时，锁操作会将调用线程置于休眠状态，这要求在将其移入互斥锁等待列表之前，将调用线程置于`TASK_INTERRUPTIBLE`、`TASK_UNINTERRUPTIBLE`或`TASK_KILLABLE`状态。为了支持这一点，互斥锁实现提供了两种锁操作的变体，一种用于**不可中断**，另一种用于**可中断**休眠。以下是每个标准互斥锁操作的简要描述：
+- en: '[PRE12]'
+  id: totrans-147
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: 'Despite being possible blocking calls, mutex locking functions have been greatly
+    optimized for performance. They are programmed to engage fast and slow path approaches
+    while attempting lock acquisition. Let''s explore the code under the hood of the
+    locking calls to better understand fast path and slow path. The following code
+    excerpt is of the `mutex_lock()` routine from `<kernel/locking/mutex.c>`:'
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽管可能会阻塞调用，但互斥锁定函数已经针对性能进行了大幅优化。它们被设计为在尝试获取锁时采用快速路径和慢速路径方法。让我们深入了解锁定调用的代码，以更好地理解快速路径和慢速路径。以下代码摘录是来自`<kernel/locking/mutex.c>`中的`mutex_lock()`例程：
+- en: '[PRE13]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'Lock acquisition is first attempted by invoking a non-blocking fast path call
+    `__mutex_trylock_fast()`. If it fails to acquire lock through due to contention,
+    it enters slow path by invoking `__mutex_lock_slowpath()`:'
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先通过调用非阻塞的快速路径调用`__mutex_trylock_fast()`来尝试获取锁。如果由于争用而无法获取锁，则通过调用`__mutex_lock_slowpath()`进入慢速路径：
+- en: '[PRE14]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: This function is programmed to acquire lock atomically if available. It invokes
+    the `atomic_long_cmpxchg_acquire()` macro, which attempts to assign the current
+    thread as the owner of the mutex; this operation will succeed if the mutex is
+    available, in which case the function returns `true`. Should some other thread
+    own the mutex, this function will fail and return `false`. On failure, the caller
+    thread will enter the slow path routine.
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果可用，此函数被设计为原子方式获取锁。它调用`atomic_long_cmpxchg_acquire()`宏，该宏尝试将当前线程分配为互斥锁的所有者；如果互斥锁可用，则此操作将成功，此时函数返回`true`。如果某些其他线程拥有互斥锁，则此函数将失败并返回`false`。在失败时，调用线程将进入慢速路径例程。
+- en: Conventionally, the concept of slow path has always been to put the caller task
+    into sleep while waiting for the lock to become available. However, with the advent
+    of many-core CPUs, there is a growing need for scalability and improved performance,
+    so with an objective to achieve scalability, the mutex slow path implementation
+    has been reworked with an optimization called **optimistic spinning**, a.k.a.
+    **midpath**, which can improve performance considerably*.*
+  id: totrans-153
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 传统上，慢速路径的概念一直是将调用任务置于休眠状态，同时等待锁变为可用。然而，随着多核CPU的出现，人们对可伸缩性和性能的需求不断增长，因此为了实现可伸缩性，互斥锁慢速路径实现已经重新设计，引入了称为**乐观自旋**的优化，也称为**中间路径**，可以显著提高性能。
+- en: 'The core idea of optimistic spinning is to push contending tasks into poll
+    or spin instead of sleep when the mutex owner is found to be running. Once the
+    mutex becomes available (which is expected to be sooner, since the owner is found
+    to be running) it is assumed that a spinning task could always acquire it quicker
+    as compared to a suspended or sleeping task in the mutex wait list. However, such
+    spinning is only a possibility when there are no other higher-priority tasks in
+    ready state. With this feature, spinning tasks are more likely to be cache-hot,
+    resulting in deterministic execution that yields noticeable performance improvement:'
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 乐观自旋的核心思想是将竞争任务推入轮询或自旋，而不是在发现互斥体所有者正在运行时休眠。一旦互斥体变为可用（因为发现所有者正在运行，所以预计会更快），就假定自旋任务始终可以比互斥体等待列表中的挂起或休眠任务更快地获取它。但是，只有当没有其他处于就绪状态的更高优先级任务时，才有可能进行这种自旋。有了这个特性，自旋任务更有可能是缓存热点，从而产生可预测的执行，从而产生明显的性能改进：
+- en: '[PRE15]'
+  id: totrans-155
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: The `__mutex_lock_common()` function contains a slow path implementation with
+    optimistic spinning; this routine is invoked by all sleep variants of mutex locking
+    functions with appropriate flags as argument. This function first attempts to
+    acquire mutex through optimistic spinning implemented through cancellable mcs
+    spinlocks (`osq` field in mutex structure) associated with the mutex. When the
+    caller task fails to acquire mutex with optimistic spinning, as a last resort
+    this function switches to conventional slow path, resulting in the caller task
+    to be put into sleep and queued into the mutex `wait_list` until woken up by the
+    unlock path.
+  id: totrans-156
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`__mutex_lock_common()`函数包含一个带有乐观自旋的慢路径实现；这个例程由所有互斥锁定函数的睡眠变体调用，带有适当的标志作为参数。这个函数首先尝试通过与互斥体关联的可取消的mcs自旋锁（互斥体结构中的osq字段）实现乐观自旋来获取互斥体。当调用者任务无法通过乐观自旋获取互斥体时，作为最后的手段，这个函数切换到传统的慢路径，导致调用者任务进入睡眠，并排队进入互斥体的`wait_list`，直到被解锁路径唤醒。'
+- en: Debug checks and validations
+  id: totrans-157
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 调试检查和验证
+- en: Incorrect use of mutex operations can cause deadlocks, failure of exclusion,
+    and so on. To detect and prevent such possible occurrences, the mutex subsystem
+    is equipped with appropriate checks or validations instrumented into mutex operations.
+    These checks are by default disabled, and can be enabled by choosing the configuration
+    option `CONFIG_DEBUG_MUTEXES=y` during kernel build.
+  id: totrans-158
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 错误使用互斥操作可能导致死锁、排除失败等。为了检测和防止这种可能发生的情况，互斥子系统配备了适当的检查或验证，这些检查默认情况下是禁用的，可以通过在内核构建过程中选择配置选项`CONFIG_DEBUG_MUTEXES=y`来启用。
+- en: 'Following is a list of checks enforced by instrumented debug code:'
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是受检的调试代码强制执行的检查列表：
+- en: Mutex can be owned by one task at a given point in time
+  id: totrans-160
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 互斥体在给定时间点只能由一个任务拥有
+- en: Mutex can be released (unlocked) only by the valid owner, and an attempt to
+    release mutex by a context that does not own the lock will fail
+  id: totrans-161
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 互斥体只能由有效所有者释放（解锁），任何尝试由不拥有锁的上下文释放互斥体的尝试都将失败
+- en: Recursive locking or unlocking attempts will fail
+  id: totrans-162
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 递归锁定或解锁尝试将失败
+- en: A mutex can only be initialized via the initializer call, and any attempt to
+    *memset* mutex will never succeed
+  id: totrans-163
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 互斥体只能通过初始化调用进行初始化，并且任何对*memset*互斥体的尝试都不会成功
+- en: A caller task may not exit with a mutex lock held
+  id: totrans-164
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 调用者任务可能不会在持有互斥锁的情况下退出
+- en: Dynamic memory areas where held locks reside must not be freed
+  id: totrans-165
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 不得释放包含持有的锁的动态内存区域
+- en: A mutex can be initialized once, and any attempt to re-initialize an already
+    initialized mutex will fail
+  id: totrans-166
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 互斥体只能初始化一次，任何尝试重新初始化已初始化的互斥体都将失败
+- en: Mutexes may not be used in hard/soft interrupt context routines
+  id: totrans-167
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 互斥体可能不会在硬/软中断上下文例程中使用
+- en: Deadlocks can trigger due to many reasons, such as the execution pattern of
+    the kernel code and careless usage of locking calls. For instance, let's consider
+    a situation where concurrent code paths need to take ownership of *L[1]* and *L[2]*
+    locks by nesting the locking functions. It must be ensured that all the kernel
+    functions that require these locks are programmed to acquire them in the same
+    order. When such ordering is not strictly imposed, there is always a possibility
+    of two different functions trying to lock *L1* and *L2* in opposite order, which
+    could trigger lock inversion deadlock, when these functions execute concurrently.
+  id: totrans-168
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 死锁可能由许多原因触发，例如内核代码的执行模式和锁定调用的粗心使用。例如，让我们考虑这样一种情况：并发代码路径需要通过嵌套锁定函数来拥有*L[1]*和*L[2]*锁。必须确保所有需要这些锁的内核函数都被编程为以相同的顺序获取它们。当没有严格强制执行这样的顺序时，总会有两个不同的函数尝试以相反的顺序锁定*L1*和*L2*的可能性，这可能会触发锁反转死锁，当这些函数并发执行时。
+- en: 'The kernel lock validator infrastructure has been implemented to check and
+    prove that none of the locking patterns observed during kernel runtime could ever
+    cause deadlock. This infrastructure prints data pertaining to locking pattern
+    such as:'
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 内核锁验证器基础设施已经实施，以检查并证明在内核运行时观察到的任何锁定模式都不会导致死锁。此基础设施打印与锁定模式相关的数据，例如：
+- en: Point-of-acquire tracking, symbolic lookup of function names, and list of all
+    locks held in the system
+  id: totrans-170
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 获取点跟踪、函数名称的符号查找和系统中所有持有的锁列表
+- en: Owner tracking
+  id: totrans-171
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 所有者跟踪
+- en: Detection of self-recursing locks and printing out all relevant info
+  id: totrans-172
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 检测自递归锁并打印所有相关信息
+- en: Detection of lock inversion deadlocks and printing out all affected locks and
+    tasks
+  id: totrans-173
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 检测锁反转死锁并打印所有受影响的锁和任务
+- en: The lock validator can be enabled by choosing `CONFIG_PROVE_LOCKING=y` during
+    kernel build.
+  id: totrans-174
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 可以通过在内核构建过程中选择`CONFIG_PROVE_LOCKING=y`来启用锁验证器。
+- en: Wait/wound mutexes
+  id: totrans-175
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 等待/伤害互斥体
+- en: As discussed in the earlier section, unordered nested locking in the kernel
+    functions could pose a risk of lock-inversion deadlocks, and kernel developers
+    avoid this by defining rules for nested lock ordering and perform runtime checks
+    through the lock validator infrastructure. Yet, there are situations where lock
+    ordering is dynamic, and nested locking calls cannot be hardcoded or imposed as
+    per preconceived rules.
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如前一节所讨论的，在内核函数中无序的嵌套锁定可能会导致锁反转死锁的风险，内核开发人员通过定义嵌套锁定顺序的规则并通过锁验证器基础设施执行运行时检查来避免这种情况。然而，存在动态锁定顺序的情况，无法将嵌套锁定调用硬编码或根据预设规则强加。
+- en: One such use case is to do with GPU buffers; these buffers are to be owned and
+    accessed by various system entities such as GPU hardware, GPU driver, user-mode
+    applications, and other video-related drivers. User mode contexts can submit the
+    dma buffers for processing in an arbitrary order, and the GPU hardware may process
+    them at arbitrary times. If locking is used to control the ownership of the buffers,
+    and if multiple buffers must be manipulated at the same time, deadlocks cannot
+    be avoided. Wait/wound mutexes are designed to facilitate dynamic ordering of
+    nested locks, without causing lock-inversion deadlocks. This is achieved by forcing
+    the context in contention to *wound*, meaning forcing it to release the holding
+    lock.
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一个这样的用例与GPU缓冲区有关；这些缓冲区应该由各种系统实体拥有和访问，比如GPU硬件、GPU驱动程序、用户模式应用程序和其他与视频相关的驱动程序。用户模式上下文可以以任意顺序提交dma缓冲区进行处理，GPU硬件可以在任意时间处理它们。如果使用锁来控制缓冲区的所有权，并且必须同时操作多个缓冲区，则无法避免死锁。等待/伤害互斥锁旨在促进嵌套锁的动态排序，而不会导致锁反转死锁。这是通过强制争用的上下文*伤害*来实现的，意味着强制它释放持有的锁。
+- en: 'For instance, let''s presume two buffers, each protected with a lock, and further
+    consider two threads, say `T[1]` and `T`[`2`,] seek ownership of the buffers by
+    attempting locks in opposite order:'
+  id: totrans-178
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 例如，假设有两个缓冲区，每个缓冲区都受到锁的保护，进一步考虑两个线程，比如`T[1]`和`T[2]`，它们通过以相反的顺序尝试锁定来寻求对缓冲区的所有权：
+- en: '[PRE16]'
+  id: totrans-179
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: Execution of `T[1]` and `T[2]` concurrently might result in each thread waiting
+    for the lock held by the other, causing deadlock. Wait/wound mutex prevents this
+    by letting the *thread that grabbed the lock first* to remain in sleep, waiting
+    for nested lock to be available. The other thread is *wound*, causing it to release
+    its holding lock and start over again. Suppose `T[1]` got to lock on `bufA` before
+    `T[2]` could acquire lock on `bufB`. `T[1]` would be considered as the thread
+    that *got there first* and is put to sleep for lock on `bufB`, and `T[2]` would
+    be wound, causing it to release lock on `bufB` and start all over. This avoids
+    deadlock and `T[2]` would start all over when `T[1]` releases locks held.
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`T[1]`和`T[2]`的并发执行可能导致每个线程等待另一个持有的锁，从而导致死锁。等待/伤害互斥锁通过让*首先抓住锁的线程*保持睡眠，等待嵌套锁可用来防止这种情况。另一个线程被*伤害*，导致它释放其持有的锁并重新开始。假设`T[1]`在`bufA`上获得锁之前，`T[2]`可以在`bufB`上获得锁。`T[1]`将被视为*首先到达的线程*，并被放到`bufB`的锁上睡眠，`T[2]`将被伤害，导致它释放`bufB`上的锁并重新开始。这样可以避免死锁，当`T[1]`释放持有的锁时，`T[2]`将重新开始。'
+- en: 'Operation interfaces:'
+  id: totrans-181
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 操作接口：
+- en: 'Wait/wound mutexes are represented through `struct ww_mutex` defined in the
+    header `<linux/ww_mutex.h>`:'
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 等待/伤害互斥锁通过在头文件`<linux/ww_mutex.h>`中定义的`struct ww_mutex`来表示：
+- en: '[PRE17]'
+  id: totrans-183
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: The first step to use wait/wound mutex is to define a *class,* which is a mechanism
+    to represent a group of locks. When concurrent tasks contend for the same locks,
+    they must do so by specifying this class.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用等待/伤害互斥锁的第一步是定义一个*类*，这是一种表示一组锁的机制。当并发任务争夺相同的锁时，它们必须通过指定这个类来这样做。
+- en: 'A class can be defined using a macro:'
+  id: totrans-185
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 可以使用宏定义一个类：
+- en: '[PRE18]'
+  id: totrans-186
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: Each class declared is an instance of type `struct ww_class` and contains an
+    atomic counter `stamp`, which is used to hold a sequence number that records which
+    one of the contending tasks *got there first*. Other fields are used by the kernel's
+    lock validator to verify correct usage of the wait/wound mechanism.
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 声明的每个类都是`struct ww_class`类型的实例，并包含一个原子计数器`stamp`，用于记录哪个竞争任务*首先到达*的序列号。其他字段由内核的锁验证器用于验证等待/伤害机制的正确使用。
+- en: '[PRE19]'
+  id: totrans-188
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: Each contending thread must invoke `ww_acquire_init()` before attempting nested
+    locking calls. This sets up the context by assigning a sequence number to track
+    locks.
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每个竞争的线程在尝试嵌套锁定调用之前必须调用`ww_acquire_init()`。这通过分配一个序列号来设置上下文以跟踪锁。
+- en: '[PRE20]'
+  id: totrans-190
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'Once the context is set up and initialized, tasks can begin acquiring locks
+    with either `ww_mutex_lock()` or `ww_mutex_lock_interruptible()` calls:'
+  id: totrans-191
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦上下文设置和初始化，任务可以开始使用`ww_mutex_lock()`或`ww_mutex_lock_interruptible()`调用获取锁：
+- en: '[PRE21]'
+  id: totrans-192
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: 'When a task grabs all nested locks (using any of these locking routines) associated
+    with a class, it needs to notify acquisition of ownership using the function `ww_acquire_done()`.
+    This call marks the end of the acquisition phase, and the task can proceed to
+    process shared data:'
+  id: totrans-193
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当任务抓取与类相关的所有嵌套锁（使用这些锁定例程中的任何一个）时，需要使用函数`ww_acquire_done()`通知所有权的获取。这个调用标志着获取阶段的结束，任务可以继续处理共享数据：
+- en: '[PRE22]'
+  id: totrans-194
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'When a task completes its processing of shared data, it can begin releasing
+    all of the locks held, with calls to the `ww_mutex_unlock(`) routine. Once all
+    of the locks are released, the *context* must be released with a call to `ww_acquire_fini()`:'
+  id: totrans-195
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当任务完成对共享数据的处理时，可以通过调用`ww_mutex_unlock()`例程开始释放所有持有的锁。一旦所有锁都被释放，*上下文*必须通过调用`ww_acquire_fini()`来释放：
+- en: '[PRE23]'
+  id: totrans-196
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: Semaphores
+  id: totrans-197
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 信号量
+- en: Until early versions of 2.6 kernel releases, semaphores were the primary form
+    of sleep locks. A typical semaphore implementation comprises a counter, wait queue,
+    and set of operations that can increment/decrement the counter atomically.
+  id: totrans-198
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在2.6内核早期版本之前，信号量是睡眠锁的主要形式。典型的信号量实现包括一个计数器、等待队列和一组可以原子地增加/减少计数器的操作。
+- en: When a semaphore is used to protect a shared resource, its counter is initialized
+    to a number greater than zero, which is considered to be unlocked state. A task
+    seeking access to a shared resource begins by invoking the decrement operation
+    on the semaphore. This call checks the semaphore counter; if it is found to be
+    greater than zero, the counter is decremented and the function returns success.
+    However, if the counter is found to be zero, the decrement operation puts the
+    caller task to sleep until the counter is found to have increased to a number
+    greater than zero.
+  id: totrans-199
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 当信号量用于保护共享资源时，其计数器被初始化为大于零的数字，被视为解锁状态。寻求访问共享资源的任务首先通过对信号量进行减操作来开始。此调用检查信号量计数器；如果发现大于零，则将计数器减一，并返回成功。但是，如果计数器为零，则减操作将调用者任务置于睡眠状态，直到计数器增加到大于零为止。
+- en: This simple design offers great flexibility, which allows adaptability and application
+    of semaphores for different situations. For instance, for cases where a resource
+    needs to be accessible to a specific number of tasks at any point in time, the
+    semaphore count can be initialized to the number of tasks that require access,
+    say 10, which allows a maximum of 10 tasks access to shared resource at any time.
+    For yet other cases, such as a number of tasks that require mutually exclusive
+    access to a shared resource, the semaphore count can be initialized to 1, resulting
+    in a maximum of one task to access the resource at any given point in time.
+  id: totrans-200
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这种简单的设计提供了很大的灵活性，允许信号量适应和应用于不同的情况。例如，对于需要在任何时候对特定数量的任务可访问的资源的情况，信号量计数可以初始化为需要访问的任务数量，比如10，这允许最多10个任务在任何时候访问共享资源。对于其他情况，例如需要互斥访问共享资源的任务数量，信号量计数可以初始化为1，导致在任何给定时刻最多一个任务访问资源。
+- en: 'Semaphore structure and its interface operations are declared in the kernel
+    header `<include/linux/semaphore.h>`:'
+  id: totrans-201
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 信号量结构及其接口操作在内核头文件`<include/linux/semaphore.h>`中声明：
+- en: '[PRE24]'
+  id: totrans-202
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: Spinlock (the `lock` field) serves as a protection for `count`, that is, semaphore
+    operations (inc/dec) are programmed to acquire `lock` before manipulating `count`.
+    `wait_list` is used to queue tasks to sleep while they wait for the semaphore
+    count to increase beyond zero.
+  id: totrans-203
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 自旋锁（`lock`字段）用作对`count`的保护，也就是说，信号量操作（增加/减少）被编程为在操作`count`之前获取`lock`。`wait_list`用于将任务排队等待，直到信号量计数增加到零以上为止。
+- en: 'Semaphores can be declared and initialized to 1 through a macro: `DEFINE_SEMAPHORE(s)`.'
+  id: totrans-204
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 信号量可以通过宏`DEFINE_SEMAPHORE(s)`声明和初始化为1。
+- en: 'A semaphore can also be initialized dynamically to any positive number through
+    the following:'
+  id: totrans-205
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 信号量也可以通过以下方式动态初始化为任何正数：
+- en: '[PRE25]'
+  id: totrans-206
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: 'Following is a list of operation interfaces with a brief description of each.
+    Routines with naming convention `down_xxx()` attempt to decrement the semaphore,
+    and are possible blocking calls (except `down_trylock()`), while routine `up()`
+    increments the semaphore and always succeeds:'
+  id: totrans-207
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是一系列操作接口及其简要描述。命名约定为`down_xxx()`的例程尝试减少信号量，并且可能是阻塞调用（除了`down_trylock()`），而例程`up()`增加信号量并且总是成功：
+- en: '[PRE26]'
+  id: totrans-208
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: Unlike mutex implementation, semaphore operations do not support debug checks
+    or validations; this constraint is due to their inherent generic design which
+    allows them to be used as exclusion locks, event notification counters, and so
+    on. Ever since mutexes made their way into the kernel (2.6.16), semaphores are
+    no longer the preferred choice for exclusion, and the use of semaphores as locks
+    has considerably reduced, and for other purposes, the kernel has alternate interfaces.
+    Most of the kernel code using semaphores has be converted into mutexes with a
+    few minor exceptions. Yet semaphores still exist and are likely to remain at least
+    until all of the kernel code using them is converted to mutex or other suitable
+    interfaces.
+  id: totrans-209
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 与互斥锁实现不同，信号量操作不支持调试检查或验证；这个约束是由于它们固有的通用设计，允许它们被用作排他锁、事件通知计数器等。自从互斥锁进入内核（2.6.16）以来，信号量不再是排他性的首选，信号量作为锁的使用大大减少，而对于其他目的，内核有备用接口。大部分使用信号量的内核代码已经转换为互斥锁，只有少数例外。然而，信号量仍然存在，并且至少在所有使用它们的内核代码转换为互斥锁或其他合适的接口之前，它们可能会继续存在。
+- en: Reader-writer semaphores
+  id: totrans-210
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 读写信号量
+- en: 'This interface is an implementation of sleeping reader-writer exclusion, which
+    serves as an alternative for spinning ones. Reader-writer semaphores are represented
+    by `struct rw_semaphore`, declared in the kernel header `<linux/rwsem.h>`:'
+  id: totrans-211
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该接口是睡眠读写排他的实现，作为自旋的替代。读写信号量由`struct rw_semaphore`表示，在内核头文件`<linux/rwsem.h>`中声明：
+- en: '[PRE27]'
+  id: totrans-212
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: This structure is identical to that of a mutex, and is designed to support optimistic
+    spinning with `osq`; it also includes debug support through the kernel's *lockdep*.
+    `Count` serves as an exclusion counter, which is set to 1, allowing a maximum
+    of one writer to own the lock at a point in time. This works since mutual exclusion
+    is only enforced between contending writers, and any number of readers can concurrently
+    share the read lock. `wait_lock` is a spinlock which protects the semaphore `wait_list`.
+  id: totrans-213
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该结构与互斥锁的结构相同，并且设计为支持通过`osq`进行乐观自旋；它还通过内核的*lockdep*包括调试支持。`Count`用作排他计数器，设置为1，允许最多一个写者在某一时刻拥有锁。这是因为互斥仅在竞争写者之间执行，并且任意数量的读者可以同时共享读锁。`wait_lock`是一个自旋锁，用于保护信号量`wait_list`。
+- en: An `rw_semaphore` can be instantiated and initialized statically through `DECLARE_RWSEM(name)`,
+    and alternatively, it can be dynamically initialized through `init_rwsem(sem)`.
+  id: totrans-214
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`rw_semaphore`可以通过`DECLARE_RWSEM(name)`静态实例化和初始化，也可以通过`init_rwsem(sem)`动态初始化。'
+- en: 'As with the case of rw-spinlocks, this interface too offers distinct routines
+    for lock acquisition in reader and writer paths. Following is a list of interface
+    operations:'
+  id: totrans-215
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 与rw自旋锁一样，该接口也为读者和写者路径的锁获取提供了不同的例程。以下是接口操作的列表：
+- en: '[PRE28]'
+  id: totrans-216
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: These operations are implemented in the source file `<kernel/locking/rwsem.c>`;
+    the code is quite self explanatory and we will not discuss it any further.
+  id: totrans-217
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这些操作是在源文件`<kernel/locking/rwsem.c>`中实现的；代码相当自解释，我们不会进一步讨论它。
+- en: Sequence locks
+  id: totrans-218
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 序列锁
+- en: Conventional reader-writer locks are designed with reader priority, and they
+    might cause a writer task to wait for a non-deterministic duration, which might
+    not be suitable on shared data with time-sensitive updates. This is where sequential
+    lock comes in handy, as it aims at providing a quick and lock-free access to shared
+    resources. Sequential locks are best when the resource that needs to be protected
+    is small and simple, with write access being quick and non-frequent, as internally
+    sequential locks fall back on the spinlock primitive.
+  id: totrans-219
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 传统的读写锁设计为读者优先，它们可能导致写入任务等待非确定性的持续时间，这在具有时间敏感更新的共享数据上可能不合适。这就是顺序锁派上用场的地方，因为它旨在提供对共享资源的快速和无锁访问。当需要保护的资源较小且简单，写访问快速且不频繁时，顺序锁是最佳选择，因为在内部，顺序锁会退回到自旋锁原语。
+- en: 'Sequential locks introduce a special counter that is incremented every time
+    a writer acquires a sequential lock along with a spinlock. After the writer completes,
+    it releases the spinlock and increments the counter again and opens the access
+    for other writers. For read, there are two types of readers: sequence readers
+    and locking readers. The **sequence reader** checks for the counter before it
+    enters the critical section and then checks again at the end of it without blocking
+    any writer. If the counter remains the same, it implies that no writer had accessed
+    the section during read, but if there is an increment of the counter at the end
+    of the section, it is an indication that a writer had accessed, which calls for
+    the reader to re-read the critical section for updated data. A **locking reader**,
+    as the name implies, will get a lock and block other readers and writers when
+    it is in progress; it will also wait when another locking reader or writer is
+    in progress.'
+  id: totrans-220
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 顺序锁引入了一个特殊的计数器，每当写入者获取顺序锁时都会增加该计数器，并附带一个自旋锁。写入者完成后，释放自旋锁并再次增加计数器，为其他写入者打开访问。对于读取，有两种类型的读取者：序列读取者和锁定读取者。**序列读取者**在进入临界区之前检查计数器，然后在不阻塞任何写入者的情况下在临界区结束时再次检查。如果计数器保持不变，这意味着在读取期间没有写入者访问该部分，但如果在部分结束时计数器增加，则表明写入者已访问，这要求读取者重新读取临界部分以获取更新的数据。**锁定读取者**会获得锁并在进行时阻塞其他读取者和写入者；当另一个锁定读取者或写入者进行时，它也会等待。
+- en: 'A sequence lock is represented by the following type:'
+  id: totrans-221
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 序列锁由以下类型表示：
+- en: '[PRE29]'
+  id: totrans-222
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: 'We can initialize a sequence lock statically using the following macro:'
+  id: totrans-223
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以使用以下宏静态初始化序列锁：
+- en: '[PRE30]'
+  id: totrans-224
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'Actual initialization is done using the `__SEQLOCK_UNLOCKED(x)`, which is defined
+    here:'
+  id: totrans-225
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 实际初始化是使用`__SEQLOCK_UNLOCKED(x)`来完成的，其定义在这里：
+- en: '[PRE31]'
+  id: totrans-226
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: 'To dynamically initialize sequence lock, we need to use the `seqlock_init`
+    macro, which is defined as follows:'
+  id: totrans-227
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要动态初始化序列锁，我们需要使用`seqlock_init`宏，其定义如下：
+- en: '[PRE32]'
+  id: totrans-228
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE32]'
+- en: API
+  id: totrans-229
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: API
+- en: 'Linux provides many APIs for using sequence locks, which are defined in `</linux/seqlock.h>`.
+    Some of the important ones are listed here:'
+  id: totrans-230
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Linux提供了许多用于使用序列锁的API，这些API在`</linux/seqlock.h>`中定义。以下是一些重要的API：
+- en: '[PRE33]'
+  id: totrans-231
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE33]'
+- en: 'The following two functions are used for reading by starting and finalizing
+    a read section:'
+  id: totrans-232
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下两个函数用于通过开始和完成读取部分：
+- en: '[PRE34]'
+  id: totrans-233
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE34]'
+- en: Completion locks
+  id: totrans-234
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 完成锁
+- en: '**Completion locks** are an efficient way to achieve code synchronization if
+    you need one or multiple threads of execution to wait for completion of some event,
+    such as waiting for another process to reach a point or state. Completion locks
+    may be preferred over a semaphore for a couple of reasons: multiple threads of
+    execution can wait for a completion, and using `complete_all()`, they can all
+    be released at once. This is way better than a semaphore waking up to multiple
+    threads. Secondly, semaphores can lead to race conditions if a waiting thread
+    deallocates the synchronization object; this problem doesn’t exist when using
+    completion.'
+  id: totrans-235
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '**完成锁**是一种有效的方式来实现代码同步，如果需要一个或多个执行线程等待某个事件的完成，比如等待另一个进程达到某个点或状态。完成锁可能比信号量更受欢迎，原因有几点：多个执行线程可以等待完成，并且使用`complete_all()`，它们可以一次性全部释放。这比信号量唤醒多个线程要好得多。其次，如果等待线程释放同步对象，信号量可能导致竞争条件；使用完成时，这个问题就不存在。'
+- en: 'Completion can be used by including `<linux/completion.h>` and by creating
+    a variable of type `struct completion`, which is an opaque structure for maintaining
+    the state of completion. It uses a FIFO to queue the threads waiting for the completion
+    event:'
+  id: totrans-236
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 通过包含`<linux/completion.h>`并创建一个`struct completion`类型的变量来使用完成结构，这是一个用于维护完成状态的不透明结构。它使用FIFO来排队等待完成事件的线程：
+- en: '[PRE35]'
+  id: totrans-237
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE35]'
+- en: Completion basically consists of initializing the completion structure, waiting
+    through any of the variants of `wait_for_completion()` call, and finally signalling
+    the completion through `complete()` or the `complete_all()` call. There are also
+    functions to check the state of completions during its lifetime.
+  id: totrans-238
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 完成基本上包括初始化完成结构，通过`wait_for_completion()`调用的任何变体等待，最后通过`complete()`或`complete_all()`调用发出完成信号。在其生命周期中还有函数来检查完成的状态。
+- en: Initialization
+  id: totrans-239
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 初始化
+- en: 'The following macro can be used for static declaration and initialization of
+    a completion structure:'
+  id: totrans-240
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下宏可用于静态声明和初始化完成结构：
+- en: '[PRE36]'
+  id: totrans-241
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE36]'
+- en: 'The following inline function will initialize a dynamically created completion
+    structure:'
+  id: totrans-242
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下内联函数将初始化动态创建的完成结构：
+- en: '[PRE37]'
+  id: totrans-243
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE37]'
+- en: 'The following inline function will be used to reinitialize a completion structure
+    if you need to reuse it. This can be used after `complete_all()`:'
+  id: totrans-244
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下内联函数将用于在需要重用时重新初始化完成结构。这可以在`complete_all()`之后使用：
+- en: '[PRE38]'
+  id: totrans-245
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE38]'
+- en: Waiting for completion
+  id: totrans-246
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 等待完成
+- en: 'If any thread needs to wait for a task to complete, it will call `wait_for_completion()`
+    on the initialized completion structure. If the `wait_for_completion` operation
+    happens after the call to `complete()` or `complete_all()`, the thread simply
+    continues, as the reason it wanted to wait for has been satisfied; else, it waits
+    till `complete()` is signalled. There are variants available for the `wait_for_completion()`
+    calls:'
+  id: totrans-247
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果任何线程需要等待任务完成，它将在初始化的完成结构上调用`wait_for_completion（）`。如果`wait_for_completion`操作发生在调用`complete（）`或`complete_all（）`之后，则线程将简单地继续，因为它想要等待的原因已经得到满足；否则，它将等待直到`complete（）`被发出信号。对于`wait_for_completion（）`调用有可用的变体：
+- en: '[PRE39]'
+  id: totrans-248
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE39]'
+- en: Signalling completion
+  id: totrans-249
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 完成信号
+- en: 'The execution thread that wants to signal the completion of the intended task
+    calls `complete()` to a waiting thread so that it can continue. Threads will be
+    awakened in the same order in which they were queued. In the case of multiple
+    waiters, it calls `complete_all()`:'
+  id: totrans-250
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 希望发出完成预期任务的执行线程调用`complete（）`向等待的线程发出信号，以便它可以继续。线程将按照它们排队的顺序被唤醒。在有多个等待者的情况下，它调用`complete_all（）`：
+- en: '[PRE40]'
+  id: totrans-251
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE40]'
+- en: Summary
+  id: totrans-252
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: Throughout this chapter, we not only understood the various protection and synchronization
+    mechanisms provided by the kernel, but also made an underlying attempt at appreciating
+    the effectiveness of these options, with their varied functionalities and shortcomings.
+    Our takeaway from this chapter has to be the tenacity with which the kernel addresses
+    these varying complexities for providing protection and synchronization of data.
+    Another notable fact remains in the way the kernel maintains ease of coding along
+    with design panache when tackling these issues.
+  id: totrans-253
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们不仅了解了内核提供的各种保护和同步机制，还试图欣赏这些选项的有效性，以及它们的各种功能和缺陷。本章的收获必须是内核处理这些不同复杂性以提供数据保护和同步的坚韧性。另一个值得注意的事实是内核在处理这些问题时保持了编码的便利性和设计的优雅。
+- en: In our next chapter, we will look at another crucial aspect of how interrupts
+    are handled by the kernel.
+  id: totrans-254
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们的下一章中，我们将看一下中断如何由内核处理的另一个关键方面。

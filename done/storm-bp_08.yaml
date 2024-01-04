@@ -1,0 +1,1299 @@
+- en: Chapter 8. Natural Language Processing
+  id: totrans-0
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 第8章。自然语言处理
+- en: Some people believe Storm will eventually replace Hadoop as demand increases
+    for real-time analytics and data processing. In this chapter, we will see how
+    Storm and Hadoop actually complement each other.
+  id: totrans-1
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有些人认为随着对实时分析和数据处理的需求增加，Storm最终会取代Hadoop。在本章中，我们将看到Storm和Hadoop实际上是如何互补的。
+- en: Although Storm blurs the lines between traditional **On-Line Transactional Processing**
+    (**OLTP**) and **On-Line Analytical Processing** (**OLAP**), it can handle a high
+    volume of transactions while performing aggregations and dimensional analysis
+    typically associated with data warehouses. It is often the case that you still
+    need additional infrastructure to perform historical analysis and to support ad
+    hoc queries across the entire dataset. Additionally, batch processing is often
+    used to correct anomalies where the OLTP system cannot ensure consistency in the
+    event of failures. This is exactly what we encountered in the Storm-Druid integration.
+  id: totrans-2
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 尽管Storm模糊了传统OLTP和OLAP之间的界限，但它可以处理大量交易，同时执行通常与数据仓库相关的聚合和维度分析。通常情况下，您仍然需要额外的基础设施来执行历史分析，并支持整个数据集的临时查询。此外，批处理通常用于纠正OLTP系统无法在故障发生时确保一致性的异常情况。这正是我们在Storm-Druid集成中遇到的情况。
+- en: For these reasons, batch processing infrastructure is often paired with real-time
+    infrastructure. Hadoop provides us with such a batch processing framework. In
+    this chapter, we will implement an architecture that supports historical and ad
+    hoc analyses via batch processing.
+  id: totrans-3
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 出于这些原因，批处理基础设施通常与实时基础设施配对使用。Hadoop为我们提供了这样一个批处理框架。在本章中，我们将实现一个支持历史和临时分析的架构，通过批处理。
+- en: 'This chapter covers the following topics:'
+  id: totrans-4
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章涵盖以下主题：
+- en: The CAP theorem
+  id: totrans-5
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: CAP定理
+- en: Lambda architectures
+  id: totrans-6
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: Lambda架构
+- en: OLTP and OLAP integration
+  id: totrans-7
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: OLTP和OLAP集成
+- en: An introduction to Hadoop
+  id: totrans-8
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: Hadoop简介
+- en: Motivating a Lambda architecture
+  id: totrans-9
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 激发Lambda架构
+- en: First, from a logical perspective, let's take a look at the Storm-Druid integration.
+    Storm, and more specifically Trident, is able to perform distributed analytics
+    because it isolates state transitions. To do this, Storm makes certain assumptions
+    about the underlying persistence mechanisms for state. Storm assumes that the
+    persistence mechanism is both *consistent* and *available*. Specifically, Storm
+    assumes that once a state transition is made, that new state is shared, consistent
+    across all nodes, and immediately available.
+  id: totrans-10
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，从逻辑角度来看，让我们看一下Storm-Druid集成。Storm，特别是Trident，能够执行分布式分析，因为它隔离了状态转换。为了做到这一点，Storm对状态的基础持久性机制做出了一些假设。Storm假设持久性机制既是*一致的*又是*可用的*。具体来说，Storm假设一旦进行了状态转换，新状态就会被共享，在所有节点上保持一致，并立即可用。
+- en: 'From the CAP theorem, we know that it is difficult for any distributed system
+    to provide all three of the following guarantees simultaneously:'
+  id: totrans-11
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 根据CAP定理，我们知道任何分布式系统要同时提供以下三个保证是困难的：
+- en: '**Consistency**: The state is the same across all nodes'
+  id: totrans-12
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 一致性：所有节点上的状态相同
+- en: '**Availability**: The system can respond to a query with either success or
+    failure'
+  id: totrans-13
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 可用性：系统可以对查询做出成功或失败的响应
+- en: '**Partition Tolerance**: The system continues to respond despite loss of communication
+    or partial system failure'
+  id: totrans-14
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+  zh: 分区容错性：系统在通信丢失或部分系统故障的情况下仍能做出响应
+- en: More and more, web-scale architectures integrate persistence mechanisms that
+    take a relaxed approach to Consistency in order to meet Availability and Partition
+    Tolerance requirements. Often, these systems do so because the coordination required
+    to provide transactional consistency across the entire system becomes untenable
+    in large distributed systems. Performance and throughput are more important.
+  id: totrans-15
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 越来越多的Web规模架构集成了对一致性采取宽松态度的持久性机制，以满足可用性和分区容错性的要求。通常，这些系统这样做是因为在大型分布式系统中提供整个系统的事务一致性所需的协调变得不可行。性能和吞吐量更重要。
+- en: 'Druid made these same trade-offs. If we take a look at the persistence model
+    for Druid, we see a few different stages:'
+  id: totrans-16
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Druid也做出了同样的权衡。如果我们看一下Druid的持久性模型，我们会看到几个不同的阶段：
+- en: '![Motivating a Lambda architecture](img/8294OS_08_01.jpg)'
+  id: totrans-17
+  prefs: []
+  type: TYPE_IMG
+  zh: '![激发Lambda架构](img/8294OS_08_01.jpg)'
+- en: First, Druid consumes the data via the `Firehose` interface and places that
+    data in the memory. Second, the data is persisted to the disk and the `Firehose`
+    implementation is notified via the `Runnable` interface. Finally, this data is
+    pushed to **Deep Storage**, which makes the data available to other parts of the
+    system.
+  id: totrans-18
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，Druid通过`Firehose`接口消耗数据并将数据放入内存。其次，数据被持久化到磁盘，并通过`Runnable`接口通知`Firehose`实现。最后，这些数据被推送到**深度存储**，使数据对系统的其他部分可用。
+- en: Now, if we consider the implications of inconsistent data to fault tolerance,
+    we see that the data is at risk until it is persisted in Deep Storage. If we lose
+    that node, we lose the analytics for all the data on that node we have consumed
+    thus far via Storm, because we have already acknowledged the tuples.
+  id: totrans-19
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，如果我们考虑不一致数据对容错性的影响，我们会发现数据在持久存储之前是有风险的。如果我们丢失了某个节点，我们就会失去该节点上所有数据的分析，因为我们已经确认了元组。
+- en: One obvious solution to this problem is to push the segment to Deep Storage
+    prior to acknowledging the tuples in Storm. This would be acceptable, but it would
+    create a tenuous relationship between Storm and Druid. Specifically, batch sizes
+    and timeouts would need to align with segment sizes and the timing of Druid's
+    segment push to Deep Storage. If described in another way, the throughput of our
+    transactional processing system would be limited and intimately tied to the system
+    we are using for analytical processing. In the end, that is a dependency we most
+    likely do not want.
+  id: totrans-20
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 解决这个问题的一个明显的方法是在承认Storm中的元组之前将段推送到深度存储。这是可以接受的，但它会在Storm和Druid之间创建一个脆弱的关系。具体来说，批处理大小和超时需要与段大小和Druid的段推送到深度存储的时间保持一致。换句话说，我们的事务处理系统的吞吐量将受到限制，并与我们用于分析处理的系统密切相关。最终，这很可能是我们不想要的依赖关系。
+- en: However, we still want real-time analytics and are willing to tolerate those
+    analytics missing some portion of the data in the unlikely event of a partial
+    system failure. From this perspective, this integration is satisfactory. Ideally
+    though, we would have a mechanism to correct and recover from any fault. To do
+    this, we will introduce an offline batch processing mechanism to recover and correct
+    data in the event of a failure.
+  id: totrans-21
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然而，我们仍然希望进行实时分析，并愿意容忍在部分系统故障的情况下，这些分析可能会缺少一部分数据。从这个角度来看，这种集成是令人满意的。但理想情况下，我们希望有一种机制来纠正和恢复任何故障。为此，我们将引入离线批处理机制，以在发生故障时恢复和纠正数据。
+- en: For this to work, we will first persist the data prior to sending the data to
+    Druid. Our batch processing system will read the data from that persistence mechanism
+    offline. The batch processing system will be able to correct/update any data that
+    the system may have lost during real-time processing. Combining these approaches,
+    we can achieve the throughput we need during real-time processing with analytics
+    that are accurate until there is a system failure and a mechanism that corrects
+    those analytics if/when a failure occurs.
+  id: totrans-22
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 为了使这项工作，我们将首先在将数据发送到Druid之前持久化数据。我们的批处理系统将离线从持久性机制中读取数据。批处理系统将能够纠正/更新系统在实时处理期间可能丢失的任何数据。通过结合这些方法，我们可以在实时处理中实现所需的吞吐量，并且分析结果准确，直到系统发生故障，并且有一种机制可以在发生故障时纠正这些分析。
+- en: 'The de facto standard for distributed batch processing is Hadoop. Thus, we
+    will incorporate the use of Hadoop for historical (that is, non-real-time) analytics.
+    The following diagram depicts the pattern we will use here:'
+  id: totrans-23
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 分布式批处理的事实标准是Hadoop。因此，我们将在这里使用Hadoop进行历史（即非实时）分析。以下图表描述了我们将在这里使用的模式：
+- en: '![Motivating a Lambda architecture](img/8294OS_08_02.jpg)'
+  id: totrans-24
+  prefs: []
+  type: TYPE_IMG
+  zh: 激励Lambda架构
+- en: The preceding pattern shows how we can integrate OLTP and OLAP systems successfully
+    while mostly providing consistent and complete analytics in real time with high
+    throughput, availability, and partitioning. It also simultaneously provides mechanisms
+    to account for partial system failures.
+  id: totrans-25
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 前面的模式显示了我们如何成功地集成OLTP和OLAP系统，同时在大部分情况下提供一致和完整的实时高吞吐量、可用性和分区分析。它同时提供了解决部分系统故障的机制。
+- en: The other gap that this approach fills is the ability to introduce new analytics
+    into the system. Since the Storm-Druid integration focuses on the real-time problem,
+    there is no easy way to introduce new analyses into the system. Hadoop closes
+    that gap since it can run over the historical data to populate new dimensions
+    or perform additional aggregations.
+  id: totrans-26
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 这种方法填补的另一个空白是能够将新的分析引入系统。由于Storm-Druid集成侧重于实时问题，因此没有简单的方法将新的分析引入系统。 Hadoop填补了这个空白，因为它可以在历史数据上运行以填充新的维度或执行额外的聚合。
+- en: Nathan Marz, the original author of Storm, refers to this approach as a **Lambda
+    architecture**.
+  id: totrans-27
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Storm的原始作者Nathan Marz将这种方法称为**Lambda架构**。
+- en: Examining our use case
+  id: totrans-28
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 检查我们的用例
+- en: Now, let's apply this pattern to the field of **Natural Language Processing**
+    (**NLP**). In this use case, we will search Twitter for relevant tweets for a
+    phrase (for example, "Apple Jobs"). The system will then process those tweets
+    trying to find the most relevant words. Using Druid to aggregate the terms, we
+    will be able to trend the most relevant words over time.
+  id: totrans-29
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们将这种模式应用到**自然语言处理**（**NLP**）领域。在这个用例中，我们将搜索Twitter上与短语（例如“Apple Jobs”）相关的推文。然后系统将处理这些推文，试图找到最相关的单词。使用Druid来聚合这些术语，我们将能够随时间趋势最相关的单词。
+- en: Let's define the problem a little more. Given a search phrase *p*, using the
+    Twitter API, we will find the most relevant sets of Tweets, *T*. For each tweet,
+    *t* in *T*, we will count the occurrences of each word, *w*. We will compare the
+    frequency of that word in the tweets with the frequency of that word in a sample
+    of English text, *E*. The system will then rank those words and display the top
+    20 results.
+  id: totrans-30
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们更详细地定义问题。给定搜索短语*p*，使用Twitter API，我们将找到最相关的一组推文*T*。对于*T*中的每条推文*t*，我们将计算每个单词*w*的出现次数。我们将比较推文中该单词的频率与英文文本样本*E*中该单词的频率。然后系统将对这些单词进行排名，并显示前20个结果。
+- en: 'Mathematically, this equates to the following:'
+  id: totrans-31
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 从数学上讲，这相当于以下形式：
+- en: '![Examining our use case](img/equation_1.jpg)'
+  id: totrans-32
+  prefs: []
+  type: TYPE_IMG
+  zh: 查看我们的用例
+- en: 'Here, the frequency of a word *w* in a corpus *C* is as follows:'
+  id: totrans-33
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这里，语料库*C*中单词*w*的频率如下：
+- en: '![Examining our use case](img/equation_2.jpg)'
+  id: totrans-34
+  prefs: []
+  type: TYPE_IMG
+  zh: 检查我们的用例
+- en: 'Since we are only concerned with the relative frequency, and the total count
+    of words in *T* and words in *E* are constant across all words, we can ignore
+    them in the equations, reducing the complexity of the problem to the following:'
+  id: totrans-35
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 由于我们只关心相对频率，并且*T*中的单词总数和*E*中的单词总数在所有单词中都是恒定的，我们可以在方程中忽略它们，从而降低问题的复杂性，简化为以下形式：
+- en: '![Examining our use case](img/equation_3.jpg)'
+  id: totrans-36
+  prefs: []
+  type: TYPE_IMG
+  zh: 检查我们的用例
+- en: 'For the denominator, we will use a freely available word frequency list from
+    the following link:'
+  id: totrans-37
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于分母，我们将使用以下链接中的免费可用单词频率列表：
+- en: '[http://invokeit.wordpress.com/frequency-word-lists/](http://invokeit.wordpress.com/frequency-word-lists/)'
+  id: totrans-38
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '[http://invokeit.wordpress.com/frequency-word-lists/](http://invokeit.wordpress.com/frequency-word-lists/)'
+- en: We will use Storm to process the results of the Twitter search and enrich the
+    tuple with the count information for the denominator. Druid will then count the
+    occurrences for the numerator, and we will use a post-aggregation function to
+    perform the actual relevance calculation.
+  id: totrans-39
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们将使用Storm来处理Twitter搜索的结果，并使用计数信息为分母来丰富元组。然后Druid将对分子进行计数，并使用后聚合函数来执行实际的相关性计算。
+- en: Realizing a Lambda architecture
+  id: totrans-40
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 实现Lambda架构
+- en: For this use case, we are focusing on a distributed computing pattern that integrates
+    a real-time processing platform (that is, Storm) with an analytics engine (that
+    is, Druid); we then pair it with an offline batch processing mechanism (that is,
+    Hadoop) to ensure we have accurate historical metrics.
+  id: totrans-41
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于这个用例，我们专注于一个分布式计算模式，它将实时处理平台（即Storm）与分析引擎（即Druid）集成起来；然后将其与离线批处理机制（即Hadoop）配对，以确保我们拥有准确的历史指标。
+- en: While that remains the focus, the other key goal we are trying to achieve is
+    continuous availability and fault tolerance. More specifically, the system should
+    tolerate the permanent loss of a node or even a data center. To achieve this kind
+    of availability and fault tolerance, we need to focus a bit more on the persistence.
+  id: totrans-42
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 虽然这仍然是重点，但我们试图实现的另一个关键目标是持续可用性和容错。更具体地说，系统应该能够容忍节点或者甚至数据中心的永久丢失。为了实现这种可用性和容错，我们需要更多地关注持久性。
+- en: In a live system, we would use a distributed storage mechanism for persistence,
+    ideally a storage mechanism that supported replication across data centers. Thus,
+    even in a disastrous scenario, whereby a data center is entirely lost, the system
+    can recover without losing data. When interacting with the persistent store, the
+    client will demand a consistency level that replicates data across multiple data
+    centers within the transaction.
+  id: totrans-43
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在一个实时系统中，我们会使用分布式存储机制进行持久化，理想情况下是支持跨数据中心复制的存储机制。因此，即使在灾难情况下，一个数据中心完全丢失，系统也能够在不丢失数据的情况下恢复。在与持久存储交互时，客户端将要求一个一致性级别，该级别在事务中复制数据到多个数据中心。
+- en: For this discussion, assume we are using Cassandra as our persistence mechanism.
+    With Cassandra, which has tunable consistency, writes will use a consistency level
+    of `EACH_QUORUM`. This ensures that a copy of the data is written consistently
+    to all data centers. Of course, this introduces the overhead of interdata center
+    communication on each write. For less critical applications, `LOCAL_QUORUM` is
+    most likely acceptable, which avoids the latency of interdata center communication.
+  id: totrans-44
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这次讨论中，假设我们使用Cassandra作为我们的持久化机制。对于Cassandra，具有可调一致性的写入将使用`EACH_QUORUM`一致性级别。这确保了数据的副本一致地写入到所有数据中心。当然，这会在每次写入时引入数据中心间通信的开销。对于不太关键的应用程序，`LOCAL_QUORUM`可能是可以接受的，它避免了数据中心间通信的延迟。
+- en: 'Another benefit of using a distributed storage engine such as Cassandra is
+    that a separate ring/cluster could be set up for offline / batch processing. Hadoop
+    could then use that ring as the input, allowing the system to reingest the historical
+    data without impacting transactional processing. Consider the following architecture
+    diagram:'
+  id: totrans-45
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 使用Cassandra等分布式存储引擎的另一个好处是，可以为离线/批处理设置一个单独的环/集群。然后Hadoop可以使用该环作为输入，使系统能够重新摄入历史数据而不影响事务处理。考虑以下架构图：
+- en: '![Realizing a Lambda architecture](img/8294OS_08_03.jpg)'
+  id: totrans-46
+  prefs: []
+  type: TYPE_IMG
+  zh: '![实现Lambda架构](img/8294OS_08_03.jpg)'
+- en: In the preceding diagram, we have two physical data centers, each with a Cassandra
+    cluster servicing the transactional processing within Storm. This ensures that
+    any write from the topology will replicate in real time to the data center, either
+    before the tuple is acknowledged, if we use `EACH_QUORUM` consistency, or lazily,
+    if we use `LOCAL_QUORUM`.
+  id: totrans-47
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上图中，我们有两个物理数据中心，每个数据中心都有一个为Storm提供事务处理的Cassandra集群。这确保了拓扑中的任何写入都会实时复制到数据中心，无论是在元组被确认之前（如果我们使用`EACH_QUORUM`一致性）还是在懒惰地（如果我们使用`LOCAL_QUORUM`）。
+- en: Additionally, we have a third *virtual* data center supporting the offline batch
+    processing. **Ring 3** is a Cassandra cluster that is physically collocated with
+    **Ring 1** but is configured as a second data center within Cassandra. When we
+    run the Hadoop job to process the historical metrics, we can use a `LOCAL_QUORUM`.
+    Since local quorum seeks to gain consensus within the local data center, read
+    traffic from Hadoop will not cross over into our transactional processing cluster.
+  id: totrans-48
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，我们有第三个*虚拟*数据中心支持离线批处理。**Ring 3**是一个Cassandra集群，物理上与**Ring 1**相邻，但在Cassandra中配置为第二个数据中心。当我们运行Hadoop作业处理历史指标时，我们可以使用`LOCAL_QUORUM`。由于本地四分位数试图在本地数据中心内获得共识，来自Hadoop的读取流量不会跨越到我们的事务处理集群。
+- en: In general, this is a great pattern to deploy if your organization has data
+    scientists/stewards that are running analyses on your data. Often, these jobs
+    are data intensive. Isolating this workload from the transactional system is important.
+  id: totrans-49
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 总的来说，如果你的组织有数据科学家/数据管理者在对数据进行分析，部署这种模式是一个很好的选择。通常，这些工作对数据要求很高。将这种工作负载与事务系统隔离开是很重要的。
+- en: Additionally, and arguably just as important as our ability to tolerate faults
+    in the system, this architecture allows us to introduce new analytics into the
+    system that we did not have at the time of data ingestion. Hadoop can run over
+    all the relevant historical data using a new analytics configuration to populate
+    new dimensions or perform additional aggregations.
+  id: totrans-50
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此外，和我们在系统中容忍故障的能力一样重要的是，这种架构使我们能够在数据摄入时没有的情况下引入新的分析。Hadoop可以使用新的分析配置运行所有相关的历史数据，以填充新的维度或执行额外的聚合。
+- en: Designing the topology for our use case
+  id: totrans-51
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 为我们的用例设计拓扑
+- en: 'For this example, we will again use Trident and build on the topology that
+    we constructed in the previous chapter. The Trident topology is depicted as follows:'
+  id: totrans-52
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这个例子中，我们将再次使用 Trident，并在前一章中构建的拓扑的基础上进行扩展。Trident 拓扑如下所示：
+- en: '![Designing the topology for our use case](img/8294OS_08_04.jpg)'
+  id: totrans-53
+  prefs: []
+  type: TYPE_IMG
+  zh: '![为我们的用例设计拓扑](img/8294OS_08_04.jpg)'
+- en: The `TwitterSpout` performs the search against the Twitter API periodically,
+    emitting the tweets that it returns into a Trident stream. The `TweetSplitterFunction`
+    then parses the tweets and emits a tuple for each word in the tweets. The `WordFrequencyFunction`
+    enriches each tuple with the count for that word from a random sample of the English
+    language. Finally, we let Druid consume that information to perform the aggregations
+    over time. Druid partitions the data into temporal slices and persists that data
+    as described previously.
+  id: totrans-54
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`TwitterSpout` 定期针对 Twitter API 进行搜索，将返回的 tweets 发射到 Trident 流中。`TweetSplitterFunction`
+    然后解析 tweets，并为每个单词发射一个元组。`WordFrequencyFunction` 为每个单词的元组添加来自英语语言的随机样本的计数。最后，我们让
+    Druid 消费这些信息，以执行随时间的聚合。Druid 将数据分区为时间切片，并像之前描述的那样持久化数据。'
+- en: In this case, because the persistence mechanism is our means of addressing fault
+    tolerance/system failure, the persistence mechanism should distribute storage
+    and provide both consistency and high-availability. Additionally, Hadoop should
+    be capable of using the persistence mechanism as an input into a map/reduce job.
+  id: totrans-55
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在这种情况下，因为持久化机制是我们解决容错/系统故障的手段，所以持久化机制应该分发存储，并提供一致性和高可用性。此外，Hadoop 应该能够使用持久化机制作为
+    map/reduce 作业的输入。
+- en: With its tunable consistency and support for Hadoop, Cassandra makes for an
+    ideal persistence mechanism for this pattern. Since Cassandra and polyglot persistence
+    are covered elsewhere, we will keep this example simple and use the local file
+    storage.
+  id: totrans-56
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 由于其可调整的一致性和对 Hadoop 的支持，Cassandra 是这种模式的理想持久化机制。由于 Cassandra 和多语言持久化已在其他地方进行了介绍，我们将保持这个例子简单，并使用本地文件存储。
+- en: Implementing the design
+  id: totrans-57
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 实施设计
+- en: Let's first examine the real-time portion of the system beginning with the spout
+    through to the Druid persistence. The topology is straightforward and mimics topologies
+    we have written in previous chapters.
+  id: totrans-58
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们首先从 spout 开始，逐步分析实时部分，直到 Druid 持久化。拓扑很简单，模仿了我们在前几章中编写的拓扑。
+- en: 'The following are the critical lines of the topology:'
+  id: totrans-59
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是拓扑的关键行：
+- en: '[PRE0]'
+  id: totrans-60
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE0]'
+- en: 'In the end, after parsing and enrichment, the tuples have four fields as shown
+    in the following table:'
+  id: totrans-61
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，在解析和丰富之后，元组有四个字段，如下表所示：
+- en: '| Field name | Use |'
+  id: totrans-62
+  prefs: []
+  type: TYPE_TB
+  zh: '| 字段名称 | 用途 |'
+- en: '| --- | --- |'
+  id: totrans-63
+  prefs: []
+  type: TYPE_TB
+  zh: '| --- | --- |'
+- en: '| `searchphrase` | This field contains the search phrase being ingested. This
+    is the phrase sent to the Twitter API. In reality, the system would most likely
+    be monitoring multiple search phrases at a time. In this system, the value is
+    hardcoded. |'
+  id: totrans-64
+  prefs: []
+  type: TYPE_TB
+  zh: '| `searchphrase` | 这个字段包含正在被摄取的搜索短语。这是发送到 Twitter API 的短语。在现实中，系统很可能会同时监视多个搜索短语。在这个系统中，这个值是硬编码的。|'
+- en: '| `tweet` | This field contains tweets that are returned when searching the
+    Twitter API for `searchphrase`. There is a 1:n relationship between `searchphrase`
+    and `tweet`. |'
+  id: totrans-65
+  prefs: []
+  type: TYPE_TB
+  zh: '| `tweet` | 这个字段包含在搜索 Twitter API 时返回的 tweets。`searchphrase` 和 `tweet` 之间是一对多的关系。|'
+- en: '| `word` | After parsing, this field contains the words found in the tweets.
+    There is a 1:n relationship between `tweet` and `word`. |'
+  id: totrans-66
+  prefs: []
+  type: TYPE_TB
+  zh: '| `word` | 解析后，这个字段包含在 tweets 中找到的单词。`tweet` 和 `word` 之间是一对多的关系。|'
+- en: '| `baseline` | This field contains the count associated with the word in an
+    ordinary sampled text. There is a 1:1 relationship between `word` and `baseline`.
+    |'
+  id: totrans-67
+  prefs: []
+  type: TYPE_TB
+  zh: '| `baseline` | 这个字段包含普通抽样文本中与单词相关的计数。`word` 和 `baseline` 之间是一对一的关系。|'
+- en: TwitterSpout/TweetEmitter
+  id: totrans-68
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: TwitterSpout/TweetEmitter
+- en: Now, let's take a look at the spout/emitter. For this example, we will use the
+    Twitter4J API, and the `Emitter` function is not much more than a thin glue layer
+    between that API and the Storm API. As shown previously, it simply invokes the
+    Twitter API using Twitter4J and emits all the results as a single batch within
+    Storm.
+  id: totrans-69
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们来看看 spout/emitter。在这个例子中，我们将使用 Twitter4J API，`Emitter` 函数不过是该 API 和 Storm
+    API 之间的薄胶层。如前所示，它只是使用 Twitter4J 调用 Twitter API，并将所有结果作为一个批次在 Storm 中发射。
+- en: 'In a more complex scenario, one might also tap into the `Twitter Firehose`
+    and use a queue to buffer the live updates before emitting them into Storm. The
+    following are the key lines in the `Emitter` portion of the spout:'
+  id: totrans-70
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在更复杂的情况下，一个可能还会接入 `Twitter Firehose` 并使用队列来缓冲实时更新，然后将其发射到 Storm 中。以下是 spout
+    的 `Emitter` 部分的关键行：
+- en: '[PRE1]'
+  id: totrans-71
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE1]'
+- en: Functions
+  id: totrans-72
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: 函数
+- en: This section covers the functions used in the topology. In this example, all
+    the functions can either have side effects (for example, persistence) or they
+    add fields and values to the tuple.
+  id: totrans-73
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本节涵盖了拓扑中使用的函数。在这个例子中，所有的函数都可以有副作用（例如持久化），或者它们可以为元组添加字段和值。
+- en: TweetSplitterFunction
+  id: totrans-74
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: TweetSplitterFunction
+- en: 'The first function that the tweet passes through is the `TweetSplitterFunction`.
+    This function simply parses the tweet and emits one tuple per word in the tweet.
+    The code for this function is as follows:'
+  id: totrans-75
+  prefs: []
+  type: TYPE_NORMAL
+  zh: tweet 经过的第一个函数是 `TweetSplitterFunction`。这个函数简单地解析 tweet，并为 tweet 中的每个单词发射一个元组。该函数的代码如下：
+- en: '[PRE2]'
+  id: totrans-76
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE2]'
+- en: In a more sophisticated NLP system, this function will do more than simply split
+    the tweet by whitespace. An NLP system would most likely try to parse the tweet,
+    assigning parts of speech to the words and associating them with one another.
+    Although, instant messages and tweets typically lack the traditional grammatical
+    constructs that parsers are trained on, the system might still use elementary
+    associations such as the distance between the words. In such systems, instead
+    of word frequencies, systems use n-gram frequencies where each n-gram comprises
+    multiple words.
+  id: totrans-77
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在一个更复杂的NLP系统中，这个函数将不仅仅是通过空格分割推文。NLP系统很可能会尝试解析推文，为单词分配词性并将它们与彼此关联起来。尽管即时消息和推文通常缺乏解析器训练的传统语法结构，系统仍可能使用诸如单词之间距离之类的基本关联。在这种系统中，系统使用n-gram频率而不是单词频率，其中每个n-gram包括多个单词。
+- en: To learn about the use of n-grams, visit [http://books.google.com/ngrams](http://books.google.com/ngrams).
+  id: totrans-78
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 要了解n-gram的使用，请访问[http://books.google.com/ngrams](http://books.google.com/ngrams)。
+- en: WordFrequencyFunction
+  id: totrans-79
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: WordFrequencyFunction
+- en: Now we move on to the `WordFrequencyFunction`. This function enriches the tuple
+    with the `baseline` count. This is the number of times the word was encountered
+    in a random sampled text.
+  id: totrans-80
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在我们转向“WordFrequencyFunction”。这个函数用“baseline”计数丰富了元组。这是单词在随机抽样文本中遇到的次数。
+- en: 'The key code for this function is shown as follows:'
+  id: totrans-81
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该函数的关键代码如下所示：
+- en: '[PRE3]'
+  id: totrans-82
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE3]'
+- en: 'The constructor in the code loads the word counts into the memory. The file
+    format of `en.txt` is as follows:'
+  id: totrans-83
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 代码中的构造函数将单词计数加载到内存中。 “en.txt”的文件格式如下：
+- en: '[PRE4]'
+  id: totrans-84
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE4]'
+- en: Each line contains the word and the frequency count for that word. Again, since
+    we are only worried about relative counts, we need not consider the total counts
+    in the corpus. However, if we were calculating a true likelihood, we would need
+    to consider the overall total word count as well.
+  id: totrans-85
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 每行包含单词和该单词的频率计数。同样，由于我们只关心相对计数，因此无需考虑语料库中的总计数。但是，如果我们正在计算真实的可能性，我们还需要考虑总体单词计数。
+- en: The `execute` method of the function is straightforward and simply adds the
+    baseline count to the tuple. However, if we examine the method that retrieves
+    the count from the `HashMap` class, notice that it includes a `DEFAULT_BASELINE`.
+    This is the value used when the system encounters a word that was not in the original
+    corpus.
+  id: totrans-86
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 函数的“execute”方法很简单，只是将基线计数添加到元组中。但是，如果我们检查从“HashMap”类中检索计数的方法，注意它包括一个“DEFAULT_BASELINE”。这是系统遇到原始语料库中没有的单词时使用的值。
+- en: Since Twitter feeds contain many abbreviations, acronyms, and other terms that
+    are not found typically in standard text, the `DEFAULT_BASELINE` becomes an important
+    configuration parameter. In some cases, unique words are important and unique
+    because they pertain to the `searchphrase` field. Others are anomalies because
+    the sample corpus differs from the target corpus.
+  id: totrans-87
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 由于Twitter动态包含许多缩写词、首字母缩写词和其他通常在标准文本中找不到的术语，“DEFAULT_BASELINE”成为一个重要的配置参数。在某些情况下，独特的单词很重要，因为它们涉及到“searchphrase”字段。其他单词是异常的，因为样本语料库与目标语料库不同。
+- en: Ideally, the raw baseline counts would be drawn from the same source that the
+    analytics are targeting. In this case, it would be ideal to have both word and
+    n-gram counts calculated using the entire `Twitter Firehose`.
+  id: totrans-88
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 理想情况下，原始基线计数应该来自分析的目标相同来源。在这种情况下，最好使用整个“Twitter Firehose”计算单词和n-gram计数。
+- en: PersistenceFunction
+  id: totrans-89
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: PersistenceFunction
+- en: 'We will not go into the details of a full multidata center Cassandra deployment
+    here. Instead, for this example, we will keep it simple and use the local file
+    storage. The code for the `PersistenceFunction` is as follows:'
+  id: totrans-90
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们不会在这里详细介绍完整的多数据中心Cassandra部署。相反，对于这个例子，我们将保持简单并使用本地文件存储。 “PersistenceFunction”的代码如下：
+- en: '[PRE5]'
+  id: totrans-91
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE5]'
+- en: In the preceding code, the function simply persists the tuple in the native
+    format that Druid expects to consume in the Hadoop indexing job. This code is
+    inefficient in that we are opening up the file for writing each time. Alternatively,
+    we could have implemented additional `StateFactory` and `State` objects that persisted
+    the tuples; however, since this is just an example, we can tolerate the inefficient
+    file access.
+  id: totrans-92
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在上述代码中，该函数只是以Druid期望在Hadoop索引作业中使用的本机格式保存元组。这段代码效率低下，因为我们每次都要打开文件进行写入。或者，我们可以实现额外的“StateFactory”和“State”对象来持久化元组；然而，由于这只是一个例子，我们可以容忍低效的文件访问。
+- en: Additionally, notice that we generate a timestamp here that is not re-emitted
+    with the tuple. Ideally, we would generate a timestamp and add it to the tuple,
+    which would then be used downstream by Druid to align the temporal partitioning.
+    For this example, we will accept the discrepancy.
+  id: totrans-93
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 另外，请注意我们在这里生成了一个时间戳，但没有与元组一起重新发出。理想情况下，我们会生成一个时间戳并将其添加到元组中，然后由Druid在下游使用以对齐时间分区。在这个例子中，我们将接受这种差异。
+- en: Tip
+  id: totrans-94
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 提示
+- en: Even though this function does not enrich the tuple at all, it must still re-emit
+    the tuple. Since functions can also act as filters, it is the obligation of the
+    function to declare which tuples are passed downstream.
+  id: totrans-95
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 即使这个函数根本不丰富元组，它仍然必须重新发出元组。由于函数也可以充当过滤器，函数有义务声明哪些元组被传递到下游。
+- en: 'The function writes the following lines to the `nlp.json` file:'
+  id: totrans-96
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该函数将以下行写入“nlp.json”文件：
+- en: '[PRE6]'
+  id: totrans-97
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE6]'
+- en: Examining the analytics
+  id: totrans-98
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 检查分析
+- en: 'The Druid integration is the same that was used in the previous chapter. As
+    a brief recap, this integration comprises the `StateFactory`, `StateUpdater`,
+    and `State` implementations. The `State` implementation then communicates with
+    a `StormFirehoseFactory` implementation and a `StormFirehose` implementation for
+    Druid. At the heart of this implementation is the `StormFirehose` implementation,
+    which maps the tuples into input rows for Druid. The listing for this method is
+    shown as follows:'
+  id: totrans-99
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Druid集成与上一章中使用的相同。简而言之，此集成包括`StateFactory`、`StateUpdater`和`State`实现。然后，`State`实现与`StormFirehoseFactory`实现和Druid的`StormFirehose`实现进行通信。在此实现的核心是`StormFirehose`实现，它将元组映射到Druid的输入行。此方法的清单如下所示：
+- en: '[PRE7]'
+  id: totrans-100
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE7]'
+- en: 'Looking at this method, there are two key data structures: `theMap` and `dimensions`.
+    The first contains the data values for the row. The second contains the dimensions
+    for that row, which is what Druid will use to perform the aggregations, and determines
+    what queries you can run against the data. In this case, we will use the `searchphrase`
+    and `word` fields as dimensions. This will allow us to perform counts and groupings
+    in our queries, as we will see in a moment.'
+  id: totrans-101
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查看此方法时，有两个关键数据结构：`theMap`和`dimensions`。第一个包含行的数据值。第二个包含该行的维度，这是Druid用来执行聚合的，也决定了您可以针对数据运行哪些查询。在这种情况下，我们将使用`searchphrase`和`word`字段作为维度。这将允许我们在查询中执行计数和分组，我们马上就会看到。
+- en: First, let's look at the Druid configuration for ingesting the data. We will
+    largely use the same configuration for the embedded real-time server that we used
+    in the previous chapter. Segments will be pushed to Cassandra for Deep Storage,
+    while MySQL is used to write the segment metadata.
+  id: totrans-102
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 首先，让我们看一下用于摄取数据的Druid配置。我们将主要使用与上一章中使用的嵌入式实时服务器相同的配置。段将被推送到Cassandra进行深度存储，而MySQL用于编写段元数据。
+- en: 'The following are the key configuration parameters from `runtime.properties`:'
+  id: totrans-103
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是`runtime.properties`中的关键配置参数：
+- en: '[PRE8]'
+  id: totrans-104
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE8]'
+- en: 'This configuration points to the `realtime.spec` file, which is what specifies
+    the details of the analytics performed by the real-time server. The following
+    is the `realtime.spec` file for this use case:'
+  id: totrans-105
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此配置指向`realtime.spec`文件，该文件指定了实时服务器执行的分析的详细信息。以下是此用例的`realtime.spec`文件：
+- en: '[PRE9]'
+  id: totrans-106
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE9]'
+- en: 'In addition to the temporal granularities, we also specify the aggregators
+    in this file. This tells Druid how to aggregate metrics between rows. Without
+    aggregators, Druid cannot collapse the data. In this use case, there are two aggregators:
+    `wordcount` and `maxbaseline`.'
+  id: totrans-107
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 除了时间粒度，我们还在此文件中指定了聚合器。这告诉Druid如何在行之间聚合指标。没有聚合器，Druid无法合并数据。在此用例中，有两个聚合器：`wordcount`和`maxbaseline`。
+- en: The `wordcount` field counts instances of rows that have the same values along
+    the dimensions provided. Referring back to the `StormFirehose` implementation,
+    the two dimensions are `searchphrase` and `word`. Thus, Druid can collapse the
+    rows, adding a field named `wordcount`, which will contain the total count of
+    the number of instances of that word found for that `searchphrase` and for that
+    temporal slice.
+  id: totrans-108
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`wordcount`字段计算具有相同维度值的行的实例。回顾`StormFirehose`实现，两个维度是`searchphrase`和`word`。因此，Druid可以合并行，添加一个名为`wordcount`的字段，其中将包含该单词在该`searchphrase`和时间片段中找到的实例总数。'
+- en: The `maxbaseline` field contains the baseline for that word. In reality, the
+    value for this is the same for each row. We simply use `max` as a convenient function
+    to propagate the value into an aggregation that we can then use when we query
+    the system.
+  id: totrans-109
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`maxbaseline`字段包含该单词的基线。实际上，每行的值都是相同的。我们只是使用`max`作为一个方便的函数，将该值传播到我们在查询系统时可以使用的聚合中。'
+- en: 'Now, let''s look at the query. The following is the query we use to retrieve
+    the most relevant words:'
+  id: totrans-110
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们来看看查询。以下是我们用来检索最相关单词的查询：
+- en: '[PRE10]'
+  id: totrans-111
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE10]'
+- en: The query needs to align with the `realtime.spec` file. At the bottom of the
+    query, we specify the time interval in which we are interested. At the top of
+    the file, we specify the dimensions in which we are interested, followed by the
+    aggregations that allow Druid to collapse the rows to match the granularity requested.
+    In this use case, the aggregations exactly match the aggregations that we are
+    performing when indexing the data in real time.
+  id: totrans-112
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 查询需要与`realtime.spec`文件对齐。在查询的底部，我们指定我们感兴趣的时间间隔。在文件的顶部，我们指定我们感兴趣的维度，然后是允许Druid将行折叠以匹配所请求的粒度的聚合。在此用例中，聚合与我们实时索引数据时执行的聚合完全匹配。
+- en: Specifically, we introduce the `totalcount` field, which contains the sum of
+    `wordcount`. This will therefore contain the total number of instances observed
+    for that `word` and `searchphrase` combination. Additionally, we perform the same
+    trick with `baseline` to pass that value through.
+  id: totrans-113
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 具体来说，我们引入了`totalcount`字段，其中包含`wordcount`的总和。因此，它将包含观察到的该`word`和`searchphrase`组合的实例总数。此外，我们使用`baseline`进行相同的技巧来传递该值。
+- en: Finally, in this query, we include a post aggregation, which will combine the
+    aggregations into a relevant score. The post aggregation divides the total count
+    observed in the tweets by the baseline frequency.
+  id: totrans-114
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，在此查询中，我们包括一个后聚合，它将聚合结果组合成相关分数。后聚合将观察到的推文总数除以基线频率。
+- en: 'The following is a simple Ruby file that processes the results of the query
+    and returns the top 20 words:'
+  id: totrans-115
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是一个简单的Ruby文件，用于处理查询结果并返回前20个单词：
+- en: '[PRE11]'
+  id: totrans-116
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE11]'
+- en: Notice that the URL we are using to access the server is the port of the embedded
+    real-time server. In production, the queries go through a broker node.
+  id: totrans-117
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，我们用于访问服务器的URL是嵌入式实时服务器的端口。在生产中，查询会通过代理节点进行。
+- en: 'Executing this script results in the following code snippet:'
+  id: totrans-118
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 执行此脚本将产生以下代码片段：
+- en: '[PRE12]'
+  id: totrans-119
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE12]'
+- en: Tip
+  id: totrans-120
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: 提示
+- en: If you change the dimensions or metrics you are capturing, be sure to delete
+    the local directory that the real-time server is using to cache the data. Otherwise,
+    the real-time server may re-read old data that does not have the dimensions and/or
+    metrics needed to fulfill the query; additionally, the query will fail because
+    Druid is unable to find requisite metrics or dimensions.
+  id: totrans-121
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 如果更改您正在捕获的维度或指标，请务必删除实时服务器用于缓存数据的本地目录。否则，实时服务器可能会重新读取旧数据，这些数据没有需要满足查询的维度和/或指标；此外，查询将失败，因为Druid无法找到必需的指标或维度。
+- en: Batch processing / historical analysis
+  id: totrans-122
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 批处理/历史分析
+- en: Now, let's turn our attention to the batch processing mechanism. For this, we
+    will use Hadoop. Although a complete description of Hadoop is well beyond the
+    scope of this section, we will give a brief overview of Hadoop alongside the Druid-specific
+    setup.
+  id: totrans-123
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，让我们把注意力转向批处理机制。为此，我们将使用Hadoop。虽然完整描述Hadoop远远超出了本节的范围，但我们将在Druid特定设置的同时对Hadoop进行简要概述。
+- en: 'Hadoop provides two major components: a distributed file system and a distributed
+    processing framework. The distributed file system is aptly named the **Hadoop
+    Distributed Filesystem** (**HDFS**). The distributed processing framework is known
+    as MapReduce. Since we chose to leverage Cassandra as our storage mechanism in
+    the hypothetical system architecture, we will not need HDFS. We will, however,
+    use the MapReduce portion of Hadoop to distribute the processing across all of
+    the historical data.'
+  id: totrans-124
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Hadoop提供了两个主要组件：分布式文件系统和分布式处理框架。分布式文件系统的名称是**Hadoop分布式文件系统**（**HDFS**）。分布式处理框架称为MapReduce。由于我们选择在假设的系统架构中利用Cassandra作为存储机制，我们将不需要HDFS。但是，我们将使用Hadoop的MapReduce部分来将处理分布到所有历史数据中。
+- en: In our simple example, we will run a local Hadoop job that will read the local
+    file written in our `PersistenceFunction`. Druid comes with a Hadoop job that
+    we will use in this example.
+  id: totrans-125
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们的简单示例中，我们将运行一个读取我们`PersistenceFunction`中编写的本地文件的本地Hadoop作业。Druid附带了一个我们将在本示例中使用的Hadoop作业。
+- en: Hadoop
+  id: totrans-126
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: Hadoop
+- en: Before we jump to loading data, a quick overview of MapReduce is warranted.
+    Although Druid comes prepackaged with a convenient MapReduce job to accommodate
+    historical data, generally speaking, large distributed systems will need custom
+    jobs to perform analyses over the entire data set.
+  id: totrans-127
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们开始加载数据之前，有必要简要介绍一下MapReduce。尽管Druid预先打包了一个方便的MapReduce作业来适应历史数据，但一般来说，大型分布式系统将需要自定义作业来对整个数据集执行分析。
+- en: An overview of MapReduce
+  id: totrans-128
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: MapReduce概述
+- en: 'MapReduce is a framework that breaks processing into two phases: a map phase
+    and a reduce phase. In the map phase, a function is applied to the entire set
+    of input data, one element at a time. Each application of the `map` function results
+    in a set of tuples, each containing a key and a value. Tuples with similar keys
+    are then combined via the `reduce` function. The `reduce` function emits another
+    set of tuples, typically by combining the values associated with the key.'
+  id: totrans-129
+  prefs: []
+  type: TYPE_NORMAL
+  zh: MapReduce是一个将处理分为两个阶段的框架：map阶段和reduce阶段。在map阶段，一个函数被应用于整个输入数据集，每次处理一个元素。每次应用`map`函数都会产生一组元组，每个元组包含一个键和一个值。具有相似键的元组然后通过`reduce`函数组合。`reduce`函数通常会发出另一组元组，通过组合与键相关联的值。
+- en: The canonical "Hello World" example for MapReduce is the word count. Given a
+    set of documents that contain words, count the occurrences of each word. (Ironically,
+    this is very similar to our NLP example.)
+  id: totrans-130
+  prefs: []
+  type: TYPE_NORMAL
+  zh: MapReduce的经典“Hello World”示例是单词计数。给定一组包含单词的文档，计算每个单词的出现次数。（讽刺的是，这与我们的NLP示例非常相似。）
+- en: 'The following are Ruby functions that express the `map` and `reduce` functions
+    for the word count example. The `map` function looks like the following code snippet:'
+  id: totrans-131
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是Ruby函数，用于表达单词计数示例的`map`和`reduce`函数。`map`函数如下代码片段所示：
+- en: '[PRE13]'
+  id: totrans-132
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE13]'
+- en: 'The `map` function yields the following output, given the supplied input is
+    as follows:'
+  id: totrans-133
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 给定以下输入，`map`函数产生以下输出：
+- en: '[PRE14]'
+  id: totrans-134
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE14]'
+- en: 'The corresponding `reduce` function looks like the following code snippet:'
+  id: totrans-135
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 相应的`reduce`函数如下代码片段所示：
+- en: '[PRE15]'
+  id: totrans-136
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE15]'
+- en: 'The MapReduce function would then group the values for each key and pass them
+    to the preceding `reduce` function as follows, resulting in the total word count:'
+  id: totrans-137
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 然后，MapReduce函数将为每个键分组值，并将它们传递给前面的`reduce`函数，如下所示，从而得到总的单词计数：
+- en: '[PRE16]'
+  id: totrans-138
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE16]'
+- en: The Druid setup
+  id: totrans-139
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+  zh: Druid设置
+- en: With Hadoop as the background, let's take a look at our setup for Druid. In
+    order for Druid to consume data from a Hadoop job, we need to start **Master**
+    and **Compute** nodes (also known as **Historical** nodes). To do this, we will
+    create a directory structure that has the Druid self-contained job at its root,
+    with subdirectories that contain the configuration files for both the Master and
+    Compute servers.
+  id: totrans-140
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有了Hadoop作为背景，让我们来看看我们为Druid设置的情况。为了让Druid从Hadoop作业中获取数据，我们需要启动**Master**和**Compute**节点（也称为**Historical**节点）。为此，我们将创建一个目录结构，该目录结构的根目录包含Druid自包含作业，子目录包含Master和Compute服务器的配置文件。
+- en: 'This directory structure looks like the following code snippet:'
+  id: totrans-141
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 此目录结构如下代码片段所示：
+- en: '[PRE17]'
+  id: totrans-142
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE17]'
+- en: 'The runtime properties for the Master and Compute nodes are largely the same
+    as the real-time node with a few notable differences. They both include settings
+    to cache segments as shown in the following code snippet:'
+  id: totrans-143
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Master和Compute节点的运行时属性与实时节点基本相同，但有一些显著的区别。它们都包括用于缓存段的设置，如下所示的代码片段：
+- en: '[PRE18]'
+  id: totrans-144
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE18]'
+- en: 'Also, note that if you are running the Master and Compute servers on the same
+    machine, you will need to change the ports so that they do not conflict as follows:'
+  id: totrans-145
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 另外，请注意，如果您在同一台机器上运行Master和Compute服务器，您需要更改端口，以避免冲突，如下所示：
+- en: '[PRE19]'
+  id: totrans-146
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE19]'
+- en: Druid packages all the server components and their dependencies into a single
+    self-contained JAR file. Using this JAR file, you can start the Master and Compute
+    servers with the following commands.
+  id: totrans-147
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Druid将所有服务器组件及其依赖项打包到一个单独的自包含JAR文件中。使用这个JAR文件，您可以使用以下命令启动Master和Compute服务器。
+- en: 'For the Compute node, we use the following code snippet:'
+  id: totrans-148
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于Compute节点，我们使用以下代码片段：
+- en: '[PRE20]'
+  id: totrans-149
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE20]'
+- en: 'For the Master node, we use the following code snippet:'
+  id: totrans-150
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 对于Master节点，我们使用以下代码片段：
+- en: '[PRE21]'
+  id: totrans-151
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE21]'
+- en: Once both nodes are running, we are ready to load data with the Hadoop job.
+  id: totrans-152
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 一旦两个节点都运行起来，我们就可以使用Hadoop作业加载数据。
+- en: HadoopDruidIndexer
+  id: totrans-153
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+  zh: HadoopDruidIndexer
+- en: With our servers up and running, we can examine the internals of the Druid MapReduce
+    job. The `HadoopDruidIndexer` function uses a JSON configuration file much like
+    the `realtime.spec` file.
+  id: totrans-154
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在我们的服务器正常运行后，我们可以检查Druid MapReduce作业的内部。`HadoopDruidIndexer`函数使用一个类似`realtime.spec`文件的JSON配置文件。
+- en: 'The file is specified on the command line when the Hadoop job is started, as
+    shown in the following code snippet:'
+  id: totrans-155
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 文件在启动Hadoop作业时通过命令行指定，如下面的代码片段所示：
+- en: '[PRE22]'
+  id: totrans-156
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE22]'
+- en: 'The following is the `batchConfig.json` file we used in this example:'
+  id: totrans-157
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 以下是我们在这个例子中使用的`batchConfig.json`文件：
+- en: '[PRE23]'
+  id: totrans-158
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE23]'
+- en: Much of the configuration will look familiar. The two fields of particular interest
+    are the `pathSpec` and `rollupSpec` fields. The `pathSpec` field contains the
+    location of the file that was written by the `PersistenceFunction`. The `rollupSpec`
+    field contains the same aggregation functions that we included in the `realtime.spec`
+    file during transactional processing.
+  id: totrans-159
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 许多配置看起来很熟悉。特别感兴趣的两个字段是`pathSpec`和`rollupSpec`字段。`pathSpec`字段包含了由`PersistenceFunction`编写的文件的位置。`rollupSpec`字段包含了我们在事务处理期间在`realtime.spec`文件中包含的相同聚合函数。
+- en: 'Additionally, notice that the timestamp column and format are specified, which
+    aligns with the field that we are outputting in the persisted file:'
+  id: totrans-160
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 另外，请注意指定了时间戳列和格式，这与我们在持久化文件中输出的字段相一致：
+- en: '[PRE24]'
+  id: totrans-161
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE24]'
+- en: The `HadoopDruidIndexer` function loads the preceding configuration file and
+    performs the `map`/`reduce` functions to construct the index. If we look more
+    closely at that job, we can see the specific functions it is running.
+  id: totrans-162
+  prefs: []
+  type: TYPE_NORMAL
+  zh: '`HadoopDruidIndexer`函数加载前述配置文件，并执行`map`/`reduce`函数来构建索引。如果我们更仔细地查看该作业，我们可以看到它正在运行的具体函数。'
+- en: 'Hadoop jobs are started using the Hadoop job class. Druid runs a couple of
+    jobs to index the data, but we will focus on the `IndexGeneratorJob`. In the `IndexGeneratorJob`,
+    Druid configures the job with the following lines:'
+  id: totrans-163
+  prefs: []
+  type: TYPE_NORMAL
+  zh: Hadoop作业是使用Hadoop作业类启动的。Druid运行了一些作业来索引数据，但我们将专注于`IndexGeneratorJob`。在`IndexGeneratorJob`中，Druid使用以下行配置作业：
+- en: '[PRE25]'
+  id: totrans-164
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE25]'
+- en: The preceding properties are set on nearly all Hadoop jobs. They set the input
+    and output classes for each phase of the processing and the classes that implement
+    the `Mapper` and `Reducer` interfaces.
+  id: totrans-165
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 几乎所有Hadoop作业都设置了上述属性。它们为处理的每个阶段设置了输入和输出类以及实现`Mapper`和`Reducer`接口的类。
+- en: 'For a complete description of Hadoop job configurations, visit the following
+    URL: [http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration](http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration)'
+  id: totrans-166
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 有关Hadoop作业配置的完整描述，请访问以下网址：[http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration](http://hadoop.apache.org/docs/r0.18.3/mapred_tutorial.html#Job+Configuration)
+- en: 'The job configuration also specifies the input paths, which specify the files
+    or other data sources for processing. Within the call to `config.addInputPaths`,
+    Druid adds the files from the `pathSpec` field to the Hadoop configuration for
+    processing, as shown in the following code snippet:'
+  id: totrans-167
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 作业配置还指定了输入路径，指定了要处理的文件或其他数据源。在对`config.addInputPaths`的调用中，Druid将`pathSpec`字段中的文件添加到Hadoop配置中进行处理，如下面的代码片段所示：
+- en: '[PRE26]'
+  id: totrans-168
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE26]'
+- en: You can see that out-of-the-box, Druid only supports instances of `FileInputFormat`.
+    As an exercise for the reader, it might be fun to enhance the `DruidHadoopIndexer`
+    function to support direct reads from Cassandra, as envisioned in the hypothetical
+    architecture.
+  id: totrans-169
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 您可以看到，Druid只支持`FileInputFormat`的实例。作为读者的练习，可以尝试增强`DruidHadoopIndexer`函数，以支持直接从Cassandra读取，就像在假设的架构中设想的那样。
+- en: Looking back at the job configuration, the `Mapper` class used by Druid is the
+    `IndexGeneratorMapper` class, and the `Reducer` class is the `IndexGeneratorReducer`
+    class.
+  id: totrans-170
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 回顾作业配置，Druid使用的`Mapper`类是`IndexGeneratorMapper`类，而`Reducer`类是`IndexGeneratorReducer`类。
+- en: Let's first have a look at the `map` function within the `IndexGeneratorMapper`
+    class. The `IndexGeneratorMapper` class actually subclasses from `HadoopDruidIndexerMapper`,
+    which contains the implementation of the `map` method, delegating it to the `IndexGeneratorMapper`
+    class to emit the actual values, as we see in the following code.
+  id: totrans-171
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 让我们首先看一下`IndexGeneratorMapper`类中的`map`函数。`IndexGeneratorMapper`类实际上是从`HadoopDruidIndexerMapper`继承的，其中包含了`map`方法的实现，将其委托给`IndexGeneratorMapper`类来发出实际的值，就像我们在下面的代码中看到的那样。
+- en: 'Within `HadoopDruidIndexerMapper`, we see the `map` method implementation as
+    follows:'
+  id: totrans-172
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在`HadoopDruidIndexerMapper`中，我们看到`map`方法的实现如下：
+- en: '[PRE27]'
+  id: totrans-173
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE27]'
+- en: 'We can see that the superclass `map` method handles rows that do not parse,
+    marking them invalid, and checks to see if the row contains the necessary data
+    to carry out the map. Specifically, the superclass ensures that the row contains
+    a timestamp. The map requires the timestamp because it partitions the data into
+    time slices (that is, buckets) as we see in the `abstract` method call to `innerMap`,
+    which is shown as follows:'
+  id: totrans-174
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们可以看到超类`map`方法处理无法解析的行，将它们标记为无效，并检查行是否包含执行`map`所需的必要数据。具体来说，超类确保行包含时间戳。`map`需要时间戳，因为它将数据分区为时间片（即桶），就像我们在对`innerMap`的`abstract`方法调用中看到的那样，如下所示：
+- en: '[PRE28]'
+  id: totrans-175
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE28]'
+- en: The key line in this method and in any Hadoop-based `map` function is the call
+    to `context.write` that emits the tuple from the `map` function. In this case,
+    the `map` function is emitting a key of the type `SortableBytes`, which represents
+    the bucket for the metric and the actual text read from the input source as the
+    value.
+  id: totrans-176
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 该方法中的关键行以及任何基于Hadoop的`map`函数中的关键行是对`context.write`的调用，它从`map`函数中发出元组。在这种情况下，`map`函数发出的是`SortableBytes`类型的键，它表示度量的桶和从输入源读取的实际文本作为值。
+- en: 'At this point, after the map phase completes, we have parsed the file, constructed
+    our buckets, and partitioned the data into those buckets, sorted by timestamp.
+    Each bucket is then processed via calls to the `reduce` method, which is shown
+    as follows:'
+  id: totrans-177
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在此时，映射阶段完成后，我们已解析了文件，构建了我们的存储桶，并将数据分区到这些存储桶中，按时间戳排序。然后，通过调用`reduce`方法处理每个存储桶，如下所示：
+- en: '[PRE29]'
+  id: totrans-178
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE29]'
+- en: As you can see, the `reduce` method contains the meat of the analytics. It constructs
+    the index based on the aggregations in the roll up specification and dimensions
+    specified in the batch configuration file. The final lines of the method write
+    the segment to a disk.
+  id: totrans-179
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 正如您所看到的，`reduce`方法包含了分析的核心内容。它根据汇总规范中的聚合和批处理配置文件中指定的维度构建索引。该方法的最后几行将段写入磁盘。
+- en: 'In the end, when you run the `DruidHadoopIndexer` class, you will see something
+    similar to the following code snippet:'
+  id: totrans-180
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 最后，当您运行`DruidHadoopIndexer`类时，您将看到类似以下代码片段的内容：
+- en: '[PRE30]'
+  id: totrans-181
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE30]'
+- en: 'Notice that the segment added is named `historical`. To query the data loaded
+    by the `historical` / batch processing mechanism, update the query to specify
+    the historical data source and use the port of the Compute node. Provided everything
+    is loaded properly, you will receive the aggregations we saw originally with the
+    real-time server; an example of this is shown as follows:'
+  id: totrans-182
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 请注意，添加的段名为`historical`。要查询由`historical` /批处理机制加载的数据，请更新查询以指定历史数据源，并使用计算节点的端口。如果一切加载正确，您将收到我们最初在实时服务器上看到的聚合结果；示例如下：
+- en: '[PRE31]'
+  id: totrans-183
+  prefs: []
+  type: TYPE_PRE
+  zh: '[PRE31]'
+- en: Now, if we schedule the Hadoop job to run periodically, the historical index
+    will lag the real-time index but will continually update the index, correcting
+    errors and accounting for any system failures.
+  id: totrans-184
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 现在，如果我们定期安排Hadoop作业运行，历史索引将滞后于实时索引，但将持续更新索引，纠正错误并解决任何系统故障。
+- en: Summary
+  id: totrans-185
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+  zh: 总结
+- en: In this chapter, we saw that pairing a batch processing mechanism with a real-time
+    processing engine such as Storm provides a more complete and robust overall solution.
+  id: totrans-186
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在本章中，我们看到将批处理机制与Storm等实时处理引擎配对，提供了更完整和强大的整体解决方案。
+- en: We examined an approach to implementing a Lambda architecture. Such an approach
+    delivers real-time analytics supported by a batch processing system retroactively
+    correcting the analytics. Additionally, we saw how to configure a multidata center
+    system architecture to isolate the offline processing from the transactional system
+    while also providing continuous availability and fault tolerance via distributed
+    storage.
+  id: totrans-187
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 我们研究了实施Lambda架构的方法。这种方法提供了由批处理系统支持的实时分析，可以对分析进行追溯性修正。此外，我们还看到了如何配置多数据中心系统架构，以将离线处理与事务系统隔离开来，并通过分布式存储提供持续可用性和容错性。
+- en: The chapter also included an introduction to Hadoop, using Druid's implementation
+    as an example.
+  id: totrans-188
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 本章还介绍了Hadoop，并以Druid的实现为例。
+- en: In the next chapter, we will take an existing batch process that leverages Pig
+    and Hadoop and demonstrate what it takes to convert that into a real-time system.
+    At the same time, we will demonstrate how to deploy Storm onto the Hadoop infrastructure
+    using Storm-YARN.
+  id: totrans-189
+  prefs: []
+  type: TYPE_NORMAL
+  zh: 在下一章中，我们将采用现有的利用Pig和Hadoop的批处理过程，并演示将其转换为实时系统所需的步骤。同时，我们还将演示如何使用Storm-YARN将Storm部署到Hadoop基础架构上。

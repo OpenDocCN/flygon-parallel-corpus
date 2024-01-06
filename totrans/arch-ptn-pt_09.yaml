@@ -1,0 +1,829 @@
+- en: Chapter 7\. Aggregates and Consistency Boundaries
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we’d like to revisit our domain model to talk about invariants
+    and constraints, and see how our domain objects can maintain their own internal
+    consistency, both conceptually and in persistent storage. We’ll discuss the concept
+    of a *consistency boundary* and show how making it explicit can help us to build
+    high-performance software without compromising maintainability.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Figure 7-1](#maps_chapter_06) shows a preview of where we’re headed: we’ll
+    introduce a new model object called `Product` to wrap multiple batches, and we’ll
+    make the old `allocate()` domain service available as a method on `Product` instead.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0701](Images/apwp_0701.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7-1\. Adding the Product aggregate
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Why? Let’s find out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'The code for this chapter is in the appendix_csvs branch [on GitHub](https://oreil.ly/vlnGg):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Why Not Just Run Everything in a Spreadsheet?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What’s the point of a domain model, anyway? What’s the fundamental problem we’re
+    trying to address?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Couldn’t we just run everything in a spreadsheet? Many of our users would be
+    delighted by that. Business users *like* spreadsheets because they’re simple,
+    familiar, and yet enormously powerful.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In fact, an enormous number of business processes do operate by manually sending
+    spreadsheets back and forth over email. This “CSV over SMTP” architecture has
+    low initial complexity but tends not to scale very well because it’s difficult
+    to apply logic and maintain consistency.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Who is allowed to view this particular field? Who’s allowed to update it? What
+    happens when we try to order –350 chairs, or 10,000,000 tables? Can an employee
+    have a negative salary?
+  prefs: []
+  type: TYPE_NORMAL
+- en: These are the constraints of a system. Much of the domain logic we write exists
+    to enforce these constraints in order to maintain the invariants of the system.
+    The *invariants* are the things that have to be true whenever we finish an operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Invariants, Constraints, and Consistency
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The two words are somewhat interchangeable, but a *constraint* is a rule that
+    restricts the possible states our model can get into, while an *invariant* is
+    defined a little more precisely as a condition that is always true.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If we were writing a hotel-booking system, we might have the constraint that
+    double bookings are not allowed. This supports the invariant that a room cannot
+    have more than one booking for the same night.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Of course, sometimes we might need to temporarily *bend* the rules. Perhaps
+    we need to shuffle the rooms around because of a VIP booking. While we’re moving
+    bookings around in memory, we might be double booked, but our domain model should
+    ensure that, when we’re finished, we end up in a final consistent state, where
+    the invariants are met. If we can’t find a way to accommodate all our guests,
+    we should raise an error and refuse to complete the operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let’s look at a couple of concrete examples from our business requirements;
+    we’ll start with this one:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An order line can be allocated to only one batch at a time.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '>'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The business
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: This is a business rule that imposes an invariant. The invariant is that an
+    order line is allocated to either zero or one batch, but never more than one.
+    We need to make sure that our code never accidentally calls `Batch.allocate()`
+    on two different batches for the same line, and currently, there’s nothing there
+    to explicitly stop us from doing that.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Invariants, Concurrency, and Locks
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Let’s look at another one of our business rules:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We can’t allocate to a batch if the available quantity is less than the quantity
+    of the order line.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '>'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The business
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: Here the constraint is that we can’t allocate more stock than is available to
+    a batch, so we never oversell stock by allocating two customers to the same physical
+    cushion, for example. Every time we update the state of the system, our code needs
+    to ensure that we don’t break the invariant, which is that the available quantity
+    must be greater than or equal to zero.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In a single-threaded, single-user application, it’s relatively easy for us to
+    maintain this invariant. We can just allocate stock one line at a time, and raise
+    an error if there’s no stock available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This gets much harder when we introduce the idea of *concurrency*. Suddenly
+    we might be allocating stock for multiple order lines simultaneously. We might
+    even be allocating order lines at the same time as processing changes to the batches
+    themselves.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We usually solve this problem by applying *locks* to our database tables. This
+    prevents two operations from happening simultaneously on the same row or same
+    table.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As we start to think about scaling up our app, we realize that our model of
+    allocating lines against all available batches may not scale. If we process tens
+    of thousands of orders per hour, and hundreds of thousands of order lines, we
+    can’t hold a lock over the whole `batches` table for every single one—we’ll get
+    deadlocks or performance problems at the very least.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What Is an Aggregate?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: OK, so if we can’t lock the whole database every time we want to allocate an
+    order line, what should we do instead? We want to protect the invariants of our
+    system but allow for the greatest degree of concurrency. Maintaining our invariants
+    inevitably means preventing concurrent writes; if multiple users can allocate
+    `DEADLY-SPOON` at the same time, we run the risk of overallocating.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On the other hand, there’s no reason we can’t allocate `DEADLY-SPOON` at the
+    same time as `FLIMSY-DESK`. It’s safe to allocate two products at the same time
+    because there’s no invariant that covers them both. We don’t need them to be consistent
+    with each other.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The *Aggregate* pattern is a design pattern from the DDD community that helps
+    us to resolve this tension. An *aggregate* is just a domain object that contains
+    other domain objects and lets us treat the whole collection as a single unit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The only way to modify the objects inside the aggregate is to load the whole
+    thing, and to call methods on the aggregate itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a model gets more complex and grows more entity and value objects, referencing
+    each other in a tangled graph, it can be hard to keep track of who can modify
+    what. Especially when we have *collections* in the model as we do (our batches
+    are a collection), it’s a good idea to nominate some entities to be the single
+    entrypoint for modifying their related objects. It makes the system conceptually
+    simpler and easy to reason about if you nominate some objects to be in charge
+    of consistency for the others.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, if we’re building a shopping site, the Cart might make a good
+    aggregate: it’s a collection of items that we can treat as a single unit. Importantly,
+    we want to load the entire basket as a single blob from our data store. We don’t
+    want two requests to modify the basket at the same time, or we run the risk of
+    weird concurrency errors. Instead, we want each change to the basket to run in
+    a single database transaction.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We don’t want to modify multiple baskets in a transaction, because there’s no
+    use case for changing the baskets of several customers at the same time. Each
+    basket is a single *consistency boundary* responsible for maintaining its own
+    invariants.
+  prefs: []
+  type: TYPE_NORMAL
+- en: An AGGREGATE is a cluster of associated objects that we treat as a unit for
+    the purpose of data changes.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '>'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Eric Evans, Domain-Driven Design blue book
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: Per Evans, our aggregate has a root entity (the Cart) that encapsulates access
+    to items. Each item has its own identity, but other parts of the system will always
+    refer to the Cart only as an indivisible whole.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Just as we sometimes use `*_leading_underscores*` to mark methods or functions
+    as “private,” you can think of aggregates as being the “public” classes of our
+    model, and the rest of the entities and value objects as “private.”
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing an Aggregate
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What aggregate should we use for our system? The choice is somewhat arbitrary,
+    but it’s important. The aggregate will be the boundary where we make sure every
+    operation ends in a consistent state. This helps us to reason about our software
+    and prevent weird race issues. We want to draw a boundary around a small number
+    of objects—the smaller, the better, for performance—that have to be consistent
+    with one another, and we need to give this boundary a good name.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The object we’re manipulating under the covers is `Batch`. What do we call a
+    collection of batches? How should we divide all the batches in the system into
+    discrete islands of consistency?
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We *could* use `Shipment` as our boundary. Each shipment contains several batches,
+    and they all travel to our warehouse at the same time. Or perhaps we could use
+    `Warehouse` as our boundary: each warehouse contains many batches, and counting
+    all the stock at the same time could make sense.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Neither of these concepts really satisfies us, though. We should be able to
+    allocate `DEADLY-SPOONs` and `FLIMSY-DESKs` at the same time, even if they’re
+    in the same warehouse or the same shipment. These concepts have the wrong granularity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When we allocate an order line, we’re interested only in batches that have
+    the same SKU as the order line. Some sort of concept like `GlobalSkuStock` could
+    work: a collection of all the batches for a given SKU.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It’s an unwieldy name, though, so after some bikeshedding via `SkuStock`, `Stock`,
+    `ProductStock`, and so on, we decided to simply call it `Product`—after all, that
+    was the first concept we came across in our exploration of the domain language
+    back in [Chapter 1](ch01.xhtml#chapter_01_domain_model).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So the plan is this: when we want to allocate an order line, instead of [Figure 7-2](#before_aggregates_diagram),
+    where we look up all the `Batch` objects in the world and pass them to the `allocate()`
+    domain service…'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0702](Images/apwp_0702.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7-2\. Before: allocate against all batches using the domain service'
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: …we’ll move to the world of [Figure 7-3](#after_aggregates_diagram), in which
+    there is a new `Product` object for the particular SKU of our order line, and
+    it will be in charge of all the batches *for that SKU*, and we can call a `.allocate()`
+    method on that instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0703](Images/apwp_0703.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7-3\. After: ask Product to allocate against its batches'
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Let’s see how that looks in code form:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Our chosen aggregate, Product (src/allocation/domain/model.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_aggregates_and_consistency_boundaries_CO1-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`Product`’s main identifier is the `sku`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_aggregates_and_consistency_boundaries_CO1-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our `Product` class holds a reference to a collection of `batches` for that
+    SKU.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_aggregates_and_consistency_boundaries_CO1-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Finally, we can move the `allocate()` domain service to be a method on the `Product`
+    aggregate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: This `Product` might not look like what you’d expect a `Product` model to look
+    like. No price, no description, no dimensions. Our allocation service doesn’t
+    care about any of those things. This is the power of bounded contexts; the concept
+    of a product in one app can be very different from another. See the following
+    sidebar for more discussion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One Aggregate = One Repository
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Once you define certain entities to be aggregates, we need to apply the rule
+    that they are the only entities that are publicly accessible to the outside world.
+    In other words, the only repositories we are allowed should be repositories that
+    return aggregates.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The rule that repositories should only return aggregates is the main place where
+    we enforce the convention that aggregates are the only way into our domain model.
+    Be wary of breaking it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our case, we’ll switch from `BatchRepository` to `ProductRepository`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Our new UoW and repository (unit_of_work.py and repository.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The ORM layer will need some tweaks so that the right batches automatically
+    get loaded and associated with `Product` objects. The nice thing is, the Repository
+    pattern means we don’t have to worry about that yet. We can just use our `FakeRepository`
+    and then feed through the new model into our service layer to see how it looks
+    with `Product` as its main entrypoint:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Service layer (src/allocation/service_layer/services.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: What About Performance?
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We’ve mentioned a few times that we’re modeling with aggregates because we want
+    to have high-performance software, but here we are loading *all* the batches when
+    we only need one. You might expect that to be inefficient, but there are a few
+    reasons why we’re comfortable here.
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, we’re purposefully modeling our data so that we can make a single query
+    to the database to read, and a single update to persist our changes. This tends
+    to perform much better than systems that issue lots of ad hoc queries. In systems
+    that don’t model this way, we often find that transactions slowly get longer and
+    more complex as the software evolves.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Second, our data structures are minimal and comprise a few strings and integers
+    per row. We can easily load tens or even hundreds of batches in a few milliseconds.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Third, we expect to have only 20 or so batches of each product at a time. Once
+    a batch is used up, we can discount it from our calculations. This means that
+    the amount of data we’re fetching shouldn’t get out of control over time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If we *did* expect to have thousands of active batches for a product, we’d have
+    a couple of options. For one, we could use lazy-loading for the batches in a product.
+    From the perspective of our code, nothing would change, but in the background,
+    SQLAlchemy would page through data for us. This would lead to more requests, each
+    fetching a smaller number of rows. Because we need to find only a single batch
+    with enough capacity for our order, this might work pretty well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If all else failed, we’d just look for a different aggregate. Maybe we could
+    split up batches by region or by warehouse. Maybe we could redesign our data access
+    strategy around the shipment concept. The Aggregate pattern is designed to help
+    manage some technical constraints around consistency and performance. There isn’t
+    *one* correct aggregate, and we should feel comfortable changing our minds if
+    we find our boundaries are causing performance woes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Optimistic Concurrency with Version Numbers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We have our new aggregate, so we’ve solved the conceptual problem of choosing
+    an object to be in charge of consistency boundaries. Let’s now spend a little
+    time talking about how to enforce data integrity at the database level.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: This section has a lot of implementation details; for example, some of it is
+    Postgres-specific. But more generally, we’re showing one way of managing concurrency
+    issues, but it is just one approach. Real requirements in this area vary a lot
+    from project to project. You shouldn’t expect to be able to copy and paste code
+    from here into production.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We don’t want to hold a lock over the entire `batches` table, but how will we
+    implement holding a lock over just the rows for a particular SKU?
+  prefs: []
+  type: TYPE_NORMAL
+- en: One answer is to have a single attribute on the `Product` model that acts as
+    a marker for the whole state change being complete and to use it as the single
+    resource that concurrent workers can fight over. If two transactions read the
+    state of the world for `batches` at the same time, and both want to update the
+    `allocations` tables, we force both to also try to update the `version_number`
+    in the `products` table, in such a way that only one of them can win and the world
+    stays consistent.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Figure 7-4](#version_numbers_sequence_diagram) illustrates two concurrent
+    transactions doing their read operations at the same time, so they see a `Product`
+    with, for example, `version=3`. They both call `Product.allocate()` in order to
+    modify a state. But we set up our database integrity rules such that only one
+    of them is allowed to `commit` the new `Product` with `version=4`, and the other
+    update is rejected.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Version numbers are just one way to implement optimistic locking. You could
+    achieve the same thing by setting the Postgres transaction isolation level to
+    `SERIALIZABLE`, but that often comes at a severe performance cost. Version numbers
+    also make implicit concepts explicit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0704](Images/apwp_0704.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 7-4\. Sequence diagram: two transactions attempting a concurrent update
+    on `Product`'
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: Implementation Options for Version Numbers
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are essentially three options for implementing version numbers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`version_number` lives in the domain; we add it to the `Product` constructor,
+    and `Product.allocate()` is responsible for incrementing it.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: The service layer could do it! The version number isn’t *strictly* a domain
+    concern, so instead our service layer could assume that the current version number
+    is attached to `Product` by the repository, and the service layer will increment
+    it before it does the `commit()`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Since it’s arguably an infrastructure concern, the UoW and repository could
+    do it by magic. The repository has access to version numbers for any products
+    it retrieves, and when the UoW does a commit, it can increment the version number
+    for any products it knows about, assuming them to have changed.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Option 3 isn’t ideal, because there’s no real way of doing it without having
+    to assume that *all* products have changed, so we’ll be incrementing version numbers
+    when we don’t have to.^([1](ch07.xhtml#idm45714892121352))
+  prefs: []
+  type: TYPE_NORMAL
+- en: Option 2 involves mixing the responsibility for mutating state between the service
+    layer and the domain layer, so it’s a little messy as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'So in the end, even though version numbers don’t *have* to be a domain concern,
+    you might decide the cleanest trade-off is to put them in the domain:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Our chosen aggregate, Product (src/allocation/domain/model.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_aggregates_and_consistency_boundaries_CO2-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There it is!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: If you’re scratching your head at this version number business, it might help
+    to remember that the *number* isn’t important. What’s important is that the `Product`
+    database row is modified whenever we make a change to the `Product` aggregate.
+    The version number is a simple, human-comprehensible way to model a thing that
+    changes on every write, but it could equally be a random UUID every time.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing for Our Data Integrity Rules
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Now to make sure we can get the behavior we want: if we have two concurrent
+    attempts to do allocation against the same `Product`, one of them should fail,
+    because they can’t both update the version number.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: First, let’s simulate a “slow” transaction using a function that does allocation
+    and then does an explicit sleep:^([2](ch07.xhtml#idm45714891984264))
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*time.sleep can reproduce concurrency behavior (tests/integration/test_uow.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we have our test invoke this slow allocation twice, concurrently, using
+    threads:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*An integration test for concurrency behavior (tests/integration/test_uow.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_aggregates_and_consistency_boundaries_CO3-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We start two threads that will reliably produce the concurrency behavior we
+    want: `read1, read2, write1, write2`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_aggregates_and_consistency_boundaries_CO3-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We assert that the version number has been incremented only once.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_aggregates_and_consistency_boundaries_CO3-4)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We can also check on the specific exception if we like.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![4](Images/4.png)](#co_aggregates_and_consistency_boundaries_CO3-5)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: And we double-check that only one allocation has gotten through.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Enforcing Concurrency Rules by Using Database Transaction Isolation Levels
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'To get the test to pass as it is, we can set the transaction isolation level
+    on our session:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Set isolation level for session (src/allocation/service_layer/unit_of_work.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Transaction isolation levels are tricky stuff, so it’s worth spending time understanding
+    [the Postgres documentation](https://oreil.ly/5vxJA).^([3](ch07.xhtml#idm45714891528632))
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Pessimistic Concurrency Control Example: SELECT FOR UPDATE'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'There are multiple ways to approach this, but we’ll show one. [`SELECT FOR
+    UPDATE`](https://oreil.ly/i8wKL) produces different behavior; two concurrent transactions
+    will not be allowed to do a read on the same rows at the same time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`SELECT FOR UPDATE` is a way of picking a row or rows to use as a lock (although
+    those rows don’t have to be the ones you update). If two transactions both try
+    to `SELECT FOR UPDATE` a row at the same time, one will win, and the other will
+    wait until the lock is released. So this is an example of pessimistic concurrency
+    control.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here’s how you can use the SQLAlchemy DSL to specify `FOR UPDATE` at query
+    time:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*SQLAlchemy with_for_update (src/allocation/adapters/repository.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: This will have the effect of changing the concurrency pattern from
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: to
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Some people refer to this as the “read-modify-write” failure mode. Read [“PostgreSQL
+    Anti-Patterns: Read-Modify-Write Cycles”](https://oreil.ly/uXeZI) for a good overview.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We don’t really have time to discuss all the trade-offs between `REPEATABLE
+    READ` and `SELECT FOR UPDATE`, or optimistic versus pessimistic locking in general.
+    But if you have a test like the one we’ve shown, you can specify the behavior
+    you want and see how it changes. You can also use the test as a basis for performing
+    some performance experiments.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrap-Up
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Specific choices around concurrency control vary a lot based on business circumstances
+    and storage technology choices, but we’d like to bring this chapter back to the
+    conceptual idea of an aggregate: we explicitly model an object as being the main
+    entrypoint to some subset of our model, and as being in charge of enforcing the
+    invariants and business rules that apply across all of those objects.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Choosing the right aggregate is key, and it’s a decision you may revisit over
+    time. You can read more about it in multiple DDD books. We also recommend these
+    three online papers on [effective aggregate design](https://dddcommunity.org/library/vernon_2011)
+    by Vaughn Vernon (the “red book” author).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Table 7-1](#chapter_07_aggregate_tradoffs) has some thoughts on the trade-offs
+    of implementing the Aggregate pattern.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Table 7-1\. Aggregates: the trade-offs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Pros | Cons |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Python might not have “official” public and private methods, but we do have
+    the underscores convention, because it’s often useful to try to indicate what’s
+    for “internal” use and what’s for “outside code” to use. Choosing aggregates is
+    just the next level up: it lets you decide which of your domain model classes
+    are the public ones, and which aren’t.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Modeling our operations around explicit consistency boundaries helps us avoid
+    performance problems with our ORM.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Putting the aggregate in sole charge of state changes to its subsidiary models
+    makes the system easier to reason about, and makes it easier to control invariants.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Yet another new concept for new developers to take on. Explaining entities versus
+    value objects was already a mental load; now there’s a third type of domain model
+    object?
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Sticking rigidly to the rule that we modify only one aggregate at a time is
+    a big mental shift.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Dealing with eventual consistency between aggregates can be complex.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Part I Recap
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Do you remember [Figure 7-5](#recap_components_diagram), the diagram we showed
+    at the beginning of [Part I](part01.xhtml#part1) to preview where we were heading?
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0705](Images/apwp_0705.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 7-5\. A component diagram for our app at the end of Part I
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'So that’s where we are at the end of Part I. What have we achieved? We’ve seen
+    how to build a domain model that’s exercised by a set of high-level unit tests.
+    Our tests are living documentation: they describe the behavior of our system—the
+    rules upon which we agreed with our business stakeholders—in nice readable code.
+    When our business requirements change, we have confidence that our tests will
+    help us to prove the new functionality, and when new developers join the project,
+    they can read our tests to understand how things work.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We’ve decoupled the infrastructural parts of our system, like the database and
+    API handlers, so that we can plug them into the outside of our application. This
+    helps us to keep our codebase well organized and stops us from building a big
+    ball of mud.
+  prefs: []
+  type: TYPE_NORMAL
+- en: By applying the dependency inversion principle, and by using ports-and-adapters-inspired
+    patterns like Repository and Unit of Work, we’ve made it possible to do TDD in
+    both high gear and low gear and to maintain a healthy test pyramid. We can test
+    our system edge to edge, and the need for integration and end-to-end tests is
+    kept to a minimum.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Lastly, we’ve talked about the idea of consistency boundaries. We don’t want
+    to lock our entire system whenever we make a change, so we have to choose which
+    parts are consistent with one another.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For a small system, this is everything you need to go and play with the ideas
+    of domain-driven design. You now have the tools to build database-agnostic domain
+    models that represent the shared language of your business experts. Hurrah!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: At the risk of laboring the point—we’ve been at pains to point out that each
+    pattern comes at a cost. Each layer of indirection has a price in terms of complexity
+    and duplication in our code and will be confusing to programmers who’ve never
+    seen these patterns before. If your app is essentially a simple CRUD wrapper around
+    a database and isn’t likely to be anything more than that in the foreseeable future,
+    *you don’t need these patterns*. Go ahead and use Django, and save yourself a
+    lot of bother.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In Part II, we’ll zoom out and talk about a bigger topic: if aggregates are
+    our boundary, and we can update only one at a time, how do we model processes
+    that cross consistency boundaries?'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([1](ch07.xhtml#idm45714892121352-marker)) Perhaps we could get some ORM/SQLAlchemy
+    magic to tell us when an object is dirty, but how would that work in the generic
+    case—for example, for a `CsvRepository`?
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([2](ch07.xhtml#idm45714891984264-marker)) `time.sleep()` works well in our
+    use case, but it’s not the most reliable or efficient way to reproduce concurrency
+    bugs. Consider using semaphores or similar synchronization primitives shared between
+    your threads to get better guarantees of behavior.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([3](ch07.xhtml#idm45714891528632-marker)) If you’re not using Postgres, you’ll
+    need to read different documentation. Annoyingly, different databases all have
+    quite different definitions. Oracle’s `SERIALIZABLE` is equivalent to Postgres’s
+    `REPEATABLE READ`, for example.
+  prefs: []
+  type: TYPE_NORMAL

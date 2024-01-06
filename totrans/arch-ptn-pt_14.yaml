@@ -1,0 +1,494 @@
+- en: 'Chapter 11\. Event-Driven Architecture: Using Events to Integrate Microservices'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In the preceding chapter, we never actually spoke about *how* we would receive
+    the “batch quantity changed” events, or indeed, how we might notify the outside
+    world about reallocations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We have a microservice with a web API, but what about other ways of talking
+    to other systems? How will we know if, say, a shipment is delayed or the quantity
+    is amended? How will we tell the warehouse system that an order has been allocated
+    and needs to be sent to a customer?
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this chapter, we’d like to show how the events metaphor can be extended to
+    encompass the way that we handle incoming and outgoing messages from the system.
+    Internally, the core of our application is now a message processor. Let’s follow
+    through on that so it becomes a message processor *externally* as well. As shown
+    in [Figure 11-1](#message_processor_diagram), our application will receive events
+    from external sources via an external message bus (we’ll use Redis pub/sub queues
+    as an example) and publish its outputs, in the form of events, back there as well.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1101](Images/apwp_1101.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-1\. Our application is a message processor
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'The code for this chapter is in the chapter_11_external_events branch [on GitHub](https://oreil.ly/UiwRS):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: Distributed Ball of Mud, and Thinking in Nouns
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Before we get into that, let’s talk about the alternatives. We regularly talk
+    to engineers who are trying to build out a microservices architecture. Often they
+    are migrating from an existing application, and their first instinct is to split
+    their system into *nouns*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What nouns have we introduced so far in our system? Well, we have batches of
+    stock, orders, products, and customers. So a naive attempt at breaking up the
+    system might have looked like [Figure 11-2](#batches_context_diagram) (notice
+    that we’ve named our system after a noun, *Batches*, instead of *Allocation*).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1102](Images/apwp_1102.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-2\. Context diagram with noun-based services
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: Each “thing” in our system has an associated service, which exposes an HTTP
+    API.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let’s work through an example happy-path flow in [Figure 11-3](#command_flow_diagram_1):
+    our users visit a website and can choose from products that are in stock. When
+    they add an item to their basket, we will reserve some stock for them. When an
+    order is complete, we confirm the reservation, which causes us to send dispatch
+    instructions to the warehouse. Let’s also say, if this is the customer’s third
+    order, we want to update the customer record to flag them as a VIP.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1103](Images/apwp_1103.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-3\. Command flow 1
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We can think of each of these steps as a command in our system: `ReserveStock`,
+    `ConfirmReservation`, `DispatchGoods`, `MakeCustomerVIP`, and so forth.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This style of architecture, where we create a microservice per database table
+    and treat our HTTP APIs as CRUD interfaces to anemic models, is the most common
+    initial way for people to approach service-oriented design.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This works *fine* for systems that are very simple, but it can quickly degrade
+    into a distributed ball of mud.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To see why, let’s consider another case. Sometimes, when stock arrives at the
+    warehouse, we discover that items have been water damaged during transit. We can’t
+    sell water-damaged sofas, so we have to throw them away and request more stock
+    from our partners. We also need to update our stock model, and that might mean
+    we need to reallocate a customer’s order.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Where does this logic go?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Well, the Warehouse system knows that the stock has been damaged, so maybe it
+    should own this process, as shown in [Figure 11-4](#command_flow_diagram_2).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1104](Images/apwp_1104.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-4\. Command flow 2
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: This sort of works too, but now our dependency graph is a mess. To allocate
+    stock, the Orders service drives the Batches system, which drives Warehouse; but
+    in order to handle problems at the warehouse, our Warehouse system drives Batches,
+    which drives Orders.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Multiply this by all the other workflows we need to provide, and you can see
+    how services quickly get tangled up.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Error Handling in Distributed Systems
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: “Things break” is a universal law of software engineering. What happens in our
+    system when one of our requests fails? Let’s say that a network error happens
+    right after we take a user’s order for three `MISBEGOTTEN-RUG`, as shown in [Figure 11-5](#command_flow_diagram_with_error).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We have two options here: we can place the order anyway and leave it unallocated,
+    or we can refuse to take the order because the allocation can’t be guaranteed.
+    The failure state of our batches service has bubbled up and is affecting the reliability
+    of our order service.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'When two things have to be changed together, we say that they are *coupled*.
+    We can think of this failure cascade as a kind of *temporal coupling*: every part
+    of the system has to work at the same time for any part of it to work. As the
+    system gets bigger, there is an exponentially increasing probability that some
+    part is degraded.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1105](Images/apwp_1105.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-5\. Command flow with error
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The Alternative: Temporal Decoupling Using Asynchronous Messaging'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: How do we get appropriate coupling? We’ve already seen part of the answer, which
+    is that we should think in terms of verbs, not nouns. Our domain model is about
+    modeling a business process. It’s not a static data model about a thing; it’s
+    a model of a verb.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So instead of thinking about a system for orders and a system for batches, we
+    think about a system for *ordering* and a system for *allocating*, and so on.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When we separate things this way, it’s a little easier to see which system should
+    be responsible for what. When thinking about *ordering*, really we want to make
+    sure that when we place an order, the order is placed. Everything else can happen
+    *later*, so long as it happens.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: If this sounds familiar, it should! Segregating responsibilities is the same
+    process we went through when designing our aggregates and commands.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Like aggregates, microservices should be *consistency boundaries*. Between two
+    services, we can accept eventual consistency, and that means we don’t need to
+    rely on synchronous calls. Each service accepts commands from the outside world
+    and raises events to record the result. Other services can listen to those events
+    to trigger the next steps in the workflow.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To avoid the Distributed Ball of Mud anti-pattern, instead of temporally coupled
+    HTTP API calls, we want to use asynchronous messaging to integrate our systems.
+    We want our `BatchQuantityChanged` messages to come in as external messages from
+    upstream systems, and we want our system to publish `Allocated` events for downstream
+    systems to listen to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Why is this better? First, because things can fail independently, it’s easier
+    to handle degraded behavior: we can still take orders if the allocation system
+    is having a bad day.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Second, we’re reducing the strength of coupling between our systems. If we need
+    to change the order of operations or to introduce new steps in the process, we
+    can do that locally.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using a Redis Pub/Sub Channel for Integration
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let’s see how it will all work concretely. We’ll need some way of getting events
+    out of one system and into another, like our message bus, but for services. This
+    piece of infrastructure is often called a *message broker*. The role of a message
+    broker is to take messages from publishers and deliver them to subscribers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At MADE.com, we use [Event Store](https://eventstore.org); Kafka or RabbitMQ
+    are valid alternatives. A lightweight solution based on Redis [pub/sub channels](https://redis.io/topics/pubsub)
+    can also work just fine, and because Redis is much more generally familiar to
+    people, we thought we’d use it for this book.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: We’re glossing over the complexity involved in choosing the right messaging
+    platform. Concerns like message ordering, failure handling, and idempotency all
+    need to be thought through. For a few pointers, see [“Footguns”](afterword01.xhtml#footguns).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Our new flow will look like [Figure 11-6](#reallocation_sequence_diagram_with_redis):
+    Redis provides the `BatchQuantityChanged` event that kicks off the whole process,
+    and our `Allocated` event is published back out to Redis again at the end.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1106](Images/apwp_1106.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 11-6\. Sequence diagram for reallocation flow
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: Test-Driving It All Using an End-to-End Test
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here’s how we might start with an end-to-end test. We can use our existing
+    API to create batches, and then we’ll test both inbound and outbound messages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*An end-to-end test for our pub/sub model (tests/e2e/test_external_events.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO1-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can read the story of what’s going on in this test from the comments: we
+    want to send an event into the system that causes an order line to be reallocated,
+    and we see that reallocation come out as an event in Redis too.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO1-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`api_client` is a little helper that we refactored out to share between our
+    two test types; it wraps our calls to `requests.post`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO1-4)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`redis_client` is another little test helper, the details of which don’t really
+    matter; its job is to be able to send and receive messages from various Redis
+    channels. We’ll use a channel called `change_batch_quantity` to send in our request
+    to change the quantity for a batch, and we’ll listen to another channel called
+    `line_allocated` to look out for the expected reallocation.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![4](Images/4.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO1-8)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Because of the asynchronous nature of the system under test, we need to use
+    the `tenacity` library again to add a retry loop—first, because it may take some
+    time for our new `line_allocated` message to arrive, but also because it won’t
+    be the only message on that channel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Redis Is Another Thin Adapter Around Our Message Bus
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our Redis pub/sub listener (we call it an *event consumer*) is very much like
+    Flask: it translates from the outside world to our events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Simple Redis message listener (src/allocation/entrypoints/redis_eventconsumer.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO2-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`main()` subscribes us to the `change_batch_quantity` channel on load.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO2-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our main job as an entrypoint to the system is to deserialize JSON, convert
+    it to a `Command`, and pass it to the service layer—much as the Flask adapter
+    does.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We also build a new downstream adapter to do the opposite job—converting domain
+    events to public events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Simple Redis message publisher (src/allocation/adapters/redis_eventpublisher.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_event_driven_architecture__using_events_to_integrate_microservices_CO3-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We take a hardcoded channel here, but you could also store a mapping between
+    event classes/names and the appropriate channel, allowing one or more message
+    types to go to different channels.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our New Outgoing Event
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Here’s what the `Allocated` event will look like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*New event (src/allocation/domain/events.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'It captures everything we need to know about an allocation: the details of
+    the order line, and which batch it was allocated to.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We add it into our model’s `allocate()` method (having added a test first,
+    naturally):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Product.allocate() emits new event to record what happened (src/allocation/domain/model.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The handler for `ChangeBatchQuantity` already exists, so all we need to add
+    is a handler that publishes the outgoing event:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*The message bus grows (src/allocation/service_layer/messagebus.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Publishing the event uses our helper function from the Redis wrapper:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Publish to Redis (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Internal Versus External Events
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: It’s a good idea to keep the distinction between internal and external events
+    clear. Some events may come from the outside, and some events may get upgraded
+    and published externally, but not all of them will. This is particularly important
+    if you get into [event sourcing](https://oreil.ly/FXVil) (very much a topic for
+    another book, though).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Outbound events are one of the places it’s important to apply validation. See
+    [Appendix E](app05.xhtml#appendix_validation) for some validation philosophy and
+    examples.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrap-Up
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Events can come *from* the outside, but they can also be published externally—our
+    `publish` handler converts an event to a message on a Redis channel. We use events
+    to talk to the outside world. This kind of temporal decoupling buys us a lot of
+    flexibility in our application integrations, but as always, it comes at a cost.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Event notification is nice because it implies a low level of coupling, and is
+    pretty simple to set up. It can become problematic, however, if there really is
+    a logical flow that runs over various event notifications...It can be hard to
+    see such a flow as it’s not explicit in any program text....This can make it hard
+    to debug and modify.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '>'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Martin Fowler, [“What do you mean by ‘Event-Driven’”](https://oreil.ly/uaPNt)
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '[Table 11-1](#chapter_11_external_events_tradeoffs) shows some trade-offs to
+    think about.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Table 11-1\. Event-based microservices integration: the trade-offs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Pros | Cons |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Avoids the distributed big ball of mud.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Services are decoupled: it’s easier to change individual services and add new
+    ones.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The overall flows of information are harder to see.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Eventual consistency is a new concept to deal with.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Message reliability and choices around at-least-once versus at-most-once delivery
+    need thinking through.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: More generally, if you’re moving from a model of synchronous messaging to an
+    async one, you also open up a whole host of problems having to do with message
+    reliability and eventual consistency. Read on to [“Footguns”](afterword01.xhtml#footguns).
+  prefs: []
+  type: TYPE_NORMAL

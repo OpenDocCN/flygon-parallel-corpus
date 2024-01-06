@@ -1,0 +1,638 @@
+- en: Chapter 12\. Command-Query Responsibility Segregation (CQRS)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'In this chapter, we’re going to start with a fairly uncontroversial insight:
+    reads (queries) and writes (commands) are different, so they should be treated
+    differently (or have their responsibilities segregated, if you will). Then we’re
+    going to push that insight as far as we can.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you’re anything like Harry, this will all seem extreme at first, but hopefully
+    we can make the argument that it’s not *totally* unreasonable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Figure 12-1](#maps_chapter_11) shows where we might end up.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The code for this chapter is in the chapter_12_cqrs branch [on GitHub](https://oreil.ly/YbWGT).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: First, though, why bother?
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1201](Images/apwp_1201.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 12-1\. Separating reads from writes
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Domain Models Are for Writing
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: We’ve spent a lot of time in this book talking about how to build software that
+    enforces the rules of our domain. These rules, or constraints, will be different
+    for every application, and they make up the interesting core of our systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In this book, we’ve set explicit constraints like “You can’t allocate more stock
+    than is available,” as well as implicit constraints like “Each order line is allocated
+    to a single batch.”
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We wrote down these rules as unit tests at the beginning of the book:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Our basic domain tests (tests/unit/test_batches.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: To apply these rules properly, we needed to ensure that operations were consistent,
+    and so we introduced patterns like *Unit of Work* and *Aggregate* that help us
+    commit small chunks of work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To communicate changes between those small chunks, we introduced the Domain
+    Events pattern so we can write rules like “When stock is damaged or lost, adjust
+    the available quantity on the batch, and reallocate orders if necessary.”
+  prefs: []
+  type: TYPE_NORMAL
+- en: All of this complexity exists so we can enforce rules when we change the state
+    of our system. We’ve built a flexible set of tools for writing data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What about reads, though?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Most Users Aren’t Going to Buy Your Furniture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: At MADE.com, we have a system very like the allocation service. In a busy day,
+    we might process one hundred orders in an hour, and we have a big gnarly system
+    for allocating stock to those orders.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In that same busy day, though, we might have one hundred product views per *second*.
+    Each time somebody visits a product page, or a product listing page, we need to
+    figure out whether the product is still in stock and how long it will take us
+    to deliver it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The *domain* is the same—we’re concerned with batches of stock, and their arrival
+    date, and the amount that’s still available—but the access pattern is very different.
+    For example, our customers won’t notice if the query is a few seconds out of date,
+    but if our allocate service is inconsistent, we’ll make a mess of their orders.
+    We can take advantage of this difference by making our reads *eventually consistent*
+    in order to make them perform better.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We can think of these requirements as forming two halves of a system: the read
+    side and the write side, shown in [Table 12-1](#read_and_write_table).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: For the write side, our fancy domain architectural patterns help us to evolve
+    our system over time, but the complexity we’ve built so far doesn’t buy anything
+    for reading data. The service layer, the unit of work, and the clever domain model
+    are just bloat.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12-1\. Read versus write
+  prefs: []
+  type: TYPE_NORMAL
+- en: '|  | Read side | Write side |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Behavior | Simple read | Complex business logic |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Cacheability | Highly cacheable | Uncacheable |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Consistency | Can be stale | Must be transactionally consistent |'
+  prefs: []
+  type: TYPE_TB
+- en: Post/Redirect/Get and CQS
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: If you do web development, you’re probably familiar with the Post/Redirect/Get
+    pattern. In this technique, a web endpoint accepts an HTTP POST and responds with
+    a redirect to see the result. For example, we might accept a POST to */batches*
+    to create a new batch and redirect the user to */batches/123* to see their newly
+    created batch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This approach fixes the problems that arise when users refresh the results page
+    in their browser or try to bookmark a results page. In the case of a refresh,
+    it can lead to our users double-submitting data and thus buying two sofas when
+    they needed only one. In the case of a bookmark, our hapless customers will end
+    up with a broken page when they try to GET a POST endpoint.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both these problems happen because we’re returning data in response to a write
+    operation. Post/Redirect/Get sidesteps the issue by separating the read and write
+    phases of our operation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This technique is a simple example of command-query separation (CQS). In CQS
+    we follow one simple rule: functions should either modify state or answer questions,
+    but never both. This makes software easier to reason about: we should always be
+    able to ask, “Are the lights on?” without flicking the light switch.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: When building APIs, we can apply the same design technique by returning a 201
+    Created, or a 202 Accepted, with a Location header containing the URI of our new
+    resources. What’s important here isn’t the status code we use but the logical
+    separation of work into a write phase and a query phase.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As you’ll see, we can use the CQS principle to make our systems faster and
+    more scalable, but first, let’s fix the CQS violation in our existing code. Ages
+    ago, we introduced an `allocate` endpoint that takes an order and calls our service
+    layer to allocate some stock. At the end of the call, we return a 200 OK and the
+    batch ID. That’s led to some ugly design flaws so that we can get the data we
+    need. Let’s change it to return a simple OK message and instead provide a new
+    read-only endpoint to retrieve allocation state:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*API test does a GET after the POST (tests/e2e/test_api.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: OK, what might the Flask app look like?
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Endpoint for viewing allocations (src/allocation/entrypoints/flask_app.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_command_query_responsibility_segregation__cqrs__CO1-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: All right, a *views.py*, fair enough; we can keep read-only stuff in there,
+    and it’ll be a real *views.py*, not like Django’s, something that knows how to
+    build read-only views of our data…
+  prefs: []
+  type: TYPE_NORMAL
+- en: Hold On to Your Lunch, Folks
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Hmm, so we can probably just add a list method to our existing repository object:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Views do…raw SQL? (src/allocation/views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: '*Excuse me? Raw SQL?*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you’re anything like Harry encountering this pattern for the first time,
+    you’ll be wondering what on earth Bob has been smoking. We’re hand-rolling our
+    own SQL now, and converting database rows directly to dicts? After all the effort
+    we put into building a nice domain model? And what about the Repository pattern?
+    Isn’t that meant to be our abstraction around the database? Why don’t we reuse
+    that?
+  prefs: []
+  type: TYPE_NORMAL
+- en: Well, let’s explore that seemingly simpler alternative first, and see what it
+    looks like in practice.
+  prefs: []
+  type: TYPE_NORMAL
+- en: We’ll still keep our view in a separate *views.py* module; enforcing a clear
+    distinction between reads and writes in your application is still a good idea.
+    We apply command-query separation, and it’s easy to see which code modifies state
+    (the event handlers) and which code just retrieves read-only state (the views).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Splitting out your read-only views from your state-modifying command and event
+    handlers is probably a good idea, even if you don’t want to go to full-blown CQRS.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Testing CQRS Views
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Before we get into exploring various options, let’s talk about testing. Whichever
+    approaches you decide to go for, you’re probably going to need at least one integration
+    test. Something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*An integration test for a view (tests/integration/test_views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_command_query_responsibility_segregation__cqrs__CO2-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We do the setup for the integration test by using the public entrypoint to our
+    application, the message bus. That keeps our tests decoupled from any implementation/infrastructure
+    details about how things get stored.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '“Obvious” Alternative 1: Using the Existing Repository'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: How about adding a helper method to our `products` repository?
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*A simple view that uses the repository (src/allocation/views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_command_query_responsibility_segregation__cqrs__CO3-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our repository returns `Product` objects, and we need to find all the products
+    for the SKUs in a given order, so we’ll build a new helper method called `.for_order()`
+    on the repository.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_command_query_responsibility_segregation__cqrs__CO3-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now we have products but we actually want batch references, so we get all the
+    possible batches with a list comprehension.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_command_query_responsibility_segregation__cqrs__CO3-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We filter *again* to get just the batches for our specific order. That, in turn,
+    relies on our `Batch` objects being able to tell us which order IDs it has allocated.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We implement that last using a `.orderid` property:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*An arguably unnecessary property on our model (src/allocation/domain/model.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: You can start to see that reusing our existing repository and domain model classes
+    is not as straightforward as you might have assumed. We’ve had to add new helper
+    methods to both, and we’re doing a bunch of looping and filtering in Python, which
+    is work that would be done much more efficiently by the database.
+  prefs: []
+  type: TYPE_NORMAL
+- en: So yes, on the plus side we’re reusing our existing abstractions, but on the
+    downside, it all feels quite clunky.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Your Domain Model Is Not Optimized for Read Operations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: What we’re seeing here are the effects of having a domain model that is designed
+    primarily for write operations, while our requirements for reads are often conceptually
+    quite different.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This is the chin-stroking-architect’s justification for CQRS. As we’ve said
+    before, a domain model is not a data model—we’re trying to capture the way the
+    business works: workflow, rules around state changes, messages exchanged; concerns
+    about how the system reacts to external events and user input. *Most of this stuff
+    is totally irrelevant for read-only operations*.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: This justification for CQRS is related to the justification for the Domain Model
+    pattern. If you’re building a simple CRUD app, reads and writes are going to be
+    closely related, so you don’t need a domain model or CQRS. But the more complex
+    your domain, the more likely you are to need both.
+  prefs: []
+  type: TYPE_NORMAL
+- en: To make a facile point, your domain classes will have multiple methods for modifying
+    state, and you won’t need any of them for read-only operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: As the complexity of your domain model grows, you will find yourself making
+    more and more choices about how to structure that model, which make it more and
+    more awkward to use for read operations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '“Obvious” Alternative 2: Using the ORM'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You may be thinking, OK, if our repository is clunky, and working with `Products`
+    is clunky, then I can at least use my ORM and work with `Batches`. That’s what
+    it’s for!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*A simple view that uses the ORM (src/allocation/views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: But is that *actually* any easier to write or understand than the raw SQL version
+    from the code example in [“Hold On to Your Lunch, Folks”](#hold-on-ch12)? It may
+    not look too bad up there, but we can tell you it took several attempts, and plenty
+    of digging through the SQLAlchemy docs. SQL is just SQL.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But the ORM can also expose us to performance problems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: SELECT N+1 and Other Performance Considerations
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The so-called [`SELECT N+1`](https://oreil.ly/OkBOS) problem is a common performance
+    problem with ORMs: when retrieving a list of objects, your ORM will often perform
+    an initial query to, say, get all the IDs of the objects it needs, and then issue
+    individual queries for each object to retrieve their attributes. This is especially
+    likely if there are any foreign-key relationships on your objects.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: In all fairness, we should say that SQLAlchemy is quite good at avoiding the
+    `SELECT N+1` problem. It doesn’t display it in the preceding example, and you
+    can request [eager loading](https://oreil.ly/XKDDm) explicitly to avoid it when
+    dealing with joined objects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Beyond `SELECT N+1`, you may have other reasons for wanting to decouple the
+    way you persist state changes from the way that you retrieve current state. A
+    set of fully normalized relational tables is a good way to make sure that write
+    operations never cause data corruption. But retrieving data using lots of joins
+    can be slow. It’s common in such cases to add some denormalized views, build read
+    replicas, or even add caching layers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Time to Completely Jump the Shark
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'On that note: have we convinced you that our raw SQL version isn’t so weird
+    as it first seemed? Perhaps we were exaggerating for effect? Just you wait.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: So, reasonable or not, that hardcoded SQL query is pretty ugly, right? What
+    if we made it nicer…
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*A much nicer query (src/allocation/views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: …by *keeping a totally separate, denormalized data store for our view model*?
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Hee hee hee, no foreign keys, just strings, YOLO (src/allocation/adapters/orm.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: OK, nicer-looking SQL queries wouldn’t be a justification for anything really,
+    but building a denormalized copy of your data that’s optimized for read operations
+    isn’t uncommon, once you’ve reached the limits of what you can do with indexes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Even with well-tuned indexes, a relational database uses a lot of CPU to perform
+    joins. The fastest queries will always be `SELECT * from *mytable* WHERE *key*
+    = :*value*`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: More than raw speed, though, this approach buys us scale. When we’re writing
+    data to a relational database, we need to make sure that we get a lock over the
+    rows we’re changing so we don’t run into consistency problems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If multiple clients are changing data at the same time, we’ll have weird race
+    conditions. When we’re *reading* data, though, there’s no limit to the number
+    of clients that can concurrently execute. For this reason, read-only stores can
+    be horizontally scaled out.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Because read replicas can be inconsistent, there’s no limit to how many we can
+    have. If you’re struggling to scale a system with a complex data store, ask whether
+    you could build a simpler read model.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Keeping the read model up to date is the challenge! Database views (materialized
+    or otherwise) and triggers are a common solution, but that limits you to your
+    database. We’d like to show you how to reuse our event-driven architecture instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Updating a Read Model Table Using an Event Handler
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We add a second handler to the `Allocated` event:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Allocated event gets a new handler (src/allocation/service_layer/messagebus.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Here’s what our update-view-model code looks like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Update on allocation (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: Believe it or not, that will pretty much work! *And it will work against the
+    exact same integration tests as the rest of our options.*
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'OK, you’ll also need to handle `Deallocated`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*A second listener for read model updates*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[Figure 12-2](#read_model_sequence_diagram) shows the flow across the two requests.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 1202](Images/apwp_1202.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 12-2\. Sequence diagram for read model
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: In [Figure 12-2](#read_model_sequence_diagram), you can see two transactions
+    in the POST/write operation, one to update the write model and one to update the
+    read model, which the GET/read operation can use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Changing Our Read Model Implementation Is Easy
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let’s see the flexibility that our event-driven model buys us in action, by
+    seeing what happens if we ever decide we want to implement a read model by using
+    a totally separate storage engine, Redis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Just watch:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handlers update a Redis read model (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The helpers in our Redis module are one-liners:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Redis read model read and update (src/allocation/adapters/redis_eventpublisher.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: (Maybe the name *redis_eventpublisher.py* is a misnomer now, but you get the
+    idea.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'And the view itself changes very slightly to adapt to its new backend:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*View adapted to Redis (src/allocation/views.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And the *exact same* integration tests that we had before still pass, because
+    they are written at a level of abstraction that’s decoupled from the implementation:
+    setup puts messages on the message bus, and the assertions are against our view.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Event handlers are a great way to manage updates to a read model, if you decide
+    you need one. They also make it easy to change the implementation of that read
+    model at a later date.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrap-Up
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '[Table 12-2](#view_model_tradeoffs) proposes some pros and cons for each of
+    our options.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As it happens, the allocation service at MADE.com does use “full-blown” CQRS,
+    with a read model stored in Redis, and even a second layer of cache provided by
+    Varnish. But its use cases are quite a bit different from what we’ve shown here.
+    For the kind of allocation service we’re building, it seems unlikely that you’d
+    need to use a separate read model and event handlers for updating it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: But as your domain model becomes richer and more complex, a simplified read
+    model become ever more compelling.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Table 12-2\. Trade-offs of various view model options
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Option | Pros | Cons |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Just use repositories | Simple, consistent approach. | Expect performance
+    issues with complex query patterns. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Use custom queries with your ORM | Allows reuse of DB configuration and model
+    definitions. | Adds another query language with its own quirks and syntax. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Use hand-rolled SQL | Offers fine control over performance with a standard
+    query syntax. | Changes to DB schema have to be made to your hand-rolled queries
+    *and* your ORM definitions. Highly normalized schemas may still have performance
+    limitations. |'
+  prefs: []
+  type: TYPE_TB
+- en: '| Create separate read stores with events | Read-only copies are easy to scale
+    out. Views can be constructed when data changes so that queries are as simple
+    as possible. | Complex technique. Harry will be forever suspicious of your tastes
+    and motives. |'
+  prefs: []
+  type: TYPE_TB
+- en: Often, your read operations will be acting on the same conceptual objects as
+    your write model, so using the ORM, adding some read methods to your repositories,
+    and using domain model classes for your read operations is *just fine*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In our book example, the read operations act on quite different conceptual entities
+    to our domain model. The allocation service thinks in terms of `Batches` for a
+    single SKU, but users care about allocations for a whole order, with multiple
+    SKUs, so using the ORM ends up being a little awkward. We’d be quite tempted to
+    go with the raw-SQL view we showed right at the beginning of the chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: On that note, let’s sally forth into our final chapter.
+  prefs: []
+  type: TYPE_NORMAL

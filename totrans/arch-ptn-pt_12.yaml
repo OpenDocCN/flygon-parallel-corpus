@@ -1,0 +1,670 @@
+- en: Chapter 9\. Going to Town on the Message Bus
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter, we’ll start to make events more fundamental to the internal
+    structure of our application. We’ll move from the current state in [Figure 9-1](#maps_chapter_08_before),
+    where events are an optional side effect…
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0901](Images/apwp_0901.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: 'Figure 9-1\. Before: the message bus is an optional add-on'
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: …to the situation in [Figure 9-2](#map_chapter_08_after), where everything goes
+    via the message bus, and our app has been transformed fundamentally into a message
+    processor.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0902](Images/apwp_0902.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-2\. The message bus is now the main entrypoint to the service layer
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Tip
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'The code for this chapter is in the chapter_09_all_messagebus branch [on GitHub](https://oreil.ly/oKNkn):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: A New Requirement Leads Us to a New Architecture
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Rich Hickey talks about *situated software,* meaning software that runs for
+    extended periods of time, managing a real-world process. Examples include warehouse-management
+    systems, logistics schedulers, and payroll systems.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This software is tricky to write because unexpected things happen all the time
+    in the real world of physical objects and unreliable humans. For example:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: During a stock-take, we discover that three `SPRINGY-MATTRESS`es have been water
+    damaged by a leaky roof.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A consignment of `RELIABLE-FORK`s is missing the required documentation and
+    is held in customs for several weeks. Three `RELIABLE-FORK`s subsequently fail
+    safety testing and are destroyed.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A global shortage of sequins means we’re unable to manufacture our next batch
+    of `SPARKLY-BOOKCASE`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In these types of situations, we learn about the need to change batch quantities
+    when they’re already in the system. Perhaps someone made a mistake on the number
+    in the manifest, or perhaps some sofas fell off a truck. Following a conversation
+    with the business,^([1](ch09.xhtml#idm45714888912728)) we model the situation
+    as in [Figure 9-3](#batch_changed_events_flow_diagram).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0903](Images/apwp_0903.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-3\. Batch quantity changed means deallocate and reallocate
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'An event we’ll call `BatchQuantityChanged` should lead us to change the quantity
+    on the batch, yes, but also to apply a *business rule*: if the new quantity drops
+    to less than the total already allocated, we need to *deallocate* those orders
+    from that batch. Then each one will require a new allocation, which we can capture
+    as an event called `AllocationRequired`.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Perhaps you’re already anticipating that our internal message bus and events
+    can help implement this requirement. We could define a service called `change_batch_quantity`
+    that knows how to adjust batch quantities and also how to *deallocate* any excess
+    order lines, and then each deallocation can emit an `AllocationRequired` event
+    that can be forwarded to the existing `allocate` service, in separate transactions.
+    Once again, our message bus helps us to enforce the single responsibility principle,
+    and it allows us to make choices about transactions and data integrity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Imagining an Architecture Change: Everything Will Be an Event Handler'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'But before we jump in, think about where we’re headed. There are two kinds
+    of flows through our system:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: API calls that are handled by a service-layer function
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Internal events (which might be raised as a side effect of a service-layer function)
+    and their handlers (which in turn call service-layer functions)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Wouldn’t it be easier if everything was an event handler? If we rethink our
+    API calls as capturing events, the service-layer functions can be event handlers
+    too, and we no longer need to make a distinction between internal and external
+    event handlers:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`services.allocate()` could be the handler for an `AllocationRequired` event
+    and could emit `Allocated` events as its output.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`services.add_batch()` could be the handler for a `BatchCreated` event.^([2](ch09.xhtml#idm45714888887096))'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Our new requirement will fit the same pattern:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: An event called `BatchQuantityChanged` can invoke a handler called `change_batch_quantity()`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: And the new `AllocationRequired` events that it may raise can be passed on to
+    `services.allocate()` too, so there is no conceptual difference between a brand-new
+    allocation coming from the API and a reallocation that’s internally triggered
+    by a deallocation.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'All sound like a bit much? Let’s work toward it all gradually. We’ll follow
+    the [Preparatory Refactoring](https://oreil.ly/W3RZM) workflow, aka “Make the
+    change easy; then make the easy change”:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We refactor our service layer into event handlers. We can get used to the idea
+    of events being the way we describe inputs to the system. In particular, the existing
+    `services.allocate()` function will become the handler for an event called `AllocationRequired`.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: We build an end-to-end test that puts `BatchQuantityChanged` events into the
+    system and looks for `Allocated` events coming out.
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: 'Our implementation will conceptually be very simple: a new handler for `BatchQuantityChanged`
+    events, whose implementation will emit `AllocationRequired` events, which in turn
+    will be handled by the exact same handler for allocations that the API uses.'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Along the way, we’ll make a small tweak to the message bus and UoW, moving the
+    responsibility for putting new events on the message bus into the message bus
+    itself.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Refactoring Service Functions to Message Handlers
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We start by defining the two events that capture our current API inputs—`AllocationRequired`
+    and `BatchCreated`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*BatchCreated and AllocationRequired events (src/allocation/domain/events.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Then we rename *services.py* to *handlers.py*; we add the existing message
+    handler for `send_out_of_stock_notification`; and most importantly, we change
+    all the handlers so that they have the same inputs, an event and a UoW:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handlers and services are the same thing (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'The change might be clearer as a diff:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Changing from services to handlers (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: Along the way, we’ve made our service-layer’s API more structured and more consistent.
+    It was a scattering of primitives, and now it uses well-defined objects (see the
+    following sidebar).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Message Bus Now Collects Events from the UoW
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our event handlers now need a UoW. In addition, as our message bus becomes
+    more central to our application, it makes sense to put it explicitly in charge
+    of collecting and processing new events. There was a bit of a circular dependency
+    between the UoW and message bus until now, so this will make it one-way:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handle takes a UoW and manages a queue (src/allocation/service_layer/messagebus.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_going_to_town_on_the_message_bus_CO1-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The message bus now gets passed the UoW each time it starts up.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_going_to_town_on_the_message_bus_CO1-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When we begin handling our first event, we start a queue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_going_to_town_on_the_message_bus_CO1-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We pop events from the front of the queue and invoke their handlers (the `HANDLERS`
+    dict hasn’t changed; it still maps event types to handler functions).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![4](Images/4.png)](#co_going_to_town_on_the_message_bus_CO1-5)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The message bus passes the UoW down to each handler.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![5](Images/5.png)](#co_going_to_town_on_the_message_bus_CO1-6)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After each handler finishes, we collect any new events that have been generated
+    and add them to the queue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In *unit_of_work.py*, `publish_events()` becomes a less active method, `collect_new_events()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*UoW no longer puts events directly on the bus (src/allocation/service_layer/unit_of_work.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_going_to_town_on_the_message_bus_CO2-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `unit_of_work` module now no longer depends on `messagebus`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_going_to_town_on_the_message_bus_CO2-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We no longer `publish_events` automatically on commit. The message bus is keeping
+    track of the event queue instead.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_going_to_town_on_the_message_bus_CO2-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: And the UoW no longer actively puts events on the message bus; it just makes
+    them available.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our Tests Are All Written in Terms of Events Too
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our tests now operate by creating events and putting them on the message bus,
+    rather than invoking service-layer functions directly:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handler tests use events (tests/unit/test_handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'A Temporary Ugly Hack: The Message Bus Has to Return Results'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our API and our service layer currently want to know the allocated batch reference
+    when they invoke our `allocate()` handler. This means we need to put in a temporary
+    hack on our message bus to let it return events:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Message bus returns results (src/allocation/service_layer/messagebus.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: It’s because we’re mixing the read and write responsibilities in our system.
+    We’ll come back to fix this wart in [Chapter 12](ch12.xhtml#chapter_12_cqrs).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Modifying Our API to Work with Events
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: '*Flask changing to message bus as a diff (src/allocation/entrypoints/flask_app.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_going_to_town_on_the_message_bus_CO3-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Instead of calling the service layer with a bunch of primitives extracted from
+    the request JSON…
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_going_to_town_on_the_message_bus_CO3-2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: We instantiate an event.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](Images/3.png)](#co_going_to_town_on_the_message_bus_CO3-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Then we pass it to the message bus.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'And we should be back to a fully functional application, but one that’s now
+    fully event-driven:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What used to be service-layer functions are now event handlers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: That makes them the same as the functions we invoke for handling internal events
+    raised by our domain model.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We use events as our data structure for capturing inputs to the system, as well
+    as for handing off of internal work packages.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The entire app is now best described as a message processor, or an event processor
+    if you prefer. We’ll talk about the distinction in the [next chapter](ch10.xhtml#chapter_10_commands).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Implementing Our New Requirement
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'We’re done with our refactoring phase. Let’s see if we really have “made the
+    change easy.” Let’s implement our new requirement, shown in [Figure 9-4](#reallocation_sequence_diagram):
+    we’ll receive as our inputs some new `BatchQuantityChanged` events and pass them
+    to a handler, which in turn might emit some `AllocationRequired` events, and those
+    in turn will go back to our existing handler for reallocation.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![apwp 0904](Images/apwp_0904.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-4\. Sequence diagram for reallocation flow
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: Warning
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'When you split things out like this across two units of work, you now have
+    two database transactions, so you are opening yourself up to integrity issues:
+    something could happen that means the first transaction completes but the second
+    one does not. You’ll need to think about whether this is acceptable, and whether
+    you need to notice when it happens and do something about it. See [“Footguns”](afterword01.xhtml#footguns)
+    for more discussion.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our New Event
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The event that tells us a batch quantity has changed is simple; it just needs
+    a batch reference and a new quantity:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*New event (src/allocation/domain/events.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11]'
+  prefs: []
+  type: TYPE_PRE
+- en: Test-Driving a New Handler
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Following the lessons learned in [Chapter 4](ch04.xhtml#chapter_04_service_layer),
+    we can operate in “high gear” and write our unit tests at the highest possible
+    level of abstraction, in terms of events. Here’s what they might look like:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handler tests for change_batch_quantity (tests/unit/test_handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE12]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](Images/1.png)](#co_going_to_town_on_the_message_bus_CO4-1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The simple case would be trivially easy to implement; we just modify a quantity.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](Images/2.png)](#co_going_to_town_on_the_message_bus_CO4-3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: But if we try to change the quantity to less than has been allocated, we’ll
+    need to deallocate at least one order, and we expect to reallocate it to a new
+    batch.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Implementation
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Our new handler is very simple:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Handler delegates to model layer (src/allocation/service_layer/handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We realize we’ll need a new query type on our repository:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*A new query type on our repository (src/allocation/adapters/repository.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'And on our `FakeRepository` too:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Updating the fake repo too (tests/unit/test_handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: We’re adding a query to our repository to make this use case easier to implement.
+    So long as our query is returning a single aggregate, we’re not bending any rules.
+    If you find yourself writing complex queries on your repositories, you might want
+    to consider a different design. Methods like `get_most_popular_products` or `find_products_by_order_id`
+    in particular would definitely trigger our spidey sense. [Chapter 11](ch11.xhtml#chapter_11_external_events)
+    and the [epilogue](afterword01.xhtml#epilogue_1_how_to_get_there_from_here) have
+    some tips on managing complex queries.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A New Method on the Domain Model
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'We add the new method to the model, which does the quantity change and deallocation(s)
+    inline and publishes a new event. We also modify the existing allocate function
+    to publish an event:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Our model evolves to capture the new requirement (src/allocation/domain/model.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'We wire up our new handler:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*The message bus grows (src/allocation/service_layer/messagebus.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: And our new requirement is fully implemented.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Optionally: Unit Testing Event Handlers in Isolation with a Fake Message Bus'
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Our main test for the reallocation workflow is *edge-to-edge* (see the example
+    code in [“Test-Driving a New Handler”](#test-driving-ch9)). It uses the real message
+    bus, and it tests the whole flow, where the `BatchQuantityChanged` event handler
+    triggers deallocation, and emits new `AllocationRequired` events, which in turn
+    are handled by their own handlers. One test covers a chain of multiple events
+    and handlers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Depending on the complexity of your chain of events, you may decide that you
+    want to test some handlers in isolation from one another. You can do this using
+    a “fake” message bus.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In our case, we actually intervene by modifying the `publish_events()` method
+    on `FakeUnitOfWork` and decoupling it from the real message bus, instead making
+    it record what events it sees:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Fake message bus implemented in UoW (tests/unit/test_handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE18]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'Now when we invoke `messagebus.handle()` using the `FakeUnitOfWorkWithFakeMessageBus`,
+    it runs only the handler for that event. So we can write a more isolated unit
+    test: instead of checking all the side effects, we just check that `BatchQuantityChanged`
+    leads to `AllocationRequired` if the quantity drops below the total already allocated:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Testing reallocation in isolation (tests/unit/test_handlers.py)*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: Whether you want to do this or not depends on the complexity of your chain of
+    events. We say, start out with edge-to-edge testing, and resort to this only if
+    necessary.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wrap-Up
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: Let’s look back at what we’ve achieved, and think about why we did it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What Have We Achieved?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Events are simple dataclasses that define the data structures for inputs and
+    internal messages within our system. This is quite powerful from a DDD standpoint,
+    since events often translate really well into business language (look up *event
+    storming* if you haven’t already).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handlers are the way we react to events. They can call down to our model or
+    call out to external services. We can define multiple handlers for a single event
+    if we want to. Handlers can also raise other events. This allows us to be very
+    granular about what a handler does and really stick to the SRP.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why Have We Achieved?
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Our ongoing objective with these architectural patterns is to try to have the
+    complexity of our application grow more slowly than its size. When we go all in
+    on the message bus, as always we pay a price in terms of architectural complexity
+    (see [Table 9-1](#chapter_09_all_messagebus_tradeoffs)), but we buy ourselves
+    a pattern that can handle almost arbitrarily complex requirements without needing
+    any further conceptual or architectural change to the way we do things.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here we’ve added quite a complicated use case (change quantity, deallocate,
+    start new transaction, reallocate, publish external notification), but architecturally,
+    there’s been no cost in terms of complexity. We’ve added new events, new handlers,
+    and a new external adapter (for email), all of which are existing categories of
+    *things* in our architecture that we understand and know how to reason about,
+    and that are easy to explain to newcomers. Our moving parts each have one job,
+    they’re connected to each other in well-defined ways, and there are no unexpected
+    side effects.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Table 9-1\. Whole app is a message bus: the trade-offs'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '| Pros | Cons |'
+  prefs: []
+  type: TYPE_TB
+- en: '| --- | --- |'
+  prefs: []
+  type: TYPE_TB
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Handlers and services are the same thing, so that’s simpler.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We have a nice data structure for inputs to the system.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A message bus is still a slightly unpredictable way of doing things from a web
+    point of view. You don’t know in advance when things are going to end.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There will be duplication of fields and structure between model objects and
+    events, which will have a maintenance cost. Adding a field to one usually means
+    adding a field to at least one of the others.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '|'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Now, you may be wondering, where are those `BatchQuantityChanged` events going
+    to come from? The answer is revealed in a couple chapters’ time. But first, let’s
+    talk about [events versus commands](ch10.xhtml#chapter_10_commands).
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([1](ch09.xhtml#idm45714888912728-marker)) Event-based modeling is so popular
+    that a practice called *event storming* has been developed for facilitating event-based
+    requirements gathering and domain model elaboration.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([2](ch09.xhtml#idm45714888887096-marker)) If you’ve done a bit of reading
+    about event-driven architectures, you may be thinking, “Some of these events sound
+    more like commands!” Bear with us! We’re trying to introduce one concept at a
+    time. In the [next chapter](ch10.xhtml#chapter_10_commands), we’ll introduce the
+    distinction between commands and events.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([3](ch09.xhtml#idm45714886833944-marker)) The “simple” implementation in this
+    chapter essentially uses the *messagebus.py* module itself to implement the Singleton
+    Pattern.
+  prefs: []
+  type: TYPE_NORMAL

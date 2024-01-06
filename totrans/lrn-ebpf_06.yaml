@@ -1,0 +1,629 @@
+- en: Chapter 6\. The eBPF Verifier
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I’ve mentioned the verification step a few times, so you already know that when
+    you load an eBPF program into the kernel, this verification process ensures that
+    the program is safe. In this chapter we’ll dive into how the verifier works to
+    achieve this goal.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Verification involves checking every possible execution path through the program
+    and ensuring that every instruction is safe. The verifier also makes some updates
+    to the bytecode to ready it for execution. In this chapter I’ll show some examples
+    of verification failures, by starting from an example that works and making modifications
+    that render that code invalid to the verifier.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The example code for this chapter is in the *chapter6* directory of the repository
+    at [*github.com/lizrice/learning-ebpf*](https://github.com/lizrice/learning-ebpf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: This chapter doesn’t attempt to cover every possible check the verifier makes.
+    It’s intended to be an overview, with illustrative examples that will help you
+    deal with verification errors that you might run into when writing your own eBPF
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One thing to bear in mind is that the verifier works on eBPF bytecode, not directly
+    on the source. That bytecode depends on the output from the compiler. Because
+    of things like compiler optimization, a change in the source code might not always
+    result in exactly what you expect in the bytecode, so correspondingly it might
+    not give you the result you expect in the verifier’s verdict. For example, the
+    verifier will reject unreachable instructions, but the compiler might optimize
+    them away before the verifier sees them.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Verification Process
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The verifier analyzes the program to assess all possible execution paths. It
+    steps through the instructions in order, evaluating them rather than actually
+    executing them. As it goes along it keeps track of the state of each register
+    in a structure called `bpf_reg_state`. (The registers I’m referring to here are
+    the registers from the eBPF virtual machine that you met in [Chapter 3](ch03.html#anatomy_of_an_ebpf_program).)
+    This structure includes a field called `bpf_reg_type`, which describes what type
+    of value is held in that register. There are several possible types, including
+    these:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`NOT_INIT`, indicating that the register has not yet been set to a value.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`SCALAR_VALUE`, indicating that the register has been set to a value that doesn’t
+    represent a pointer.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Several `PTR_TO_*` types, indicating that the register holds a pointer to something.
+    That something could be, for example:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PTR_TO_CTX`: The register holds a pointer to the context passed as the argument
+    to a BPF program.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PTR_TO_PACKET`: The register points to a network packet (held in the kernel
+    as `skb->data`).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`PTR_TO_MAP_KEY` or `PTR_TO_MAP_VALUE`: I’m sure you can guess what these mean.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: There are several other `PTR_TO_*` types, and you can find the full set enumerated
+    in the [*linux/bpf.h* header file](https://oreil.ly/aWb50).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `bpf_reg_state` structure also keeps track of the range of possible values
+    the register might hold. This information is used by the verifier to determine
+    when invalid actions are being attempted.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Each time the verifier comes to a branch, where a decision has to be made on
+    whether to carry on in sequence or jump to a different instruction, the verifier
+    pushes a copy of the current state of all the registers onto a stack and explores
+    one of the possible paths. It continues evaluating the instructions until it reaches
+    the return at the end of the program (or reaches the limit on the number of instructions
+    it will process, which is currently one million instructions^([1](ch06.html#ch06fn1))),
+    at which point it pops a branch off the stack to evaluate next. If it finds an
+    instruction that could result in an invalid operation, it fails verification.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Verifying every single possibility could get computationally expensive, so in
+    practice there are optimizations called *state pruning* that avoid reevaluating
+    paths through the program that are essentially equivalent. As it works through
+    the program, the verifier records the state of all the registers at certain instructions
+    within the program. If it later arrives at the same instruction with registers
+    in a matching state, there is no need to continue to verify the rest of that path,
+    as it’s already known to be valid.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Lots of work has gone into optimizing the verifier](https://oreil.ly/pQDES)
+    and its pruning process. The verifier used to store pruning state before and after
+    each jump instruction, but analysis showed that this results in storing state
+    on average every four instructions or so, and the vast majority of these pruning
+    states would never get matched. It turned out that it’s more efficient to store
+    pruning state every 10 instructions, regardless of branching.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: You can read more details on how verification works in the [kernel documentation](https://oreil.ly/atNda).
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Verifier Log
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When the verification of a program fails, the verifier generates a log showing
+    how it reached the conclusion that the program is invalid. If you’re using `bpftool
+    prog load`, the verifier log gets output to stderr. When you’re writing a program
+    with *libbpf*, you can use the function `libbpf_set_print()` to set a handler
+    that will display (or do something else useful with) any errors. (You’ll see an
+    example of this in the *hello-verifier.c* source code for this chapter.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: If you really want to dig into what the verifier is doing, you can get it to
+    generate the log on success as well as on failure. There is a basic example of
+    this in the *hello-verifier.c* file too. It involves passing a buffer that will
+    hold verifier log contents into the *libbpf* call that loads the program into
+    the kernel and then writing the contents of that log to screen.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The verifier log includes a summary of how much work the verifier did, which
+    looks something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: In this example, the verifier processed 61 instructions, including potentially
+    processing the same instruction multiple times by arriving at it through different
+    paths. Note that the complexity limit of one million is an upper bound on the
+    number of instructions in a program; in practice, if there are branches in the
+    code, the verifier will process some instructions more than once.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The total number of states stored was four, which for this simple program matches
+    the peak number of stored states. If some of the states had been pruned, the peak
+    number might be lower than the total.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The log output includes the BPF instructions the verifier has analyzed, along
+    with the corresponding C source code lines (if the object file was built with
+    the `-g` flag to include debug information) and summaries of verifier state information.
+    Here is an example extract of the verifier log relating to the first few lines
+    of the program in *hello-verifier.bpf.c*:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](assets/1.png)](#code_id_6_1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The log includes source code lines to make it easier to understand how the output
+    relates to the source. This source code is available because the `-g` flag was
+    used to build in debug information during the compilation step.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](assets/2.png)](#code_id_6_2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here’s an example of some register state information being output in the log.
+    It tells us that at this stage Register 1 contains a map value, Register 6 holds
+    the context, and Register 10 is the frame (or stack) pointer where local variables
+    are held.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](assets/3.png)](#code_id_6_3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is another example of register state information. Here you can see not
+    only the types of values that are held in each (initialized) register, but also
+    the range of possible values for Register 2 and Register 3.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let’s dig further into the details of this. I said that Register 6 holds the
+    context, and the verifier log indicates this with `R6_w=ctx(id=0,off=0,imm=0)`.
+    This was set up in the very first line of the bytecode, where Register 1 was copied
+    to Register 6\. When an eBPF program is called, Register 1 always holds the context
+    argument passed to the program. Why copy it to Register 6? Well, when a BPF helper
+    function is called, the arguments to that call are passed in Registers 1 through
+    5\. Helper functions don’t modify the contents of Registers 6 through 9, so saving
+    the context off into Register 6 means the code can call a helper function without
+    losing access to the context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Register 0 is used for the return value from a helper function and also for
+    the return value from an eBPF program. Register 10 always holds a pointer to the
+    eBPF stack frame (and the eBPF program can’t modify it).
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Let’s look at the register state information for Registers 2 and 3 after instruction
+    6:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]'
+  prefs: []
+  type: TYPE_PRE
+- en: Register 2 doesn’t have a minimum value, and the `umax_value` shown here in
+    decimal corresponds to 0xFFFFFFFF, which is the largest value that can be held
+    in an 8-byte register. In other words, at this point the register could hold any
+    of its possible values.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In instruction 4, the contents of Register 2 are copied into Register 3, and
+    then instruction 5 adds one to that value. Therefore, Register 3 could have any
+    value that’s 1 or greater. You can see this in the state information for Register
+    3, which has `umin_value` set to `1`, and a `umax_value` of `0xFFFFFFFF`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The verifier uses the information about not just the states of each register,
+    but also the range of values each can contain, to determine the possible paths
+    through the program. This is also used for the state pruning that I mentioned
+    before: if the verifier has been in the same position in the code, with the same
+    types and possible ranges of values for each register, there’s no need to evaluate
+    this path further. What’s more, if the current state is a subset of a state that
+    was seen earlier, it can also be pruned.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Visualizing Control Flow
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'The verifier explores all the possible paths through the eBPF program, and
+    if you’re trying to debug an issue, it can be helpful to see those paths for yourself.
+    The `bpftool` utility can help with this by producing a control flow graph of
+    the program in [DOT format](https://oreil.ly/V-1WN), which you can then convert
+    into an image format, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: This produces a visual representation of the control flow like that shown in
+    [Figure 6-1](#extract_from_control_flow_graph_left_pa).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Extract from control flow graph (the full image can be found as chapter6/kprobe_exec.png
+    in the GitHub repo for this book)](assets/lebp_0601.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 6-1\. Extract from control flow graph (the full image can be found as
+    chapter6/kprobe_exec.png in the [GitHub repo](http://github.com/lizrice/learning-ebpf)
+    for this book)
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Validating Helper Functions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You’re not allowed to call directly from eBPF programs to any kernel function
+    (unless it has been registered as a kfunc, which you’ll meet in the next chapter),
+    but eBPF provides a number of helper functions that enable programs to access
+    information from the kernel. There’s a [bpf-helpers manpage](https://oreil.ly/pdLGW)
+    that attempts to document them all.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Different helper functions are valid for different BPF program types. For example,
+    the helper function `bpf_get_current_pid_tgid()` retrieves the current user space
+    process ID and thread ID, but it doesn’t make sense to call this from an XDP program
+    that is triggered by the receipt of a packet at a network interface, because there
+    is no user space process involved. You can see an example of this by changing
+    the `SEC()` definition for the *hello* eBPF program in *hello-verifier.bpf.c*
+    from `kprobe` to `xdp`. On attempting to load this program the verifier output
+    gives the following message:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4]'
+  prefs: []
+  type: TYPE_PRE
+- en: The `unknown func` doesn’t mean the function is completely unknown, just that
+    it is unknown *for this BPF program type*. (BPF program types are a topic for
+    the next chapter; for now you can just think of them as being programs that are
+    suitable for attaching to different types of event.)
+  prefs: []
+  type: TYPE_NORMAL
+- en: Helper Function Arguments
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'If you look, for example, in [*kernel/bpf/helpers.c*](https://oreil.ly/tjjVR),^([2](ch06.html#ch06fn2))
+    you’ll find that each helper function has a `bpf_func_proto` structure similar
+    to this example for the helper function `bpf_map_lookup_elem()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'This structure defines the constraints for arguments to and return values from
+    the helper function. Because the verifier is keeping track of the type of value
+    held in each register, it can spot if you try to pass the wrong kind of argument
+    to a helper function. For example, try changing the argument to the call to `bpf_map_lookup_elem()`
+    in the *hello* program, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: '`Instead of passing `&my_config`, which is a pointer to a map, this now passes
+    `&data`, which is a pointer to a local variable structure. This is valid from
+    the compiler’s point of view, so you can build the BPF object file *hello-verifier.bpf.o*,
+    but when you try to load the program into the kernel, you’ll see an error like
+    this in the verifier log:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: Here, `fp` stands for *frame pointer*, and it’s the area of memory on the stack
+    where local variables are stored. Register 1 was loaded with the address of the
+    local variable called `data`, but the function expects a pointer to a map (as
+    indicated by the `arg1_type` field in the `bpf_func_proto` structure shown earlier).
+    By tracking the types of value stored in each register, the verifier was able
+    to spot this discrepancy.`  `# Checking the License
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The verifier also checks that if you are using a BPF helper function that’s
+    licensed under GPL, your program also has a GPL-compatible license. The last line
+    in the [Chapter 6](#the_ebpf_verifier) example code *hello-verifier.bpf.c* defines
+    a “license” section that holds the string `Dual BSD/GPL`. If you remove this line,
+    the output from the verifier will end like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE8]'
+  prefs: []
+  type: TYPE_PRE
+- en: That’s because the `gpl_only` field is set to `true` for the `bpf_probe_read_kernel()`
+    helper function. There are other helper functions called earlier in this eBPF
+    program, but they are not GPL licensed, so the verifier doesn’t object to their
+    use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The BCC project maintains a [list of helper functions](https://oreil.ly/mCpvB),
+    indicating whether they are GPL licensed or not. If you’re interested in more
+    details on how helper functions are implemented, there’s a section on this in
+    the [BPF and XDP reference guide](https://oreil.ly/kVd6j).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Checking Memory Access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The verifier performs a number of checks to make sure BPF programs only access
+    memory they are supposed to have access to.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, when processing a network packet, an XDP program is only permitted
+    to access the memory locations that make up that network packet. Most XDP programs
+    start with something very similar to the following:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]``'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]The `xdp_md` structure passed as the context to the program describes
+    the network packet that has been received. The `ctx->data` field within that structure
+    is the location in memory where the packet starts, and `ctx->data_end` is the
+    last location in the packet. The verifier will ensure that the program doesn’t
+    exceed these bounds.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'For example, the following program in *hello_verifier.bpf.c* is valid:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11][PRE12]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]'
+  prefs: []
+  type: TYPE_PRE
+- en: data_end++;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]'
+  prefs: []
+  type: TYPE_PRE
+- en: ; data_end++;
+  prefs: []
+  type: TYPE_NORMAL
+- en: '1: (07) r3 += 1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: R3 pointer arithmetic on pkt_end prohibited
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]'
+  prefs: []
+  type: TYPE_PRE
+- en: if(c<sizeof(message)){ `char``a``=``message``[``c``];` ``bpf_printk``(``"%c"``,``a``);`
+    ``}[PRE16]
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]'
+  prefs: []
+  type: TYPE_PRE
+- en: if(c<=sizeof(message)){ `char``a``=``message``[``c``];` ``bpf_printk``(``"%c"``,``a``);`
+    ``}[PRE18]
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]'
+  prefs: []
+  type: TYPE_PRE
+- en: invalid access to map value, value_size=16 off=16 size=1
+  prefs: []
+  type: TYPE_NORMAL
+- en: R2 max value is outside of the allowed memory range
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]'
+  prefs: []
+  type: TYPE_PRE
+- en: ; if (c <= sizeof(message)) {
+  prefs: []
+  type: TYPE_NORMAL
+- en: '30: (25) if r1 > 0xc goto pc+10                                ![3](assets/3.png)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: R0_w=map_value_or_null(id=2,off=0,ks=4,vs=12,imm=0) R1_w=inv(id=0,
+  prefs: []
+  type: TYPE_NORMAL
+- en: umax_value=12,var_off=(0x0; 0xf)) R6=ctx(id=0,off=0,imm=0) ...
+  prefs: []
+  type: TYPE_NORMAL
+- en: ; char a = message[c];
+  prefs: []
+  type: TYPE_NORMAL
+- en: '31: (18) r2 = 0xffff800008e00004                               ![2](assets/2.png)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '33: (0f) r2 += r1'
+  prefs: []
+  type: TYPE_NORMAL
+- en: last_idx 33 first_idx 19
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'regs=2 stack=0 before 31: (18) r2 = 0xffff800008e00004'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'regs=2 stack=0 before 30: (25) if r1 > 0xc goto pc+10'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'regs=2 stack=0 before 29: (61) r1 = *(u32 *)(r8 +0)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '34: (71) r3 = *(u8 *)(r2 +0)                                   ![1](assets/1.png)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: R0_w=map_value_or_null(id=2,off=0,ks=4,vs=12,imm=0) R1_w=invP(id=0,
+  prefs: []
+  type: TYPE_NORMAL
+- en: umax_value=12,var_off=(0x0; 0xf)) R2_w=map_value(id=0,off=4,ks=4,vs=16,
+  prefs: []
+  type: TYPE_NORMAL
+- en: umax_value=12,var_off=(0x0; 0xf),s32_max_value=15,u32_max_value=15)
+  prefs: []
+  type: TYPE_NORMAL
+- en: R6=ctx(id=0,off=0,imm=0) ...
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21][PRE22][PRE23]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE24]This will fail the verifier. However, if you put the line with the helper
+    function `bpf_printf()` back in, the verifier won’t complain, even though there’s
+    no explicit return value set by the source code!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This is because Register 0 is also used to hold the return code from a helper
+    function. After returning from a helper function in an eBPF program, Register
+    0 is no longer uninitialized.[PRE25]# Invalid Instructions
+  prefs: []
+  type: TYPE_NORMAL
+- en: As you know from the discussion of the eBPF (virtual) machine in [Chapter 3](ch03.html#anatomy_of_an_ebpf_program),
+    eBPF programs consist of a set of bytecode instructions. The verifier checks that
+    the instructions in a program are valid bytecode instructions—for example, using
+    only known opcodes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It would be considered a bug in the compiler if it emitted invalid bytecode,
+    so you’re not likely to see this kind of verifier error unless you choose (for
+    some reason best known to yourself) to write eBPF bytecode by hand. However, there
+    have been some instructions added more recently, such as the atomic operations.
+    If your compiled bytecode uses these instructions, they would fail verification
+    on an older kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Unreachable Instructions
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The verifier also rejects programs that have unreachable instructions. Oftentimes,
+    these will get optimized out by the compiler anyway.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: When I first got interested in eBPF, getting code through the verifier seemed
+    like a dark art, where seemingly valid code would get rejected, throwing up what
+    seemed to be arbitrary errors. Over time there have been *lots* of improvements
+    to the verifier, and in this chapter you’ve seen several examples where the verifier
+    log gives hints to help you figure out what the problem is.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These hints are more helpful when you have a mental model of how the eBPF (virtual)
+    machine works, using a set of registers for temporary value storage as it steps
+    through an eBPF program. The verifier keeps track of the types and possible range
+    of values for each register to ensure that eBPF programs are safe to run.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you try writing some eBPF code of your own, you might find yourself needing
+    assistance to resolve verifier errors. The [eBPF community Slack channel](http://ebpf.io/slack)
+    is a good place to ask for help, and lots of people have also found advice on
+    [StackOverflow](https://oreil.ly/nu_0v).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Exercises
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Here are some more ways to cause a verifier error. See if you can correlate
+    the verifier log output to the errors you get:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In [“Checking Memory Access”](#checking_memory_access), you saw the verifier
+    rejecting access beyond the end of the global `message` array. In the example
+    code there’s a section that accesses the local variable `data.message` in a similar
+    way:'
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: '[PRE26]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE27]Try adjusting the code to make the same out-by-one mistake by replacing
+    the `<` with `<=`, and you’ll see an error message about `invalid variable-offset
+    read from stack R2`.[PRE28]*   Find the commented-out loops in *xdp_hello* in
+    the example code. Try adding in the first loop that looks like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE29]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE30]'
+  prefs: []
+  type: TYPE_PRE
+- en: '42: (18) r1 = 0xffff800008e10009'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '44: (b7) r2 = 11'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '45: (b7) r3 = 8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '46: (85) call bpf_trace_printk#6'
+  prefs: []
+  type: TYPE_NORMAL
+- en: R0=inv(id=0) R1_w=map_value(id=0,off=9,ks=4,vs=26,imm=0) R2_w=inv11
+  prefs: []
+  type: TYPE_NORMAL
+- en: R3_w=inv8 R6=pkt_end(id=0,off=0,imm=0) R7=pkt(id=0,off=0,r=0,imm=0)
+  prefs: []
+  type: TYPE_NORMAL
+- en: R10=fp0
+  prefs: []
+  type: TYPE_NORMAL
+- en: last_idx 46 first_idx 42
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'regs=4 stack=0 before 45: (b7) r3 = 8'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'regs=4 stack=0 before 44: (b7) r2 = 11'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE31] [PRE32]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: for(inti=0;i<c;i++){ `bpf_printk``(``"Looping %d"``,``i``);` ``}``
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE33]You should see that the verifier tries to explore this loop to its conclusion,
+    but it reaches the instruction complexity limit before it completes (because there
+    is no upper bound on the global variable `c`).[PRE34]*   Write a program that
+    attaches to a tracepoint. (You may have done this already for the exercises in
+    [Chapter 4](ch04.html#the_bpfleft_parenthesisright_parenthesi).) Looking ahead
+    to [“Tracepoints”](ch07.html#tracepoints), you can see a structure definition
+    for the context argument that starts with these fields:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE35]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[PRE36]Create your own version of a structure that starts like this, and make
+    the context argument in your program a pointer to this structure. In the program,
+    try accessing any of these fields and see that the verifier fails with `invalid
+    bpf_context access`.[PRE37][PRE38][PRE39]``'
+  prefs: []
+  type: TYPE_NORMAL

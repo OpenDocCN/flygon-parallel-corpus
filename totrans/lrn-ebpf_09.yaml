@@ -1,0 +1,588 @@
+- en: Chapter 9\. eBPF for Security
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: You’ve seen how eBPF can be used to observe events across a system and report
+    information about those events to user space tools. In this chapter you’ll consider
+    how to build on the concept of event detection to create eBPF-based security tools
+    that can detect, or even prevent, malicious activity. I’ll start by helping you
+    understand what makes security different from other types of observability.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Example code for this chapter is in the [GitHub repo](http://github.com/lizrice/learning-ebpf)
+    in the *chapter9* directory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Security Observability Requires Policy and Context
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The difference between a security tool and an observability tool that reports
+    on events is that a security tool needs to be able to distinguish between events
+    that are expected under normal circumstances and events that suggest malicious
+    activity might be taking place. For example, suppose you have an application that
+    writes data to a local file as part of its normal processing. Let’s say the app
+    is expected to write to */home/<username>/<filename>*, so this activity isn’t
+    something you’re interested in from a security perspective. However, you would
+    want to be notified if the app writes to one of the many sensitive file locations
+    in Linux. For example, it is unlikely that it needs to modify the password information
+    stored in */etc/passwd*.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Policies have to take into account not just normal behavior when systems are
+    fully functional, but also the expected error path behavior. For example, if a
+    physical disk gets full, the application might start sending network messages
+    to alert about this situation. These network messages shouldn’t be seen as security
+    events—even though they are unusual, they’re not suspicious. Taking error paths
+    into account can make it challenging to create effective policies, and we’ll come
+    back to that challenge later in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Defining what is and isn’t expected behavior is the job of a policy. A security
+    tool compares activity to a policy and takes some action when the activity is
+    outside the policy, making it suspicious. That action would typically involve
+    generating a security event log, which would usually get sent to a Security Information
+    Event Management (SIEM) platform. It might also result in an alert to a human
+    who will be called on to investigate what happened.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The more contextual information that’s available to the investigator, the more
+    likely they will be able to find out the root cause of the event and determine
+    whether it was an attack, which components were affected, how and when the attack
+    took place, and who was responsible. As illustrated in [Figure 9-1](#contextual_information_is_required_alon),
+    being able to answer questions like this takes a tool from mere logging to deserving
+    the nomenclature “security observability.”
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Contextual information is required alongside out-of-policy event detection
+    for security observability](assets/lebp_0901.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-1\. Contextual information is required alongside out-of-policy event
+    detection for security observability
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Let’s explore some of the ways eBPF programs are being used to detect and enforce
+    security events. As you know, eBPF programs can be attached to a variety of events,
+    and one set of events that have been commonly used for security for many years
+    are syscalls. We’ll start our discussion with syscalls, but as you’ll see, syscalls
+    might not be the most effective way to implement security tooling with eBPF. We’ll
+    see some newer and more sophisticated approaches later in this chapter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Using System Calls for Security Events
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'System calls (or syscalls) are the interface between user space applications
+    and the kernel. If you can restrict the set of syscalls an app can make, that
+    will limit what it is able to do. For example, if you stop an app from making
+    syscalls in the `open*()` family, it won’t be able to open files. If you have
+    an application that you never expect to open files, you might want to create this
+    limitation so that even if the app gets compromised, it won’t be able to open
+    files maliciously. If you’ve been using Docker or Kubernetes over the past few
+    years, there is a very good chance you have already come across a security tool
+    that uses BPF to limit syscalls: seccomp*.*'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Seccomp
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The name *seccomp* is a contraction of “SECure COMPuting.” In its original,
+    or “strict,” form, seccomp is used to limit the set of syscalls a process can
+    use to a very small subset: `read()`, `write()`, `_exit()`, and `sigreturn()`.
+    The intention of this strict mode was to allow users to run untrusted code (perhaps
+    a program downloaded from the internet) without any possibility of that code doing
+    malicious things.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Strict mode is very restrictive, and many applications need to use a much larger
+    set of syscalls—but that doesn’t mean they need all 400 and more of them. It makes
+    sense to allow a more flexible method for restricting the set that any given application
+    can use. This is the reasoning behind the flavor of seccomp that most of us from
+    the container world have encountered, which is more properly known as seccomp-bpf.
+    Instead of having a fixed subset of syscalls that it permits, this mode of seccomp
+    uses BPF code to filter the syscalls that are and aren’t allowed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In seccomp-bpf, a set of BPF instructions are loaded that act as a filter.
+    Each time a syscall is called, the filter is triggered. The filter code has access
+    to the arguments that are passed to the syscall so that it can make decisions
+    based on both the syscall itself and the arguments that have been passed to it.
+    The outcome is one of a set of possible actions that include:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Allowing the syscall to go ahead
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Returning an error code to the user space application
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Killing the thread
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Notifying a user space application (seccomp-unotify*)* (as of kernel version
+    5.0)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: If you want to explore writing your own BPF filter code, Michael Kerrisk has
+    some good examples at [*https://oreil.ly/cJ6HL*](https://oreil.ly/cJ6HL).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some of the arguments passed to syscalls are pointers, and the BPF code in seccomp-bpf
+    is not able to dereference these pointers. This limits the flexibility of a seccomp
+    profile, as it can only use value arguments in its decision-making process. Also,
+    it has to be applied to the process when it starts—you can’t modify the profile
+    that is being applied to a given application process.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You may well have used seccomp-bpf without writing BPF code, as the code is
+    often derived from a human-readable seccomp profile. [Docker’s default profile](https://oreil.ly/IT_Bf)
+    is a good example. This is a general-purpose profile intended to be usable with
+    pretty much any normal, containerized application. That inevitably means it allows
+    most syscalls and disallows only a few that are unlikely to be appropriate in
+    any application, `reboot()` being a great example.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[According to Aqua Security](https://oreil.ly/1xWmn), most containerized apps
+    use somewhere in the range of 40 to 70 syscalls. For better security, it would
+    be preferable to use a more constrained profile that is targeted at each specific
+    application and only allows the syscalls it actually uses.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Generating Seccomp Profiles
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: If you ask the average app developer to tell you what syscalls one of their
+    programs makes, you’re likely to get a blank look. That’s not intended to be insulting.
+    It’s just that most developers write in programming languages that give them higher-level
+    abstractions far removed from the details of syscalls. For example, they might
+    know what files their application opens, but it’s less likely that they could
+    tell you whether they are opened using `open()` or `openat()`*.* This makes it
+    unlikely that you’ll get a positive response if you ask the developer to handcraft
+    an appropriate seccomp profile along with their application code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Automation is the way forward: the idea is to use a tool to record the set
+    of syscalls an application makes. In the early days, seccomp profiles were generally
+    compiled using `strace` to gather the set of syscalls an application calls.^([1](ch09.html#ch09fn2))
+    This isn’t a wonderful solution in the cloud native age, as there’s no easy way
+    to point `strace` at a specific container or Kubernetes pod. It would also be
+    more helpful to generate the profile not just as a list of syscalls, but in the
+    JSON format that Kubernetes and OCI-compatible container runtimes can take as
+    input. There are a couple of tools that do this, using eBPF to gather information
+    about all the syscalls being called:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Inspektor Gadget](https://www.inspektor-gadget.io) includes a seccomp profiler
+    that allows you to generate a custom seccomp profile for the containers in a Kubernetes
+    pod.^([2](ch09.html#ch09fn3))'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Red Hat created a seccomp profiler in the form of an [OCI runtime hook](https://oreil.ly/nC8vM).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: With these profilers, you need to run the application for some arbitrary amount
+    of time to generate a profile that includes the full list of the syscalls it might
+    legitimately call. As discussed earlier in this chapter, this list needs to include
+    error paths. If your application can’t behave correctly under error conditions
+    because the syscalls it needs to call are blocked, this might cause a bigger problem.
+    And since seccomp profiles deal with a lower abstraction level than most developers
+    are familiar with, it’s hard to review them manually to see if they cover all
+    the right cases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Taking the OCI runtime hook as an example, an eBPF program is [attached to the
+    `syscall_enter` raw tracepoint](https://oreil.ly/sbWSc) and maintains an eBPF
+    map that keeps track of [which syscalls have been seen](https://oreil.ly/czUM7).
+    The user space parts of this tool are written in Go and use the [*iovisor/gobpf*
+    library](https://oreil.ly/sYCT3). (I’ll discuss this and other Golang libraries
+    for eBPF in [Chapter 10](ch10.html#ebpf_programming).)
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The following are the [lines of code](https://oreil.ly/DOShA) from the OCI
+    runtime hook that load the eBPF program into the kernel and attach it to the tracepoint
+    (a few lines have been omitted for brevity):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]'
+  prefs: []
+  type: TYPE_PRE
+- en: '[![1](assets/1.png)](#code_id_9_1)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This line does something quite interesting: it replaces a variable named `$PARENT_PID`
+    in the eBPF source code with a numeric process ID. This is a common pattern, and
+    it indicates that this tool will load individual eBPF programs for each process
+    being instrumented.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](assets/2.png)](#code_id_9_2)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here, an eBPF program called `enter_trace` gets loaded into the kernel.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](assets/3.png)](#code_id_9_3)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `enter_trace` program gets attached to the tracepoint `raw_syscalls:sys_enter`.
+    This is the tracepoint at the point of entry to any syscall, which you’ve encountered
+    in earlier examples. Whenever any user space code makes a syscall, this tracepoint
+    will be hit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These profilers use eBPF code attached to `sys_enter` to keep track of the set
+    of syscalls that have been used, and they generate a seccomp profile to be used
+    with seccomp, which does the actual job of enforcing the profile. The next class
+    of eBPF tools we’ll consider also attach to `sys_enter`, but they use syscalls
+    to track the behavior of an application and compare it against security policies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Syscall-Tracking Security Tools
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The best-known tool that falls into this category of syscall-tracking security
+    tools is the CNCF project [Falco](https://falco.org), which provides security
+    alerts. By default, Falco is installed as a kernel module, but there is also an
+    eBPF version. Users can define [rules](https://oreil.ly/enufu) to determine what
+    events are security relevant, and Falco can generate alerts in a variety of formats
+    when events happen that don’t match the policies defined in these rules.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Both the kernel module driver and the eBPF-based driver attach to system calls.
+    If you examine the [Falco eBPF programs on GitHub](https://oreil.ly/Q_cBD) you’ll
+    see lines like the following that attach probes to raw syscall entry and exit
+    points (plus a few other events, such as page faults):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]'
+  prefs: []
+  type: TYPE_PRE
+- en: '``Since eBPF programs can be loaded dynamically and can detect events triggered
+    by preexisting processes, tools like Falco can apply policies to application workloads
+    that are already running. Users can modify the set of rules being applied without
+    having to modify the applications or their configuration. This is in contrast
+    to seccomp profiles, which have to be applied to the application process when
+    it is launched.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Unfortunately there is a problem with this approach of using syscall entry
+    points for security tooling: there is a Time Of Check to Time Of Use (TOCTOU)
+    issue.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When an eBPF program is triggered at the entry point to a system call, it can
+    access the arguments that user space has passed to that system call. If those
+    arguments are pointers, the kernel will need to copy the pointed-to data into
+    its own data structures before acting on that data. As illustrated in [Figure 9-2](#an_attacker_can_change_syscall_argument),
+    there is a window of opportunity for an attacker to modify this data, after it
+    has been inspected by the eBPF program but before the kernel copies it. Thus,
+    the data being acted on might not be the same as what was captured by the eBPF
+    program.^([3](ch09.html#ch09fn4))
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![An attacker can change syscall arguments before they are accessed by the
+    kernel](assets/lebp_0902.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-2\. An attacker can change syscall arguments before they are accessed
+    by the kernel
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The same window would apply for seccomp-bpf, were it not for the fact that in
+    seccomp-bpf the program is not allowed to dereference the user space pointer,
+    so it’s not possible to examine the data at all.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The TOCTOU issue does apply for seccomp_unotify, a recently added mode of seccomp
+    where a violation can be reported to user space. The [manpage for seccomp_unotify](https://oreil.ly/cwpki)
+    explicitly notes that “It should thus be absolutely clear that the seccomp user-space
+    notification mechanism *cannot* be used to implement a security policy!”
+  prefs: []
+  type: TYPE_NORMAL
+- en: The syscall entry point might be very convenient for observability purposes,
+    but for a serious security tool it’s really not sufficient.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The [Sysmon for Linux tool](https://oreil.ly/pbtF3) addresses the TOCTOU window
+    by attaching to both the entry and exit points for syscalls. Once the call has
+    completed, it looks at the kernel’s data structures to get an accurate view. For
+    example, if the syscall returns a file descriptor, the eBPF program attached to
+    the exit can retrieve correct information about the object that the file descriptor
+    represents by looking into the related process’s file descriptor table. While
+    this approach can result in an accurate record of security-related activity, it
+    can’t prevent an action from taking place, since the syscall has already completed
+    by the time a check is made.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To be certain that it is inspecting the same information the kernel will act
+    on, the eBPF program should be attached to an event that occurs after the parameters
+    have been copied into kernel memory. Unfortunately, there is no single common
+    place in the kernel to do this, as the data is handled differently in syscall-specific
+    code. However, there is a well-defined interface where eBPF programs can be safely
+    attached: the Linux Security Module (LSM) API. This requires a relatively new
+    eBPF feature: BPF LSM.``  ``# BPF LSM'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The LSM interface provides a set of hooks that each occur just before the kernel
+    is about to act on a kernel data structure. The function called by a hook can
+    make a decision about whether to allow the action to go ahead. This interface
+    was originally provided to allow security tools to be implemented in the form
+    of [kernel modules](https://oreil.ly/mF_OD); [BPF LSM](https://oreil.ly/KzaMT)
+    extends this so that eBPF programs can be attached to the same hook points, as
+    shown in [Figure 9-3](#with_lsm_bpfcomma_ebpf_programs_can_be_).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![With LSM BPF, eBPF programs can be triggered by LSM hook events](assets/lebp_0903.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-3\. With LSM BPF, eBPF programs can be triggered by LSM hook events
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: There are hundreds of LSM hooks, and they’re pretty nicely [documented in the
+    kernel source code](https://oreil.ly/dO8jT). To be clear, there isn’t a one-to-one
+    mapping between syscalls and LSM hooks, but if a syscall has the potential to
+    do something interesting from a security perspective, processing that syscall
+    will trigger one or more of the hooks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here’s a trivial example of an eBPF program attached to an LSM hook. This example
+    is called during the processing of a `chmod` command (“chmod” stands for “change
+    modes” and is mostly used to change the access permissions on a file):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE2]``'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]This example simply traces out the name of the file and always returns
+    `0`, but you can imagine a real implementation that would make use of the arguments
+    to decide whether to allow this change of mode. Returning a nonzero value would
+    deny permission to make this change, so the kernel wouldn’t go ahead with it.
+    It’s worth noting that making policy checks entirely within the kernel like this
+    is highly performant.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The `path` argument to `BPF_PROG()` is the kernel data structure representing
+    the file, and the `mode` argument is the desired new mode value. You can see the
+    name of the file being accessed from the field `path->dentry->d_iname`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: LSM BPF was added in kernel version 5.7, which means that (at least at the time
+    of this writing) it’s not yet available on many supported Linux distributions,
+    but I expect that over the next couple of years many vendors will develop security
+    tooling that makes use of this interface. Before LSM BPF is made widely available,
+    there is another possible approach, as used by the developers of Cilium Tetragon.[PRE4]#
+    Cilium Tetragon
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Tetragon](https://oreil.ly/p-bdc) is part of the Cilium project (also part
+    of the CNCF). Rather than attaching to LSM API hooks, Tetragon’s approach is to
+    build a framework for attaching eBPF programs to arbitrary functions in the Linux
+    kernel.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Tetragon is designed for use in a Kubernetes environment, and the project defines
+    a custom Kubernetes resource type called a *TracingPolicy*. This is used to define
+    a set of events to which eBPF programs should be attached, conditions that need
+    to be checked by eBPF code, and actions to take if the conditions are met. The
+    following is an extract from a sample TracingPolicy:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE5]'
+  prefs: []
+  type: TYPE_PRE
+- en: This policy defines a set of kprobes to attach programs to, the first of which
+    is the kernel function `fd_install`. This is an internal function in the kernel.
+    Let’s explore why you might choose to attach to a function like that.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Attaching to Internal Kernel Functions
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: The system call interface and the LSM interface are defined as stable interfaces
+    in the Linux kernel; that is to say, they won’t change in a backward-incompatible
+    way. If you write code today that uses the functions in those interfaces, they
+    will continue to work in future versions of the kernel. These interfaces represent
+    just a tiny fraction of the 30 million lines of code that make up the Linux kernel.
+    Parts of that codebase are de facto stable, even if they are not officially declared
+    as such; they haven’t changed for a long time and are unlikely to do so in the
+    future.
+  prefs: []
+  type: TYPE_NORMAL
+- en: It’s perfectly reasonable to write eBPF programs that attach to kernel functions
+    that aren’t officially stable, with the expectation that they are likely to work
+    for some considerable time to come. Also, given that it typically takes several
+    years for a new kernel version to be widely deployed, it’s a safe bet that there
+    will be plenty of time to address any incompatibility issues that might arise.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The Tetragon contributors include a number of kernel developers who have used
+    their knowledge of kernel internals to identify some good, safe places where eBPF
+    programs can be attached for useful security purposes. There are several [example
+    TracingPolicy definitions](https://oreil.ly/51yRN) that make use of this knowledge.
+    These examples monitor security events covering file operations, network activity,
+    program executions, and changes to privileges—all the kinds of things a malicious
+    actor would do as part of an attack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Let’s come back to that example policy definition that attaches to `fd_install`.
+    The “fd” stands for “file descriptor,” and the [comment in the source code for
+    this function](https://oreil.ly/Tm6MN) tells us this function “Install[s] a file
+    pointer in the fd array.” This happens when a file is opened, and it’s called
+    after the file’s data structure has been populated in the kernel. It’s a safe
+    place to check the name of the file—and in the earlier TracingPolicy example,
+    it’s only of interest if the filename starts with “/etc/”.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Just as in LSM BPF programs, Tetragon eBPF programs have access to contextual
+    information to allow them to make security decisions entirely within the kernel.
+    Rather than reporting all events of a given type to user space, security-relevant
+    events can be filtered within the kernel so that only the out-of-policy events
+    get reported to user space.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Preventative Security
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Most eBPF-based security tools have used eBPF programs to detect malicious events,
+    which notify a user space application that can then take action. As you can see
+    in [Figure 9-4](#an_asynchronous_notification_from_kerne), any action the user
+    space app takes happens asynchronously, by which time it might be too late—perhaps
+    data could have been exfiltrated, or the attacker could have persisted malicious
+    code onto disk.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![An asynchronous notification from kernel to user space allows some time for
+    an attack to continue](assets/lebp_0904.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-4\. An asynchronous notification from kernel to user space allows some
+    time for an attack to continue
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: In kernel versions 5.3 and up, there is a BPF helper function called `b⁠p⁠f⁠_⁠s⁠e⁠n⁠d⁠_​s⁠i⁠g⁠n⁠a⁠l⁠(⁠)`.
+    Tetragon uses this function to implement preventative security. If a policy defines
+    a Sigkill action, any matching events will cause Tetragon eBPF code to generate
+    a SIGKILL signal that terminates the process that was attempting the out-of-policy
+    action. As shown in [Figure 9-5](#tetragon_kills_malicious_processes_sync), this
+    happens synchronously; that is, the activity the kernel was performing that the
+    eBPF code determined to be out of policy is prevented from completing.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Tetragon kills malicious processes synchronously by sending a SIGKILL signal
+    from the kernel](assets/lebp_0905.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 9-5\. Tetragon kills malicious processes synchronously by sending a SIGKILL
+    signal from the kernel
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Sigkill policies need to be used with care, because an incorrectly configured
+    policy could result in terminating applications unnecessarily, but it’s an incredibly
+    powerful use of eBPF for security purposes. You can start by running in an “audit”
+    mode that generates security events but doesn’t apply the SIGKILL enforcement,
+    until you’re confident that the policy won’t break anything.
+  prefs: []
+  type: TYPE_NORMAL
+- en: If you’re interested in learning more about using Cilium Tetragon for detecting
+    security events, there is a report titled “[Security Observability with eBPF](https://www.oreilly.com/library/view/security-observability-with/9781492096719/)”
+    by Natália Réka Ivánkó and Jed Salazar that digs into much more detail.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Network Security
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '[Chapter 8](ch08.html#ebpf_for_networking) discussed how eBPF can be used very
+    effectively to implement network security mechanisms. To summarize:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Firewalling and DDoS protection are a natural fit for eBPF programs attached
+    early in the ingress path for network packets. And with the possibility of XDP
+    programs offloaded to hardware, malicious packets may never even reach the CPU!
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For implementing more sophisticated network policies, such as Kubernetes policies
+    determining which services are allowed to communicate with one another, eBPF programs
+    that attach to points in the network stack can drop packets if they are determined
+    to be out of policy.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Network security tools are very often used in a preventative mode, dropping
+    packets rather than just auditing malicious activity. This is because it’s so
+    easy for bad actors to mount network-related attacks; if you give a device a public
+    IP address exposed to the internet, it won’t be long before you start seeing suspicious
+    traffic, so organizations are forced to use preventative measures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In contrast, lots of organizations use intrusion detection tools in an audit
+    mode, and they rely on forensics to determine whether a suspicious event was really
+    malicious and what remedial action needs to be taken. If a given security tool
+    is too blunt an instrument and is prone to detecting false-positives, it’s not
+    surprising that it needs to be run in audit mode rather than preventative mode.
+    It’s my belief that eBPF is enabling more sophisticated security tools with finer-grained,
+    accurate controls. Just as we consider firewalls today to be sufficiently accurate
+    to use in preventative mode, we’ll see increased use of preventative tooling that
+    acts on other, non-networking events. This could even include eBPF-based controls
+    being packaged as part of an application product so that it can provide its own
+    runtime security.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Summary
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: In this chapter you saw how eBPF’s use in security has evolved from low-level
+    checks on system calls to much more sophisticated use of eBPF programs for security
+    policy checks, in-kernel event filtering, and runtime enforcement.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There’s still much active development in the area of using eBPF for security
+    purposes. I believe we will see tools in this area evolving and becoming widely
+    adopted over the coming years.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '^([1](ch09.html#ch09fn2-marker)) See, for example, this post from Jess Frazelle,
+    who developed the default seccomp profile for Docker: [“How to Use the New Docker
+    Seccomp Profiles”](https://oreil.ly/EcpnM).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([2](ch09.html#ch09fn3-marker)) The documentation for Inspektor Gadget’s seccomp
+    profiler is quite dry, but [this video overview from Jose Blanquicet](https://oreil.ly/0bYaa)
+    is more accessible.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '^([3](ch09.html#ch09fn4-marker)) Exploiting this window was discussed in a
+    DEFCON 29 talk titled “[Phantom Attack: Evading System Call Monitoring](https://oreil.ly/WguKq)”
+    by Rex Guo and Junyuan Zeng, and its impact on Falco was covered in more detail
+    in the talk “[LSM BPF Change Everything](https://oreil.ly/17c-3)” by Leo Di Donato
+    and KP Singh.`````'
+  prefs: []
+  type: TYPE_NORMAL

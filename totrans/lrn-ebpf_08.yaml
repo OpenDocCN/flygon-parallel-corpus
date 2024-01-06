@@ -1,0 +1,624 @@
+- en: Chapter 8\. eBPF for Networking
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: As you saw in [Chapter 1](ch01.html#what_is_ebpf_and_why_is_it_importantque),
+    the dynamic nature of eBPF allows us to customize the behavior of the kernel.
+    In the world of networking, there is a huge range of desirable behavior that depends
+    on the application. For example, a telecommunications operator might have to interface
+    with telco-specific protocols like SRv6; a Kubernetes environment might need to
+    be integrated with legacy applications; dedicated hardware load balancers can
+    be replaced with XDP programs running on commodity hardware. eBPF allows programmers
+    to build networking features to meet specific needs, without having to force them
+    on all upstream kernel users.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Network tools based on eBPF are now widely used and have proven to be effective
+    at prolific scale. The CNCF’s [Cilium project](http://cilium.io), for example,
+    uses eBPF as a platform for Kubernetes networking, standalone load balancing,
+    and much more, and it’s used by cloud native adopters in every conceivable industry
+    vertical.^([1](ch08.html#ch08fn1)) Meta has been using eBPF at a vast scale—every
+    packet to and from Facebook since 2017 has been through an XDP program. Another
+    public and hyper-scaled example is Cloudflare’s use of eBPF for DDoS (distributed
+    denial-of-service) protection.
+  prefs: []
+  type: TYPE_NORMAL
+- en: These are complex, production-ready solutions, and their details are far beyond
+    the scope of this book, but by reading the examples in this chapter you can get
+    a feel for how eBPF networking solutions like these are built.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The code examples for this chapter are in the *chapter8* directory of the repository
+    at [*github.com/lizrice/learning-ebpf*](https://github.com/lizrice/learning-ebpf).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Packet Drops
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'There are several network security features that involve dropping certain incoming
+    packets and allowing others. These features include firewalling, DDoS protection,
+    and mitigating packet-of-death vulnerabilities:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Firewalling involves deciding on a per-packet basis whether to allow a packet,
+    based on the source and destination IP addresses and/or port numbers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: DDoS protection adds some complexity, perhaps keeping track of the rate at which
+    packets are arriving from a particular source and/or detecting certain characteristics
+    of the packet contents to determine that an attacker or set of attackers is trying
+    to flood the interface with traffic.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A packet-of-death vulnerability is a class of kernel vulnerability in which
+    the kernel fails to safely process a packet crafted in a particular way. An attacker
+    who sends packets with this particular format can exploit the vulnerability, which
+    could potentially cause the kernel to crash. Traditionally, when a kernel vulnerability
+    like this is found, it requires installing a new kernel with the fix, which in
+    turn requires machine downtime. But an eBPF program that detects and drops these
+    malicious packets can be installed dynamically, instantly protecting that host
+    without affecting any applications running on the machine.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The decision-making algorithms for features like these are beyond the scope
+    of this book, but let’s explore how eBPF programs attached to the XDP hook on
+    a network interface drop certain packets, which is the basis for implementing
+    these use cases.
+  prefs: []
+  type: TYPE_NORMAL
+- en: XDP Program Return Codes
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'An XDP program is triggered by the arrival of a network packet. The program
+    examines the packet, and when it’s done, the return code gives a *verdict* that
+    indicates what to do next with that packet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`XDP_PASS` indicates that the packet should be sent to the network stack in
+    the normal way (as it would have done if there were no XDP program).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`XDP_DROP` causes the packet to be discarded immediately.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`XDP_TX` sends the packet back out of the same interface it arrived on.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`XDP_REDIRECT` is used to send it to a different network interface.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`XDP_ABORTED` results in the packet being dropped, but its use implies an error
+    case or something unexpected, rather than a “normal” decision to discard a packet.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'For some use cases (like firewalling), the XDP program simply has to decide
+    between passing the packet on or dropping it. An outline for an XDP program that
+    decides whether to drop packets looks something like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE0]``'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE1]An XDP program can also manipulate the packet contents, but I’ll come
+    to that later in this chapter.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: XDP programs get triggered whenever an inbound network packet arrives on the
+    interface to which it is attached. The `ctx` parameter is a pointer to an `xdp_md`
+    structure, which holds metadata about the incoming packet. Let’s see how you can
+    use this structure to examine the packet’s contents in order to reach a verdict.[PRE2]##
+    XDP Packet Parsing
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here’s the definition of the `xdp_md` structure:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE3]'
+  prefs: []
+  type: TYPE_PRE
+- en: Don’t be fooled by the `__u32` type for the first three fields, as they are
+    really pointers. The `data` field indicates the location in memory where the packet
+    starts, and `data_end` shows where it ends. As you saw in [Chapter 6](ch06.html#the_ebpf_verifier),
+    to pass the eBPF verifier you will have to explicitly check that any reads or
+    writes to the packet’s contents are within the range `data` to `data_end`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There is also an area in memory ahead of the packet, between `data_meta` and
+    `data`, for storing metadata about this packet. This can be used for coordination
+    between multiple eBPF programs that might process the same packet at various places
+    on its journey through the stack.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'To illustrate the basics of parsing a network packet, there is an XDP program
+    called `ping()` in the example code, which will simply generate a line of trace
+    whenever it detects a ping (ICMP) packet. Here’s the code for that program:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE4][PRE5]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE6]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'ping-26622   [000] d.s11 276880.862408: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26622   [000] d.s11 276880.862459: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26622   [000] d.s11 276881.889575: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26622   [000] d.s11 276881.889676: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26622   [000] d.s11 276882.910777: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26622   [000] d.s11 276882.910930: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE7]'
+  prefs: []
+  type: TYPE_PRE
+- en: if(protocol==1)// ICMP
+  prefs: []
+  type: TYPE_NORMAL
+- en: '{ `bpf_printk``(``"Hello ping"``);` ``return``XDP_DROP``;` ``}` ``return``XDP_PASS``;[PRE8]'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE9]'
+  prefs: []
+  type: TYPE_PRE
+- en: 'ping-26639   [002] d.s11 277050.589356: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26639   [002] d.s11 277051.615329: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'ping-26639   [002] d.s11 277052.637708: bpf_trace_printk: Hello ping'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE10]'
+  prefs: []
+  type: TYPE_PRE
+- en: unsignedcharlookup_protocol(structxdp_md*ctx){unsignedcharprotocol=0;void*data=(void*)(long)ctx->data;![1](assets/1.png)void*data_end=(void*)(long)ctx->data_end;structethhdr*eth=data;![2](assets/2.png)if(data+sizeof(structethhdr)>data_end)![3](assets/3.png)return0;//
+    Check that it's an IP packet
+  prefs: []
+  type: TYPE_NORMAL
+- en: if(bpf_ntohs(eth->h_proto)==ETH_P_IP)![4](assets/4.png){// Return the protocol
+    of this packet
+  prefs: []
+  type: TYPE_NORMAL
+- en: // 1 = ICMP
+  prefs: []
+  type: TYPE_NORMAL
+- en: // 6 = TCP
+  prefs: []
+  type: TYPE_NORMAL
+- en: // 17 = UDP
+  prefs: []
+  type: TYPE_NORMAL
+- en: structiphdr*iph=data+sizeof(structethhdr);![5](assets/5.png)if(data+sizeof(structethhdr)+sizeof(structiphdr)<=data_end)![6](assets/6.png)protocol=iph->protocol;![7](assets/7.png)}returnprotocol;}
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE11][PRE12]  ``# Load Balancing and Forwarding'
+  prefs: []
+  type: TYPE_NORMAL
+- en: XDP programs aren’t limited to inspecting the contents of a packet. They can
+    also modify the packet’s contents. Let’s consider what’s involved if you want
+    to build a simple load balancer that takes packets sent to a given IP address
+    and fans those requests to a number of backends that can fulfill the request.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There’s an example of this in the GitHub repo.^([2](ch08.html#ch08fn2)) The
+    setup here is a set of containers that run on the same host. There’s a client,
+    a load balancer, and two backends, each running in their own container. As illustrated
+    in [Figure 8-2](#example_load_balancer_setup), the load balancer receives traffic
+    from the client and forwards it to one of the two backend containers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Example load balancer setup](assets/lebp_0802.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8-2\. Example load balancer setup
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: The load balancing function is implemented as an XDP program attached to the
+    load balancer’s eth0 network interface. The return code from this program is `XDP_TX`,
+    indicating that the packet should be sent back out of the interface it came in
+    on. But before that happens, the program has to update the address information
+    in the packet headers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Although I think it’s useful as a learning exercise, this example code is very,
+    very far from being production ready; for example, it uses hard-coded addresses
+    that assume the exact setup of IP addresses shown in [Figure 8-2](#example_load_balancer_setup).
+    It assumes that the only TCP traffic it will ever receive is requests from the
+    client or responses to the client. It also cheats by taking advantage of the way
+    Docker sets up virtual MAC addresses, using each container’s IP address as the
+    last four bytes of the MAC address for the virtual Ethernet interface for each
+    container. That virtual Ethernet interface is called eth0 from the perspective
+    of the container.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here’s the XDP program from the example load balancer code:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE13]cpp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![1](assets/1.png)](#code_id_8_8)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The first part of this function is practically the same as in the previous
+    example: it locates the Ethernet header and then the IP header in the packet.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](assets/2.png)](#code_id_8_9)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This time it will process only TCP packets, passing anything else it receives
+    on up the stack as if nothing had happened.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](assets/3.png)](#code_id_8_10)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Here the source IP address is checked. If this packet didn’t come from the client,
+    I will assume it is a response going to the client.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![4](assets/4.png)](#code_id_8_11)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: This code generates a pseudorandom choice between backends A and B.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![5](assets/5.png)](#code_id_8_12)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The destination IP and MAC addresses are updated to match whichever backend
+    was chosen…
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![6](assets/6.png)](#code_id_8_13)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: …or if this is a response from a backend (which is the assumption here if it
+    didn’t come from a client), the destination IP and MAC addresses are updated to
+    match the client.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![7](assets/7.png)](#code_id_8_14)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Wherever this packet is going, the source addresses need to be updated so that
+    it looks as though the packet originated from the load balancer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![8](assets/8.png)](#code_id_8_15)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The IP header includes a checksum calculated over its contents, and since the
+    source and destination IP addresses have both been updated, the checksum also
+    needs to be recalculated and replaced in this packet.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Since this is a book on eBPF and not networking, I haven’t delved into details
+    such as why the IP and MAC addresses need to be updated or what happens if they
+    aren’t. If you’re interested, I cover this some more in my [YouTube video of the
+    eBPF Summit talk](https://oreil.ly/mQxtT) where I originally wrote this example
+    code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Much like the previous example, the Makefile includes instructions to not only
+    build the code but also use `bpftool` to load and attach the XDP program to the
+    interface, like this:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE14]cpp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'This `make` instruction needs to be run *inside* the load balancer container
+    so that eth0 corresponds to its virtual Ethernet interface. This leads to an interesting
+    point: an eBPF program is loaded into the kernel, of which there is only one;
+    yet the attachment point may be within a particular network namespace and visible
+    only within that network namespace.^([3](ch08.html#ch08fn3))'
+  prefs: []
+  type: TYPE_NORMAL
+- en: XDP Offloading
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: The idea for XDP originated from a conversation speculating how useful it would
+    be if you could run eBPF programs on a network card to make decisions about individual
+    packets before they even reach the kernel’s networking stack.^([4](ch08.html#ch08fn4))
+    There are some network interface cards that support this full *XDP offload* capability
+    where they can indeed run eBPF programs on inbound packets on their own processor.
+    This is illustrated in [Figure 8-3](#network_interface_cards_that_support_xd).
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![Network interface cards that support XDP offload can process, drop, and retransmit
+    packets without any work required from the host CPU](assets/lebp_0803.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8-3\. Network interface cards that support XDP offload can process, drop,
+    and retransmit packets without any work required from the host CPU
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: This means a packet that gets dropped or redirected back out of the same physical
+    interface—like the packet drop and load balancing examples earlier in this chapter—is
+    never seen by the host’s kernel, and no CPU cycles on the host machine are ever
+    spent processing them, as all the work is done on the network card.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Even if the physical network interface card doesn’t support full XDP offload,
+    many NIC drivers support XDP hooks, which minimizes the memory copying required
+    for an eBPF program to process a packet.^([5](ch08.html#ch08fn5))
+  prefs: []
+  type: TYPE_NORMAL
+- en: This can result in significant performance benefits and allows functionality
+    like load balancing to run very efficiently on commodity hardware.^([6](ch08.html#ch08fn6))
+  prefs: []
+  type: TYPE_NORMAL
+- en: You’ve seen how XDP can be used to process inbound network packets, accessing
+    them as soon as possible as they arrive on a machine. eBPF can also be used to
+    process traffic at other points in the network stack, in whatever direction it
+    is flowing. Let’s move on and think about eBPF programs attached within the TC
+    subsystem.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traffic Control (TC)
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: I mentioned traffic control in the previous chapter. By the time a network packet
+    reaches this point it will be in kernel memory in the form of an [`sk_buff`](https://oreil.ly/TKDCF).
+    This is a data structure that’s used throughout the kernel’s network stack. eBPF
+    programs attached within the TC subsystem receive a pointer to the `sk_buff` structure
+    as the context parameter.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: You might be wondering why XDP programs don’t also use this same structure for
+    their context. The answer is that the XDP hook happens before the network data
+    reaches the network stack and before the `sk_buff` structure has been set up.
+  prefs: []
+  type: TYPE_NORMAL
+- en: The TC subsystem is intended to regulate how network traffic is scheduled. For
+    example, you might want to limit the bandwidth available to each application so
+    that they all get a fair chance. But when you’re looking at scheduling individual
+    packets, *bandwidth* isn’t a terribly meaningful term, as it’s used for the average
+    amount of data being sent or received. A given application might be very bursty,
+    or another application might be very sensitive to network latency, so TC gives
+    much finer control over the way packets are handled and prioritized.^([7](ch08.html#ch08fn7))
+  prefs: []
+  type: TYPE_NORMAL
+- en: eBPF programs were introduced here to give custom control over the algorithms
+    used within TC. But with the power to manipulate, drop, or redirect packets, eBPF
+    programs attached within TC can also be used as the building blocks for complex
+    network behaviors.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A given piece of network data in the stack flows in one of two directions:
+    *ingress* (inbound from the network interface) or *egress* (outbound toward the
+    network interface). eBPF programs can be attached in either direction and will
+    affect traffic only in that direction. Unlike XDP, it’s possible to attach multiple
+    eBPF programs that will be processed in sequence.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Traditional traffic control is split into *classifiers*, which classify packets
+    based on some rule, and separate *actions*, which are taken based on the output
+    from a classifier and determine what to do with a packet. There can be a series
+    of classifiers, all defined as part of a *qdisc* or queuing discipline.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'eBPF programs are attached as a classifier, but they can also determine what
+    action to take within the same program. The action is indicated by the program’s
+    return code (whose values are defined in *linux/pkt_cls.h*):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '`TC_ACT_SHOT` tells the kernel to drop the packet.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`TC_ACT_UNSPEC` behaves as if the eBPF program hadn’t been run on this packet
+    (so it would be passed to the next classifier in the sequence, if there is one).'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`TC_ACT_OK` tells the kernel to pass the packet to the next layer in the stack.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '`TC_ACT_REDIRECT` sends the packet to the ingress or egress path of a different
+    network device.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Let’s take a look at a few simple examples of programs that can be attached
+    within TC. The first simply generates a line of trace and then tells the kernel
+    to drop the packet:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE15]cpp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE16]cppNow let’s consider how to drop only a subset of packets. This example
+    drops ICMP (ping) request packets and is very similar to the XDP example you saw
+    earlier in this chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE17]cpp[PRE18]cpp  ``# Packet Encryption and Decryption'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If an application uses encryption to secure data it sends or receives, there
+    will be a point before it’s encrypted or after it’s decrypted where the data is
+    in the clear. Recall that eBPF can attach programs pretty much anywhere on a machine,
+    so if you can hook into a point where data is being passed and isn’t yet encrypted,
+    or just after it has been decrypted, that would allow your eBPF program to observe
+    that data in the clear. There’s no need to supply any certificates to decrypt
+    the traffic, as you would in a traditional SSL inspection tool.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In many cases an application will encrypt data using a library like OpenSSL
+    or BoringSSL that lives in user space. In this case the traffic will already be
+    encrypted by the time it reaches the socket, which is the user space/kernel boundary
+    for network traffic. If you want to trace out this data in its unencrypted form,
+    you can use an eBPF program attached to the right place in the user space code.
+  prefs: []
+  type: TYPE_NORMAL
+- en: User Space SSL Libraries
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: One common way to trace out the decrypted content of encrypted packets is to
+    hook into calls made to user space libraries like OpenSSL or BoringSSL. An application
+    using OpenSSL sends data to be encrypted by making a call to a function called
+    `SSL_write()` and retrieves cleartext data that was received over the network
+    in encrypted form using `SSL_read()`. Hooking eBPF programs into these functions
+    with uprobes allows an application to observe the data *from any application that
+    uses this shared library* in the clear, before it is encrypted or after it has
+    been decrypted. And there is no need for any keys, because those are already being
+    provided by the application.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'There is a fairly straightforward example called [openssl-tracer in the Pixie
+    project](https://oreil.ly/puDp9),^([8](ch08.html#ch08fn8)) within which the eBPF
+    programs are in a file called *openssl_tracer_bpf_funcs.c*. Here’s the part of
+    that code that sends data to user space, using a perf buffer (similar to examples
+    you have seen earlier in this book):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE19]cpp``'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE20]cppYou can see that data from `buf` gets read into an `event` structure
+    using the helper function `bpf_probe_read()`, and then that `event` structure
+    is submitted to a perf buffer.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'If this data is being sent to user space, it’s reasonable to assume this must
+    be the data in unencrypted format. So where is this buffer of data obtained? You
+    can work that out by seeing where the `process_SSL_data()` function is called.
+    It’s called in two places: one for data being read and one for data being written.
+    [Figure 8-4](#ebpf_programs_are_hooked_to_uprobes_at_) illustrates what is happening
+    in the case of reading data that arrives on this machine in encrypted form.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: When you’re reading data, you supply a pointer to a buffer to `SSL_read()`,
+    and when the function returns, that buffer will contain the unencrypted data.
+    Much like kprobes, the input parameters to a function—including that buffer pointer—are
+    only available to a uprobe attached to the entry point, as the registers they’re
+    held in might well get overwritten during the function’s execution. But the data
+    won’t be available in the buffer until the function exits, when you can read it
+    using a uretprobe.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![eBPF programs are hooked to uprobes at the entry to and exit from SSL_read()
+    so that the unencrypted data can be read from the buffer pointer](assets/lebp_0804.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 8-4\. eBPF programs are hooked to uprobes at the entry to and exit from
+    `SSL_read()` so that the unencrypted data can be read from the buffer pointer
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'So this example follows a common pattern for kprobes and uprobes, illustrated
+    in [Figure 8-4](#ebpf_programs_are_hooked_to_uprobes_at_), where the entry probe
+    temporarily stores input parameters using a map, from which the exit probe can
+    retrieve them. Let’s look at the code that does this, starting with the eBPF program
+    attached to the start of `SSL_read()`:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE21]cpp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![1](assets/1.png)](#code_id_8_21)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As described in the comment for this function, the buffer pointer is the second
+    parameter passed into the `SSL_read()` function to which this probe will be attached.
+    The `PT_REGS_PARM2` macro gets this parameter from the context.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](assets/2.png)](#code_id_8_22)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The buffer pointer is stored in a hash map, for which the key is the current
+    process and thread ID, obtained at the start of the function using the helper
+    `bpf_get_current_pid_tgif()`.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here’s the corresponding program for the exit probe:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[PRE22]cpp'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![1](assets/1.png)](#code_id_8_23)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Having looked up the current process and thread ID, use this as the key to retrieve
+    the buffer pointer from the hash map.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![2](assets/2.png)](#code_id_8_24)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: If this isn’t a null pointer, call `process_SSL_data()`, which is the function
+    you saw earlier that sends the data from that buffer to user space using the perf
+    buffer.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[![3](assets/3.png)](#code_id_8_25)'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clean up the entry in the hash map, since every entry call should be paired
+    with an exit.
+  prefs: []
+  type: TYPE_NORMAL
+- en: This example shows how to trace out the cleartext version of encrypted data
+    that gets sent and received by a user space application. The tracing itself is
+    attached to a user space library, and there’s no guarantee that every application
+    will use a given SSL library. The BCC project includes a utility called [*sslsniff*](https://oreil.ly/tFT9p)
+    that also supports GnuTLS and NSS. But if someone’s application uses some other
+    encryption library (or even, heaven forbid, they chose to “roll their own crypto”),
+    the uprobes simply won’t have the right places to hook to and these tracing tools
+    won’t work.
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are even more common reasons why this uprobe-based approach might not
+    be successful. Unlike the kernel (of which there is only one per [virtual] machine),
+    there can be multiple copies of user space library code. If you’re using containers,
+    each one is likely to have its own set of all library dependencies. You can hook
+    into uprobes in these libraries, but you’d have to identify the right copy for
+    the particular container you want to trace. Another possibility is that rather
+    than using a shared, dynamically linked library, an application might be statically
+    linked so that it’s a single standalone executable.[PRE23]```
+  prefs: []
+  type: TYPE_NORMAL

@@ -1,0 +1,1442 @@
+- en: Chapter 15\. Investigating Systems
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: By Pete Nuttall, Matt Linton‎, and David Seidman
+  prefs: []
+  type: TYPE_NORMAL
+- en: with Vera Haas, Julie Saracino, and Amaya Booker
+  prefs: []
+  type: TYPE_NORMAL
+- en: In an ideal world, we would all build perfect systems, and our users would have
+    only the best of intentions. In reality, you’ll encounter bugs and need to conduct
+    security investigations. As you observe a system running in production over time,
+    you’ll identify areas for improvement and places where you can streamline and
+    optimize processes. All of these tasks require debugging and investigation techniques,
+    and appropriate system access.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, granting even read-only debugging access creates a risk that this access
+    may be abused. To address this risk, you need proper security mechanisms in place.
+    You also need to strike a careful balance between the debugging needs of developers
+    and operations staff, and the security requirements of storing and accessing sensitive
+    data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: In this chapter, we use the term *debugger* to mean a human who is debugging
+    software problems—not [GDB (the GNU Debugger)](https://oreil.ly/Fl82Z) or similar
+    tools. Unless otherwise noted, we use the term “we” to refer to the authors of
+    this chapter, not Google as a whole.
+  prefs: []
+  type: TYPE_NORMAL
+- en: From Debugging to Investigation
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: '[T]he realization came over me with full force that a good part of the remainder
+    of my life was going to be spent in finding errors in my own programs.'
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: '>'
+  prefs: []
+  type: TYPE_NORMAL
+- en: —Maurice Wilkes, Memoirs of a Computer Pioneer (MIT Press, 1985)
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: Debugging has a bad reputation. Bugs surface at the worst of times. It can be
+    hard to estimate when a bug will be fixed, or when a system will be “good enough”
+    to let many people use it. For most people, it’s more fun to write new code than
+    to debug existing programs. Debugging can be perceived as unrewarding. However,
+    it’s necessary, and you may even find the practice enjoyable when viewed through
+    the lens of learning new facts and tools. In our experience, debugging also makes
+    us better programmers, and reminds us that sometimes we’re not as smart as we
+    think we are.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Example: Temporary Files'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Consider the following outage, which we (the authors) debugged two years ago.^([1](ch15.html#ch15fn2))
+    The investigation began when we received an alert that a [Spanner database](https://oreil.ly/ZYr1W)
+    was running out of storage quota. We went through the process of debugging, asking
+    ourselves the following questions:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: What caused the database to run out of storage?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Quick triage indicated the problem was caused by an accumulation of many small
+    files being created in Google’s massive distributed filesystem, [Colossus](https://oreil.ly/dkocj),
+    which was likely triggered by a change in user request traffic.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What was creating all the tiny files?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: We looked at service metrics, which showed the files resulted from the Spanner
+    server running low on memory. According to normal behavior, recent writes (updates)
+    were buffered in memory; as the server ran low on memory, it flushed the data
+    to files on Colossus. Unfortunately, each server in the Spanner zone had only
+    a small amount of memory to accommodate updates. As a result, rather than flushing
+    a manageable number of larger, compressed files,^([2](ch15.html#ch15fn3)) each
+    server flushed many tiny files to Colossus.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Where was the memory being used?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: Each server ran as a Borg task (in a container), which capped the memory available
+    to it.^([3](ch15.html#ch15fn4)) To determine where within the kernel memory was
+    used, we directly issued the `slabtop` command on the production machine. We determine
+    that the directory entry (dentry) cache was the largest user of memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Why was the dentry cache so big?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: We made an educated guess that the Spanner database server was creating and
+    deleting vast numbers of temporary files—a few for each flush operation. Each
+    flush operation increased the size of the dentry cache, making the problem worse.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How could we confirm our hypothesis?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: To test this theory, we created and ran a program on Borg to reproduce the bug
+    by creating and deleting files in a loop. After a few million files, the dentry
+    cache had used all the memory in its container, confirming the hypothesis.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Was this a kernel bug?
+  prefs:
+  - PREF_OL
+  type: TYPE_NORMAL
+- en: We researched expected behavior of the Linux kernel, and determined that the
+    kernel caches the nonexistence of files—some build systems need this feature to
+    ensure acceptable performance. In normal operation, the kernel evicts entries
+    from the dentry cache when the container is full. However, because the Spanner
+    server repeatedly flushed updates, the container never became full enough to trigger
+    evictions. We addressed this issue by designating that temporary files didn’t
+    need to be cached.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'The debugging process described here illustrates many of the concepts we discuss
+    in this chapter. However, the most important takeaway from this story is that
+    *we debugged this issue*—and you can, too! Solving and fixing the problem didn’t
+    require any magic; it just required slow and structured investigation. To break
+    down the characteristics of our investigation:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: After the system showed signs of degradation, we debugged the problem using
+    existing logs and monitoring infrastructure.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We were able to debug the issue even though it occurred in kernel space and
+    code that the debuggers had not seen before.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We’d never noticed the issue before this outage, even though it had likely been
+    present for several years.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: No part of the system was broken. All parts were working as intended.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The developers of the Spanner server were surprised that temporary files could
+    consume memory long after the files had been deleted.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We were able to debug the kernel’s memory usage by using tools provided by the
+    kernel developers. Even though we’d never used these tools before, we were able
+    to make progress relatively quickly because we were trained and well practiced
+    in debugging techniques.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: We initially misdiagnosed the bug as a user error. We changed our minds only
+    after examining our data.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: By developing a hypothesis and then creating a way to test our theory, we confirmed
+    the root cause before we introduced changes to the system.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Debugging Techniques
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'This section shares some techniques for systematic debugging.^([4](ch15.html#ch15fn5))
+    Debugging is a skill that you can learn and practice. [Chapter 12 of the SRE book](https://landing.google.com/sre/sre-book/chapters/effective-troubleshooting/)
+    offers two requirements for successful debugging:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Know how the system is supposed to work.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Be systematic: collect data, hypothesize causes, and test theories.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The first of these requirements is trickier. Take the canonical example of a
+    system built by a single developer who suddenly leaves the company, taking all
+    knowledge of the system with them. The system may continue to work for months,
+    but one day it mysteriously breaks and no one can fix it. Some of the advice that
+    follows can help, but there’s no real substitute for understanding the system
+    ahead of time (see [Chapter 6](ch06.html#design_for_understandability)).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Distinguish horses from zebras
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'When you hear hoofbeats, do you first think of horses, or zebras? Instructors
+    sometime pose this question to medical students learning how to triage and diagnose
+    diseases. It’s a reminder that most ailments are common—most hoofbeats are caused
+    by horses, not zebras. You can imagine why this is helpful advice for a medical
+    student: they don’t want to assume symptoms add up to a rare disease when, in
+    fact, the condition is common and straightforward to remedy.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In contrast, given a large enough scale, experienced engineers will observe
+    both common *and* rare events. People building computer systems can (and must)
+    work to completely eliminate all problems. As a system grows in scale, and its
+    operators eliminate common problems over time, rare problems appear more frequently.
+    To quote [Bryan Cantrill](https://oreil.ly/eYfUO): “Over time, the horses are
+    found; only the zebras are left.”'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Consider the very rare issue of memory corruption by bit flip. A modern error-correcting
+    memory module has a less than 1% chance per year of encountering an uncorrectable
+    bit flip that can crash a system.^([5](ch15.html#ch15fn6)) An engineer debugging
+    an unexpected crash probably won’t think, “I bet this was caused by an extremely
+    unlikely electrical malfunction in the memory chips!” However, at very large scale,
+    these rarities become certainties. A hypothetical cloud service utilizing 25,000
+    machines might use memory across 400,000 RAM chips. Given the odds of a 0.1% yearly
+    risk of uncorrectable errors *per chip,* the scale of the service could lead to
+    400 occurrences annually. People running the cloud service will likely observe
+    a memory failure every day.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Debugging these kinds of rare events can be challenging, but it’s achievable
+    with the right kind of data. To provide one example, Google hardware engineers
+    once noticed that certain RAM chips failed much more often than expected. Asset
+    data allowed them to track the source of the failing DIMMs (memory modules), and
+    they were able to trace the modules to a single provider. After extensive debugging
+    and investigation, the engineers identified the root cause: an environmental failure
+    in a clean room, in a single factory where the DIMMs were produced. This problem
+    was a “zebra”—a rare bug visible only at scale.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: As a service grows, today’s strange outlier bug may become next year’s routine
+    bug. In the year 2000, [memory hardware corruption was a surprise for Google](https://oreil.ly/CicjH).
+    Today, such hardware failures are routine, and we plan for them with end-to-end
+    integrity checking and other reliability measures.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In recent years, we’ve encountered some other zebras:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Two web search requests hashed to the same 64-bit cache key, causing results
+    for one request to be served in place of the other.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: C++ converted an `int64` to an `int` (only 32 bits), resulting in problems after
+    2^(32) requests (for more about this bug, see [“Clean up code”](#clean_up_code)).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A bug in a distributed rebalancing algorithm was triggered only when the code
+    ran simultaneously on hundreds of servers.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Someone left a load test running for a week, causing performance to slowly degrade.
+    We eventually determined that the machine was gradually suffering from memory
+    allocation issues, leading to the degradation. We discovered this particular zebra
+    because a normally short-lived test was left running for much longer than normal.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Investigating slow C++ tests showed that the dynamic linker’s loading time
+    was superlinear in terms of the number of shared libraries loaded: at 10,000 shared
+    libraries, it could take minutes to start running `main`.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When dealing with smaller, newer systems, expect horses (common bugs). When
+    dealing with older, larger, and relatively stable systems, expect zebras (rare
+    bugs)—operators have likely observed and fixed common bugs that surfaced over
+    time. Issues are more likely to crop up in new parts of the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Set aside time for debugging and investigations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Both security investigations (to be discussed later) and debugging often take
+    time—many hours of uninterrupted work. The temporary files scenario described
+    in the previous section required somewhere between 5 and 10 hours of debugging.
+    When running a major incident, give debuggers and investigators the space to focus
+    by isolating them from the minute-by-minute response.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Debugging rewards slow, methodical, persistent approaches, in which people
+    double-check their work and assumptions and are willing to dig deep. The temporary
+    files problem also offers a negative example of debugging: the first responder
+    initially diagnosed the outage as caused by user traffic and blamed poor system
+    behavior on users. At the time, the team was in operational overload and experiencing
+    pager fatigue due to nonurgent pages.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: '[Chapter 17 of the SRE workbook](https://landing.google.com/sre/workbook/chapters/overload/)
+    discusses reducing operational overload. [Chapter 11 of the SRE book](https://landing.google.com/sre/sre-book/chapters/being-on-call/)
+    suggests keeping ticket and pager volume below two per shift to give engineers
+    time to dig deep into issues.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Record your observations and expectations
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Write down what you see. Separately, write down your theories, even if you’ve
+    already rejected them. Doing so has several advantages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: It introduces structure to the investigation and helps you remember the steps
+    you took during your investigation. When you start debugging, you don’t know how
+    long it will take to solve the issue—resolution might take five minutes or five
+    months.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Another debugger can read your notes, understand what you observed, and quickly
+    participate in or take over the investigation. Your notes can help teammates avoid
+    duplicative work, and may inspire others to think of new avenues for investigation.
+    For more on this topic, see “Negative Results Are Magic” in [Chapter 12 of the
+    SRE book](https://landing.google.com/sre/sre-book/chapters/effective-troubleshooting/).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: In the case of potential security issues, it can be helpful to keep a log of
+    each access and investigation step. Later, you may need to prove (sometimes in
+    a court of law) which actions were performed by the attacker and which were performed
+    by investigators.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: After you’ve written down what you observed, write down what you expected to
+    observe and why. Bugs often lurk in the space between your mental model of the
+    system and its actual implementation. In the temporary files example, the developers
+    assumed that deleting a file removed all references to it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Know what’s normal for your system
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Often, debuggers start debugging what is actually an expected system behavior.
+    Here are a few examples from our experience:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: A binary called `abort` near the end of its `shutdown` code. New developers
+    saw the `abort` call in the logs and started debugging the call, not noticing
+    that the interesting failure was actually the reason for the call to `shutdown`.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: When the Chrome web browser starts, it attempts to resolve three random domains
+    (such as `cegzaukxwefark.local`) to determine whether the network is illicitly
+    tampering with DNS. Even Google’s own investigation team has mistaken these DNS
+    resolutions for malware trying to resolve a command-and-control server hostname.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Debuggers often need to filter out these normal events, even if the events look
+    relevant or suspicious. Security investigators have the added problem of a steady
+    level of background noise and active adversaries that may be trying to hide their
+    actions. You often need to filter out routine noisy activity like automated SSH
+    login brute forcing, authentication errors caused by users’ mistyped passwords,
+    and port scanning before you can observe more serious issues.
+  prefs: []
+  type: TYPE_NORMAL
+- en: One way to understand normal system behavior is to establish a baseline of system
+    behavior when you don’t suspect any problems. If you have a problem already, you
+    may be able to infer your baseline by examining historical logs from before the
+    problem began.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For example, in [Chapter 1](ch01.html#the_intersection_of_security_and_reliab)
+    we described a global YouTube outage caused by a change to a generic logging library.
+    The change caused the servers to run out of memory (OOM) and fail. Because the
+    library was widely used within Google, our post-outage investigation questioned
+    whether the outage had affected the number of OOMs for all other Borg tasks. While
+    logs suggested that we had many OOM conditions that day, we were able to compare
+    that data against a baseline of data from the previous two weeks, which showed
+    that Google has many OOM conditions *every* day. Although the bug was serious,
+    it did not meaningfully affect the OOM metric for Borg tasks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Beware of normalizing deviance from best practices. Often, bugs become “normal
+    behavior” over time, and you no longer notice them. For example, we once worked
+    on a server that had spent ~10% of its memory in heap fragmentation. After many
+    years of asserting that ~10% was the expected and therefore acceptable amount
+    of loss, we examined a fragmentation profile and quickly found major opportunities
+    for saving memory.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '[Operational overload](https://oreil.ly/L144H) and alert fatigue can lead you
+    to grow a blind spot, and thus normalize deviance. To address normalized deviance,
+    we actively listen to newcomers to the team, and to facilitate fresh perspectives,
+    we rotate people in and out of on-call rotations and response teams—the process
+    of writing documentation and explaining a system to others can also prompt you
+    to question how well you understand a system. Additionally, we use Red Teams (see
+    [Chapter 20](ch20.html#twozero_understanding_roles_and_respons)) to test our blind
+    spots.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reproduce the bug
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'If possible, attempt to reproduce the bug outside of the production environment.
+    This approach has two main advantages:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You don’t impact systems serving actual users, so you can crash the system and
+    corrupt data as much as you want.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Because you don’t expose any sensitive data, you can involve many people in
+    the investigation without raising data security issues. You can also enable operations
+    that aren’t appropriate with actual user data, and capabilities like extra logging.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Sometimes, debugging outside of the production environment isn’t feasible.
+    Perhaps the bug triggers only at scale, or you can’t isolate its trigger. The
+    temporary files example is one such situation: we couldn’t reproduce the bug with
+    a full serving stack.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Isolate the problem
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: If you can reproduce the issue, the next step is to isolate the problem—ideally,
+    to the smallest subset of code that still manifests it. You can do this by disabling
+    components or temporarily commenting out subroutines until the problem is revealed.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'In the temporary files example, once we observed that the memory management
+    was acting strangely on all servers, we no longer had to debug all components
+    on every affected machine. For another example, consider a single server (out
+    of a large cluster of systems) that suddenly starts introducing high latency or
+    errors. This scenario is the standard test of your monitoring, logs and other
+    observability systems: can you quickly find a single bad server among the many
+    servers in your system? See [“What to Do When You’re Stuck”](#what_to_do_when_youapostrophere_stuck)
+    for more information.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can also isolate problems within code. To provide a concrete example, we
+    recently investigated memory usage for a program with a very limited memory budget.
+    In particular, we examined the memory mappings for thread stacks. Although our
+    mental model assumed that all threads had the same stack size, to our surprise
+    we found that different thread stacks had many different sizes. Some stacks were
+    quite large and risked consuming a big chunk of our memory budget. The initial
+    debugging scope included the kernel, glibc, Google’s threading library, and all
+    code that started threads. A trivial example based around glibc’s `pthread_create`
+    created thread stacks of the same size, so we could rule out the kernel and glibc
+    as the sources of the different sizes. We then examined the code that started
+    threads, and discovered that many libraries just picked a thread size at random,
+    explaining the variation of sizes. This understanding enabled us to save memory
+    by focusing on the few threads with large stacks.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Be mindful of correlation versus causation
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Sometimes debuggers assume that two events that start at the same time, or that
+    exhibit similar symptoms, have the same root cause. However, correlation does
+    not always imply causation. Two mundane problems might occur at the same time
+    but have different root causes.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Some correlations are trivial. For example, an increase in latency might lead
+    to a reduction in user requests, simply because users are waiting longer for the
+    system to respond. If a team repeatedly discovers correlations that in retrospect
+    are trivial, there might be a gap in their understanding of how the system is
+    supposed to work. In the temporary files example, if you know that the failure
+    to delete files results in full disks, you won’t be surprised by the correlation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: However, our experience has shown that investigating correlations is often useful—notably,
+    correlations that occur at the start of outages. You can home in on likely causes
+    by thinking, “*X* is broken, *Y* is broken, *Z* is broken; what’s the common element
+    among the three?” We’ve also had some success with correlation-based tooling.
+    For example, we deployed a system that automatically correlates machine problems
+    with the Borg tasks running on the machine. As a result, we can often identify
+    a suspicious Borg task causing a widespread problem. This kind of automated tooling
+    produces much more effective, statistically stronger, and faster correlations
+    than human observation.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Errors can also manifest during deployment—see [Chapter 12 in the SRE book](https://landing.google.com/sre/sre-book/chapters/effective-troubleshooting/).
+    In simple situations, the new code being deployed may have problems, but deployments
+    can also trigger latent bugs in old systems. In these situations, debugging may
+    erroneously focus on the new code being deployed, rather than the latent issues.
+    Systematic investigation—determining what is happening, and why—helps in these
+    cases. In one example we witnessed, the old code had much worse performance than
+    the new code, which resulted in an accidental throttle on the system as a whole.
+    When its performance improved, other parts of the system became overloaded instead.
+    The outage was correlated with the new deployment, but the deployment was not
+    the root cause.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Test your hypotheses with actual data
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: When debugging, it can be tempting to speculate about the root causes of issues
+    before actually looking at the system. When it comes to performance issues, this
+    tendency introduces blind spots, as the problems often lie in code the debuggers
+    have not looked at in a long time. As an example, once we were debugging a web
+    server that was running slowly. We assumed the problem lay in the backends, but
+    a [profiler](https://oreil.ly/3YrvQ) showed that the practice of logging every
+    possible scrap of input to disk and then calling `sync` was causing vast amounts
+    of delay. We discovered this only when we set aside our initial assumptions and
+    dug into the system more deeply.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Observability* is the property of being able to determine what your system
+    is doing by examining its outputs. Tracing solutions like [Dapper](https://oreil.ly/9qDWj)
+    and [Zipkin](https://zipkin.io) are very useful for this kind of debugging. Debugging
+    sessions start with basic questions like, “Can you find a slow Dapper trace?”^([6](ch15.html#ch15fn7))'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: It can be challenging for beginners to determine what tool is best for the job,
+    or even what tools exist. Brendan Gregg’s *Systems Performance* (Prentice Hall,
+    2013), which provides an exhaustive tour of tooling and techniques, is a fantastic
+    reference for performance debugging.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reread the docs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Consider the following guidance from the [Python documentation](https://oreil.ly/PudXU):'
+  prefs: []
+  type: TYPE_NORMAL
+- en: There are no implied relationships among the comparison operators. The truth
+    of `x==y` does not imply that `x!=y` is false. Accordingly, when defining `__eq__()`,
+    one should also define `__ne__()` so that the operators will behave as expected.
+  prefs:
+  - PREF_BQ
+  type: TYPE_NORMAL
+- en: Recently, a Google team spent a good amount of time debugging an internal dashboard
+    optimization. When they got stuck, the team reread the documentation and discovered
+    a plainly written warning message that explained why the optimization had never
+    worked at all. People were so used to the dashboard’s slow performance, they failed
+    to notice that the optimization was completely ineffective.^([7](ch15.html#ch15fn9))
+    Initially, the bug seemed remarkable; the team thought it was an issue in Python
+    itself. After they found the warning message, they determined that it wasn’t a
+    zebra, it was a horse—their code had never worked.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Practice!
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Debugging skills stay fresh only if you use them often. You can speed up your
+    investigations and keep the tips we’ve provided here fresh in your mind by staying
+    familiar with relevant tools and logs. Regularly practicing debugging also provides
+    the opportunity to script the common and tedious parts of the process—for example,
+    automation to examine logs. To get better at debugging (or to stay sharp), practice,
+    and keep the code you write during debugging sessions.
+  prefs: []
+  type: TYPE_NORMAL
+- en: At Google, we formally practice debugging with regular large-scale disaster
+    recovery tests (referred to as DiRT, or the Disaster Recovery Testing program)^([8](ch15.html#ch15fn10))
+    and security penetration tests (see [Chapter 16](ch16.html#onesix_disaster_planning)).
+    Smaller-scale tests, involving one or two engineers in a room for an hour, are
+    much easier to set up and are still quite valuable.
+  prefs: []
+  type: TYPE_NORMAL
+- en: What to Do When You’re Stuck
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: What should you do when you’ve been investigating an issue for days and still
+    have no idea what caused the problem? Maybe it manifests only in the production
+    environment, and you can’t reproduce the bug without affecting live users. Maybe
+    while mitigating the problem, you lost important debugging information when the
+    logs rotated. Maybe the nature of the problem prevents useful logging. We once
+    debugged an issue where a memory container ran out of RAM and the kernel issued
+    a SIGKILL for all processes in the container, stopping all logging. Without logs,
+    we couldn’t debug the issue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A key strategy in these situations is to improve the debugging process. Sometimes,
+    using the methods for developing postmortems (as described in [Chapter 18](ch18.html#oneeight_recovery_and_aftermath))
+    may suggest ways forward. Many systems are in production for years or decades,
+    so efforts to improve debugging are nearly always worthwhile. This section describes
+    some approaches to improving your debugging methods.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Improve observability
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Sometimes you need to see what a bit of code is doing. Is this code branch used?
+    Is this function used? Could this data structure be large? Is this backend slow
+    at the 99th percentile? What backends is this query even using? In these situations,
+    you need better visibility into the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: In some cases, methods like adding more structured logging to improve observability
+    are straightforward. We once investigated a system that monitoring showed was
+    serving too many 404 errors,^([9](ch15.html#ch15fn11)) but the web server wasn’t
+    logging these errors. After adding additional logging for the web server, we discovered
+    that malware was attempting to fetch erroneous files from the system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Other debugging improvements take serious engineering effort. For example, debugging
+    a complex system like [Bigtable](https://oreil.ly/31cv1) requires sophisticated
+    instrumentation. The Bigtable master is the central coordinator for a Bigtable
+    zone. It stores the list of servers and tablets in RAM, and several mutexes protect
+    these critical sections. As Bigtable deployments at Google grew over time, the
+    Bigtable master and these mutexes became a scaling bottleneck. To get more visibility
+    into possible problems, we implemented a wrapper around a mutex that exposes stats
+    such as queue depth and the time the mutex is held.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Tracing solutions like Dapper and Zipkin are very useful for this kind of complex
+    debugging. For example, suppose you have a tree of RPCs, with the frontend calling
+    a server, which calls another server, and so on. Each RPC tree has a unique ID
+    assigned at the root. Each server then logs traces about the RPCs it receives,
+    sends, and so on. Dapper collects all traces centrally and joins them via ID.
+    This way, a debugger can see all the backends touched by the user’s request. We’ve
+    found Dapper to be critical to understanding latency in distributed systems. Similarly,
+    Google embeds a simple web server in nearly every binary to provide visibility
+    into each binary’s behavior. The server has debugging endpoints that provide counters,
+    a symbolized dump of all the running threads, inflight RPCs, and so on. For more
+    information, see Henderson (2017).^([10](ch15.html#ch15fn12))
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Observability is not a substitute for understanding your system. Nor is it a
+    substitute for critical thinking when debugging (sadly!). Often, we’ve found ourselves
+    frantically adding more logging and counters in an effort to see what the system
+    is doing, but what’s really going on becomes clear only when we’ve taken a step
+    back and thought about the problem.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Observability is a large and quickly evolving topic, and it’s useful for more
+    than debugging.^([11](ch15.html#ch15fn13)) If you’re a smaller organization with
+    limited developer resources, you can consider using open source systems or purchasing
+    a third-party observability solution.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Take a break
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Giving yourself a bit of distance from an issue can often lead to new insights
+    when you return to the problem. If you’ve been working heads-down on debugging
+    and hit a lull, take a break: drink some water, go outside, get some exercise,
+    or read a book. Bugs sometimes make themselves evident after a good sleep. A senior
+    engineer in our forensic investigation team keeps a cello in the team’s lab. When
+    he’s truly stuck on a problem, it’s common for him to retreat into the lab for
+    20 minutes or so to play; he then comes back [reenergized and refocused](https://oreil.ly/axc_Y).
+    Another investigator keeps a guitar handy, and others keep sketching and doodling
+    pads in their desks so they can draw or create a silly animated GIF to share with
+    the team when they need that mental realignment.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Make sure to also maintain good team communication. When you step aside to take
+    a break, let the team know that you need a recharge and are following best practices.
+    It’s also helpful to document where you are in the investigation and why you’re
+    stuck. Doing so makes it easier for another investigator to pick up your work,
+    and for you to return to the place where you left off. [Chapter 17](ch17.html#oneseven_crisis_management)
+    has more advice on maintaining morale.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Clean up code
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Sometimes you suspect there’s a bug in a chunk of your code, but can’t see it.
+    Trying to generically improve code quality may help in this situation. As mentioned
+    earlier in this chapter, we once debugged a bit of code that failed in production
+    after 2^(32) requests because C++ was converting an `int64` into an `int` (only
+    32 bits) and truncating it. Although the compiler can warn you about such conversions
+    using [`-Wconversion`](https://oreil.ly/BUPuH), we weren’t using the warning because
+    our code had many benign conversions. Cleaning up the code enabled us to use the
+    compiler warning to detect more possible bugs and prevent new bugs related to
+    conversion.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Here are some other tips for cleanup:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Improve unit test coverage. Target functions where you suspect bugs may lie,
+    or that have a track record of being buggy. (See [Chapter 13](ch13.html#onethree_testing_code)
+    for more information.)
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: For concurrent programs, use [sanitizers](https://oreil.ly/GJJq9) (see [“Sanitize
+    Your Code”](ch12.html#sanitize_your_code)) and [annotate mutexes](https://oreil.ly/z1BQk).
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Improve error handling. Often, adding some more context around an error is sufficient
+    to expose the problem.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Delete it!
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Sometimes bugs lurk in legacy systems, especially if developers haven’t had
+    time to get or stay familiar with the codebase or maintenance has lapsed. A legacy
+    system might also be compromised or incur new bugs. Instead of debugging or hardening
+    the legacy system, consider deleting it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Deleting a legacy system can also improve your security posture. For example,
+    one of the authors was once contacted (through Google’s Vulnerability Reward Program,
+    as described in [Chapter 20](ch20.html#twozero_understanding_roles_and_respons))
+    by a security researcher who had found a security issue in one of our team’s legacy
+    systems. The team had previously isolated this system to its own network, but
+    hadn’t upgraded the system in quite some time. Newer members of the team were
+    unaware that the legacy system even existed. To address the researcher’s discovery,
+    we decided to remove the system. We no longer needed most of the functionality
+    it provided, and we were able to replace it with a considerably simpler modern
+    system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Note
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: 'Be thoughtful when rewriting legacy systems. Ask yourself why your rewritten
+    system will do a better job than the legacy system. Sometimes, you might want
+    to rewrite a system because it’s fun to add new code, and debugging old code is
+    tedious. There are better reasons for replacing systems: sometimes requirements
+    for the system change, and with a small amount of work, you can remove the old
+    system. Alternatively, perhaps you’ve learned something from the first system
+    and can incorporate this knowledge to make the second system better.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Stop when things start to go wrong
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: 'Many bugs are tricky to find because the source and its effects can be far
+    apart in the system. We recently encountered an issue where network gear was corrupting
+    internal DNS responses for hundreds of machines. For example, programs would perform
+    a DNS lookup for the machine `exa1`, but receive the address of `exa2`. Two of
+    our systems had different responses to this bug:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: One system, an archival service, would connect to `exa2`, the wrong machine.
+    However, the system then checked that the machine to which it had connected was
+    the expected machine. Since the machine names didn’t match, the archival service
+    job failed.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Another system that collected machine metrics would collect metrics from the
+    wrong machine, `exa2`. The system then triggered repairs on `exa1`. We detected
+    this behavior only when a technician pointed out that they’d been asked to repair
+    the fifth disk of a machine that didn’t have five disks.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Of these two responses, we prefer the behavior of the archival service. When
+    issues and their effects are far apart in the system—for example, when the network
+    is causing application-level errors—having applications fail closed can prevent
+    downstream effects (such as suspecting disk failure on the wrong system). We cover
+    the topic of whether to fail open or fail closed in greater depth in [Chapter 8](ch08.html#design_for_resilience).
+  prefs: []
+  type: TYPE_NORMAL
+- en: Improve access and authorization controls, even for nonsensitive systems
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: It’s possible to have “too many cooks in the kitchen”—that is, you may run into
+    debugging situations where many people could be the source of a bug, making it
+    difficult to isolate the cause. We once responded to an outage caused by a corrupted
+    database row, and we couldn’t locate the source of the corrupt data. To eliminate
+    the possibility that someone could write to the production database by mistake,
+    we minimized the number of roles that had access and required a justification
+    for any human access. Even though the data was not sensitive, implementing a standard
+    security system helped us prevent and investigate future bugs. Thankfully, we
+    were also able to restore that database row from backup.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Collaborative Debugging: A Way to Teach'
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Many engineering teams teach debugging by working collectively on actual live
+    issues in person (or over a videoconference). In addition to keeping experienced
+    debuggers’ skills fresh, collaborative debugging helps to build psychological
+    safety for new team members: they have the opportunity to see the best debuggers
+    on the team get stuck, backtrack, or otherwise struggle, which shows them that
+    it’s OK to be wrong and to have a hard time.^([12](ch15.html#ch15fn14)) For more
+    on security education, see [Chapter 21](ch21.html#twoone_building_a_culture_of_security_a).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We’ve found that the following rules optimize the learning experience:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Only two people should have laptops open:'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A “driver,” who performs actions requested by the others
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: A “note taker”
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Every action should be determined by the audience. Only the driver and the note
+    taker are permitted to use computers, but they do not determine the actions taken.
+    This way, participants don’t perform solo debugging, only to present an answer
+    without sharing their thought processes and troubleshooting steps.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The team collectively identifies one or more problems to examine, but no one
+    in the room should know in advance how to solve the issues. Each person can request
+    that the driver perform an action to troubleshoot the issue (for example, open
+    a dashboard, look at logs, reboot a server, etc.). Since everyone is present to
+    witness the suggestions, everyone can learn about tools and techniques that participants
+    suggest. Even very experienced team members learn new things from these exercises.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'As described in [Chapter 28 of the SRE book](https://landing.google.com/sre/sre-book/chapters/accelerating-sre-on-call/),
+    some teams also use “Wheel of Misfortune” simulation exercises. These exercises
+    can either be theoretical, with verbal walk-throughs of problem solving, or practical,
+    where the test giver induces a fault in a system. These scenarios also involve
+    two roles:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The “test giver,” who constructs and presents the test
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: The “test taker,” who attempts to solve the problem, perhaps with the help of
+    their teammates
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Some teams prefer the safe environment of staged exercises, but practical Wheel
+    of Misfortune exercises require nontrivial setup, whereas most systems always
+    have a live issue to collectively debug. Regardless of the approach, it’s important
+    to maintain an inclusive learning environment where everyone feels safe to actively
+    contribute.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Both collaborative debugging and Wheel of Misfortune exercises are excellent
+    ways to introduce new techniques to your team and reinforce best practices. People
+    can see how the techniques are useful in real-world situations, often for the
+    trickiest of problems. Teams also get some practice debugging issues together,
+    making them more effective when a real crisis occurs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: How Security Investigations and Debugging Differ
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: We expect every engineer to debug systems, but we advise that trained and experienced
+    security and forensic specialists investigate system compromises. When the line
+    between “bug investigation” and “security problem” is unclear, there’s an opportunity
+    for collaboration between the two sets of specialist teams.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'A *bug investigation* often begins when a system experiences a problem. The
+    investigation focuses on what happened in the system: what data was sent, what
+    happened with that data, and how the service began acting contrary to its intent.
+    *Security investigations* begin a little differently, and quickly pivot to questions
+    like: What has the user who submitted that job been doing? What other activity
+    is that user responsible for? Do we have a live attacker in the system? What will
+    the attacker do next? In short, debugging is more code-focused, while a security
+    investigation may quickly focus on the adversary behind an attack.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: The steps we recommended previously for debugging issues may also be counterproductive
+    during security investigations. Adding new code, deprecating systems, and so on
+    may have unintended side effects. We’ve responded to a number of incidents where
+    a debugger removed files that normally didn’t belong on the system in the hopes
+    of resolving errant behavior, and it turned out that those files had been introduced
+    by the attacker, who was thus alerted to the investigation. In one case, the attacker
+    even responded in kind by deleting the entire system!
+  prefs: []
+  type: TYPE_NORMAL
+- en: Once you suspect that a security compromise has occurred, your investigation
+    may also take on a new sense of urgency. The possibility that a system is being
+    intentionally subverted raises questions that feel serious and pressing. What
+    is the adversary after? What other systems may be subverted? Do you need to call
+    law enforcement or regulators? Security investigations grow organically in complexity
+    as the organization begins to address operational security concerns ([Chapter 17](ch17.html#oneseven_crisis_management)
+    discusses this topic further). Experts from other teams, such as Legal, may get
+    involved before you can begin your investigation. In short, the moment you suspect
+    a security compromise is a good time to get help from security professionals.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Deciding when to stop investigating and declare a security incident can be
+    a difficult judgment call. Many engineers have a natural inclination to refrain
+    from “making a scene” by escalating issues that aren’t yet proven to be security-related,
+    but continuing the investigation to the point of proof may be the wrong move.
+    Our advice is to remember “horses versus zebras”: the vast majority of bugs are,
+    in fact, bugs, not malicious actions. However, *also* keep a vigilant eye open
+    for those black and white stripes zipping by.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Collect Appropriate and Useful Logs
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: At their heart, logs and system crash dumps are both just information you can
+    collect to help you understand what happened in a system and to investigate problems—both
+    accidental and intentional.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before you launch any service, it’s important to consider the kinds of data
+    the service will store on behalf of users, and the pathways to access the data.
+    Assume that any action that leads to data or system access may be in scope for
+    a future investigation, and that someone will need to audit that action. Investigating
+    any service issue *or* security issue depends heavily on logs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Our discussion here of “logs” refers to structured, timestamped records from
+    systems. During investigations, analysts may also rely heavily on other sources
+    of data, like core dumps, memory dumps, or stack traces. We recommend handling
+    those systems as much like logs as possible. Structured logs are useful for many
+    different business purposes, such as per-usage billing. However, we focus here
+    on structured logs collected for security investigations—the information you need
+    to collect now so it’s available in the event of a future issue.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Design Your Logging to Be Immutable
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The system you build to collect logs should be immutable. When log entries
+    are written, it should be difficult to alter them (but not impossible; see [“Take
+    Privacy into Consideration”](#take_privacy_into_consideration)), and alterations
+    should have an immutable audit trail. Attackers commonly erase traces of their
+    activity on a system from all log sources as soon as they establish a solid foothold.
+    A common best practice to counter this tactic is to write your logs remotely to
+    a centralized and distributed log server. This increases the attacker’s workload:
+    in addition to compromising the original system, they also have to compromise
+    the remote log server. Be sure to harden the log system carefully.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Before the age of modern computing, extra-critical servers logged directly to
+    an attached line printer, like the one in [Figure 15-1](#a_line_printer), which
+    printed log records to paper as they were generated. In order to erase their traces,
+    a remote attacker would have needed someone to physically remove paper from the
+    printer and burn it!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '![A line printer](assets/bsrs_1501.png)'
+  prefs: []
+  type: TYPE_IMG
+- en: Figure 15-1\. A line printer
+  prefs:
+  - PREF_H6
+  type: TYPE_NORMAL
+- en: Take Privacy into Consideration
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'The need for privacy-preserving features is an increasingly important factor
+    in the design of systems. While privacy is not a focus of this book, you will
+    likely need to take into account local regulations and your organization’s privacy
+    policies when designing logging for security investigations and debugging. Be
+    sure to consult with any privacy and legal colleagues in your organization on
+    this topic. Here are some topics you may want to discuss:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Depth of logging
+  prefs: []
+  type: TYPE_NORMAL
+- en: To be maximally useful for any investigation, logs need to be as complete as
+    possible. A security investigation might need to examine every action a user (or
+    an attacker using their account) performed inside a system, the host from which
+    they logged in, and the exact times at which the events occurred. Agree on an
+    organizational policy about what information is acceptable to log, given that
+    many privacy-preserving techniques discourage retaining sensitive user data in
+    logs.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Retention
+  prefs: []
+  type: TYPE_NORMAL
+- en: For some investigations, it can be beneficial to retain logs for a long time.
+    According to a 2018 study, it takes most organizations an average of about [200
+    days](https://oreil.ly/vAunm) to discover a system compromise. Insider threat
+    investigations at Google have relied on operating system security logs going back
+    several years. How long you can keep logs is an important discussion to have within
+    your organization.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Access and audit controls
+  prefs: []
+  type: TYPE_NORMAL
+- en: Many of the controls we recommend for protecting data also apply to logs. Be
+    sure to protect logs and metadata just as you protect other data. See [Chapter 5](ch05.html#design_for_least_privilege)
+    for relevant strategies.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Data anonymization or pseudonymization
+  prefs: []
+  type: TYPE_NORMAL
+- en: Anonymizing unnecessary data components—either as they’re written or after a
+    period of time—is one increasingly common privacy-preserving method for handling
+    logs. You can even implement this functionality such that investigators and debuggers
+    can’t determine who a given user is, but can clearly build a timeline of that
+    user’s actions throughout their session for debugging purposes. Anonymization
+    is tricky to get right. We recommend consulting privacy specialists and reading
+    published literature on this topic.^([13](ch15.html#ch15fn15))
+  prefs: []
+  type: TYPE_NORMAL
+- en: Encryption
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'You can also implement privacy-preserving logging using asymmetric encryption
+    of data. This encryption method is ideal for protecting log data: it uses a nonsensitive
+    “public key” that anyone can use to write data securely, but requires a secret
+    (private) key to decrypt the data. Design options like daily key pairs can allow
+    debuggers to obtain small subsets of log data from recent system activity, while
+    preventing someone from obtaining large amounts of log data in aggregate. Be sure
+    to carefully consider how you store keys.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Determine Which Security Logs to Retain
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Although security engineers would often prefer having too many logs to having
+    too few, it pays to be a bit selective in what you log and retain. Storing an
+    overabundance of logs can be costly (as discussed in [“Budget for Logging”](#budget_for_logging)),
+    and sifting through excessively large data sets can slow down an investigator
+    and use a large amount of resources. In this section, we discuss some types of
+    logs you may want to capture and retain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Operating system logs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Most modern operating systems have built-in logging. Windows has Windows Event
+    logs, while Linux and Mac have syslog and auditd logs. Many vendor-supplied appliances
+    (such as camera systems, environmental controls, and fire alarm panels) have a
+    standard operating system that also produces logs (such as Linux) under the hood.
+    Built-in logging frameworks are useful for investigations, and using them requires
+    almost no effort because they’re often enabled by default or easily configured.
+    Some mechanisms, like auditd, are not enabled by default for performance reasons,
+    but enabling them can be an acceptable tradeoff in real-world use.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Host agents
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Many companies choose to enable additional logging capabilities by installing
+    a *host intrusion detection system* (HIDS) or *host agent* on workstations and
+    servers.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Modern (sometimes referred to as “next-gen”) host agents use innovative techniques
+    aimed at detecting increasingly sophisticated threats. Some agents blend system
+    and user behavior modeling, machine learning, and threat intelligence to identify
+    previously unknown attacks. Other agents are more focused on gathering additional
+    data about the system’s operation, which can be useful for offline detection and
+    debugging activities. Some, such as [OSQuery](https://osquery.io) and [GRR](https://github.com/google/grr),
+    provide real-time visibility into a system.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Host agents always impact performance, and are often a source of friction between
+    end users and IT teams. Generally speaking, the more data an agent can gather,
+    the greater its performance impact may be because of deeper platform integration
+    and more on-host processing. Some agents run as part of the kernel, while others
+    run as userspace applications. Kernel agents have more functionality, and are
+    therefore typically more effective, but they can suffer from reliability and performance
+    issues as they try to keep up with operating system functionality changes. Agents
+    that run as applications are much easier to install and configure, and tend to
+    have fewer compatibility problems. The value and performance of host agents varies
+    widely, so we recommend thoroughly evaluating a host agent before using it.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Application logs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Logging applications—whether vendor-supplied like SAP and Microsoft SharePoint,
+    open source, or custom-written—generate logs that you can collect and analyze.
+    You can then use these logs for custom detection and to augment investigation
+    data. For example, we use [application logs from Google Drive](https://oreil.ly/Fhckk)
+    to determine if a compromised computer has downloaded sensitive data.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When developing custom applications, collaboration between security specialists
+    and developers can ensure that the applications log security-relevant actions,
+    such as data writes, changes in ownership or state, and account-related activity.
+    As we mention in [“Improve observability”](#improve_observability), instrumenting
+    your applications for logging can also facilitate debugging for esoteric security
+    and reliability issues that would otherwise be difficult to triage.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Cloud logs
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Increasingly, organizations are moving parts of their business or IT processes
+    to cloud-based services, ranging from data in Software-as-a-Service (SaaS) applications
+    to virtual machines running critical customer-facing workloads. All of these services
+    present unique attack surfaces and generate unique logs. For example, an attacker
+    can compromise the account credentials for a cloud project, deploy new containers
+    to the project’s Kubernetes cluster, and use those containers to steal data from
+    the cluster’s accessible storage buckets. Cloud computing models commonly launch
+    new instances daily, which makes detecting threats in the cloud dynamic and complex.
+  prefs: []
+  type: TYPE_NORMAL
+- en: When it comes to detecting suspicious activity, cloud services present advantages
+    and disadvantages. Using services like Google’s BigQuery, it’s easy and relatively
+    cheap to collect and store large amounts of log data, and even to run detection
+    rules, directly in the cloud. Google Cloud services also offer built-in logging
+    solutions like [Cloud Audit Logs](https://oreil.ly/XF4ta) and [Stackdriver Logging](https://oreil.ly/6SUwV).
+    On the other hand, because there are many kinds of cloud services, it can be hard
+    to identify, enable, and centralize all the logs you need. Because it’s easy for
+    developers to create new IT assets in the cloud, many companies find it difficult
+    to identify all of their cloud-based assets. Cloud service providers may also
+    predetermine which logs are available to you, and these options may not be configurable.
+    It’s important to understand the limitations of your provider’s logging and your
+    potential blind spots.
+  prefs: []
+  type: TYPE_NORMAL
+- en: A variety of commercial software, often itself based in the cloud, aims to detect
+    attacks against cloud services. Most of the established cloud providers offer
+    integrated threat detection services, such as Google’s [Event Threat Detection](https://oreil.ly/yJdVl).
+    Many companies combine these built-in services with internally developed detection
+    rules or third-party products.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Cloud access security brokers* (CASBs) are a notable category of detection
+    and prevention technology. CASBs function as intermediaries between end users
+    and cloud services to enforce security controls and provide logging. For example,
+    a CASB might prevent your users from uploading certain kinds of files, or log
+    every file downloaded by a user. Many CASBs have a detection function that alerts
+    the detection team about potentially malicious access. You can also integrate
+    logs from the CASB into custom detection rules.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Network-based logging and detection
+  prefs:
+  - PREF_H3
+  type: TYPE_NORMAL
+- en: Since the late 1990s, the use of *network intrusion detection systems* (NIDSs)
+    and *intrusion prevention systems* (IPSs) that capture and inspect network packets
+    has been a common detection and logging technique. IPSs also block some attacks.
+    For example, they may capture information about which IP addresses have exchanged
+    traffic, along with limited information about that traffic, such as packet size.
+    Some IPSs may have the ability to record the entire contents of certain packets,
+    based on customizable criteria—for example, packets sent to high-risk systems.
+    Others can also detect malicious activity in real time and send alerts to the
+    appropriate team. Since these systems are very useful and have few downsides beyond
+    cost, we highly recommend them for almost any organization. However, think carefully
+    about who can effectively triage the alerts they generate.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Logs of DNS queries are also useful network-based sources. DNS logs enable you
+    to see whether any computer at the company has resolved a hostname. For example,
+    you might want to see whether any host on your network has performed a DNS query
+    for a known malicious hostname, or you may want to examine previously resolved
+    domains to identify every machine visited by an attacker that had control of your
+    system. A security operations team might also use DNS “sinkholes” that falsely
+    resolve known malicious domains so they can’t be effectively used by attackers.
+    Detection systems then tend to trigger a high-priority alert when users access
+    a sinkholed domain.
+  prefs: []
+  type: TYPE_NORMAL
+- en: You can also use logs from any web proxies used for internal or egress traffic.
+    For example, you can use a web proxy to scan web pages for indicators of phishing
+    or known vulnerability patterns. When using a proxy for detection, you’ll also
+    want to consider employee privacy and discuss the use of proxy logs with a legal
+    team. Generally speaking, we recommend tailoring your detection as closely as
+    possible to malicious content in order to minimize the amount of employee data
+    you encounter while triaging alerts.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Budget for Logging
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: Debugging and investigative activities use resources. One system we worked on
+    had 100 TB of logs, which were mostly never used. Because logging consumes a significant
+    amount of resources, and logs are often monitored less frequently in the absence
+    of problems, it can be tempting to underinvest in the logging and debugging infrastructure.
+    To avoid this, we strongly recommend that you budget for logging in advance, taking
+    into account how much data you may need to resolve a service issue or security
+    incident.
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'Modern log systems often incorporate a relational data system (e.g., Elasticsearch
+    or BigQuery) to quickly and easily query data in real time. The cost of this system
+    grows along with the number of events it needs to store and index, the number
+    of machines it needs to process and query the data, and the storage space required.
+    When retaining data for long periods of time, it’s therefore useful to prioritize
+    logs from relevant data sources for longer-term storage. This is an important
+    tradeoff decision: if an attacker is good at hiding their tracks, it may take
+    you quite some time to discover that an incident has occurred. If you store only
+    a week’s worth of access logs, you may not be able to investigate an intrusion
+    at all!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: 'We also recommend the following investment strategies for security-focused
+    log collection:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Focus on logs that have a good signal-to-noise ratio. For example, firewalls
+    routinely block many packets, most of which are harmless. Even malicious packets
+    blocked by a firewall may not be worth paying attention to. Gathering logs for
+    these blocked packets could use a tremendous amount of bandwidth and storage for
+    almost no benefit.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Compress logs whenever possible. Because most logs contain a lot of duplicated
+    metadata, compression is typically very effective.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Separate storage into “warm” and “cold.” You can offload logs from the distant
+    past to cheap offline cloud storage (“cold storage”), while retaining logs that
+    are more recent or related to known incidents on local servers for immediate use
+    (“warm storage”). Similarly, you might store compressed raw logs for a long time,
+    but put only recent logs in the expensive relational database with full indexing.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Rotate logs intelligently. Generally, it’s best to delete the oldest logs first,
+    but you may want to retain the most important log types longer.
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: Robust, Secure Debugging Access
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'To debug issues, you often need access to the systems and the data they store.
+    Can a malicious or compromised debugger see sensitive information? Can a failure
+    of a security system (and remember: all systems fail!) be resolved? You need to
+    ensure that your debugging systems are reliable and secure.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Reliability
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: 'Logging is another way systems can fail. For example, a system can run out
+    of disk space to store logs. Failing open in this example entails another tradeoff:
+    the approach can make your entire system more resilient, but an attacker can potentially
+    disrupt your logging mechanism.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: Plan for situations where you might need to debug or repair the security systems
+    themselves. Consider the tradeoffs necessary to make sure you don’t lock yourself
+    out of a system, but can still keep it secure. In this case, you might consider
+    keeping a set of emergency-only credentials, offline in a secure location, that
+    set off high-confidence alarms when used. As an example, [a recent Google network
+    outage](https://oreil.ly/hxpj3) caused high packet loss. When responders attempted
+    to obtain internal credentials, the authentication system could not reach one
+    backend and failed closed. However, emergency credentials enabled the responders
+    to authenticate and fix the network.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Security
+  prefs:
+  - PREF_H2
+  type: TYPE_NORMAL
+- en: One system we worked on, used for phone support, allowed administrators to impersonate
+    a user and to view the UI from their perspective. As a debugger, this system was
+    wonderful; you could clearly and quickly reproduce a user’s problem. However,
+    this type of system provides possibilities for abuse. Debugging endpoints—from
+    impersonation to raw database access—need to be secured.
+  prefs: []
+  type: TYPE_NORMAL
+- en: For many incidents, debugging unusual system behavior need not require access
+    to user data. For example, when diagnosing TCP traffic problems, the speed and
+    quality of bytes on the wire is often enough to diagnose issues. Encrypting data
+    in transit can protect it from any possible attempt by third parties to observe
+    it. This has the fortunate side effect of allowing more engineers access to packet
+    dumps when needed. However, one possible mistake is to treat metadata as nonsensitive.
+    A malicious actor can still learn a lot about a user from metadata by tracking
+    correlated access patterns—for instance, by noting the same user accessing a divorce
+    lawyer and a dating site in the same session. You should carefully assess the
+    risks from treating metadata as nonsensitive.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Also, some analysis *does* require actual data—for example, finding frequently
+    accessed records in a database, and then figuring out why these accesses are common.
+    We once debugged a low-level storage problem caused by a single account receiving
+    thousands of emails per hour. [“Zero Trust Networking”](ch05.html#zero_trust_networking)
+    has more information about access control for these situations.
+  prefs: []
+  type: TYPE_NORMAL
+- en: Conclusion
+  prefs:
+  - PREF_H1
+  type: TYPE_NORMAL
+- en: 'Debugging and investigations are necessary aspects of managing a system. To
+    reiterate the key points in the chapter:'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '*Debugging* is an essential activity whereby systematic techniques—not guesswork—achieve
+    results. You can make debugging vastly easier by implementing tools or logging
+    to provide visibility into the system. Practice debugging to hone your skills.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Security investigations* are different from debugging. They involve different
+    people, tactics, and risks. Your investigation team should include experienced
+    security professionals.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Centralized logging* is useful for debugging purposes, critical for investigations,
+    and often useful for business analysis.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Iterate* by looking at some recent investigations and asking yourself what
+    information would have helped you debug an issue or investigate a concern. Debugging
+    is a process of continuous improvement; you will regularly add data sources and
+    look for ways to improve observability.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: '*Design for safety*. You need logs. Debuggers need access to systems and stored
+    data. However, as the amount of data you store increases, both logs and debugging
+    endpoints can become targets for adversaries. Design logging systems to collect
+    information you’ll need, but also to require robust permissions, privileges, and
+    policies to obtain that data.'
+  prefs:
+  - PREF_UL
+  type: TYPE_NORMAL
+- en: 'Both debugging and security investigations often depend on sudden insight and
+    luck, and even the best debuggers are sometimes sadly left in the dark. Remember
+    that chance favors the prepared: by being ready with logs, and a system for indexing
+    and investigating them, you can take advantage of the chances that come your way.
+    Good luck!'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([1](ch15.html#ch15fn2-marker)) Although the outage occurred in a large distributed
+    system, people who have maintained smaller and self-contained systems will see
+    a lot of similarities—for example, in outages involving a single mail server whose
+    hard drive has run out of space!
+  prefs: []
+  type: TYPE_NORMAL
+- en: '^([2](ch15.html#ch15fn3-marker)) Spanner stores data as a Log-Structured Merge
+    (LSM) tree. For details on this format, see Luo, Chen, and Michael J. Carey. 2018\.
+    “LSM-Based Storage Techniques: A Survey.” arXiv preprint [arXiv:1812.07527v3](https://oreil.ly/DjWJn).'
+  prefs: []
+  type: TYPE_NORMAL
+- en: '^([3](ch15.html#ch15fn4-marker)) For more on Borg, see Verma, Abhishek et al.
+    2015\. “Large-Scale Cluster Management at Google with Borg.” *Proceedings of the
+    10th European Conference on Computer Systems*: 1–17\. doi:10.1145/2741948.2741964.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([4](ch15.html#ch15fn5-marker)) You may also be interested in the blog post
+    [“What Does Debugging a Program Look Like?”](https://oreil.ly/J2U1R) by Julia
+    Evans.
+  prefs: []
+  type: TYPE_NORMAL
+- en: '^([5](ch15.html#ch15fn6-marker)) Schroeder, Bianca, Eduardo Pinheiro, and Wolf-Dietrich
+    Weber. 2009\. “DRAM Errors in the Wild: A Large-Scale Field Study.” *ACM SIGMETRICS
+    Performance Evaluation Review* 37(1). doi:10.1145/2492101.1555372.'
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([6](ch15.html#ch15fn7-marker)) These tools often require some setup; we will
+    discuss them further in [“What to Do When You’re Stuck”](#what_to_do_when_youapostrophere_stuck).
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([7](ch15.html#ch15fn9-marker)) This is another example of normalized deviance,
+    where people get used to suboptimal behavior!
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([8](ch15.html#ch15fn10-marker)) See Krishnan, Kripa. 2012\. “Weathering the
+    Unexpected.” *ACM Queue* 10(9). [*https://oreil.ly/xFPfT*](https://oreil.ly/xFPfT).
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([9](ch15.html#ch15fn11-marker)) 404 is a standard HTTP error code for “file
+    not found.”
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([10](ch15.html#ch15fn12-marker)) Henderson, Fergus. 2017\. “Software Engineering
+    at Google.” arXiv preprint [arXiv:1702.01715v2](https://oreil.ly/2-6pU).
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([11](ch15.html#ch15fn13-marker)) For a comprehensive survey of the topic,
+    see Cindy Sridharan’s [“Monitoring in the Time of Cloud Native”](https://oreil.ly/n6-j9)
+    blog post.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([12](ch15.html#ch15fn14-marker)) See Julia Rozovsky’s blog post [“The Five
+    Keys to a Successful Google Team”](https://oreil.ly/gpxoL) and the *New York Times*
+    article [“What Google Learned from Its Quest to Build the Perfect Team”](https://oreil.ly/YJmwk)
+    by Charles Duhigg.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([13](ch15.html#ch15fn15-marker)) See, e.g., Ghiasvand, Siavash, and Florina
+    M. Ciorba. 2017\. “Anonymization of System Logs for Privacy and Storage Benefits.”
+    arXiv preprint [arXiv:1706.04337](https://oreil.ly/c_a0N). See also Jan Lindquist’s
+    article on [pseudonymization of personal data](https://oreil.ly/W3OFr) for General
+    Data Protection Regulation (GDPR) compliance.
+  prefs: []
+  type: TYPE_NORMAL
+- en: ^([14](ch15.html#ch15fn16-marker)) See, e.g., Joxean Koret’s presentation [“Breaking
+    Antivirus Software”](https://oreil.ly/alqtv) at 44CON 2014.
+  prefs: []
+  type: TYPE_NORMAL
